@@ -15,10 +15,14 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::common::test_util::batches_to_sort_string;
+use datafusion::datasource::physical_plan::parquet::ParquetSplitConfig;
 use datafusion::error::Result;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, create_udf,
 };
+use datafusion::morsel::MorselMetrics;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use datafusion::physical_plan::metrics::MetricValue;
@@ -1229,6 +1233,1010 @@ async fn parquet_filter_projection_prunes_filter_only_columns() -> Result<()> {
                     batches_to_sort_string(&actual),
                     batches_to_sort_string(&expected),
                     "pushdown={pushdown}, partitions={partitions}: {sql}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_fixture(
+    files: usize,
+    rgs_per_file: usize,
+    rows_per_rg: usize,
+    write_page_index: bool,
+) -> Result<TempDir> {
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Int32, true),
+        Field::new("delta", DataType::Int32, true),
+        Field::new("payload", DataType::Int64, true),
+        Field::new("unused", DataType::Int64, false),
+    ]));
+    let stats = if write_page_index {
+        EnabledStatistics::Page
+    } else {
+        EnabledStatistics::Chunk
+    };
+    let mut row_start = 0i64;
+    for file in 0..files {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_rg))
+            .set_write_batch_size(35)
+            .set_data_page_row_count_limit(70)
+            .set_data_page_size_limit(256)
+            .set_dictionary_page_size_limit(256)
+            .set_dictionary_enabled(true)
+            .set_statistics_enabled(stats)
+            .set_offset_index_disabled(!write_page_index)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("part-{file:03}.parquet")))?,
+            Arc::clone(&schema),
+            Some(props),
+        )?;
+        for _ in 0..rgs_per_file {
+            let ids: Vec<i64> = (row_start..row_start + rows_per_rg as i64).collect();
+            let scores: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&id| (id % 19 != 0).then_some(((id * 17) % 100) as i32))
+                .collect();
+            // Low cardinality so delta uses dictionary encoding with multiple pages.
+            let deltas: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&id| (id % 23 != 0).then_some((id % 7) as i32))
+                .collect();
+            let payloads: Vec<Option<i64>> = ids
+                .iter()
+                .map(|&id| (id % 11 != 0).then_some(id * 31 + 7))
+                .collect();
+            let unused: Vec<i64> = ids.iter().map(|&id| id * 101).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(scores)),
+                    Arc::new(Int32Array::from(deltas)),
+                    Arc::new(Int64Array::from(payloads)),
+                    Arc::new(Int64Array::from(unused)),
+                ],
+            )?;
+            writer.write(&batch)?;
+            writer.flush()?;
+            row_start += rows_per_rg as i64;
+        }
+        writer.close()?;
+    }
+    Ok(dir)
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn split_context(
+    dir: &TempDir,
+    mode: &str,
+    workers: usize,
+    pushdown: bool,
+    enable_page_index: bool,
+    split_config: Option<ParquetSplitConfig>,
+    metrics: Option<Arc<MorselMetrics>>,
+    pool: Option<Arc<dyn MemoryPool>>,
+) -> Result<SessionContext> {
+    let mut config = SessionConfig::new()
+        .with_target_partitions(workers)
+        .with_batch_size(128);
+    config.options_mut().execution.parquet.pushdown_filters = pushdown;
+    config.options_mut().execution.parquet.enable_page_index = enable_page_index;
+    config.options_mut().execution.collect_statistics = false;
+    if let Some(split_cfg) = split_config {
+        config.set_extension(Arc::new(split_cfg));
+    }
+    if let Some(m) = metrics {
+        config.set_extension(m);
+    }
+    let ctx = if let Some(pool) = pool {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()?;
+        SessionContext::new_with_config_rt(config, runtime)
+    } else {
+        SessionContext::new_with_config(config)
+    };
+    ctx.register_parquet(
+        "t",
+        dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+        .await?;
+    Ok(ctx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_parity_across_boundaries_filters_nulls_and_pushdown()
+-> Result<()> {
+    // 2 files x 2 large RGs x 2400 rows = 9600 rows; 300 rows/slice -> 32 slices.
+    let dir = split_fixture(2, 2, 2400, true)?;
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&dir, "off", 8, pushdown, true, None, None, None).await?;
+        let metrics = Arc::new(MorselMetrics::default());
+        let native = split_context(
+            &dir,
+            "required",
+            8,
+            pushdown,
+            true,
+            Some(split_cfg.clone()),
+            Some(Arc::clone(&metrics)),
+            None,
+        )
+        .await?;
+
+        // 1. Full projection across split boundaries with NULLs and dictionary column
+        for sql in [
+            "SELECT id, score, delta, payload FROM t",
+            "SELECT id, payload + delta AS p FROM t WHERE (score + 3 * delta) % 10 < 3",
+            "SELECT COUNT(*) AS n FROM t WHERE (score + 3 * delta) % 10 < 3",
+            "SELECT id, score FROM t WHERE score > 50 AND random() >= 0.0",
+        ] {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "pushdown={pushdown}: {sql}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "parquet_morsels_claimed"),
+                32,
+                "pushdown={pushdown}: {sql}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "parquet_split_row_groups"),
+                4,
+                "pushdown={pushdown}: {sql}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "parquet_split_slices"),
+                32,
+                "pushdown={pushdown}: {sql}"
+            );
+            assert!(
+                metric(plan.as_ref(), "parquet_split_reused_bytes") > 0,
+                "expected page/dictionary reuse for pushdown={pushdown}: {sql}"
+            );
+            let runs = metrics.take_runs();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(
+                runs[0].sum_by_name("morsels_claimed").unwrap().as_usize(),
+                32
+            );
+            assert_eq!(
+                runs[0].sum_by_name("morsels_completed").unwrap().as_usize(),
+                32
+            );
+        }
+
+        // 2. Page-index-pruned sub-ranges (only a subset of slices survive!)
+        for sql in [
+            "SELECT id, score FROM t WHERE id >= 2000 AND id < 2100",
+            "SELECT COUNT(*) AS n FROM t WHERE id >= 2000 AND id < 2100",
+            "SELECT id, score FROM t WHERE (id >= 100 AND id < 200) OR (id >= 1800 AND id < 2200)",
+            "SELECT COUNT(*) AS n FROM t WHERE id < 0",
+        ] {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "pruned pushdown={pushdown}: {sql}"
+            );
+            let runs = metrics.take_runs();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(
+                runs[0].sum_by_name("morsels_claimed").unwrap().as_usize(),
+                runs[0].sum_by_name("morsels_completed").unwrap().as_usize()
+            );
+        }
+
+        // 3. Metadata-only (0 projected columns) scan skips splitting
+        let sql = "SELECT 42 AS c FROM t";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(metric(plan.as_ref(), "parquet_split_row_groups"), 0);
+        let _ = metrics.take_runs();
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_enables_all_8_workers_on_4_large_row_groups() -> Result<()> {
+    // 2 files x 2 large RGs = 4 row groups total across 8 workers.
+    let dir = split_fixture(2, 2, 2400, true)?;
+
+    // Control: default ParquetSplitConfig is opt-in (enabled == false), so
+    // even with thresholds below the RG size at most 4 workers claim the 4 RGs.
+    assert!(!ParquetSplitConfig::default().enabled);
+    let disabled_metrics = Arc::new(MorselMetrics::default());
+    let disabled_ctx = split_context(
+        &dir,
+        "required",
+        8,
+        false,
+        true,
+        Some(ParquetSplitConfig {
+            min_row_group_rows: 800,
+            target_slice_rows: 300,
+            ..Default::default()
+        }),
+        Some(Arc::clone(&disabled_metrics)),
+        None,
+    )
+    .await?;
+    let disabled_plan = disabled_ctx
+        .sql("SELECT COUNT(*) AS n FROM t WHERE score > 10")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let expected = collect(Arc::clone(&disabled_plan), disabled_ctx.task_ctx()).await?;
+    assert_eq!(metric(disabled_plan.as_ref(), "parquet_morsels_claimed"), 4);
+    let disabled_runs = disabled_metrics.take_runs();
+    let disabled_active_workers = disabled_runs[0]
+        .iter()
+        .filter(|m| m.value().name() == "morsels_claimed" && m.value().as_usize() > 0)
+        .count();
+    assert!(
+        disabled_active_workers <= 4,
+        "expected <= 4 active workers without splitting, got {disabled_active_workers}"
+    );
+
+    // Enabled: barrier inside a scalar UDF requires all 8 workers to claim and
+    // run slices concurrently on the exact same 4-row-group table!
+    let split_metrics = Arc::new(MorselMetrics::default());
+    let split_ctx = split_context(
+        &dir,
+        "required",
+        8,
+        false,
+        true,
+        Some(ParquetSplitConfig {
+            enabled: true,
+            min_row_group_rows: 800,
+            target_slice_rows: 300, // 32 slices across 8 workers
+            ..Default::default()
+        }),
+        Some(Arc::clone(&split_metrics)),
+        None,
+    )
+    .await?;
+    let seen_threads = Arc::new(Mutex::new(HashSet::<ThreadId>::new()));
+    let barrier = Arc::new(Barrier::new(8));
+    let seen_threads_udf = Arc::clone(&seen_threads);
+    let barrier_udf = Arc::clone(&barrier);
+    let gate_udf = create_udf(
+        "sync_eight_workers",
+        vec![DataType::Int32],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            let first_for_thread =
+                seen_threads_udf.lock().insert(std::thread::current().id());
+            if first_for_thread {
+                barrier_udf.wait();
+            }
+            let arr = args[0].clone().into_array(1)?;
+            let ints = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            let mask: BooleanArray = ints.iter().map(|v| v.map(|x| x > 10)).collect();
+            Ok(ColumnarValue::Array(Arc::new(mask)))
+        }),
+    );
+    split_ctx.register_udf(gate_udf);
+
+    let split_plan = split_ctx
+        .sql("SELECT COUNT(*) AS n FROM t WHERE sync_eight_workers(score)")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let actual = timeout(
+        Duration::from_secs(15),
+        collect(Arc::clone(&split_plan), split_ctx.task_ctx()),
+    )
+    .await
+    .expect("timed out waiting for all 8 workers to claim split slices")?;
+    assert_eq!(actual, expected);
+    assert_eq!(metric(split_plan.as_ref(), "parquet_morsels_claimed"), 32);
+    assert_eq!(metric(split_plan.as_ref(), "parquet_split_row_groups"), 4);
+
+    let split_runs = split_metrics.take_runs();
+    assert_eq!(split_runs.len(), 1);
+    let active_workers = split_runs[0]
+        .iter()
+        .filter(|m| m.value().name() == "morsels_claimed" && m.value().as_usize() > 0)
+        .count();
+    assert_eq!(active_workers, 8, "all 8 workers must claim split slices");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intra_rg_splitting_fallbacks_and_mixed_split_unsplit_rgs() -> Result<()> {
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+
+    // 1. Missing Page/Offset Index -> clean unsplit fallback with exact parity
+    let no_index_dir = split_fixture(2, 2, 2400, false)?;
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&no_index_dir, "off", 4, pushdown, true, None, None, None)
+                .await?;
+        let native = split_context(
+            &no_index_dir,
+            "required",
+            4,
+            pushdown,
+            true,
+            Some(split_cfg.clone()),
+            None,
+            None,
+        )
+        .await?;
+        let sql = "SELECT id, score FROM t WHERE score > 50";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 4);
+        assert_eq!(metric(plan.as_ref(), "parquet_split_row_groups"), 0);
+    }
+
+    // 2. Indexed file with enable_page_index=false -> clean unsplit fallback
+    let indexed_dir = split_fixture(2, 2, 2400, true)?;
+    let native_pi_off = split_context(
+        &indexed_dir,
+        "required",
+        4,
+        false,
+        false,
+        Some(split_cfg.clone()),
+        None,
+        None,
+    )
+    .await?;
+    let plan = native_pi_off
+        .sql("SELECT id, score FROM t")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let batches = collect(Arc::clone(&plan), native_pi_off.task_ctx()).await?;
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        9600
+    );
+    assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 4);
+    assert_eq!(metric(plan.as_ref(), "parquet_split_row_groups"), 0);
+
+    // 3. Mixed file: 1 large RG (2400 rows -> 8 slices) + 1 small RG (200 rows -> 1 unsplit)
+    //    AND includes a Utf8 + Struct column to verify unsupported-type fallback vs
+    //    fixed-width-only projection splitting on the exact same file!
+    let mixed_dir = TempDir::new()?;
+    let mixed_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Int32, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new(
+            "nested",
+            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int32, false)])),
+            false,
+        ),
+    ]));
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2400))
+        .set_write_batch_size(35)
+        .set_data_page_row_count_limit(70)
+        .set_data_page_size_limit(256)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(mixed_dir.path().join("mixed.parquet"))?,
+        Arc::clone(&mixed_schema),
+        Some(props),
+    )?;
+    for (start, len) in [(0i64, 2400usize), (2400i64, 200usize)] {
+        let ids: Vec<i64> = (start..start + len as i64).collect();
+        let scores: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 7 != 0).then_some((i % 100) as i32))
+            .collect();
+        let labels: Vec<Option<String>> = ids
+            .iter()
+            .map(|&i| (i % 5 != 0).then_some(format!("v{i}")))
+            .collect();
+        let x_arr = Arc::new(Int32Array::from_iter_values(ids.iter().map(|&i| i as i32)));
+        let nested = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int32, false)),
+            x_arr as _,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&mixed_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int32Array::from(scores)),
+                Arc::new(StringArray::from(labels)),
+                nested,
+            ],
+        )?;
+        writer.write(&batch)?;
+        writer.flush()?;
+    }
+    writer.close()?;
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&mixed_dir, "off", 4, pushdown, true, None, None, None).await?;
+        let native = split_context(
+            &mixed_dir,
+            "required",
+            4,
+            pushdown,
+            true,
+            Some(split_cfg.clone()),
+            None,
+            None,
+        )
+        .await?;
+
+        // Flat fixed-width projection -> RG 0 splits (8 slices) + RG 1 unsplit (1) = 9 morsels!
+        let sql_flat = "SELECT id, score FROM t WHERE score > 20";
+        let expected = stock.sql(sql_flat).await?.collect().await?;
+        let plan = native.sql(sql_flat).await?.create_physical_plan().await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 9);
+        assert_eq!(metric(plan.as_ref(), "parquet_split_row_groups"), 1);
+        assert_eq!(metric(plan.as_ref(), "parquet_split_slices"), 8);
+
+        // Unsupported string or struct columns -> clean unsplit fallback (2 morsels)
+        for sql_unsupported in [
+            "SELECT id, label FROM t WHERE score > 20",
+            "SELECT id, nested FROM t WHERE score > 20",
+        ] {
+            let expected = stock.sql(sql_unsupported).await?.collect().await?;
+            let plan = native
+                .sql(sql_unsupported)
+                .await?
+                .create_physical_plan()
+                .await?;
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected)
+            );
+            assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 2);
+            assert_eq!(metric(plan.as_ref(), "parquet_split_row_groups"), 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_cancellation_and_mid_rg_error_cleanup() -> Result<()> {
+    let dir = split_fixture(2, 2, 2400, true)?;
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+
+    // 1. Early stream drop mid-RG releases all memory pool reservations and reports partial metrics
+    for pushdown in [false, true] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(128 << 20));
+        let metrics = Arc::new(MorselMetrics::default());
+        let native = split_context(
+            &dir,
+            "required",
+            8,
+            pushdown,
+            true,
+            Some(split_cfg.clone()),
+            Some(Arc::clone(&metrics)),
+            Some(Arc::clone(&pool)),
+        )
+        .await?;
+        let plan = native
+            .sql("SELECT id, score, delta FROM t WHERE score > 10")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let mut stream = execute_stream(Arc::clone(&plan), native.task_ctx())?;
+        let first = timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("timed out reading first batch")
+            .expect("expected at least one batch")?;
+        assert!(first.num_rows() > 0);
+        drop(stream);
+
+        // Wait briefly for aborted tasks to drop their reservations and publish partial report.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if pool.reserved() == 0 && !metrics.take_runs().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for cancelled split scan to release reservations");
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 2. Mid-RG UDF error propagates cleanly and releases all reservations
+    let fail_mid_rg = create_udf(
+        "fail_mid_rg",
+        vec![DataType::Int64],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(|args| {
+            let arr = args[0].clone().into_array(1)?;
+            let ids = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            // id=1502 has score=(1502*17)%100=34 > 10 and 1502%19 != 0.
+            if ids.iter().any(|v| v == Some(1502)) {
+                return datafusion::common::exec_err!("injected mid-rg filter failure");
+            }
+            let mask: BooleanArray = ids.iter().map(|v| v.map(|x| x >= 0)).collect();
+            Ok(ColumnarValue::Array(Arc::new(mask)))
+        }),
+    );
+
+    for pushdown in [false, true] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(128 << 20));
+        let native = split_context(
+            &dir,
+            "required",
+            8,
+            pushdown,
+            true,
+            Some(split_cfg.clone()),
+            None,
+            Some(Arc::clone(&pool)),
+        )
+        .await?;
+        native.register_udf(fail_mid_rg.clone());
+        let plan = native
+            .sql("SELECT COUNT(*) AS n FROM t WHERE score > 10 AND fail_mid_rg(id)")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let err = timeout(
+            Duration::from_secs(10),
+            collect(Arc::clone(&plan), native.task_ctx()),
+        )
+        .await
+        .expect("timed out on mid-RG error")
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("injected mid-rg filter failure"), "{err}");
+        assert_eq!(metric(plan.as_ref(), "count_finalizations"), 0);
+        timeout(Duration::from_secs(5), async {
+            while pool.reserved() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reservations must return to zero after mid-RG error");
+    }
+
+    Ok(())
+}
+
+fn wide_six_col_split_fixture(
+    files: usize,
+    rgs_per_file: usize,
+    rows_per_rg: usize,
+) -> Result<TempDir> {
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int64, true),
+        Field::new("c", DataType::Int64, false),
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int64, true),
+    ]));
+    let mut row_start = 0i64;
+    for file in 0..files {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_rg))
+            .set_write_batch_size(40)
+            .set_data_page_row_count_limit(80)
+            .set_data_page_size_limit(512)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("part-{file:03}.parquet")))?,
+            Arc::clone(&schema),
+            Some(props),
+        )?;
+        for _ in 0..rgs_per_file {
+            let ids: Vec<i64> = (row_start..row_start + rows_per_rg as i64).collect();
+            let a: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&i| (i % 19 != 0).then_some(((i * 37) % 1000) as i32))
+                .collect();
+            let b: Vec<Option<i64>> = ids
+                .iter()
+                .map(|&i| (i % 17 != 0).then_some(i * 13 + 5))
+                .collect();
+            let c: Vec<i64> = ids.iter().map(|&i| i * 29 - 11).collect();
+            let d: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&i| (i % 23 != 0).then_some((i % 5) as i32))
+                .collect();
+            let e: Vec<Option<i64>> = ids
+                .iter()
+                .map(|&i| (i % 11 != 0).then_some(i * 41 + 3))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(Int64Array::from(b)),
+                    Arc::new(Int64Array::from(c)),
+                    Arc::new(Int32Array::from(d)),
+                    Arc::new(Int64Array::from(e)),
+                ],
+            )?;
+            writer.write(&batch)?;
+            writer.flush()?;
+            row_start += rows_per_rg as i64;
+        }
+        writer.close()?;
+    }
+    Ok(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_bounded_memory_pool_both_pushdown_modes() -> Result<()> {
+    // 2 files x 2 RGs x 4800 rows, 6 fixed-width columns, 8 workers.
+    let dir = wide_six_col_split_fixture(2, 2, 4800)?;
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+    let queries = [
+        "SELECT * FROM t WHERE a > 100",
+        "SELECT COUNT(*) AS n FROM t WHERE a > 500 AND d = 1",
+    ];
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&dir, "off", 8, pushdown, true, None, None, None).await?;
+        for sql in queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+
+            // 1. Bounded pool smaller than all in-flight slice estimates combined
+            //    (only ~2-3 slices fit at once across 8 workers) must pace cleanly
+            //    via backpressure, split all 4 RGs, and match stock.
+            for round in 0..3 {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(48 << 10));
+                let native = split_context(
+                    &dir,
+                    "required",
+                    8,
+                    pushdown,
+                    true,
+                    Some(split_cfg.clone()),
+                    None,
+                    Some(Arc::clone(&pool)),
+                )
+                .await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let actual = timeout(
+                    Duration::from_secs(15),
+                    collect(Arc::clone(&plan), native.task_ctx()),
+                )
+                .await
+                .expect("timed out under bounded memory pool")?;
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "bounded pool pushdown={pushdown} round={round}: {sql}"
+                );
+                assert_eq!(
+                    metric(plan.as_ref(), "parquet_split_row_groups"),
+                    4,
+                    "expected all 4 RGs to split under 48 KiB pool (pushdown={pushdown}): {sql}"
+                );
+                assert_eq!(pool.reserved(), 0);
+            }
+
+            // 2. Pool smaller than even a single slice must fall back cleanly to
+            //    the unsplit reader before publishing slice 0 instead of erroring.
+            let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+            let native = split_context(
+                &dir,
+                "required",
+                8,
+                pushdown,
+                true,
+                Some(split_cfg.clone()),
+                None,
+                Some(Arc::clone(&tiny_pool)),
+            )
+            .await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            let actual = timeout(
+                Duration::from_secs(15),
+                collect(Arc::clone(&plan), native.task_ctx()),
+            )
+            .await
+            .expect("timed out on tiny-pool fallback")?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "tiny pool fallback pushdown={pushdown}: {sql}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "parquet_split_row_groups"),
+                0,
+                "expected clean unsplit fallback under 1 KiB pool (pushdown={pushdown}): {sql}"
+            );
+            assert_eq!(tiny_pool.reserved(), 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_tight_buffer_cap_both_pushdown_modes() -> Result<()> {
+    // 2 files x 2 RGs x 4800 rows, 6 fixed-width columns, 8 workers.
+    // Tight split_buffer_cap_bytes forces frontier serialization across file
+    // lanes AND slice-by-slice cap backpressure across ready/worker/last-slice
+    // transitions for both plain and multi-conjunct pushed filter paths.
+    let dir = wide_six_col_split_fixture(2, 2, 4800)?;
+    let queries = [
+        ("SELECT * FROM t WHERE a > 100", 48 << 10),
+        (
+            "SELECT COUNT(*) AS n FROM t WHERE a > 500 AND d = 1",
+            16 << 10,
+        ),
+    ];
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&dir, "off", 8, pushdown, true, None, None, None).await?;
+        for (sql, tight_cap) in queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let split_cfg = ParquetSplitConfig {
+                enabled: true,
+                min_row_group_rows: 800,
+                target_slice_rows: 300,
+                split_buffer_cap_bytes: tight_cap,
+                ..Default::default()
+            };
+            for round in 0..5 {
+                let pool: Arc<dyn MemoryPool> =
+                    Arc::new(GreedyMemoryPool::new(128 << 10));
+                let native = split_context(
+                    &dir,
+                    "required",
+                    8,
+                    pushdown,
+                    true,
+                    Some(split_cfg.clone()),
+                    None,
+                    Some(Arc::clone(&pool)),
+                )
+                .await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let actual = timeout(
+                    Duration::from_secs(15),
+                    collect(Arc::clone(&plan), native.task_ctx()),
+                )
+                .await
+                .expect("timed out under tight split_buffer_cap_bytes")?;
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "tight cap={tight_cap} pushdown={pushdown} round={round}: {sql}"
+                );
+                assert_eq!(
+                    metric(plan.as_ref(), "parquet_split_row_groups"),
+                    4,
+                    "expected all 4 RGs to split under tight cap={tight_cap} (pushdown={pushdown}, round={round}): {sql}"
+                );
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_small_pool_sweep_both_pushdown_modes() -> Result<()> {
+    // 8 files x 1 RG x 4800 rows, id (Int64) + dictionary-encoded a, b, d with
+    // 70-row pages, batch_size=1000, 8 workers: reproduces pool-unaware
+    // multi-lane admission failures in the 6-24 KiB transition band where slice 0
+    // fits individually but pinned dictionaries + later slices exceed the pool.
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+        Field::new("d", DataType::Int32, true),
+    ]));
+    let rows_per_rg = 4800usize;
+    let mut row_start = 0i64;
+    for file in 0..8usize {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_rg))
+            .set_write_batch_size(35)
+            .set_data_page_row_count_limit(70)
+            .set_data_page_size_limit(256)
+            .set_dictionary_page_size_limit(256)
+            .set_dictionary_enabled(true)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("part-{file:03}.parquet")))?,
+            Arc::clone(&schema),
+            Some(props),
+        )?;
+        let ids: Vec<i64> = (row_start..row_start + rows_per_rg as i64).collect();
+        let a: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 19 != 0).then_some(((i % 10) * 10) as i32))
+            .collect();
+        let b: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 17 != 0).then_some((i % 11) as i32))
+            .collect();
+        let d: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 23 != 0).then_some((i % 5) as i32))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int32Array::from(a)),
+                Arc::new(Int32Array::from(b)),
+                Arc::new(Int32Array::from(d)),
+            ],
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        row_start += rows_per_rg as i64;
+    }
+
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+
+    // Sweep two workloads across 1..=64 KiB in 1 KiB steps:
+    // 1) batch_size=1000, COUNT(*) WHERE a > 50 AND d = 1 (reproduces the exact
+    //    multi-lane 6-8 KiB dictionary-pinning failure on pushdown=false).
+    // 2) batch_size=128, SELECT id, b WHERE a > 50 AND d = 1 (exercises the full
+    //    fallback -> single-lane -> multi-lane transition band for BOTH pushdown
+    //    modes, including Phase-1 + Phase-2 admission).
+    let cases = [
+        (
+            1000usize,
+            "SELECT COUNT(*) AS n FROM t WHERE a > 50 AND d = 1",
+            false,
+        ),
+        (128usize, "SELECT id, b FROM t WHERE a > 50 AND d = 1", true),
+    ];
+
+    for (batch_size, sql, require_split_both_modes) in cases {
+        for pushdown in [false, true] {
+            let mut stock_cfg = SessionConfig::new()
+                .with_target_partitions(8)
+                .with_batch_size(batch_size);
+            stock_cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            stock_cfg.options_mut().execution.parquet.enable_page_index = true;
+            stock_cfg.options_mut().execution.collect_statistics = false;
+            let stock = SessionContext::new_with_config(stock_cfg);
+            stock
+                .register_parquet(
+                    "t",
+                    dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            let expected = stock.sql(sql).await?.collect().await?;
+            let table = stock.table_provider("t").await?;
+
+            let mut saw_unsplit = false;
+            let mut saw_split = false;
+
+            for pool_kib in 1usize..=64 {
+                let repeats = if (6..=24).contains(&pool_kib) { 2 } else { 1 };
+                for round in 0..repeats {
+                    let pool: Arc<dyn MemoryPool> =
+                        Arc::new(GreedyMemoryPool::new(pool_kib << 10));
+                    let mut config = SessionConfig::new()
+                        .with_target_partitions(8)
+                        .with_batch_size(batch_size);
+                    config.options_mut().execution.parquet.pushdown_filters = pushdown;
+                    config.options_mut().execution.parquet.enable_page_index = true;
+                    config.options_mut().execution.collect_statistics = false;
+                    config.set_extension(Arc::new(split_cfg.clone()));
+                    let runtime = RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&pool))
+                        .build_arc()?;
+                    let native = SessionContext::new_with_config_rt(config, runtime);
+                    native.register_table("t", Arc::clone(&table))?;
+                    native
+                        .sql("SET datafusion.execution.morsel_mode = 'required'")
+                        .await?;
+                    let plan = native.sql(sql).await?.create_physical_plan().await?;
+                    let actual = timeout(
+                        Duration::from_secs(15),
+                        collect(Arc::clone(&plan), native.task_ctx()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}"
+                        )
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}: {err}"
+                        )
+                    });
+                    assert_eq!(
+                        batches_to_sort_string(&actual),
+                        batches_to_sort_string(&expected),
+                        "row mismatch at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}"
+                    );
+                    let split_rgs = metric(plan.as_ref(), "parquet_split_row_groups");
+                    if split_rgs == 0 {
+                        saw_unsplit = true;
+                    } else {
+                        saw_split = true;
+                    }
+                    assert_eq!(pool.reserved(), 0);
+                }
+            }
+            if !pushdown || require_split_both_modes {
+                assert!(
+                    saw_unsplit && saw_split,
+                    "expected sweep to cover both fallback and split regimes (batch={batch_size}, pushdown={pushdown}, saw_unsplit={saw_unsplit}, saw_split={saw_split})"
                 );
             }
         }

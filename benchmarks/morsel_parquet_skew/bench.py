@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import platform
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,12 +41,29 @@ LAYOUTS = {
 MODES = ("off", "required")
 
 
+class EnvStreamRunner(StreamRunner):
+    def __init__(self, binary, path, threads, timeout, mode, env_overrides=None):
+        super().__init__(binary, path, threads, timeout, mode)
+        self.env = os.environ.copy()
+        if env_overrides:
+            self.env.update(env_overrides)
+
+    def _run(self, operation, sql, output):
+        return subprocess.run(
+            [str(self.binary), operation, *self.args, sql],
+            stdout=output,
+            check=True,
+            timeout=self.timeout,
+            env=self.env,
+        ).stdout
+
+
 def layout(case, smoke):
     groups, group_rows = LAYOUTS[case]
     return groups, group_rows // 1024 if smoke else group_rows
 
 
-def generate(path, groups, group_rows):
+def generate(path, groups, group_rows, write_page_index=False):
     path.mkdir(parents=True)
     start = 0
     for file, num_groups in enumerate(groups):
@@ -55,7 +74,7 @@ def generate(path, groups, group_rows):
             compression_level=3,
             use_dictionary=False,
             write_statistics=True,
-            write_page_index=False,
+            write_page_index=write_page_index,
             version="2.6",
             data_page_version="1.0",
         ) as writer:
@@ -89,8 +108,46 @@ def check_layout(files, groups, group_rows):
             )
 
 
-def validate_sample(result, mode, query, row_groups, expected, revision):
-    validate_path(result, mode, query, row_groups)
+def validate_sample(
+    result,
+    mode,
+    query,
+    row_groups,
+    expected,
+    revision,
+    allow_split=False,
+    pushdown_filters=False,
+):
+    split_rgs = result.get("parquet_split_row_groups", 0)
+    split_slices = result.get("parquet_split_slices", 0)
+    expected_morsels = row_groups
+    if mode != "off" and allow_split and split_rgs > 0:
+        expected_morsels = split_slices + (row_groups - split_rgs)
+        if expected_morsels <= row_groups:
+            raise ValueError(
+                f"{mode}/{query}: split_rgs={split_rgs} must yield more morsels than {row_groups}"
+            )
+    plan = result["plan"]
+    if mode == "off":
+        validate_path(result, mode, query, expected_morsels)
+    else:
+        if not plan.startswith("MorselExec:") or not re.search(
+            r"NativeParquet\[fixture(?:,|\])", plan
+        ):
+            raise ValueError(
+                f"{query}: expected a native Parquet morsel plan, got {plan}"
+            )
+        if result["parquet_morsels_claimed"] != expected_morsels:
+            raise ValueError(
+                f"{query}: expected to claim {expected_morsels} Parquet morsels, got {result['parquet_morsels_claimed']}"
+            )
+        count = query.startswith("count_")
+        if ("CountSink" in plan) != count or result["count_finalizations"] != int(
+            count
+        ):
+            raise ValueError(
+                f"{query}: unexpected native count sink or finalization count"
+            )
     if result["build_revision"] != revision or result["output_rows"] != expected:
         raise ValueError(
             f"{mode}/{query}: unexpected build revision or output row count"
@@ -101,10 +158,14 @@ def validate_sample(result, mode, query, row_groups, expected, revision):
             raise ValueError(f"{mode}/{query}: unexpected native metrics")
     elif (
         not isinstance(claims, list)
+        or not isinstance(completions, list)
         or len(claims) != WORKERS
+        or len(completions) != WORKERS
         or any(type(n) is not int or n < 0 for n in claims)
-        or sum(claims) != row_groups
-        or claims != completions
+        or any(type(n) is not int or n < 0 for n in completions)
+        or sum(claims) != expected_morsels
+        or sum(completions) != expected_morsels
+        or (not pushdown_filters and claims != completions)
     ):
         raise ValueError(f"{mode}/{query}: invalid per-worker claims/completions")
 
@@ -133,29 +194,60 @@ def benchmark(args, groups, group_rows):
     check_layout(files, groups, group_rows)
     row_groups = sum(groups)
     rows = row_groups * group_rows
-    backends = {
-        mode: StreamRunner(args.runner, args.path, WORKERS, args.timeout, mode)
-        for mode in MODES
+
+    base_env = {
+        "MORSEL_ENABLE_PAGE_INDEX": "1" if args.enable_page_index else "0",
+        "MORSEL_PUSHDOWN_FILTERS": "1" if args.pushdown_filters else "0",
     }
-    # No timings are emitted until both arms pass both the oracle and plan checks.
-    matches = verify(backends["off"], rows)
-    verify(backends["required"], rows)
+    if args.compare_split:
+        arm_specs = (
+            ("off", "off", base_env),
+            ("legacy", "required", {**base_env, "MORSEL_SPLIT_ENABLED": "0"}),
+            ("split", "required", {**base_env, "MORSEL_SPLIT_ENABLED": "1"}),
+        )
+    else:
+        native_env = (
+            {**base_env, "MORSEL_SPLIT_ENABLED": "1"} if args.enable_split else base_env
+        )
+        arm_specs = (("off", "off", base_env), ("required", "required", native_env))
+    arm_names = tuple(name for name, _, _ in arm_specs)
+    arm_modes = {name: mode for name, mode, _ in arm_specs}
+    backends = {
+        name: EnvStreamRunner(args.runner, args.path, WORKERS, args.timeout, mode, env)
+        for name, mode, env in arm_specs
+    }
+    allow_split = args.enable_split or args.compare_split
+
+    # No timings are emitted until all arms pass both the oracle and plan checks.
+    matches = verify(backends[arm_names[0]], rows)
+    for name in arm_names[1:]:
+        if verify(backends[name], rows) != matches:
+            raise ValueError(f"oracle mismatch for arm {name}")
     queries = workloads()
     expected = {f"scan_{name}": n for name, n in matches.items()}
     expected.update({f"count_{name}": 1 for name in matches})
 
-    def sample(mode, query):
-        result = backends[mode].measure(queries[query])
-        validate_sample(result, mode, query, row_groups, expected[query], args.revision)
+    def sample(arm, query):
+        result = backends[arm].measure(queries[query])
+        validate_sample(
+            result,
+            arm_modes[arm],
+            query,
+            row_groups,
+            expected[query],
+            args.revision,
+            allow_split=allow_split and arm != "legacy",
+            pushdown_filters=args.pushdown_filters,
+        )
         return result
 
     evidence = []
     for query in queries:
-        for mode in MODES:
-            result = sample(mode, query)
+        for arm in arm_names:
+            result = sample(arm, query)
             evidence.append(
                 {
-                    "mode": mode,
+                    "mode": arm,
                     "query": query,
                     **{
                         key: result[key]
@@ -178,6 +270,9 @@ def benchmark(args, groups, group_rows):
                 "workers": WORKERS,
                 "build_revision": args.revision,
                 "cache_regime": "warm",
+                "enable_page_index": args.enable_page_index,
+                "pushdown_filters": args.pushdown_filters,
+                "compare_split": args.compare_split,
                 "warmups": args.warmups,
                 "repeats": args.repeats,
                 "row_groups_per_file": groups,
@@ -191,11 +286,15 @@ def benchmark(args, groups, group_rows):
         flush=True,
     )
     for rep in range(1 - args.warmups, args.repeats + 1):
-        order = MODES if rep % 2 else MODES[::-1]
+        if len(arm_names) == 2:
+            order = arm_names if rep % 2 else arm_names[::-1]
+        else:
+            shift = rep % len(arm_names)
+            order = arm_names[shift:] + arm_names[:shift]
         for query in queries:
-            for mode in order:
+            for arm in order:
                 pages = warm_pages(files)
-                result = sample(mode, query)
+                result = sample(arm, query)
                 if rep > 0:
                     del result["plan"], result["build_revision"]
                     print(
@@ -203,7 +302,7 @@ def benchmark(args, groups, group_rows):
                             {
                                 "rep": rep,
                                 "query": query,
-                                "mode": mode,
+                                "mode": arm,
                                 "cache_pages_before": pages,
                                 **result,
                             }
@@ -221,15 +320,40 @@ def main():
         cmd.add_argument("case", choices=LAYOUTS)
         cmd.add_argument("path", type=Path)
         cmd.add_argument("--smoke", action="store_true", help="use smaller row groups")
+    generate_cmd.add_argument(
+        "--page-index",
+        action="store_true",
+        help="write Parquet ColumnIndex and OffsetIndex",
+    )
     ab.add_argument("--runner", type=Path, required=True)
     ab.add_argument("--revision", required=True)
     ab.add_argument("--timeout", type=positive, default=120, help="seconds per query")
     ab.add_argument("--warmups", type=int, default=1)
     ab.add_argument("--repeats", type=positive, default=5)
+    ab.add_argument(
+        "--enable-page-index",
+        action="store_true",
+        help="enable Parquet page/offset index reads in the runner",
+    )
+    ab.add_argument(
+        "--pushdown-filters",
+        action="store_true",
+        help="enable Parquet row-filter pushdown in the runner",
+    )
+    ab.add_argument(
+        "--enable-split",
+        action="store_true",
+        help="opt into intra-row-group splitting in the required arm",
+    )
+    ab.add_argument(
+        "--compare-split",
+        action="store_true",
+        help="run paired 3-arm comparison: stock (off), legacy native (split off), and split native",
+    )
     args = parser.parse_args()
     groups, group_rows = layout(args.case, args.smoke)
     if args.command == "generate":
-        generate(args.path, groups, group_rows)
+        generate(args.path, groups, group_rows, write_page_index=args.page_index)
         return
     if args.warmups < 0:
         parser.error("--warmups must be non-negative")

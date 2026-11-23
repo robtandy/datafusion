@@ -73,6 +73,46 @@ class FixtureTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_sample(bad, "required", "scan_low", 4, 10, "pinned")
 
+    def test_split_claims_and_page_index_generation(self):
+        split_good = {
+            "build_revision": "pinned",
+            "plan": "MorselExec: workers=8, NativeParquet[fixture] -> ResultSink",
+            "output_rows": 10,
+            "parquet_morsels_claimed": 32,
+            "parquet_split_row_groups": 4,
+            "parquet_split_slices": 32,
+            "count_finalizations": 0,
+            "worker_claims": [4] * 8,
+            "worker_completions": [4] * 8,
+        }
+        validate_sample(
+            split_good, "required", "scan_low", 4, 10, "pinned", allow_split=True
+        )
+        validate_sample(
+            dict(
+                split_good,
+                plan="MorselExec: workers=8, NativeParquet[fixture, predicate=score > 0] -> ResultSink",
+            ),
+            "required",
+            "scan_low",
+            4,
+            10,
+            "pinned",
+            allow_split=True,
+        )
+        with self.assertRaises(ValueError):
+            validate_sample(
+                split_good, "required", "scan_low", 4, 10, "pinned", allow_split=False
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "indexed"
+            groups, group_rows = layout("large-row-groups", smoke=True)
+            generate(path, groups, group_rows, write_page_index=True)
+            for file in fixture_files(path):
+                meta = pq.read_metadata(file)
+                for rg in range(meta.num_row_groups):
+                    self.assertTrue(meta.row_group(rg).column(0).has_offset_index)
+
 
 @unittest.skipUnless(
     sys.platform == "linux"

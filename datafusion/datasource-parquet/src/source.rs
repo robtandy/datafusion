@@ -12,6 +12,8 @@ use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use crate::ParquetFileSchemaProvider;
 use crate::opener::ParquetMorselizer;
+use crate::opener::ParquetSplitConfig;
+use crate::opener::SplitContext;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
@@ -601,7 +603,19 @@ impl ParquetSource {
                 .unwrap_or_else(|| context.session_config().batch_size()),
         );
         source.memory_pool = Some(Arc::clone(context.memory_pool()));
-        source.make_morselizer(store, base_config, 0, true)
+        let split_config = context
+            .session_config()
+            .get_extension::<ParquetSplitConfig>()
+            .map(|c| (*c).clone())
+            .unwrap_or_default();
+        let split_context = split_config.enabled.then(|| {
+            Arc::new(SplitContext::new(
+                split_config,
+                source.memory_pool.as_ref().map(Arc::clone),
+                self.metrics().clone(),
+            ))
+        });
+        source.make_morselizer(store, base_config, 0, true, split_context)
     }
 
     fn make_morselizer(
@@ -610,6 +624,7 @@ impl ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
         buffered: bool,
+        split_context: Option<Arc<SplitContext>>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
@@ -717,6 +732,7 @@ impl ParquetSource {
             virtual_state,
             buffered,
             direct_store,
+            split_context,
         }))
     }
 }
@@ -739,7 +755,7 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        self.make_morselizer(object_store, base_config, partition, false)
+        self.make_morselizer(object_store, base_config, partition, false, None)
     }
 
     fn reorder_files(
