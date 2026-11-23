@@ -31,18 +31,21 @@ pinned #139 baseline in [README.md](README.md).
   **5.00 vs 6.17** at 200 offers/s (−19.0%, while serving 4.1× more foreground
   queries/s). With `pushdown_filters = true`, background throughput is **6.05 vs
   6.50** at 20 offers/s (−6.9%), **5.75 vs 6.38** at 50 offers/s (−9.9%), and
-  **5.00 vs 6.00** at 200 offers/s (−16.7%). Separate #138 metrics show why:
+  **5.00 vs 6.00** at 200 offers/s (−16.7%). Separate #138 metrics show that
   under 3 concurrent background lanes on 4 CPUs, `morsel_ready_wait` is already
   tiny (4.5 ms summed over 4 workers) and the 4 CPUs are saturated by
-  ~606 ms-CPU/scan of decode + filter work; the remaining ~8% gap vs stock is
-  the cost of fine-grained cooperative yielding and channel coordination that
-  delivers the 9.5× foreground p99 reduction.
+  ~606 ms-CPU/scan of decode + filter work. Stock CPU-per-scan was not
+  measured, so the source of the remaining ~7–10% background throughput gap vs
+  stock is not isolated here.
 - **Tail-latency regression flagged for `#150` (`pushdown_filters = true`), NOT
   for `#148` or `#149`:**
-  - **#148 (producer scaling):** no regression — drove the ~2× drop in mixed
-    foreground `service_time` (`11.96 → 6.20 ms` at 20 offers/s) because the
-    4-file `small` query now reads all 4 files concurrently instead of
-    serializing through one producer lane.
+  - **#148 (producer scaling):** no regression — inferred to have driven the ~2×
+    drop in mixed foreground `service_time` (`11.96 → 6.20 ms` at 20 offers/s),
+    as #148 raised the ready FIFO from `READY_READERS = 2` and the shared
+    `PENDING_IO = 2` permits to `min(workers, 16)` = 4 with one pending I/O per
+    file lane (the #139 pin `d649cacf0` already ran `FILE_LANES = 4`). This
+    attribution is inferred rather than bisected, because no intermediate
+    revision between `d649cacf0` and `98b2c8516` was benchmarked.
   - **#149 (batch coalescing + scaled result channel):** no regression observed
     (note: both #139 queries use `CountSink` with `peak_output_depth = 1` and
     `output_wait = 0`, so `ResultSink` batch coalescing is not stressed by this
@@ -88,15 +91,19 @@ Every arm verified 76,219 / 76,219 4 KiB file pages resident in the Linux page
 cache via `mincore` both before and immediately after execution. Three
 one-second `vmstat` samples before each comparison showed 87–93% whole-host
 CPU idle with no active builds or competing benchmark processes; stock `off`
-with `pushdown_filters = false` matched #139's stock latencies and throughput
-within 1–5% across all three offer rates.
+with `pushdown_filters = false` matched #139 within 0.8% on background scans/s,
+within 3.3% on mixed foreground completions/s, within 8.6% on mixed p50/p95/p99
+(mixed p50 −7.4% at 20/s, mixed p95 −8.6% at 50/s, mixed p99 within 4.9%), and
+within 8.2% on isolated percentiles except isolated p99 at 200/s (−18.3%,
+2.64 vs 3.23 ms).
 
 Each configuration ran four counterbalanced pairs per load level: 200 offers
 per phase at 20 offers/s (`--interval-ms 50`), and 600 offers per phase at 50
 (`--interval-ms 20`) and 200 offers/s (`--interval-ms 5`). Every arm passed
 scalar parity checks and physical-plan verification:
 
-- `off`: `DataSourceExec: ... file_type=parquet`, no `MorselExec`.
+- `off`: `DataSourceExec: ... file_type=parquet`, no `MorselExec`, and no
+  `FilterExec` when `pushdown_filters = true`.
 - `required`, `pushdown_filters = false`:
   `MorselExec: workers=4, NativeParquet[table] -> Filter[...] -> Projection[] -> CountSink`.
 - `required`, `pushdown_filters = true`:
@@ -267,21 +274,27 @@ Key takeaways from #138 metrics:
 
 ## Reproduction
 
-From a checkout at `98b2c851653b8525d4386d380556030a510f12e4` (with this
-directory's `--revision`, `--pushdown-filters`, and `--morsel-metrics` flag
-support):
+Following the [#139 pinned-build pattern](README.md#pinned-parquet-comparison-139),
+build the standalone harness inside a detached worktree at
+`98b2c851653b8525d4386d380556030a510f12e4` so `MORSEL_BENCH_REVISION` comes
+from the checked-out commit:
 
 ```bash
 set -e
 b=benchmarks/morsel_mixed
 p=benchmarks/morsel_parquet
-work="$HOME/.cache/issue171"
+work=$(mktemp -d "$HOME/.cache/issue171.XXXXXX")
 rev=98b2c851653b8525d4386d380556030a510f12e4
-mkdir -p "$work"
 
-MORSEL_BENCH_REVISION="$rev" CARGO_TARGET_DIR="$work/target" \
-  CARGO_PROFILE_RELEASE_OPT_LEVEL=2 timeout --kill-after=15s 1200s \
-  cargo build -j 10 --release --locked --manifest-path "$b/Cargo.toml"
+git worktree add --detach "$work/pinned" "$rev"
+mkdir -p "$work/pinned/$b"
+cp -r "$b"/{Cargo.toml,Cargo.lock,src,tests} "$work/pinned/$b/"
+(
+  cd "$work/pinned"
+  MORSEL_BENCH_REVISION="$(git rev-parse HEAD)" CARGO_TARGET_DIR="$work/target" \
+    CARGO_PROFILE_RELEASE_OPT_LEVEL=2 timeout --kill-after=15s 1200s \
+    cargo build -j 10 --release --locked --manifest-path "$b/Cargo.toml"
+)
 
 timeout 60s uv venv --python 3.12.10 "$work/venv"
 timeout 120s uv pip install --python "$work/venv/bin/python" -r "$p/requirements.txt"

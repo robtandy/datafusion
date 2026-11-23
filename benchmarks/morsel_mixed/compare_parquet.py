@@ -80,8 +80,10 @@ def validate(
             )
             expected = plan.startswith(prefix) and "CountSink" in plan
         else:
-            expected = "MorselExec:" not in plan and re.search(
-                r"DataSourceExec: .*file_type=parquet", plan
+            expected = (
+                "MorselExec:" not in plan
+                and (not pushdown_filters or "FilterExec:" not in plan)
+                and re.search(r"DataSourceExec: .*file_type=parquet", plan)
             )
         if not expected:
             raise ValueError(f"unexpected {mode}/{table} plan: {plan}")

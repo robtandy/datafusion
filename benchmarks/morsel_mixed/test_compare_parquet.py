@@ -122,6 +122,22 @@ class ComparisonTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected required/small plan"):
             validate(pushed, "required", False, 4, pushdown_filters=False)
 
+    def test_stock_pushdown_plan_accepts_no_filter_exec_and_rejects_filter_exec(self):
+        stock_pushed = report_for("off", pushdown_filters=True)
+        validate(stock_pushed, "off", False, 4, pushdown_filters=True)
+        stock_with_filter = dict(
+            stock_pushed,
+            small={
+                "plan": (
+                    "AggregateExec: mode=Final\n"
+                    "  FilterExec: gate@0 < 10\n"
+                    "    DataSourceExec: file_groups=small, file_type=parquet\n"
+                )
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "unexpected off/small plan"):
+            validate(stock_with_filter, "off", False, 4, pushdown_filters=True)
+
     def test_pair_schedule_balances_backend_and_phase_order(self):
         self.assertEqual(
             [pair_schedule(pair) for pair in range(4)],
