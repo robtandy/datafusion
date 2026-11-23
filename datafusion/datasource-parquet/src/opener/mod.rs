@@ -9,8 +9,11 @@ mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 
+pub use self::buffered::ParquetSplitConfig;
+pub(crate) use self::buffered::SplitContext;
 use self::buffered::{
     BufferedReaders, FilteredBufferedReadersConfig, PlainBufferedReaders,
+    SplitPlainBufferedReadersConfig,
 };
 use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
@@ -314,6 +317,7 @@ pub(super) struct ParquetMorselizer {
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
     pub(super) buffered: bool,
     pub(super) direct_store: Option<Arc<dyn ObjectStore>>,
+    pub(super) split_context: Option<Arc<SplitContext>>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -457,6 +461,7 @@ struct PreparedParquetOpen {
     metrics: ExecutionPlanMetricsSet,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     direct_store: Option<Arc<dyn ObjectStore>>,
+    split_context: Option<Arc<SplitContext>>,
     schema_provider: Option<Arc<dyn crate::ParquetFileSchemaProvider>>,
     async_file_reader: Box<dyn AsyncFileReader>,
     batch_size: usize,
@@ -1015,7 +1020,8 @@ impl ParquetMorselizer {
             metadata_size_hint,
             metrics: self.metrics.clone(),
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
-            direct_store: self.direct_store.clone(),
+            direct_store: self.direct_store.as_ref().map(Arc::clone),
+            split_context: self.split_context.as_ref().map(Arc::clone),
             schema_provider: self.schema_provider.clone(),
             async_file_reader,
             batch_size: self.batch_size,
@@ -1483,6 +1489,37 @@ impl RowGroupsPrunedParquetOpen {
                 return Ok(true);
             }
         }
+        // Intra-row-group splitting in the native buffered morselizer needs
+        // Offset Indexes for large candidate groups even when no predicate
+        // requires page statistics.
+        if let Some(split_ctx) = self.prepared.loaded.prepared.split_context.as_ref()
+            && split_ctx.is_enabled()
+        {
+            let has_large_rg = row_groups.row_group_indexes().any(|idx| {
+                usize::try_from(parquet_metadata.row_group(idx).num_rows()).is_ok_and(
+                    |n| {
+                        n >= split_ctx.config.min_row_group_rows
+                            && n > split_ctx.config.target_slice_rows
+                    },
+                )
+            });
+            if has_large_rg {
+                let read_plans = match &self.decoder_read_plans {
+                    Some(plans) => plans,
+                    None => self.decoder_read_plans.insert(DecoderReadPlans::try_new(
+                        &self.prepared.loaded.prepared,
+                        &self.prepared.loaded.reader_metadata,
+                    )?),
+                };
+                if split_ctx.has_index_load_candidate(
+                    parquet_metadata,
+                    row_groups.row_group_indexes(),
+                    |leaf_idx| read_plans.reads_leaf(leaf_idx),
+                ) {
+                    return Ok(true);
+                }
+            }
+        }
         let Some(page_pruning_predicate) = self.prepared.page_pruning_predicate.as_ref()
         else {
             return Ok(false);
@@ -1515,6 +1552,11 @@ impl RowGroupsPrunedParquetOpen {
 
     /// Load the page index if pruning requires it and metadata did not include it.
     async fn load_page_index(mut self) -> Result<Self> {
+        let need_column_index = self.prepared.page_pruning_predicate.is_some()
+            && !self
+                .row_groups
+                .row_group_indexes()
+                .all(|idx| self.row_groups.is_fully_matched()[idx]);
         self.prepared.loaded.reader_metadata = load_page_index(
             self.prepared.loaded.reader_metadata.clone(),
             &mut self.prepared.loaded.prepared.async_file_reader,
@@ -1523,13 +1565,11 @@ impl RowGroupsPrunedParquetOpen {
                 .options
                 .clone()
                 .with_offset_index_policy(PageIndexPolicy::Optional)
-                .with_column_index_policy(
-                    if self.prepared.page_pruning_predicate.is_some() {
-                        PageIndexPolicy::Optional
-                    } else {
-                        PageIndexPolicy::Skip
-                    },
-                ),
+                .with_column_index_policy(if need_column_index {
+                    PageIndexPolicy::Optional
+                } else {
+                    PageIndexPolicy::Skip
+                }),
         )
         .await?;
 
@@ -1862,6 +1902,7 @@ impl RowGroupsPrunedParquetOpen {
                     row_filter_skipped_fully_matched,
                     batch_size: prepared.batch_size,
                     force_filter_selections: prepared.force_filter_selections,
+                    enable_page_index: prepared.enable_page_index,
                     max_predicate_cache_size: prepared.max_predicate_cache_size,
                     arrow_reader_metrics,
                     file_metrics: prepared.file_metrics,
@@ -1872,8 +1913,70 @@ impl RowGroupsPrunedParquetOpen {
                     byte_progress,
                     async_file_reader: prepared.async_file_reader,
                     direct_store: prepared.direct_store,
+                    split_context: prepared.split_context,
                 }),
             )));
+        }
+
+        if buffered && let Some(split_context) = prepared.split_context {
+            let pending: Vec<_> = prepared_access_plan
+                .row_groups
+                .into_iter()
+                .map(|rg| {
+                    let rg_index = rg.selection.row_group_index();
+                    let entry = RgPlanEntry {
+                        rg_index,
+                        bytes: row_group_bytes(&rg_metadata[rg_index]),
+                        fully_matched: rg.fully_matched,
+                    };
+                    (rg.selection, entry)
+                })
+                .collect();
+            match BufferedReaders::try_split_plain(SplitPlainBufferedReadersConfig {
+                pending,
+                reader_metadata,
+                projection: Arc::new(decoder_projection),
+                batch_size: prepared.batch_size,
+                force_filter_selections: prepared.force_filter_selections,
+                enable_page_index: prepared.enable_page_index,
+                arrow_reader_metrics,
+                file_name: prepared.file_name.into(),
+                baseline: prepared.baseline_metrics,
+                byte_progress,
+                reader: prepared.async_file_reader,
+                split_context,
+            }) {
+                Ok(split_readers) => {
+                    return Ok(ParquetOpenState::Buffered(Box::new(split_readers)));
+                }
+                Err(cfg) => {
+                    let cfg = *cfg;
+                    let (selections, rg_plan): (Vec<_>, VecDeque<RgPlanEntry>) =
+                        cfg.pending.into_iter().unzip();
+                    let decoder_config = DecoderBuilderConfig {
+                        projection_mask: cfg.projection.projection_mask(),
+                        batch_size: cfg.batch_size,
+                        arrow_reader_metrics: &cfg.arrow_reader_metrics,
+                        force_filter_selections: cfg.force_filter_selections,
+                        decoder_limit: decode_order_limit,
+                    };
+                    let decoder = decoder_config
+                        .build(selections, cfg.reader_metadata)
+                        .build()?;
+                    return Ok(ParquetOpenState::Buffered(Box::new(
+                        BufferedReaders::Plain(PlainBufferedReaders {
+                            decoder,
+                            reader: cfg.reader,
+                            projection: cfg.projection,
+                            file_name: cfg.file_name,
+                            baseline: cfg.baseline,
+                            rg_plan,
+                            byte_progress: cfg.byte_progress,
+                            ranges: None,
+                        }),
+                    )));
+                }
+            }
         }
 
         let InitialDecoderState {
@@ -2826,6 +2929,7 @@ mod test {
                 virtual_state,
                 buffered: false,
                 direct_store: None,
+                split_context: None,
             })
         }
     }
@@ -5662,6 +5766,67 @@ mod test {
             None,
             ParquetAccessPlan::new_all(2),
         ));
+    }
+
+    #[test]
+    fn should_load_page_index_for_split_candidate_without_predicate() {
+        let metadata = page_index_metadata(&[("a", true), ("b", false)], 1);
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let check = |projection: &[usize], enable_page_index: bool, min_rows: usize| {
+            let split_ctx = Arc::new(SplitContext::new(
+                ParquetSplitConfig {
+                    enabled: true,
+                    min_row_group_rows: min_rows,
+                    target_slice_rows: 4,
+                    ..Default::default()
+                },
+                None,
+                ExecutionPlanMetricsSet::new(),
+            ));
+            let mut morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::new(InMemory::new()))
+                .with_schema(Arc::clone(&arrow_schema))
+                .with_projection_indices(projection)
+                .with_enable_page_index(enable_page_index)
+                .build();
+            morselizer.buffered = true;
+            morselizer.split_context = Some(split_ctx);
+            let file = PartitionedFile::new("test.parquet".to_string(), 1024);
+            let mut prepared = morselizer.prepare_open_file(file).unwrap();
+            prepared.physical_file_schema = Arc::clone(&arrow_schema);
+            let options = ArrowReaderOptions::new();
+            let reader_metadata =
+                ArrowReaderMetadata::try_new(Arc::new(metadata.clone()), options.clone())
+                    .unwrap();
+            let mut open = RowGroupsPrunedParquetOpen {
+                prepared: FiltersPreparedParquetOpen {
+                    loaded: MetadataLoadedParquetOpen {
+                        prepared,
+                        reader_metadata,
+                        options,
+                    },
+                    pruning_predicate: None,
+                    page_pruning_predicate: None,
+                },
+                row_groups: RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(1)),
+                decoder_read_plans: None,
+            };
+            open.should_load_page_index().unwrap()
+        };
+
+        // 10 rows >= min_rows(8), projected col "a" has offset index -> loads!
+        assert!(check(&[0], true, 8));
+        // Below threshold (10 < 100) -> does not load!
+        assert!(!check(&[0], true, 100));
+        // enable_page_index=false -> respects disabled setting!
+        assert!(!check(&[0], false, 8));
+        // Projected col "b" lacks offset index -> does not load!
+        assert!(!check(&[0, 1], true, 8));
+        // 0-column metadata-only scan -> does not load!
+        assert!(!check(&[], true, 8));
     }
 
     #[test]
