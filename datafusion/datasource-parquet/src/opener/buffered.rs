@@ -30,7 +30,7 @@ use crate::push_decoder::{RgPlanEntry, RowFilterContext};
 
 pub(super) enum BufferedReaders {
     Plain(PlainBufferedReaders),
-    Filtered(FilteredBufferedReaders),
+    Filtered(Box<FilteredBufferedReaders>),
 }
 
 pub(super) struct PlainBufferedReaders {
@@ -107,7 +107,7 @@ impl BufferedReaders {
                 )
             }
         };
-        Self::Filtered(FilteredBufferedReaders {
+        Self::Filtered(Box::new(FilteredBufferedReaders {
             pending: config.pending,
             reader_metadata: config.reader_metadata,
             projection: config.projection,
@@ -125,7 +125,7 @@ impl BufferedReaders {
             producer_reader,
             worker_fetcher,
             in_flight: None,
-        })
+        }))
     }
 }
 
@@ -288,7 +288,7 @@ impl FilteredBufferedReaders {
         Ok(builder.build()?)
     }
 
-    fn publish_morsel(self, morsel: Box<dyn Morsel>) -> MorselPlan {
+    fn publish_morsel(self: Box<Self>, morsel: Box<dyn Morsel>) -> MorselPlan {
         let mut plan = MorselPlan::new().with_morsels(vec![morsel]);
         if !self.pending.is_empty() {
             plan = plan.with_planners(vec![Box::new(BufferedReaders::Filtered(self))]);
@@ -296,7 +296,7 @@ impl FilteredBufferedReaders {
         plan
     }
 
-    fn plan(mut self) -> Result<Option<MorselPlan>> {
+    fn plan(mut self: Box<Self>) -> Result<Option<MorselPlan>> {
         let elapsed_compute = self.baseline.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
 
@@ -549,9 +549,7 @@ impl FilteredStreamState {
                 }
             }
 
-            let Some(decoder) = self.decoder.as_mut() else {
-                return None;
-            };
+            let decoder = self.decoder.as_mut()?;
             match decoder.try_next_reader() {
                 Ok(DecodeResult::NeedsData(ranges)) => {
                     timer.stop();

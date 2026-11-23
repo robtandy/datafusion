@@ -620,12 +620,14 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
         Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
     ));
 
-    let make_scan = |count: bool| -> Result<(
-        MorselExec,
-        Arc<TaskContext>,
-        mpsc::UnboundedReceiver<Request>,
-        Arc<Gates>,
-    )> {
+    struct FilteredGatedScan {
+        plan: MorselExec,
+        context: Arc<TaskContext>,
+        requests: mpsc::UnboundedReceiver<Request>,
+        gates: Arc<Gates>,
+    }
+
+    let make_scan = |count: bool| -> Result<FilteredGatedScan> {
         let (send, requests) = mpsc::unbounded_channel();
         let gates = Arc::new(Gates {
             requests: send,
@@ -686,12 +688,22 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
             },
             output_schema,
         );
-        Ok((plan, context, requests, gates))
+        Ok(FilteredGatedScan {
+            plan,
+            context,
+            requests,
+            gates,
+        })
     };
 
     // Part 1: verify exact I/O count (2 Phase-1 + 1 Phase-2 = 3; RG 1 skips Phase-2).
     {
-        let (plan, context, mut requests, gates) = make_scan(false)?;
+        let FilteredGatedScan {
+            plan,
+            context,
+            mut requests,
+            gates,
+        } = make_scan(false)?;
         let mut run = Arc::clone(&plan.pipeline).start(
             Arc::clone(&context),
             plan.metrics.clone(),
@@ -739,7 +751,12 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
 
     // Part 2: drop stream while Phase-2 worker I/O is pending; verify cancellation.
     {
-        let (plan, context, mut requests, gates) = make_scan(true)?;
+        let FilteredGatedScan {
+            plan,
+            context,
+            mut requests,
+            gates,
+        } = make_scan(true)?;
         let mut run = Arc::clone(&plan.pipeline).start(
             Arc::clone(&context),
             plan.metrics.clone(),

@@ -452,7 +452,8 @@ async fn pushdown_filters_parity_across_selectivities_nulls_and_count() -> Resul
             Some(properties),
         )?;
         let base = file * 64;
-        let groups: Vec<(Vec<Option<i32>>, Vec<Option<i32>>)> = vec![
+        type ScoreDeltaGroup = (Vec<Option<i32>>, Vec<Option<i32>>);
+        let groups: Vec<ScoreDeltaGroup> = vec![
             (
                 (0..16).map(|i| Some(200 + i)).collect(),
                 (0..16).map(|i| Some(10 + i)).collect(),
