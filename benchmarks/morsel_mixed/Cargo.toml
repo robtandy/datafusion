@@ -10,6 +10,9 @@ publish = false
 
 [workspace]
 
+[features]
+morsel-metrics = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

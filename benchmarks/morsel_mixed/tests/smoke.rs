@@ -232,6 +232,92 @@ fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
 }
 
 #[test]
+fn pushdown_filters_flag_works_on_parquet() {
+    let dir = FixtureDir::new("pushdown");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let output = parquet_count_command("required", &small, &large)
+        .arg("--pushdown-filters")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["pushdown_filters"], true);
+    for table in ["small", "large"] {
+        let plan = report[table]["plan"].as_str().unwrap();
+        assert!(
+            plan.starts_with(&format!(
+                "MorselExec: workers=2, NativeParquet[{table}, predicate="
+            )),
+            "{plan}"
+        );
+        assert!(plan.contains("CountSink"), "{plan}");
+    }
+
+    let stock_output = parquet_count_command("off", &small, &large)
+        .arg("--pushdown-filters")
+        .output()
+        .unwrap();
+    assert!(
+        stock_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stock_output.stderr)
+    );
+    let stock_report: Value = serde_json::from_slice(&stock_output.stdout).unwrap();
+    assert_eq!(stock_report["config"]["pushdown_filters"], true);
+    for table in ["small", "large"] {
+        let plan = stock_report[table]["plan"].as_str().unwrap();
+        assert!(!plan.contains("MorselExec"), "{plan}");
+        assert!(!plan.contains("FilterExec:"), "{plan}");
+        assert!(plan.contains("file_type=parquet"), "{plan}");
+    }
+}
+
+#[cfg(feature = "morsel-metrics")]
+#[test]
+fn morsel_metrics_flag_reports_parquet_metrics() {
+    let dir = FixtureDir::new("metrics");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let output = parquet_count_command("required", &small, &large)
+        .args(["--pushdown-filters", "--morsel-metrics"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config"]["morsel_metrics"], true);
+    let isolated = &report["runs"][0];
+    let mixed = &report["runs"][1];
+    assert!(
+        !isolated["morsel_metrics"]["foreground"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        isolated["morsel_metrics"]["background"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let bg_metrics = mixed["morsel_metrics"]["background"].as_array().unwrap();
+    assert!(!bg_metrics.is_empty());
+    assert!(
+        bg_metrics
+            .iter()
+            .all(|m| m["morsels_completed"].as_u64().unwrap() > 0)
+    );
+}
+
+#[test]
 fn wrong_expected_row_count_is_reported_after_drain() {
     let output = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"))
         .args([
