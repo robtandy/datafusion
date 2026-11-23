@@ -116,6 +116,7 @@ enum UnsplitReason {
     SliceCompressedCap,
     BufferCap,
     DecodedWorkspaceCap,
+    MemoryPoolCap,
 }
 
 impl UnsplitReason {
@@ -133,6 +134,7 @@ impl UnsplitReason {
             Self::SliceCompressedCap => "slice_compressed_cap",
             Self::BufferCap => "buffer_cap",
             Self::DecodedWorkspaceCap => "decoded_workspace_cap",
+            Self::MemoryPoolCap => "memory_pool_cap",
         }
     }
 }
@@ -424,17 +426,23 @@ impl SplitBudget {
         }
     }
 
-    /// Reserve compressed bytes (for every coalesced range) and optional
-    /// decoded workspace bytes atomically before issuing a file-lane read.
+    /// Reserve compressed bytes for Phase-1 (`coalesced_lengths`), pre-reserved
+    /// Phase-2 headroom (`phase2_budget_fn`), and decoded workspace bytes
+    /// atomically before issuing a file-lane read.
     async fn reserve_for_fetch(
         self: &Arc<Self>,
         coalesced_lengths: &[usize],
+        phase2_budget_fn: impl Fn() -> usize,
         decoded_estimate: usize,
-    ) -> Result<(Vec<SplitBufferLease>, SplitDecodedLease)> {
-        let compressed_needed: usize = coalesced_lengths.iter().copied().sum();
+    ) -> Result<(Vec<SplitBufferLease>, Phase2BudgetLease, SplitDecodedLease)> {
+        let phase1_compressed: usize = coalesced_lengths.iter().copied().sum();
         let mut rx = self.changed_rx.clone();
         let mut wait_start: Option<Instant> = None;
         loop {
+            // Compute Phase-2 headroom outside `self.state` lock to prevent
+            // lock-order inversion with `AsyncRangeBroker` dropping `TrackedBytes`.
+            let phase2_needed = phase2_budget_fn();
+            let compressed_needed = phase1_compressed.saturating_add(phase2_needed);
             let wait_guard;
             let seen = {
                 let mut state = self.state.lock();
@@ -443,7 +451,7 @@ impl SplitBudget {
                 if cap_ok {
                     match self.try_reserve_pool_pair(compressed_needed, decoded_estimate)
                     {
-                        Ok((compressed_res, decoded_res)) => {
+                        Ok((mut compressed_res, decoded_res)) => {
                             state.live_bytes += compressed_needed;
                             let new_peak = if state.live_bytes > state.peak_live_bytes {
                                 state.peak_live_bytes = state.live_bytes;
@@ -458,13 +466,25 @@ impl SplitBudget {
                             if let Some(start) = wait_start {
                                 self.metrics.record_reservation_wait(start.elapsed());
                             }
+                            let phase2_res = if phase2_needed == 0 {
+                                None
+                            } else if phase1_compressed == 0 {
+                                compressed_res.take()
+                            } else {
+                                compressed_res.as_mut().map(|r| r.split(phase2_needed))
+                            };
                             let leases = self
                                 .split_buffer_leases(coalesced_lengths, compressed_res);
+                            let phase2_lease = Phase2BudgetLease {
+                                budget: Arc::clone(self),
+                                bytes: phase2_needed,
+                                reservation: phase2_res,
+                            };
                             let decoded_lease = SplitDecodedLease {
                                 budget: Arc::clone(self),
                                 reservation: decoded_res,
                             };
-                            return Ok((leases, decoded_lease));
+                            return Ok((leases, phase2_lease, decoded_lease));
                         }
                         Err(err) => {
                             let can_progress = state.in_flight_decode_readers > 0
@@ -503,27 +523,43 @@ impl SplitBudget {
     }
 
     /// Reserve compressed bytes for a Phase-2 fetch on an already-admitted
-    /// filtered slice. Waits on `cap` only while decode readers are draining so
-    /// Phase-2 can never deadlock behind a file lane holding a ready slot.
+    /// filtered slice, carving first from its pre-reserved [`Phase2BudgetLease`]
+    /// so Phase-2 normally requires zero new reservations or waiting.
     async fn reserve_phase2_fetch(
         self: &Arc<Self>,
         coalesced_lengths: &[usize],
+        phase2_lease: Option<&mut Phase2BudgetLease>,
     ) -> Result<Vec<SplitBufferLease>> {
         let compressed_needed: usize = coalesced_lengths.iter().copied().sum();
+        if compressed_needed == 0 {
+            return Ok(self.split_buffer_leases(coalesced_lengths, None));
+        }
+        let (covered_bytes, mut covered_res) = match phase2_lease {
+            Some(lease) => {
+                if let Some(leases) = lease.take_leases(coalesced_lengths) {
+                    return Ok(leases);
+                }
+                lease.take_all()
+            }
+            None => (0, None),
+        };
+        let overflow = compressed_needed.saturating_sub(covered_bytes);
+        if overflow == 0 {
+            return Ok(self.split_buffer_leases(coalesced_lengths, covered_res));
+        }
+        // Only reached if Phase-2 needed bytes beyond what admission pre-reserved.
         let mut rx = self.changed_rx.clone();
         let mut wait_start: Option<Instant> = None;
         loop {
             let seen = {
                 let mut state = self.state.lock();
-                let should_throttle_cap =
-                    state.live_bytes.saturating_add(compressed_needed) > state.cap
-                        && state.in_flight_decode_readers > 0;
+                let should_throttle_cap = state.live_bytes.saturating_add(overflow)
+                    > state.cap
+                    && state.in_flight_decode_readers > 0;
                 if !should_throttle_cap {
-                    match self
-                        .try_reserve_pool_single("ParquetSplitBuffer", compressed_needed)
-                    {
-                        Ok(compressed_res) => {
-                            state.live_bytes += compressed_needed;
+                    match self.try_reserve_pool_single("ParquetSplitBuffer", overflow) {
+                        Ok(overflow_res) => {
+                            state.live_bytes += overflow;
                             let new_peak = if state.live_bytes > state.peak_live_bytes {
                                 state.peak_live_bytes = state.live_bytes;
                                 Some(state.peak_live_bytes)
@@ -537,11 +573,30 @@ impl SplitBudget {
                             if let Some(start) = wait_start {
                                 self.metrics.record_reservation_wait(start.elapsed());
                             }
-                            return Ok(self
-                                .split_buffer_leases(coalesced_lengths, compressed_res));
+                            let combined = match (covered_res.take(), overflow_res) {
+                                (Some(a), Some(b)) => {
+                                    let add = b.size();
+                                    drop(b);
+                                    a.grow(add);
+                                    Some(a)
+                                }
+                                (Some(a), None) => Some(a),
+                                (None, Some(b)) => Some(b),
+                                (None, None) => None,
+                            };
+                            return Ok(
+                                self.split_buffer_leases(coalesced_lengths, combined)
+                            );
                         }
                         Err(err) => {
-                            if state.in_flight_decode_readers == 0 {
+                            // Other decode readers or peer filter planners can still
+                            // complete and release pool capacity.
+                            let can_progress = state.in_flight_decode_readers > 0
+                                || state.in_flight_filter_planners > 1;
+                            if !can_progress {
+                                drop(covered_res);
+                                state.live_bytes =
+                                    state.live_bytes.saturating_sub(covered_bytes);
                                 self.signal_change(&mut state);
                                 return Err(err);
                             }
@@ -572,7 +627,8 @@ impl SplitBudget {
         self: &Arc<Self>,
         decoded_estimate: usize,
     ) -> Result<SplitDecodedLease> {
-        let (_, decoded_lease) = self.reserve_for_fetch(&[], decoded_estimate).await?;
+        let (_, _, decoded_lease) =
+            self.reserve_for_fetch(&[], || 0, decoded_estimate).await?;
         Ok(decoded_lease)
     }
 
@@ -690,6 +746,61 @@ impl Drop for SplitBufferLease {
     fn drop(&mut self) {
         // Release pool reservation first so woken waiters immediately see
         // reclaimed pool capacity.
+        self.reservation = None;
+        let mut state = self.budget.state.lock();
+        state.live_bytes = state.live_bytes.saturating_sub(self.bytes);
+        self.budget.signal_change(&mut state);
+    }
+}
+
+/// Pre-reserved compressed headroom for a filtered slice's Phase-2 output/predicate
+/// fetches, carved into [`SplitBufferLease`]s when Phase-2 runs and automatically
+/// releasing any unused bytes when the slice finishes or drops.
+struct Phase2BudgetLease {
+    budget: Arc<SplitBudget>,
+    bytes: usize,
+    reservation: Option<MemoryReservation>,
+}
+
+impl Phase2BudgetLease {
+    fn take_leases(&mut self, lengths: &[usize]) -> Option<Vec<SplitBufferLease>> {
+        let needed: usize = lengths.iter().copied().sum();
+        if needed > self.bytes {
+            return None;
+        }
+        self.bytes -= needed;
+        let mut leases = Vec::with_capacity(lengths.len());
+        for &len in lengths {
+            let res = if len == 0 {
+                None
+            } else if self.bytes == 0
+                && self.reservation.as_ref().is_some_and(|r| r.size() == len)
+            {
+                self.reservation.take()
+            } else {
+                self.reservation.as_mut().map(|r| r.split(len))
+            };
+            leases.push(SplitBufferLease {
+                budget: Arc::clone(&self.budget),
+                bytes: len,
+                reservation: res,
+            });
+        }
+        Some(leases)
+    }
+
+    fn take_all(&mut self) -> (usize, Option<MemoryReservation>) {
+        let bytes = std::mem::take(&mut self.bytes);
+        let res = self.reservation.take();
+        (bytes, res)
+    }
+}
+
+impl Drop for Phase2BudgetLease {
+    fn drop(&mut self) {
+        if self.bytes == 0 && self.reservation.is_none() {
+            return;
+        }
         self.reservation = None;
         let mut state = self.budget.state.lock();
         state.live_bytes = state.live_bytes.saturating_sub(self.bytes);
@@ -829,6 +940,8 @@ struct SliceSpec {
     row_range: Range<usize>,
     selection: RowSelection,
     selected_rows: usize,
+    all_ranges: Vec<(u64, u64)>,
+    decoded_estimate: usize,
 }
 
 fn push_selector(selectors: &mut Vec<RowSelector>, selector: RowSelector) {
@@ -957,6 +1070,8 @@ fn split_selection_into_slices_with_ranges(
                     row_range: r.clone(),
                     selection,
                     selected_rows: r.end - r.start,
+                    all_ranges: Vec::new(),
+                    decoded_estimate: 0,
                 });
             }
         }
@@ -984,6 +1099,8 @@ fn split_selection_into_slices_with_ranges(
                         row_range: r.clone(),
                         selection: RowSelection::from(selectors),
                         selected_rows,
+                        all_ranges: Vec::new(),
+                        decoded_estimate: 0,
                     });
                 }
             }
@@ -1017,7 +1134,6 @@ struct RowGroupSplitPlan {
     shared_ranges_per_slice: Vec<Vec<(u64, u64)>>,
     shared_consumer_counts: HashMap<(u64, u64), usize>,
     frontier_bytes: usize,
-    decoded_estimate: usize,
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1046,9 +1162,7 @@ fn plan_row_group_splits(
     }
 
     let schema_descr = metadata.file_metadata().schema_descr();
-    let mut read_leaves = Vec::new();
-    let mut batch_workspace: usize = 0;
-    let mut uncompressed_chunks: usize = 0;
+    let mut read_leaves: Vec<(usize, usize)> = Vec::new();
     for leaf_idx in 0..schema_descr.num_columns() {
         if !reads_leaf(leaf_idx) {
             continue;
@@ -1057,20 +1171,10 @@ fn plan_row_group_splits(
         else {
             return Err(UnsplitReason::UnsupportedColumnType);
         };
-        read_leaves.push(leaf_idx);
-        // Fixed-width values + null bitmap + i16 def levels per output batch.
-        batch_workspace = batch_workspace
-            .saturating_add(batch_size.saturating_mul(byte_width.saturating_add(3)));
-        let uncompressed = rg_meta.column(leaf_idx).uncompressed_size().max(0) as usize;
-        uncompressed_chunks = uncompressed_chunks.saturating_add(uncompressed);
+        read_leaves.push((leaf_idx, byte_width));
     }
     if read_leaves.is_empty() {
         return Err(UnsplitReason::MetadataOnly);
-    }
-
-    let decoded_estimate = batch_workspace.saturating_add(uncompressed_chunks);
-    if decoded_estimate > config.max_decoded_bytes {
-        return Err(UnsplitReason::DecodedWorkspaceCap);
     }
 
     let Some(page_index) = metadata.page_index() else {
@@ -1080,10 +1184,13 @@ fn plan_row_group_splits(
         locations: &'a [PageLocation],
         dict_range: Option<Range<u64>>,
         cached: bool,
+        byte_width: usize,
+        one_page_uncompressed: usize,
     }
     let mut leaf_offsets: Vec<LeafOffsetInfo<'_>> = Vec::with_capacity(read_leaves.len());
     let mut any_cached_leaf = false;
-    for &leaf_idx in &read_leaves {
+    let mut total_one_page_scratch: usize = 0;
+    for &(leaf_idx, byte_width) in &read_leaves {
         let Some(offset_index) = page_index.offset_index(rg_index, leaf_idx) else {
             return Err(UnsplitReason::MissingOffsetIndex);
         };
@@ -1094,10 +1201,23 @@ fn plan_row_group_splits(
         }
         let cached = is_cached_leaf(leaf_idx);
         any_cached_leaf |= cached;
+        // ParquetRecordBatchReader decodes one decompressed page per leaf at a
+        // time, so size per-slice scratch to one average page per leaf rather
+        // than the whole row group's uncompressed size.
+        let chunk_uncompressed =
+            rg_meta.column(leaf_idx).uncompressed_size().max(0) as u64;
+        let num_pages = locations.len().max(1) as u64;
+        let one_page_uncompressed = chunk_uncompressed
+            .div_ceil(num_pages)
+            .min(usize::MAX as u64) as usize;
+        total_one_page_scratch =
+            total_one_page_scratch.saturating_add(one_page_uncompressed);
         leaf_offsets.push(LeafOffsetInfo {
             locations,
             dict_range: dictionary_range(chunk_start, locations),
             cached,
+            byte_width,
+            one_page_uncompressed,
         });
     }
 
@@ -1105,7 +1225,7 @@ fn plan_row_group_splits(
         leaf_offsets.iter().map(|info| info.locations).collect();
     let row_ranges =
         choose_aligned_boundaries(total_rows, config.target_slice_rows, &leaf_locations);
-    let slices = split_selection_into_slices_with_ranges(
+    let mut slices = split_selection_into_slices_with_ranges(
         existing_selection,
         total_rows,
         &row_ranges,
@@ -1115,13 +1235,28 @@ fn plan_row_group_splits(
     }
 
     // Collect exact per-slice byte ranges (plus batch-boundary expansion only
-    // for leaves that RowGroupCache may widen during predicate evaluation).
+    // for leaves that RowGroupCache may widen during predicate evaluation) and
+    // per-slice decoded workspace estimates.
     let mut per_slice_ranges: Vec<Vec<(u64, u64)>> = Vec::with_capacity(slices.len());
     let mut last_consumer: HashMap<(u64, u64), usize> = HashMap::new();
     let mut consumer_counts: HashMap<(u64, u64), usize> = HashMap::new();
     let mut sum_slice_bytes: usize = 0;
 
-    for slice in &slices {
+    for slice in &mut slices {
+        let slice_batch_rows = batch_size.min(slice.selected_rows.max(1));
+        let batch_workspace: usize = leaf_offsets
+            .iter()
+            .map(|info| {
+                slice_batch_rows.saturating_mul(info.byte_width.saturating_add(3))
+            })
+            .fold(0usize, usize::saturating_add);
+        let decoded_estimate = batch_workspace.saturating_add(total_one_page_scratch);
+        if decoded_estimate > config.max_decoded_bytes {
+            return Err(UnsplitReason::DecodedWorkspaceCap);
+        }
+        slice.decoded_estimate = decoded_estimate;
+        let _ = leaf_offsets.first().map(|i| i.one_page_uncompressed);
+
         let expanded_sel = if any_cached_leaf && batch_size > 0 {
             let exp_lo = (slice.row_range.start / batch_size) * batch_size;
             let exp_hi = slice
@@ -1171,6 +1306,7 @@ fn plan_row_group_splits(
             last_consumer.insert(key, slice.slice_idx);
             *consumer_counts.entry(key).or_insert(0) += 1;
         }
+        slice.all_ranges.clone_from(&ranges);
         per_slice_ranges.push(ranges);
     }
 
@@ -1239,7 +1375,6 @@ fn plan_row_group_splits(
         shared_ranges_per_slice,
         shared_consumer_counts,
         frontier_bytes,
-        decoded_estimate,
     })
 }
 
@@ -1477,6 +1612,23 @@ enum AsyncRangeStatus {
     Failed(String),
 }
 
+enum RangeAdmission<'a> {
+    /// Phase-1 admission on the file lane: reserve Phase-1 misses, uncached
+    /// Phase-2 candidate headroom, and decoded workspace atomically.
+    Phase1 {
+        phase2_candidates: &'a [(u64, u64)],
+        decoded_estimate: usize,
+        out_leases: &'a mut Option<(Phase2BudgetLease, SplitDecodedLease)>,
+    },
+    /// Phase-2 fetch on an already-admitted filtered slice: carve from its
+    /// pre-reserved [`Phase2BudgetLease`].
+    Phase2 {
+        phase2_lease: Option<&'a mut Phase2BudgetLease>,
+    },
+    /// Follow-up file-lane fetch where the decoded lease is already held.
+    Phase1FollowUp,
+}
+
 impl AsyncRangeBroker {
     fn new(
         shared_consumer_counts: HashMap<(u64, u64), usize>,
@@ -1500,21 +1652,46 @@ impl AsyncRangeBroker {
         }
     }
 
+    /// Total bytes among `candidates` that are not yet `Ready` in this broker.
+    fn uncached_bytes(&self, candidates: &[(u64, u64)]) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let map = self.state.lock();
+        candidates
+            .iter()
+            .filter(|key| {
+                !map.get(*key)
+                    .is_some_and(|e| matches!(e.status, AsyncRangeStatus::Ready(_)))
+            })
+            .map(|&(s, e)| (e - s) as usize)
+            .sum()
+    }
+
     /// Release unconsumed shared range claims when a slice finishes (e.g.,
     /// filtered to 0 rows) or is dropped on cancellation/error.
     fn release_unconsumed(&self, keys: &mut HashSet<(u64, u64)>) {
         if keys.is_empty() {
             return;
         }
-        let mut map = self.state.lock();
-        for key in keys.drain() {
-            if let Some(entry) = map.get_mut(&key) {
-                entry.remaining_consumers = entry.remaining_consumers.saturating_sub(1);
-                if entry.remaining_consumers == 0 {
-                    map.remove(&key);
+        // Drop removed entries (which may hold TrackedBytes leases) outside
+        // `self.state` lock so SplitBufferLease::drop never nests locks.
+        let mut evicted = Vec::new();
+        {
+            let mut map = self.state.lock();
+            for key in keys.drain() {
+                if let Some(entry) = map.get_mut(&key) {
+                    entry.remaining_consumers =
+                        entry.remaining_consumers.saturating_sub(1);
+                    if entry.remaining_consumers == 0
+                        && let Some(removed) = map.remove(&key)
+                    {
+                        evicted.push(removed);
+                    }
                 }
             }
         }
+        drop(evicted);
     }
 
     /// Resolve `requested` ranges for one slice using `fetch_fn` for misses.
@@ -1524,7 +1701,7 @@ impl AsyncRangeBroker {
         self: &Arc<Self>,
         requested: &[Range<u64>],
         tracker: &mut Phase2SliceTracker,
-        is_phase2: bool,
+        mut admission: RangeAdmission<'_>,
         err_ctx: &str,
         fetch_fn: F,
     ) -> Result<Vec<Bytes>>
@@ -1538,6 +1715,7 @@ impl AsyncRangeBroker {
         let mut private_to_fetch: Vec<Range<u64>> = Vec::new();
         let mut reused_bytes = 0usize;
 
+        let mut evicted_entries = Vec::new();
         {
             let mut map = self.state.lock();
             for r in requested {
@@ -1553,8 +1731,10 @@ impl AsyncRangeBroker {
                             if tracker.consume_key(key) {
                                 entry.remaining_consumers =
                                     entry.remaining_consumers.saturating_sub(1);
-                                if entry.remaining_consumers == 0 {
-                                    map.remove(&key);
+                                if entry.remaining_consumers == 0
+                                    && let Some(removed) = map.remove(&key)
+                                {
+                                    evicted_entries.push(removed);
                                 }
                             }
                             resolved.insert(key, view);
@@ -1578,6 +1758,7 @@ impl AsyncRangeBroker {
                 }
             }
         }
+        drop(evicted_entries);
         self.split_context.metrics.record_reused_bytes(reused_bytes);
 
         // Guard ensures any shared ranges we claimed as InFlight revert to
@@ -1625,24 +1806,53 @@ impl AsyncRangeBroker {
             });
         }
 
-        if !coalesced.is_empty() {
-            let lengths: Vec<usize> = coalesced
-                .iter()
-                .map(|c| (c.range.end - c.range.start) as usize)
-                .collect();
-            let leases = if is_phase2 {
-                self.split_context
-                    .budget
-                    .reserve_phase2_fetch(&lengths)
-                    .await?
-            } else {
-                let (leases, _) = self
+        let lengths: Vec<usize> = coalesced
+            .iter()
+            .map(|c| (c.range.end - c.range.start) as usize)
+            .collect();
+        let leases = match &mut admission {
+            RangeAdmission::Phase1 {
+                phase2_candidates,
+                decoded_estimate,
+                out_leases,
+            } => {
+                let (leases, phase2_lease, decoded_lease) = self
                     .split_context
                     .budget
-                    .reserve_for_fetch(&lengths, 0)
+                    .reserve_for_fetch(
+                        &lengths,
+                        || self.uncached_bytes(phase2_candidates),
+                        *decoded_estimate,
+                    )
                     .await?;
+                **out_leases = Some((phase2_lease, decoded_lease));
                 leases
-            };
+            }
+            RangeAdmission::Phase2 { phase2_lease } => {
+                if coalesced.is_empty() {
+                    Vec::new()
+                } else {
+                    self.split_context
+                        .budget
+                        .reserve_phase2_fetch(&lengths, phase2_lease.as_deref_mut())
+                        .await?
+                }
+            }
+            RangeAdmission::Phase1FollowUp => {
+                if coalesced.is_empty() {
+                    Vec::new()
+                } else {
+                    let (leases, _, _) = self
+                        .split_context
+                        .budget
+                        .reserve_for_fetch(&lengths, || 0, 0)
+                        .await?;
+                    leases
+                }
+            }
+        };
+
+        if !coalesced.is_empty() {
             let fetch_ranges: Vec<Range<u64>> =
                 coalesced.iter().map(|c| c.range.clone()).collect();
             let raw_bytes = match fetch_fn(fetch_ranges).await {
@@ -1702,6 +1912,7 @@ impl AsyncRangeBroker {
                 .metrics
                 .record_storage_fetch(coalesced.len(), total_returned);
 
+            let mut evicted = Vec::new();
             {
                 let mut map = self.state.lock();
                 for (key, tx) in guard.pending.drain(..) {
@@ -1712,14 +1923,17 @@ impl AsyncRangeBroker {
                         if tracker.consume_key(key) {
                             entry.remaining_consumers =
                                 entry.remaining_consumers.saturating_sub(1);
-                            if entry.remaining_consumers == 0 {
-                                map.remove(&key);
+                            if entry.remaining_consumers == 0
+                                && let Some(removed) = map.remove(&key)
+                            {
+                                evicted.push(removed);
                             }
                         }
                     }
                     let _ = tx.send(true);
                 }
             }
+            drop(evicted);
         }
 
         // Wait for any shared ranges that were already in flight on another lane.
@@ -1731,6 +1945,7 @@ impl AsyncRangeBroker {
         let mut waited_reused = 0usize;
         for key in to_wait {
             loop {
+                let mut evicted = None;
                 let action = {
                     let mut map = self.state.lock();
                     match map.get_mut(&key) {
@@ -1741,7 +1956,7 @@ impl AsyncRangeBroker {
                                     entry.remaining_consumers =
                                         entry.remaining_consumers.saturating_sub(1);
                                     if entry.remaining_consumers == 0 {
-                                        map.remove(&key);
+                                        evicted = map.remove(&key);
                                     }
                                 }
                                 WaitAction::Ready(view)
@@ -1771,6 +1986,7 @@ impl AsyncRangeBroker {
                         }
                     }
                 };
+                drop(evicted);
                 match action {
                     WaitAction::Ready(view) => {
                         waited_reused += view.len();
@@ -1786,18 +2002,25 @@ impl AsyncRangeBroker {
                             pending: vec![(key, tx)],
                         };
                         let len = (key.1 - key.0) as usize;
-                        let mut leases = if is_phase2 {
-                            self.split_context
-                                .budget
-                                .reserve_phase2_fetch(&[len])
-                                .await?
-                        } else {
-                            let (l, _) = self
-                                .split_context
-                                .budget
-                                .reserve_for_fetch(&[len], 0)
-                                .await?;
-                            l
+                        let mut leases = match &mut admission {
+                            RangeAdmission::Phase2 { phase2_lease } => {
+                                self.split_context
+                                    .budget
+                                    .reserve_phase2_fetch(
+                                        &[len],
+                                        phase2_lease.as_deref_mut(),
+                                    )
+                                    .await?
+                            }
+                            RangeAdmission::Phase1 { .. }
+                            | RangeAdmission::Phase1FollowUp => {
+                                let (l, _, _) = self
+                                    .split_context
+                                    .budget
+                                    .reserve_for_fetch(&[len], || 0, 0)
+                                    .await?;
+                                l
+                            }
                         };
                         let lease = leases.pop().unwrap();
                         let range = key.0..key.1;
@@ -1820,20 +2043,27 @@ impl AsyncRangeBroker {
                         self.split_context.metrics.record_storage_fetch(1, len);
                         let tracked = wrap_tracked_bytes(buf, lease);
                         resolved.insert(key, tracked.clone());
-                        let mut map = self.state.lock();
-                        for (k, tx) in takeover_guard.pending.drain(..) {
-                            if let Some(entry) = map.get_mut(&k) {
-                                entry.status = AsyncRangeStatus::Ready(tracked.clone());
-                                if tracker.consume_key(k) {
-                                    entry.remaining_consumers =
-                                        entry.remaining_consumers.saturating_sub(1);
-                                    if entry.remaining_consumers == 0 {
-                                        map.remove(&k);
+                        let mut evicted = Vec::new();
+                        {
+                            let mut map = self.state.lock();
+                            for (k, tx) in takeover_guard.pending.drain(..) {
+                                if let Some(entry) = map.get_mut(&k) {
+                                    entry.status =
+                                        AsyncRangeStatus::Ready(tracked.clone());
+                                    if tracker.consume_key(k) {
+                                        entry.remaining_consumers =
+                                            entry.remaining_consumers.saturating_sub(1);
+                                        if entry.remaining_consumers == 0
+                                            && let Some(removed) = map.remove(&k)
+                                        {
+                                            evicted.push(removed);
+                                        }
                                     }
                                 }
+                                let _ = tx.send(true);
                             }
-                            let _ = tx.send(true);
                         }
+                        drop(evicted);
                         break;
                     }
                 }
@@ -1922,6 +2152,7 @@ enum PlainRgWork {
     },
     Split {
         rg_index: usize,
+        original_selection: RowGroupSelection,
         entry: RgPlanEntry,
         plan: RowGroupSplitPlan,
     },
@@ -1940,8 +2171,10 @@ struct InFlightPlainSlice {
 
 struct ActiveSplitPlainRg {
     rg_index: usize,
+    original_selection: RowGroupSelection,
     entry: RgPlanEntry,
     plan: RowGroupSplitPlan,
+    slices_published: usize,
     frontier_guard: Option<FrontierGuard>,
     broker: RangeBroker,
     in_flight_slice: Option<InFlightPlainSlice>,
@@ -2003,6 +2236,7 @@ enum FilteredRgWork {
     },
     Split {
         rg_index: usize,
+        original_selection: RowGroupSelection,
         entry: RgPlanEntry,
         plan: RowGroupSplitPlan,
     },
@@ -2010,8 +2244,10 @@ enum FilteredRgWork {
 
 struct ActiveSplitFilteredRg {
     rg_index: usize,
+    original_selection: RowGroupSelection,
     entry: RgPlanEntry,
     plan: RowGroupSplitPlan,
+    slices_published: usize,
     frontier_guard: Option<FrontierGuard>,
     broker: Arc<AsyncRangeBroker>,
     split_context: Arc<SplitContext>,
@@ -2080,10 +2316,10 @@ impl BufferedReaders {
                 config.batch_size,
             ) {
                 Ok(plan) => {
-                    config.split_context.metrics.record_split_rg();
                     any_split = true;
                     work.push_back(PlainRgWork::Split {
                         rg_index: entry.rg_index,
+                        original_selection: selection.clone(),
                         entry: entry.clone(),
                         plan,
                     });
@@ -2158,14 +2394,12 @@ impl BufferedReaders {
                     config.enable_page_index,
                     config.batch_size,
                 ) {
-                    Ok(plan) => {
-                        split_ctx.metrics.record_split_rg();
-                        FilteredRgWork::Split {
-                            rg_index: entry.rg_index,
-                            entry,
-                            plan,
-                        }
-                    }
+                    Ok(plan) => FilteredRgWork::Split {
+                        rg_index: entry.rg_index,
+                        original_selection: selection,
+                        entry,
+                        plan,
+                    },
                     Err(reason) => {
                         split_ctx.metrics.record_unsplit_rg(reason);
                         FilteredRgWork::Unsplit { selection, entry }
@@ -2289,6 +2523,31 @@ impl SplitPlainBufferedReaders {
         plan
     }
 
+    /// Before any slice of the active split row group has been published, fall
+    /// back cleanly to the unsplit reader instead of failing on memory pressure.
+    fn fallback_active_split_to_unsplit(&mut self) -> Result<()> {
+        let Some(ActivePlainRg::Split(rg)) = self.active.take() else {
+            return Ok(());
+        };
+        debug_assert_eq!(rg.slices_published, 0);
+        let original_selection = rg.original_selection;
+        let entry = rg.entry;
+        // Drop frontier_guard & broker before switching to unsplit.
+        drop(rg.frontier_guard);
+        drop(rg.broker);
+        self.split_context
+            .metrics
+            .record_unsplit_rg(UnsplitReason::MemoryPoolCap);
+        let decoder = self.build_decoder(original_selection)?;
+        self.active = Some(ActivePlainRg::Unsplit {
+            decoder,
+            entry,
+            fetched: None,
+            fetched_bytes: 0,
+        });
+        Ok(())
+    }
+
     fn plan(mut self: Box<Self>) -> Result<Option<MorselPlan>> {
         let elapsed_compute = self.baseline.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
@@ -2310,6 +2569,7 @@ impl SplitPlainBufferedReaders {
                     }
                     PlainRgWork::Split {
                         rg_index,
+                        original_selection,
                         entry,
                         plan,
                     } => {
@@ -2320,8 +2580,10 @@ impl SplitPlainBufferedReaders {
                         self.active =
                             Some(ActivePlainRg::Split(Box::new(ActiveSplitPlainRg {
                                 rg_index,
+                                original_selection,
                                 entry,
                                 plan,
+                                slices_published: 0,
                                 frontier_guard,
                                 broker: RangeBroker::new(),
                                 in_flight_slice: None,
@@ -2389,16 +2651,25 @@ impl SplitPlainBufferedReaders {
                 ActivePlainRg::Split(mut rg) => {
                     if rg.frontier_guard.is_none() {
                         let frontier_bytes = rg.plan.frontier_bytes;
+                        let is_first_slice = rg.slices_published == 0;
                         let budget = Arc::clone(&self.split_context.budget);
                         self.active = Some(ActivePlainRg::Split(rg));
                         return Ok(Some(MorselPlan::new().with_pending_planner(
                             async move {
-                                let guard =
-                                    budget.acquire_frontier(frontier_bytes).await?;
-                                if let Some(ActivePlainRg::Split(rg)) =
-                                    self.active.as_mut()
-                                {
-                                    rg.frontier_guard = Some(guard);
+                                match budget.acquire_frontier(frontier_bytes).await {
+                                    Ok(guard) => {
+                                        if let Some(ActivePlainRg::Split(rg)) =
+                                            self.active.as_mut()
+                                        {
+                                            rg.frontier_guard = Some(guard);
+                                        }
+                                    }
+                                    Err(DataFusionError::ResourcesExhausted(_))
+                                        if is_first_slice =>
+                                    {
+                                        self.fallback_active_split_to_unsplit()?;
+                                    }
+                                    Err(err) => return Err(err),
                                 }
                                 Ok(Box::new(BufferedReaders::SplitPlain(self))
                                     as Box<dyn MorselPlanner>)
@@ -2452,10 +2723,10 @@ impl SplitPlainBufferedReaders {
                                                 (c.range.end - c.range.start) as usize
                                             })
                                             .collect();
-                                        let (leases, _) = self
+                                        let (leases, _, _) = self
                                             .split_context
                                             .budget
-                                            .reserve_for_fetch(&lengths, 0)
+                                            .reserve_for_fetch(&lengths, || 0, 0)
                                             .await?;
                                         let fetch_ranges: Vec<Range<u64>> = coalesced
                                             .iter()
@@ -2517,16 +2788,24 @@ impl SplitPlainBufferedReaders {
                                 )));
                             }
                             DecodeResult::Data(reader) => {
+                                if rg.slices_published == 0 {
+                                    self.split_context.metrics.record_split_rg();
+                                }
+                                rg.slices_published += 1;
                                 self.split_context.metrics.record_slice(selected_rows);
                                 let rg_index = rg.rg_index;
+                                // Register the decode reader BEFORE dropping `rg`
+                                // (and `rg.frontier_guard`) so waiting lanes never
+                                // observe zero active lanes + zero in-flight readers
+                                // while this reader's compressed bytes are still live.
+                                let in_flight_guard =
+                                    self.split_context.budget.track_decode_reader();
                                 if rg.plan.slices.is_empty() {
                                     self.byte_progress.credit(rg.entry.bytes);
-                                    // Drop `rg` now to release frontier headroom & broker.
+                                    drop(rg);
                                 } else {
                                     self.active = Some(ActivePlainRg::Split(rg));
                                 }
-                                let in_flight_guard =
-                                    self.split_context.budget.track_decode_reader();
                                 let morsel = Box::new(BufferedReader {
                                     reader,
                                     compressed_bytes: compressed_bytes as u64,
@@ -2571,7 +2850,8 @@ impl SplitPlainBufferedReaders {
                     })? {
                         DecodeResult::NeedsData(requested_ranges) => {
                             let misses = rg.broker.partition_misses(&requested_ranges);
-                            let decoded_estimate = rg.plan.decoded_estimate;
+                            let decoded_estimate = slice.decoded_estimate;
+                            let is_first_slice = rg.slices_published == 0;
                             if misses.is_empty() {
                                 if let Some(decoded_lease) = self
                                     .split_context
@@ -2602,11 +2882,24 @@ impl SplitPlainBufferedReaders {
                                 self.active = Some(ActivePlainRg::Split(rg));
                                 return Ok(Some(MorselPlan::new().with_pending_planner(
                                     async move {
-                                        let decoded_lease = self
+                                        let decoded_lease = match self
                                             .split_context
                                             .budget
                                             .reserve_decoded(decoded_estimate)
-                                            .await?;
+                                            .await
+                                        {
+                                            Ok(lease) => lease,
+                                            Err(DataFusionError::ResourcesExhausted(
+                                                _,
+                                            )) if is_first_slice => {
+                                                self.fallback_active_split_to_unsplit()?;
+                                                return Ok(Box::new(
+                                                    BufferedReaders::SplitPlain(self),
+                                                )
+                                                    as Box<dyn MorselPlanner>);
+                                            }
+                                            Err(err) => return Err(err),
+                                        };
                                         if let Some(ActivePlainRg::Split(rg)) =
                                             self.active.as_mut()
                                         {
@@ -2654,11 +2947,28 @@ impl SplitPlainBufferedReaders {
                             self.active = Some(ActivePlainRg::Split(rg));
                             return Ok(Some(MorselPlan::new().with_pending_planner(
                                 async move {
-                                    let (leases, decoded_lease) = self
+                                    let (leases, _phase2, decoded_lease) = match self
                                         .split_context
                                         .budget
-                                        .reserve_for_fetch(&lengths, decoded_estimate)
-                                        .await?;
+                                        .reserve_for_fetch(
+                                            &lengths,
+                                            || 0,
+                                            decoded_estimate,
+                                        )
+                                        .await
+                                    {
+                                        Ok(res) => res,
+                                        Err(DataFusionError::ResourcesExhausted(_))
+                                            if is_first_slice =>
+                                        {
+                                            self.fallback_active_split_to_unsplit()?;
+                                            return Ok(Box::new(
+                                                BufferedReaders::SplitPlain(self),
+                                            )
+                                                as Box<dyn MorselPlanner>);
+                                        }
+                                        Err(err) => return Err(err),
+                                    };
                                     let raw = self
                                         .reader
                                         .get_byte_ranges(fetch_ranges)
@@ -2700,35 +3010,58 @@ impl SplitPlainBufferedReaders {
                             )));
                         }
                         DecodeResult::Data(reader) => {
+                            let decoded_estimate = slice.decoded_estimate;
+                            let is_first_slice = rg.slices_published == 0;
                             let decoded_lease = self
                                 .split_context
                                 .budget
-                                .try_reserve_decoded_sync(rg.plan.decoded_estimate);
+                                .try_reserve_decoded_sync(decoded_estimate);
                             let Some(decoded_lease) = decoded_lease else {
-                                let decoded_estimate = rg.plan.decoded_estimate;
                                 let rg_index = rg.rg_index;
                                 let row_range = slice.row_range;
                                 let selected_rows = slice.selected_rows;
                                 let last_slice = rg.plan.slices.is_empty();
                                 let entry_bytes = rg.entry.bytes;
-                                if last_slice {
-                                    self.byte_progress.credit(entry_bytes);
-                                } else {
-                                    self.active = Some(ActivePlainRg::Split(rg));
-                                }
+                                // Keep `rg` (and `frontier_guard`) alive across the
+                                // reservation wait so slice 0 can fall back cleanly.
+                                self.active = Some(ActivePlainRg::Split(rg));
                                 let projection = Arc::clone(&self.projection);
                                 let file_name = Arc::clone(&self.file_name);
                                 let split_context = Arc::clone(&self.split_context);
                                 let elapsed_compute_owned = elapsed_compute.clone();
                                 return Ok(Some(MorselPlan::new().with_pending_planner(
                                     async move {
-                                        let decoded_lease = split_context
+                                        let decoded_lease = match split_context
                                             .budget
                                             .reserve_decoded(decoded_estimate)
-                                            .await?;
+                                            .await
+                                        {
+                                            Ok(lease) => lease,
+                                            Err(DataFusionError::ResourcesExhausted(
+                                                _,
+                                            )) if is_first_slice => {
+                                                self.fallback_active_split_to_unsplit()?;
+                                                return Ok(Box::new(
+                                                    BufferedReaders::SplitPlain(self),
+                                                )
+                                                    as Box<dyn MorselPlanner>);
+                                            }
+                                            Err(err) => return Err(err),
+                                        };
+                                        if is_first_slice {
+                                            split_context.metrics.record_split_rg();
+                                        }
                                         split_context.metrics.record_slice(selected_rows);
                                         let in_flight_guard =
                                             split_context.budget.track_decode_reader();
+                                        if last_slice {
+                                            self.byte_progress.credit(entry_bytes);
+                                            self.active = None;
+                                        } else if let Some(ActivePlainRg::Split(rg)) =
+                                            self.active.as_mut()
+                                        {
+                                            rg.slices_published += 1;
+                                        }
                                         let morsel = Box::new(BufferedReader {
                                             reader,
                                             compressed_bytes: 0,
@@ -2756,15 +3089,20 @@ impl SplitPlainBufferedReaders {
                                     },
                                 )));
                             };
+                            if rg.slices_published == 0 {
+                                self.split_context.metrics.record_split_rg();
+                            }
+                            rg.slices_published += 1;
                             self.split_context.metrics.record_slice(slice.selected_rows);
                             let rg_index = rg.rg_index;
+                            let in_flight_guard =
+                                self.split_context.budget.track_decode_reader();
                             if rg.plan.slices.is_empty() {
                                 self.byte_progress.credit(rg.entry.bytes);
+                                drop(rg);
                             } else {
                                 self.active = Some(ActivePlainRg::Split(rg));
                             }
-                            let in_flight_guard =
-                                self.split_context.budget.track_decode_reader();
                             let morsel = Box::new(BufferedReader {
                                 reader,
                                 compressed_bytes: 0,
@@ -2895,7 +3233,9 @@ struct SplitSliceMeta {
     rg_index: usize,
     row_range: Range<usize>,
     selected_rows: usize,
+    is_last_slice: bool,
     credit_entry_bytes: Option<u64>,
+    phase2_lease: Phase2BudgetLease,
     decoded_lease: SplitDecodedLease,
     tracker: Phase2SliceTracker,
     broker: Arc<AsyncRangeBroker>,
@@ -2977,6 +3317,46 @@ impl FilteredBufferedReaders {
         plan
     }
 
+    /// Before any slice of the active split row group has been published, fall
+    /// back cleanly to the unsplit reader instead of failing on memory pressure.
+    fn fallback_active_split_to_unsplit(&mut self) {
+        let Some(split_rg) = self.active_split.take() else {
+            return;
+        };
+        debug_assert_eq!(split_rg.slices_published, 0);
+        let original_selection = split_rg.original_selection;
+        let entry = split_rg.entry;
+        let split_context = split_rg.split_context;
+        // Release frontier_guard and broker before re-queuing unsplit work.
+        drop(split_rg.frontier_guard);
+        drop(split_rg.broker);
+        split_context
+            .metrics
+            .record_unsplit_rg(UnsplitReason::MemoryPoolCap);
+        self.pending.push_front(FilteredRgWork::Unsplit {
+            selection: original_selection,
+            entry,
+        });
+    }
+
+    /// Mark one slice of the active split row group as published and release
+    /// `active_split` (including its `FrontierGuard`) once the last slice is
+    /// registered in-flight.
+    fn finish_published_split_slice(&mut self, is_last_slice: bool, fully_matched: bool) {
+        if let Some(rg) = self.active_split.as_mut() {
+            if rg.slices_published == 0 {
+                rg.split_context.metrics.record_split_rg();
+                if fully_matched {
+                    self.row_filter_skipped_fully_matched.add_one();
+                }
+            }
+            rg.slices_published += 1;
+        }
+        if is_last_slice {
+            self.active_split = None;
+        }
+    }
+
     fn plan(mut self: Box<Self>) -> Result<Option<MorselPlan>> {
         let elapsed_compute = self.baseline.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
@@ -3039,14 +3419,23 @@ impl FilteredBufferedReaders {
                     let (row_context, decoded_lease, split_phase2, in_flight_guard) =
                         match split_meta {
                             Some(meta) => {
+                                // Track filter planner BEFORE releasing active_split's
+                                // FrontierGuard on the last slice so waiters never see
+                                // zero active lanes + zero in-flight planners while
+                                // this slice's buffers are still live.
                                 let guard =
                                     meta.split_context.budget.track_filter_planner();
+                                self.finish_published_split_slice(
+                                    meta.is_last_slice,
+                                    entry.fully_matched,
+                                );
                                 (
                                     Some((meta.rg_index, meta.row_range)),
                                     Some(meta.decoded_lease),
                                     Some(SplitPhase2State {
                                         broker: meta.broker,
                                         tracker: meta.tracker,
+                                        phase2_lease: meta.phase2_lease,
                                         split_context: meta.split_context,
                                     }),
                                     Some(guard),
@@ -3127,7 +3516,7 @@ impl FilteredBufferedReaders {
                                                 &broker,
                                                 &more_ranges,
                                                 &mut meta.tracker,
-                                                false,
+                                                RangeAdmission::Phase1FollowUp,
                                                 &ctx,
                                                 reader,
                                             )
@@ -3175,10 +3564,17 @@ impl FilteredBufferedReaders {
                                         if let Some(credit) = meta.credit_entry_bytes {
                                             self.byte_progress.credit(credit);
                                         }
+                                        // Register decode reader BEFORE dropping
+                                        // active_split's FrontierGuard on last slice.
                                         let guard = meta
                                             .split_context
                                             .budget
                                             .track_decode_reader();
+                                        self.finish_published_split_slice(
+                                            meta.is_last_slice,
+                                            entry.fully_matched,
+                                        );
+                                        drop(meta.phase2_lease);
                                         (
                                             Some((meta.rg_index, meta.row_range)),
                                             Some(meta.decoded_lease),
@@ -3208,6 +3604,9 @@ impl FilteredBufferedReaders {
                                 if let Some(credit) = meta.credit_entry_bytes {
                                     self.byte_progress.credit(credit);
                                 }
+                                if meta.is_last_slice {
+                                    self.active_split = None;
+                                }
                             } else {
                                 self.byte_progress.credit(entry.bytes);
                             }
@@ -3221,13 +3620,23 @@ impl FilteredBufferedReaders {
             if let Some(mut split_rg) = self.active_split.take() {
                 if split_rg.frontier_guard.is_none() {
                     let frontier_bytes = split_rg.plan.frontier_bytes;
+                    let is_first_slice = split_rg.slices_published == 0;
                     let budget = Arc::clone(&split_rg.split_context.budget);
                     self.active_split = Some(split_rg);
                     return Ok(Some(MorselPlan::new().with_pending_planner(
                         async move {
-                            let guard = budget.acquire_frontier(frontier_bytes).await?;
-                            if let Some(rg) = self.active_split.as_mut() {
-                                rg.frontier_guard = Some(guard);
+                            match budget.acquire_frontier(frontier_bytes).await {
+                                Ok(guard) => {
+                                    if let Some(rg) = self.active_split.as_mut() {
+                                        rg.frontier_guard = Some(guard);
+                                    }
+                                }
+                                Err(DataFusionError::ResourcesExhausted(_))
+                                    if is_first_slice =>
+                                {
+                                    self.fallback_active_split_to_unsplit();
+                                }
+                                Err(err) => return Err(err),
                             }
                             Ok(Box::new(BufferedReaders::Filtered(self))
                                 as Box<dyn MorselPlanner>)
@@ -3239,6 +3648,7 @@ impl FilteredBufferedReaders {
                     continue;
                 };
                 let is_last = split_rg.plan.slices.is_empty();
+                let is_first_slice = split_rg.slices_published == 0;
                 let credit_entry_bytes = is_last.then_some(split_rg.entry.bytes);
                 let install_filter = !split_rg.entry.fully_matched;
                 let shared_keys = split_rg
@@ -3266,38 +3676,72 @@ impl FilteredBufferedReaders {
                     })?;
                 let entry = split_rg.entry.clone();
                 let rg_index = split_rg.rg_index;
-                let decoded_estimate = split_rg.plan.decoded_estimate;
+                let decoded_estimate = slice.decoded_estimate;
+                let all_ranges = slice.all_ranges;
                 let broker = Arc::clone(&split_rg.broker);
                 let split_context = Arc::clone(&split_rg.split_context);
-                if !is_last {
-                    self.active_split = Some(split_rg);
-                }
+                // Always retain `active_split` (including its `FrontierGuard`)
+                // across the last slice's Phase-1 fetch until it is published!
+                self.active_split = Some(split_rg);
 
                 match decoder.try_next_reader().map_err(|e| {
                     DataFusionError::from(e)
                         .context(format!("Preparing Parquet split reader ({ctx})"))
                 })? {
                     DecodeResult::NeedsData(ranges) => {
+                        let phase1_set: HashSet<(u64, u64)> =
+                            ranges.iter().map(|r| (r.start, r.end)).collect();
+                        let phase2_candidates: Vec<(u64, u64)> = if install_filter {
+                            all_ranges
+                                .into_iter()
+                                .filter(|k| !phase1_set.contains(k))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         return Ok(Some(MorselPlan::new().with_pending_planner(
                             async move {
-                                let decoded_lease = split_context
-                                    .budget
-                                    .reserve_decoded(decoded_estimate)
-                                    .await?;
-                                let bytes = resolve_with_reader(
+                                let mut admitted: Option<(
+                                    Phase2BudgetLease,
+                                    SplitDecodedLease,
+                                )> = None;
+                                let bytes = match resolve_with_reader(
                                     &broker,
                                     &ranges,
                                     &mut tracker,
-                                    false,
+                                    RangeAdmission::Phase1 {
+                                        phase2_candidates: &phase2_candidates,
+                                        decoded_estimate,
+                                        out_leases: &mut admitted,
+                                    },
                                     &ctx,
                                     &mut self.reader,
                                 )
-                                .await?;
+                                .await
+                                {
+                                    Ok(bytes) => bytes,
+                                    Err(DataFusionError::ResourcesExhausted(_))
+                                        if is_first_slice =>
+                                    {
+                                        drop(tracker);
+                                        drop(admitted);
+                                        self.fallback_active_split_to_unsplit();
+                                        return Ok(Box::new(BufferedReaders::Filtered(
+                                            self,
+                                        ))
+                                            as Box<dyn MorselPlanner>);
+                                    }
+                                    Err(err) => return Err(err),
+                                };
+                                let (phase2_lease, decoded_lease) = admitted
+                                    .expect("Phase1 admission always populates leases");
                                 let meta = Box::new(SplitSliceMeta {
                                     rg_index,
                                     row_range: slice.row_range,
                                     selected_rows: slice.selected_rows,
+                                    is_last_slice: is_last,
                                     credit_entry_bytes,
+                                    phase2_lease,
                                     decoded_lease,
                                     tracker,
                                     broker,
@@ -3327,14 +3771,74 @@ impl FilteredBufferedReaders {
                         )));
                     }
                     DecodeResult::Data(reader) => {
+                        let decoded_lease = split_context
+                            .budget
+                            .try_reserve_decoded_sync(decoded_estimate);
+                        let Some(decoded_lease) = decoded_lease else {
+                            let row_range = slice.row_range;
+                            let selected_rows = slice.selected_rows;
+                            let projection = Arc::clone(&self.projection);
+                            let file_name = Arc::clone(&self.file_name);
+                            let cache_metrics = self.cache_metrics();
+                            let elapsed_compute_owned = elapsed_compute.clone();
+                            return Ok(Some(MorselPlan::new().with_pending_planner(
+                                async move {
+                                    let decoded_lease = match split_context
+                                        .budget
+                                        .reserve_decoded(decoded_estimate)
+                                        .await
+                                    {
+                                        Ok(lease) => lease,
+                                        Err(DataFusionError::ResourcesExhausted(_))
+                                            if is_first_slice =>
+                                        {
+                                            drop(tracker);
+                                            self.fallback_active_split_to_unsplit();
+                                            return Ok(
+                                                Box::new(BufferedReaders::Filtered(self))
+                                                    as Box<dyn MorselPlanner>,
+                                            );
+                                        }
+                                        Err(err) => return Err(err),
+                                    };
+                                    split_context.metrics.record_slice(selected_rows);
+                                    if let Some(credit) = credit_entry_bytes {
+                                        self.byte_progress.credit(credit);
+                                    }
+                                    let in_flight_guard =
+                                        split_context.budget.track_decode_reader();
+                                    self.finish_published_split_slice(
+                                        is_last,
+                                        entry.fully_matched,
+                                    );
+                                    let morsel = Box::new(BufferedReader {
+                                        reader,
+                                        compressed_bytes: 0,
+                                        projection,
+                                        file_name,
+                                        row_context: Some((rg_index, row_range)),
+                                        elapsed_compute: elapsed_compute_owned,
+                                        cache_metrics: Some(cache_metrics),
+                                        decoded_lease: Some(decoded_lease),
+                                        in_flight_guard: Some(in_flight_guard),
+                                    });
+                                    Ok(Box::new(PublishReadyMorsel {
+                                        morsel: Some(morsel),
+                                        continuation: self.has_more_work().then(|| {
+                                            Box::new(BufferedReaders::Filtered(self))
+                                                as Box<dyn MorselPlanner>
+                                        }),
+                                    })
+                                        as Box<dyn MorselPlanner>)
+                                },
+                            )));
+                        };
                         split_context.metrics.record_slice(slice.selected_rows);
                         if let Some(credit) = credit_entry_bytes {
                             self.byte_progress.credit(credit);
                         }
-                        let decoded_lease = split_context
-                            .budget
-                            .try_reserve_decoded_sync(decoded_estimate);
                         let in_flight_guard = split_context.budget.track_decode_reader();
+                        self.finish_published_split_slice(is_last, entry.fully_matched);
                         let morsel = Box::new(BufferedReader {
                             reader,
                             compressed_bytes: 0,
@@ -3343,7 +3847,7 @@ impl FilteredBufferedReaders {
                             row_context: Some((rg_index, slice.row_range)),
                             elapsed_compute: elapsed_compute.clone(),
                             cache_metrics: Some(self.cache_metrics()),
-                            decoded_lease,
+                            decoded_lease: Some(decoded_lease),
                             in_flight_guard: Some(in_flight_guard),
                         });
                         return Ok(Some(self.publish_morsel(morsel)));
@@ -3351,6 +3855,9 @@ impl FilteredBufferedReaders {
                     DecodeResult::Finished => {
                         if let Some(credit) = credit_entry_bytes {
                             self.byte_progress.credit(credit);
+                        }
+                        if is_last {
+                            self.active_split = None;
                         }
                         continue;
                     }
@@ -3363,12 +3870,10 @@ impl FilteredBufferedReaders {
             match next {
                 FilteredRgWork::Split {
                     rg_index,
+                    original_selection,
                     entry,
                     plan,
                 } => {
-                    if entry.fully_matched {
-                        self.row_filter_skipped_fully_matched.add_one();
-                    }
                     let split_context = Arc::clone(
                         self.split_context
                             .as_ref()
@@ -3383,8 +3888,10 @@ impl FilteredBufferedReaders {
                     ));
                     self.active_split = Some(Box::new(ActiveSplitFilteredRg {
                         rg_index,
+                        original_selection,
                         entry,
                         plan,
+                        slices_published: 0,
                         frontier_guard,
                         broker,
                         split_context,
@@ -3458,7 +3965,7 @@ async fn resolve_with_reader(
     broker: &Arc<AsyncRangeBroker>,
     requested: &[Range<u64>],
     tracker: &mut Phase2SliceTracker,
-    is_phase2: bool,
+    admission: RangeAdmission<'_>,
     err_ctx: &str,
     reader: &mut Box<dyn AsyncFileReader>,
 ) -> Result<Vec<Bytes>> {
@@ -3468,7 +3975,7 @@ async fn resolve_with_reader(
     // uncontended on this single lane.
     let reader = tokio::sync::Mutex::new(reader);
     broker
-        .resolve_ranges(requested, tracker, is_phase2, err_ctx, |ranges| {
+        .resolve_ranges(requested, tracker, admission, err_ctx, |ranges| {
             let reader = &reader;
             async move {
                 let mut guard = reader.lock().await;
@@ -3492,11 +3999,16 @@ enum RgStage {
 struct SplitPhase2State {
     broker: Arc<AsyncRangeBroker>,
     tracker: Phase2SliceTracker,
+    phase2_lease: Phase2BudgetLease,
     split_context: Arc<SplitContext>,
 }
 
 /// Per-row-group (or per-slice) state machine separating worker `RowFilter`
 /// CPU work from I/O-lane Phase-2 range fetches.
+///
+/// Field drop order is load-bearing: `decoder`, `fetched`, `decoded_lease`, and
+/// `split_phase2` (all holding buffer/pool reservations) MUST drop before
+/// `_in_flight_guard` signals waiters.
 struct FilteredRowGroupPlanner {
     decoder: ParquetPushDecoder,
     stage: RgStage,
@@ -3537,19 +4049,38 @@ impl FilteredRowGroupPlanner {
     }
 
     fn into_decode_morsel(self, reader: ParquetRecordBatchReader) -> Box<dyn Morsel> {
-        let in_flight_guard = self
-            .split_phase2
+        let Self {
+            decoder,
+            buffered_bytes,
+            fetched,
+            projection,
+            file_name,
+            row_context,
+            elapsed_compute,
+            cache_metrics,
+            decoded_lease,
+            split_phase2,
+            _in_flight_guard: filter_guard,
+            ..
+        } = self;
+        let in_flight_guard = split_phase2
             .as_ref()
             .map(|s| s.split_context.budget.track_decode_reader());
+        // Release decoder, fetched buffers, and any unused Phase-2 headroom
+        // BEFORE dropping the filter-planner guard.
+        drop(decoder);
+        drop(fetched);
+        drop(split_phase2);
+        drop(filter_guard);
         Box::new(BufferedReader {
             reader,
-            compressed_bytes: self.buffered_bytes as u64,
-            projection: self.projection,
-            file_name: self.file_name,
-            row_context: self.row_context,
-            elapsed_compute: self.elapsed_compute,
-            cache_metrics: Some(self.cache_metrics),
-            decoded_lease: self.decoded_lease,
+            compressed_bytes: buffered_bytes as u64,
+            projection,
+            file_name,
+            row_context,
+            elapsed_compute,
+            cache_metrics: Some(cache_metrics),
+            decoded_lease,
             in_flight_guard,
         })
     }
@@ -3565,7 +4096,9 @@ impl FilteredRowGroupPlanner {
                     .resolve_ranges(
                         &ranges,
                         &mut split_phase2.tracker,
-                        true,
+                        RangeAdmission::Phase2 {
+                            phase2_lease: Some(&mut split_phase2.phase2_lease),
+                        },
                         &err_ctx,
                         |fetch_ranges| {
                             let transport = transport.clone();
@@ -3652,16 +4185,60 @@ impl MorselPlanner for FilteredRowGroupPlanner {
     }
 }
 
+/// Decode-ready morsel. Field drop order is load-bearing: `reader` holds
+/// `TrackedBytes` leases and MUST drop before `decoded_lease` and
+/// `in_flight_guard` so waiters never observe zero in-flight readers while
+/// compressed bytes are still counted in `SplitBudget::live_bytes`.
 struct BufferedReader {
     reader: ParquetRecordBatchReader,
+    decoded_lease: Option<SplitDecodedLease>,
+    in_flight_guard: Option<InFlightReaderGuard>,
     compressed_bytes: u64,
     projection: Arc<DecoderProjection>,
     file_name: Arc<str>,
     row_context: Option<(usize, Range<usize>)>,
     elapsed_compute: Time,
     cache_metrics: Option<PredicateCacheMetrics>,
-    decoded_lease: Option<SplitDecodedLease>,
-    in_flight_guard: Option<InFlightReaderGuard>,
+}
+
+/// Iterator wrapper guaranteeing `reader` drops BEFORE `decoded_lease` and
+/// `in_flight_guard` (struct fields drop strictly in declaration order).
+struct BufferedReaderIter {
+    reader: ParquetRecordBatchReader,
+    _decoded_lease: Option<SplitDecodedLease>,
+    _in_flight_guard: Option<InFlightReaderGuard>,
+    projection: Arc<DecoderProjection>,
+    file_name: Arc<str>,
+    row_context: Option<(usize, Range<usize>)>,
+    elapsed_compute: Time,
+    cache_metrics: Option<PredicateCacheMetrics>,
+}
+
+impl Iterator for BufferedReaderIter {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let _timer = self.elapsed_compute.timer();
+        let next = self.reader.next();
+        if let Some(metrics) = &self.cache_metrics {
+            metrics.copy_to_gauges();
+        }
+        next.map(|batch| {
+            batch
+                .map_err(DataFusionError::from)
+                .and_then(|batch| self.projection.map(&batch))
+                .map_err(|err| match &self.row_context {
+                    Some((rg, rows)) => err.context(format!(
+                        "Decoding Parquet split morsel from {} (row_group={rg}, rows={}..{})",
+                        self.file_name, rows.start, rows.end
+                    )),
+                    None => err.context(format!(
+                        "Decoding Parquet morsel from {}",
+                        self.file_name
+                    )),
+                })
+        })
+    }
 }
 
 impl fmt::Debug for BufferedReader {
@@ -3677,39 +4254,26 @@ impl Morsel for BufferedReader {
 
     fn into_stream(self: Box<Self>) -> stream::BoxStream<'static, Result<RecordBatch>> {
         let Self {
-            mut reader,
+            reader,
+            decoded_lease,
+            in_flight_guard,
             projection,
             file_name,
             row_context,
             elapsed_compute,
             cache_metrics,
-            decoded_lease,
-            in_flight_guard,
             ..
         } = *self;
-        stream::iter(std::iter::from_fn(move || {
-            let _keep_decoded = &decoded_lease;
-            let _keep_guard = &in_flight_guard;
-            let _timer = elapsed_compute.timer();
-            let next = reader.next();
-            if let Some(metrics) = &cache_metrics {
-                metrics.copy_to_gauges();
-            }
-            next.map(|batch| {
-                batch
-                    .map_err(DataFusionError::from)
-                    .and_then(|batch| projection.map(&batch))
-                    .map_err(|err| match &row_context {
-                        Some((rg, rows)) => err.context(format!(
-                            "Decoding Parquet split morsel from {file_name} (row_group={rg}, rows={}..{})",
-                            rows.start, rows.end
-                        )),
-                        None => err.context(format!(
-                            "Decoding Parquet morsel from {file_name}"
-                        )),
-                    })
-            })
-        }))
+        stream::iter(BufferedReaderIter {
+            reader,
+            _decoded_lease: decoded_lease,
+            _in_flight_guard: in_flight_guard,
+            projection,
+            file_name,
+            row_context,
+            elapsed_compute,
+            cache_metrics,
+        })
         .boxed()
     }
 }
@@ -4573,20 +5137,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_pool_exhaustion_returns_error_without_deadlock() {
+    async fn memory_pool_exhaustion_falls_back_on_slice0_and_errors_mid_rg() {
         let n = 2400usize;
         let (data, _) = build_indexed_dict_fixture(n);
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
-        let metrics = ExecutionPlanMetricsSet::new();
         let cfg = ParquetSplitConfig {
             enabled: true,
             min_row_group_rows: 800,
             target_slice_rows: 400,
             ..Default::default()
         };
+
+        // Case 1: Pool too small for slice 0 -> cleanly falls back to unsplit
+        // reader before publishing any slice, returning all rows with zero leak.
+        let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+        let metrics = ExecutionPlanMetricsSet::new();
         let split_ctx = Arc::new(SplitContext::new(
-            cfg,
-            Some(Arc::clone(&pool)),
+            cfg.clone(),
+            Some(Arc::clone(&tiny_pool)),
             metrics.clone(),
         ));
         let planner = make_split_plain_planner(
@@ -4596,18 +5163,77 @@ mod tests {
             Arc::clone(&split_ctx),
             &metrics,
         );
-
-        let result =
+        let (batches, morsels) =
             tokio::time::timeout(Duration::from_secs(5), drive_planner_collect(planner))
                 .await
-                .expect("must not deadlock on pool exhaustion");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, DataFusionError::ResourcesExhausted(_)),
-            "expected ResourcesExhausted, got: {err:?}"
+                .expect("must not deadlock on slice-0 pool exhaustion")
+                .expect("slice-0 pool denial should fall back to unsplit reader");
+        assert_eq!(morsels, 1);
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), n);
+        let snap = metrics.clone_inner();
+        assert_eq!(
+            snap.sum_by_name("parquet_split_row_groups")
+                .map_or(0, |v| v.as_usize()),
+            0
         );
         assert_eq!(split_ctx.budget.live_bytes(), 0);
         assert_eq!(split_ctx.budget.admitted_frontier_bytes(), 0);
+        assert_eq!(tiny_pool.reserved(), 0);
+
+        // Case 2: Pool fits slice 0, then external consumer drains the pool
+        // before slice 1 -> MUST return ResourcesExhausted without deadlocking
+        // or replaying slice 0.
+        let pool_cap = 1 << 20;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_cap));
+        let metrics2 = ExecutionPlanMetricsSet::new();
+        let split_ctx2 = Arc::new(SplitContext::new(
+            cfg,
+            Some(Arc::clone(&pool)),
+            metrics2.clone(),
+        ));
+        let mut planner = make_split_plain_planner(
+            &data,
+            RecordingReader::new(data.clone()),
+            &[0, 1],
+            Arc::clone(&split_ctx2),
+            &metrics2,
+        );
+        // Drain slice 0 completely so slices_published == 1 and in_flight == 0.
+        loop {
+            let mut step = planner.plan().unwrap().unwrap();
+            let morsels = step.take_morsels();
+            let mut ready = step.take_ready_planners();
+            let pending = step.take_pending_planner();
+            planner = if let Some(io) = pending {
+                io.await.unwrap()
+            } else {
+                ready.pop().unwrap()
+            };
+            if !morsels.is_empty() {
+                for m in morsels {
+                    let mut stream = m.into_stream();
+                    while let Some(b) = stream.next().await {
+                        b.unwrap();
+                    }
+                }
+                break;
+            }
+        }
+        // Exhaust remaining pool capacity externally before driving slice 1.
+        let external = MemoryConsumer::new("external").register(&pool);
+        external.try_grow(pool_cap - pool.reserved()).unwrap();
+        let err =
+            tokio::time::timeout(Duration::from_secs(5), drive_planner_collect(planner))
+                .await
+                .expect("must not deadlock on mid-RG pool exhaustion")
+                .unwrap_err();
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted mid-RG, got: {err:?}"
+        );
+        assert_eq!(split_ctx2.budget.live_bytes(), 0);
+        assert_eq!(split_ctx2.budget.admitted_frontier_bytes(), 0);
+        drop(external);
         assert_eq!(pool.reserved(), 0);
     }
 
@@ -4734,7 +5360,7 @@ mod tests {
             b1.resolve_ranges(
                 std::slice::from_ref(&req1),
                 &mut tracker,
-                true,
+                RangeAdmission::Phase2 { phase2_lease: None },
                 "slice0",
                 move |ranges| {
                     let calls = Arc::clone(&calls1);
@@ -4767,7 +5393,7 @@ mod tests {
             b2.resolve_ranges(
                 std::slice::from_ref(&req_range),
                 &mut tracker,
-                true,
+                RangeAdmission::Phase2 { phase2_lease: None },
                 "slice1",
                 move |_ranges| {
                     let calls = Arc::clone(&calls2);
