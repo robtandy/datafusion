@@ -389,6 +389,11 @@ impl RowFilterContext {
             .any(|candidate| candidate.reads_leaf(leaf_idx))
     }
 
+    /// Number of conjunct predicates in the [`RowFilter`] built by this context.
+    pub(crate) fn num_predicates(&self) -> usize {
+        self.prebuilt.as_slice().len()
+    }
+
     /// Build a fresh [`RowFilter`] for the next non-fully-matched run using
     /// the cached candidates. Cheap: no tree walks, only counter allocation
     /// and (optionally) a sort by `required_bytes`.

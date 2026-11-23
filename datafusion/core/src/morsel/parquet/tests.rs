@@ -696,7 +696,8 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
         })
     };
 
-    // Part 1: verify exact I/O count (2 Phase-1 + 1 Phase-2 = 3; RG 1 skips Phase-2).
+    // Part 1: verify exact I/O count (2 Phase-1 + 1 Phase-2 = 3; RG 1 skips Phase-2),
+    // single claim/completion per row group, and measured I/O + ready bytes.
     {
         let FilteredGatedScan {
             plan,
@@ -704,10 +705,11 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
             mut requests,
             gates,
         } = make_scan(false)?;
+        let measurement = Arc::new(MorselMetrics::default());
         let mut run = Arc::clone(&plan.pipeline).start(
             Arc::clone(&context),
             plan.metrics.clone(),
-            None,
+            Some(RunMetrics::start(Arc::clone(&measurement))),
         );
         let (rows, io_count) = timeout(DEADLINE, async {
             let mut io_count = 0usize;
@@ -742,14 +744,35 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
         assert_eq!(io_count, 3);
         assert_eq!(gates.opened.load(Ordering::SeqCst), 1);
         let m = plan.metrics.clone_inner();
+        assert_eq!(
+            m.sum_by_name("parquet_morsels_claimed").unwrap().as_usize(),
+            2
+        );
         assert_eq!(m.sum_by_name("pushdown_rows_pruned").unwrap().as_usize(), 3);
         assert_eq!(
             m.sum_by_name("pushdown_rows_matched").unwrap().as_usize(),
             1
         );
+        drop(run);
+        let report = timeout(DEADLINE, async {
+            loop {
+                let mut reports = measurement.take_runs();
+                if let Some(report) = reports.pop() {
+                    return report;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metrics were not finalized");
+        assert_eq!(metric_total(&report, "morsels_claimed"), 2);
+        assert_eq!(metric_total(&report, "morsels_completed"), 2);
+        assert!(metric_total(&report, "morsel_pending_io") > 0);
+        assert!(metric_total(&report, "morsel_decode_work") > 0);
+        assert!(metric_total(&report, "morsel_peak_ready_compressed_bytes_estimate") > 0);
     }
 
-    // Part 2: drop stream while Phase-2 worker I/O is pending; verify cancellation.
+    // Part 2: drop stream while Phase-2 I/O is pending on the I/O lane; verify cancellation.
     {
         let FilteredGatedScan {
             plan,
@@ -762,16 +785,14 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
             plan.metrics.clone(),
             None,
         );
-        // Release Phase-1 for RG 0 and wait for the next request (either Phase-1 RG 1
-        // or Phase-2 RG 0), release one more so Phase-2 is in-flight, then cancel.
+        // Request 1 is Phase-1 (gate) for RG 0; releasing it lets the worker run
+        // RowFilter and submit Phase-2 (payload) back to the I/O lane (Request 2).
         let req1 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
         req1.send(Ok(())).unwrap();
-        let req2 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
-        req2.send(Ok(())).unwrap();
-        let mut req3 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
+        let mut req2 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
         assert!(timeout(QUIET, run.next()).await.is_err());
         drop(run);
-        timeout(DEADLINE, req3.closed())
+        timeout(DEADLINE, req2.closed())
             .await
             .expect("pending Phase-2 I/O was not cancelled on drop");
         timeout(DEADLINE, async {

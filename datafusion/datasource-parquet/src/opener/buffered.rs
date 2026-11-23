@@ -6,7 +6,7 @@ use std::{collections::VecDeque, fmt, ops::Range, sync::Arc};
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Gauge, Time};
 use futures::{StreamExt, stream};
@@ -21,7 +21,7 @@ use parquet::arrow::push_decoder::{
     ParquetPushDecoder, ParquetPushDecoderBuilder, RowGroupSelection,
 };
 use parquet::errors::ParquetError;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::ParquetFileMetrics;
 use crate::decoder_projection::DecoderProjection;
@@ -64,6 +64,8 @@ pub(super) struct FilteredBufferedReadersConfig {
     pub(super) direct_store: Option<Arc<dyn ObjectStore>>,
 }
 
+type HandbackRequest = (Vec<Range<u64>>, oneshot::Sender<Result<Vec<Bytes>>>);
+
 pub(super) struct FilteredBufferedReaders {
     pending: VecDeque<(RowGroupSelection, RgPlanEntry)>,
     reader_metadata: ArrowReaderMetadata,
@@ -79,9 +81,14 @@ pub(super) struct FilteredBufferedReaders {
     file_name: Arc<str>,
     baseline: BaselineMetrics,
     byte_progress: ByteProgress,
-    producer_reader: ProducerReader,
-    worker_fetcher: RangeFetcher,
+    /// Exclusively owned by this file's I/O lane (never shared behind a lock).
+    reader: Box<dyn AsyncFileReader>,
+    /// Lock-free object-store fetcher for Phase-2 I/O lanes when using a
+    /// built-in reader factory; `None` for custom factories (which serve
+    /// Phase-2 requests via `handback_rx` on this file's I/O lane).
+    direct_fetcher: Option<Arc<DirectRangeFetcher>>,
     in_flight: Option<InFlight>,
+    handback_rx: Option<mpsc::UnboundedReceiver<HandbackRequest>>,
 }
 
 impl BufferedReaders {
@@ -89,24 +96,14 @@ impl BufferedReaders {
         let predicate_cache_inner_records =
             config.file_metrics.predicate_cache_inner_records.clone();
         let predicate_cache_records = config.file_metrics.predicate_cache_records.clone();
-        let (producer_reader, worker_fetcher) = match config.direct_store {
-            Some(store) => (
-                ProducerReader::Owned(config.async_file_reader),
-                RangeFetcher::Direct(Arc::new(DirectRangeFetcher {
-                    store,
-                    location: config.file_location,
-                    file_size: config.file_size,
-                    file_metrics: config.file_metrics,
-                })),
-            ),
-            None => {
-                let shared = Arc::new(Mutex::new(config.async_file_reader));
-                (
-                    ProducerReader::Shared(Arc::clone(&shared)),
-                    RangeFetcher::Shared(shared),
-                )
-            }
-        };
+        let direct_fetcher = config.direct_store.map(|store| {
+            Arc::new(DirectRangeFetcher {
+                store,
+                location: config.file_location,
+                file_size: config.file_size,
+                file_metrics: config.file_metrics,
+            })
+        });
         Self::Filtered(Box::new(FilteredBufferedReaders {
             pending: config.pending,
             reader_metadata: config.reader_metadata,
@@ -122,9 +119,10 @@ impl BufferedReaders {
             file_name: config.file_name,
             baseline: config.baseline,
             byte_progress: config.byte_progress,
-            producer_reader,
-            worker_fetcher,
+            reader: config.async_file_reader,
+            direct_fetcher,
             in_flight: None,
+            handback_rx: None,
         }))
     }
 }
@@ -174,6 +172,7 @@ impl PlainBufferedReaders {
                     projection: Arc::clone(&self.projection),
                     file_name: Arc::clone(&self.file_name),
                     elapsed_compute: elapsed_compute.clone(),
+                    cache_metrics: None,
                 };
                 MorselPlan::new()
                     .with_morsels(vec![Box::new(reader)])
@@ -182,23 +181,6 @@ impl PlainBufferedReaders {
             DecodeResult::Finished => return Ok(None),
         };
         Ok(Some(plan))
-    }
-}
-
-enum ProducerReader {
-    Owned(Box<dyn AsyncFileReader>),
-    Shared(Arc<Mutex<Box<dyn AsyncFileReader>>>),
-}
-
-impl ProducerReader {
-    async fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
-        match self {
-            Self::Owned(reader) => Ok(reader.get_byte_ranges(ranges).await?),
-            Self::Shared(reader) => {
-                let mut guard = reader.lock().await;
-                Ok(guard.get_byte_ranges(ranges).await?)
-            }
-        }
     }
 }
 
@@ -232,18 +214,45 @@ impl Drop for DirectRangeFetcher {
 }
 
 #[derive(Clone)]
-enum RangeFetcher {
-    Direct(Arc<DirectRangeFetcher>),
-    Shared(Arc<Mutex<Box<dyn AsyncFileReader>>>),
+struct PredicateCacheMetrics {
+    arrow_reader_metrics: ArrowReaderMetrics,
+    predicate_cache_inner_records: Gauge,
+    predicate_cache_records: Gauge,
 }
 
-impl RangeFetcher {
+impl PredicateCacheMetrics {
+    fn copy_to_gauges(&self) {
+        if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
+            self.predicate_cache_inner_records.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
+            self.predicate_cache_records.set(v);
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Phase2Transport {
+    Direct(Arc<DirectRangeFetcher>),
+    Handback(mpsc::UnboundedSender<HandbackRequest>),
+}
+
+impl Phase2Transport {
     async fn get_byte_ranges(&self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         match self {
             Self::Direct(fetcher) => fetcher.get_byte_ranges(ranges).await,
-            Self::Shared(reader) => {
-                let mut guard = reader.lock().await;
-                Ok(guard.get_byte_ranges(ranges).await?)
+            Self::Handback(tx) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send((ranges, reply_tx)).map_err(|_| {
+                    internal_datafusion_err!(
+                        "Parquet file I/O lane closed before serving Phase-2 range read"
+                    )
+                })?;
+                reply_rx.await.map_err(|_| {
+                    internal_datafusion_err!(
+                        "Parquet file I/O lane dropped Phase-2 range response"
+                    )
+                })?
             }
         }
     }
@@ -261,7 +270,19 @@ enum InFlight {
         entry: RgPlanEntry,
         ranges: Vec<Range<u64>>,
         bytes: Vec<Bytes>,
+        fetched_bytes: usize,
     },
+}
+
+/// Sentinel file continuation emitted alongside a worker-bound
+/// [`FilteredRowGroupPlanner`] when the file has no more row groups to open.
+#[derive(Debug)]
+struct EmptyDonePlanner;
+
+impl MorselPlanner for EmptyDonePlanner {
+    fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
+        Ok(None)
+    }
 }
 
 impl FilteredBufferedReaders {
@@ -288,6 +309,14 @@ impl FilteredBufferedReaders {
         Ok(builder.build()?)
     }
 
+    fn cache_metrics(&self) -> PredicateCacheMetrics {
+        PredicateCacheMetrics {
+            arrow_reader_metrics: self.arrow_reader_metrics.clone(),
+            predicate_cache_inner_records: self.predicate_cache_inner_records.clone(),
+            predicate_cache_records: self.predicate_cache_records.clone(),
+        }
+    }
+
     fn publish_morsel(self: Box<Self>, morsel: Box<dyn Morsel>) -> MorselPlan {
         let mut plan = MorselPlan::new().with_morsels(vec![morsel]);
         if !self.pending.is_empty() {
@@ -300,6 +329,23 @@ impl FilteredBufferedReaders {
         let elapsed_compute = self.baseline.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
 
+        // For custom reader factories, serve any Phase-2 range reads for the
+        // previously published row group on this file lane until the row group
+        // finishes or publishes its decode-only reader (dropping its sender).
+        if let Some(mut rx) = self.handback_rx.take() {
+            return Ok(Some(MorselPlan::new().with_pending_planner(async move {
+                while let Some((ranges, reply_tx)) = rx.recv().await {
+                    let result = self
+                        .reader
+                        .get_byte_ranges(ranges)
+                        .await
+                        .map_err(DataFusionError::from);
+                    let _ = reply_tx.send(result);
+                }
+                Ok(Box::new(BufferedReaders::Filtered(self)) as Box<dyn MorselPlanner>)
+            })));
+        }
+
         if let Some(in_flight) = self.in_flight.take() {
             match in_flight {
                 InFlight::Filtered {
@@ -308,40 +354,61 @@ impl FilteredBufferedReaders {
                     ranges,
                     bytes,
                 } => {
-                    // Push the fetched predicate column bytes without calling
-                    // `try_next_reader` again so RowFilter decoding and
-                    // evaluation run on the pipeline worker, not on the I/O lane.
+                    // Push fetched predicate column bytes without calling
+                    // `try_next_reader` so RowFilter decoding and evaluation run
+                    // on a pipeline worker, not on this I/O lane.
                     let buffered_bytes = bytes.iter().map(Bytes::len).sum();
                     decoder.push_ranges(ranges, bytes)?;
                     self.byte_progress.credit(entry.bytes);
-                    let morsel = Box::new(FilteredBufferedReader {
-                        decoder,
-                        buffered_bytes,
-                        fetcher: self.worker_fetcher.clone(),
-                        projection: Arc::clone(&self.projection),
-                        file_name: Arc::clone(&self.file_name),
-                        elapsed_compute: elapsed_compute.clone(),
-                        arrow_reader_metrics: self.arrow_reader_metrics.clone(),
-                        predicate_cache_inner_records: self
-                            .predicate_cache_inner_records
-                            .clone(),
-                        predicate_cache_records: self.predicate_cache_records.clone(),
-                    });
-                    return Ok(Some(self.publish_morsel(morsel)));
+                    let transport = match &self.direct_fetcher {
+                        Some(fetcher) => Phase2Transport::Direct(Arc::clone(fetcher)),
+                        None => {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            self.handback_rx = Some(rx);
+                            Phase2Transport::Handback(tx)
+                        }
+                    };
+                    let rg_planner: Box<dyn MorselPlanner> =
+                        Box::new(FilteredRowGroupPlanner {
+                            decoder,
+                            stage: RgStage::RunFilter,
+                            pending_predicates: self.row_filter_context.num_predicates(),
+                            buffered_bytes,
+                            fetched: None,
+                            transport,
+                            projection: Arc::clone(&self.projection),
+                            file_name: Arc::clone(&self.file_name),
+                            elapsed_compute: elapsed_compute.clone(),
+                            cache_metrics: self.cache_metrics(),
+                        });
+                    let file_continuation: Box<dyn MorselPlanner> =
+                        if self.handback_rx.is_some() || !self.pending.is_empty() {
+                            Box::new(BufferedReaders::Filtered(self))
+                        } else {
+                            Box::new(EmptyDonePlanner)
+                        };
+                    // Two ready planners signal `[file_continuation, worker_filter_step]`
+                    // to the native Parquet driver without touching stock `FileStream`.
+                    return Ok(Some(
+                        MorselPlan::new()
+                            .with_planners(vec![file_continuation, rg_planner]),
+                    ));
                 }
                 InFlight::FullyMatched {
                     mut decoder,
                     entry,
                     ranges,
                     bytes,
+                    mut fetched_bytes,
                 } => {
+                    fetched_bytes += bytes.iter().map(Bytes::len).sum::<usize>();
                     decoder.push_ranges(ranges, bytes)?;
                     match decoder.try_next_reader()? {
                         DecodeResult::NeedsData(more_ranges) => {
                             return Ok(Some(MorselPlan::new().with_pending_planner(
                                 async move {
                                     let bytes = self
-                                        .producer_reader
+                                        .reader
                                         .get_byte_ranges(more_ranges.clone())
                                         .await?;
                                     self.in_flight = Some(InFlight::FullyMatched {
@@ -349,6 +416,7 @@ impl FilteredBufferedReaders {
                                         entry,
                                         ranges: more_ranges,
                                         bytes,
+                                        fetched_bytes,
                                     });
                                     Ok(Box::new(BufferedReaders::Filtered(self))
                                         as Box<dyn MorselPlanner>)
@@ -359,10 +427,11 @@ impl FilteredBufferedReaders {
                             self.byte_progress.credit(entry.bytes);
                             let morsel = Box::new(BufferedReader {
                                 reader,
-                                compressed_bytes: entry.bytes,
+                                compressed_bytes: fetched_bytes as u64,
                                 projection: Arc::clone(&self.projection),
                                 file_name: Arc::clone(&self.file_name),
                                 elapsed_compute: elapsed_compute.clone(),
+                                cache_metrics: Some(self.cache_metrics()),
                             });
                             return Ok(Some(self.publish_morsel(morsel)));
                         }
@@ -384,10 +453,8 @@ impl FilteredBufferedReaders {
                 DecodeResult::NeedsData(ranges) => {
                     return Ok(Some(MorselPlan::new().with_pending_planner(
                         async move {
-                            let bytes = self
-                                .producer_reader
-                                .get_byte_ranges(ranges.clone())
-                                .await?;
+                            let bytes =
+                                self.reader.get_byte_ranges(ranges.clone()).await?;
                             self.in_flight = Some(if install_filter {
                                 InFlight::Filtered {
                                     decoder,
@@ -401,6 +468,7 @@ impl FilteredBufferedReaders {
                                     entry,
                                     ranges,
                                     bytes,
+                                    fetched_bytes: 0,
                                 }
                             });
                             Ok(Box::new(BufferedReaders::Filtered(self))
@@ -416,6 +484,7 @@ impl FilteredBufferedReaders {
                         projection: Arc::clone(&self.projection),
                         file_name: Arc::clone(&self.file_name),
                         elapsed_compute: elapsed_compute.clone(),
+                        cache_metrics: Some(self.cache_metrics()),
                     });
                     return Ok(Some(self.publish_morsel(morsel)));
                 }
@@ -429,12 +498,149 @@ impl FilteredBufferedReaders {
     }
 }
 
+enum RgStage {
+    /// Ready to run `RowFilter` CPU evaluation synchronously on a worker.
+    RunFilter,
+    /// Returned from a Phase-2 `PendingMorselPlanner` on an I/O lane with newly
+    /// fetched bytes in `fetched`.
+    AfterIo,
+}
+
+/// Per-row-group state machine separating worker `RowFilter` CPU work from
+/// I/O-lane Phase-2 range fetches.
+///
+/// - In [`RgStage::RunFilter`], [`Self::plan`] runs on a pipeline worker,
+///   evaluating `RowFilter` predicates on already-buffered bytes. It never
+///   performs I/O: if more column ranges are needed, it returns a
+///   `PendingMorselPlanner` for the I/O lanes to await.
+/// - In [`RgStage::AfterIo`], [`Self::plan`] runs on an I/O lane after the
+///   fetched bytes arrive. It either publishes a decode-only [`BufferedReader`]
+///   (if all predicates have run) or hands the row group back to workers for
+///   the next `RowFilter` conjunct.
+struct FilteredRowGroupPlanner {
+    decoder: ParquetPushDecoder,
+    stage: RgStage,
+    pending_predicates: usize,
+    buffered_bytes: usize,
+    fetched: Option<(Vec<Range<u64>>, Vec<Bytes>)>,
+    transport: Phase2Transport,
+    projection: Arc<DecoderProjection>,
+    file_name: Arc<str>,
+    elapsed_compute: Time,
+    cache_metrics: PredicateCacheMetrics,
+}
+
+impl fmt::Debug for FilteredRowGroupPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilteredRowGroupPlanner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilteredRowGroupPlanner {
+    fn context_err(&self, err: DataFusionError) -> DataFusionError {
+        err.context(format!("Decoding Parquet morsel from {}", self.file_name))
+    }
+
+    fn into_decode_morsel(self, reader: ParquetRecordBatchReader) -> Box<dyn Morsel> {
+        Box::new(BufferedReader {
+            reader,
+            compressed_bytes: self.buffered_bytes as u64,
+            projection: self.projection,
+            file_name: self.file_name,
+            elapsed_compute: self.elapsed_compute,
+            cache_metrics: Some(self.cache_metrics),
+        })
+    }
+
+    fn schedule_fetch(mut self: Box<Self>, ranges: Vec<Range<u64>>) -> MorselPlan {
+        self.stage = RgStage::AfterIo;
+        let transport = self.transport.clone();
+        MorselPlan::new().with_pending_planner(async move {
+            let bytes = transport.get_byte_ranges(ranges.clone()).await?;
+            self.fetched = Some((ranges, bytes));
+            Ok(self as Box<dyn MorselPlanner>)
+        })
+    }
+}
+
+impl MorselPlanner for FilteredRowGroupPlanner {
+    fn buffered_bytes_estimate(&self) -> usize {
+        self.buffered_bytes
+    }
+
+    fn plan(mut self: Box<Self>) -> Result<Option<MorselPlan>> {
+        let elapsed_compute = self.elapsed_compute.clone();
+        let _timer = elapsed_compute.timer();
+
+        match self.stage {
+            RgStage::RunFilter => {
+                let result = self
+                    .decoder
+                    .try_next_reader()
+                    .map_err(|err| self.context_err(DataFusionError::from(err)))?;
+                self.pending_predicates = self.pending_predicates.saturating_sub(1);
+                match result {
+                    DecodeResult::Finished => {
+                        self.cache_metrics.copy_to_gauges();
+                        Ok(None)
+                    }
+                    DecodeResult::Data(reader) => {
+                        let morsel = self.into_decode_morsel(reader);
+                        Ok(Some(MorselPlan::new().with_morsels(vec![morsel])))
+                    }
+                    DecodeResult::NeedsData(ranges) => {
+                        Ok(Some(self.schedule_fetch(ranges)))
+                    }
+                }
+            }
+            RgStage::AfterIo => {
+                if let Some((ranges, bytes)) = self.fetched.take() {
+                    self.buffered_bytes += bytes.iter().map(Bytes::len).sum::<usize>();
+                    self.decoder
+                        .push_ranges(ranges, bytes)
+                        .map_err(|err| self.context_err(DataFusionError::from(err)))?;
+                }
+                if self.pending_predicates > 0 {
+                    // More RowFilter conjuncts remain: send back to pipeline
+                    // workers without decoding on the I/O lane.
+                    self.stage = RgStage::RunFilter;
+                    return Ok(Some(
+                        MorselPlan::new()
+                            .with_planners(vec![Box::new(EmptyDonePlanner), self]),
+                    ));
+                }
+                // All predicates have run: build the decode-only reader from
+                // the buffered chunks without decoding output rows here.
+                let result = self
+                    .decoder
+                    .try_next_reader()
+                    .map_err(|err| self.context_err(DataFusionError::from(err)))?;
+                match result {
+                    DecodeResult::Finished => {
+                        self.cache_metrics.copy_to_gauges();
+                        Ok(None)
+                    }
+                    DecodeResult::Data(reader) => {
+                        let morsel = self.into_decode_morsel(reader);
+                        Ok(Some(MorselPlan::new().with_morsels(vec![morsel])))
+                    }
+                    DecodeResult::NeedsData(more_ranges) => {
+                        Ok(Some(self.schedule_fetch(more_ranges)))
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct BufferedReader {
     reader: ParquetRecordBatchReader,
     compressed_bytes: u64,
     projection: Arc<DecoderProjection>,
     file_name: Arc<str>,
     elapsed_compute: Time,
+    cache_metrics: Option<PredicateCacheMetrics>,
 }
 
 impl fmt::Debug for BufferedReader {
@@ -454,11 +660,16 @@ impl Morsel for BufferedReader {
             projection,
             file_name,
             elapsed_compute,
+            cache_metrics,
             ..
         } = *self;
         stream::iter(std::iter::from_fn(move || {
             let _timer = elapsed_compute.timer();
-            reader.next().map(|batch| {
+            let next = reader.next();
+            if let Some(metrics) = &cache_metrics {
+                metrics.copy_to_gauges();
+            }
+            next.map(|batch| {
                 batch
                     .map_err(DataFusionError::from)
                     .and_then(|batch| projection.map(&batch))
@@ -468,150 +679,5 @@ impl Morsel for BufferedReader {
             })
         }))
         .boxed()
-    }
-}
-
-struct FilteredBufferedReader {
-    decoder: ParquetPushDecoder,
-    buffered_bytes: usize,
-    fetcher: RangeFetcher,
-    projection: Arc<DecoderProjection>,
-    file_name: Arc<str>,
-    elapsed_compute: Time,
-    arrow_reader_metrics: ArrowReaderMetrics,
-    predicate_cache_inner_records: Gauge,
-    predicate_cache_records: Gauge,
-}
-
-impl fmt::Debug for FilteredBufferedReader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FilteredBufferedReader")
-            .finish_non_exhaustive()
-    }
-}
-
-struct FilteredStreamState {
-    decoder: Option<ParquetPushDecoder>,
-    active_reader: Option<ParquetRecordBatchReader>,
-    fetcher: RangeFetcher,
-    projection: Arc<DecoderProjection>,
-    file_name: Arc<str>,
-    elapsed_compute: Time,
-    arrow_reader_metrics: ArrowReaderMetrics,
-    predicate_cache_inner_records: Gauge,
-    predicate_cache_records: Gauge,
-}
-
-impl FilteredStreamState {
-    fn copy_arrow_reader_metrics(&self) {
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
-            self.predicate_cache_inner_records.set(v);
-        }
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
-            self.predicate_cache_records.set(v);
-        }
-    }
-
-    fn decode_error(&self, err: DataFusionError) -> DataFusionError {
-        err.context(format!("Decoding Parquet morsel from {}", self.file_name))
-    }
-
-    async fn next_batch(mut self) -> Option<(Result<RecordBatch>, Self)> {
-        if self.decoder.is_none() && self.active_reader.is_none() {
-            return None;
-        }
-        let elapsed_compute = self.elapsed_compute.clone();
-        let mut timer = elapsed_compute.timer();
-        loop {
-            if let Some(reader) = self.active_reader.as_mut() {
-                match reader.next() {
-                    Some(Ok(batch)) => {
-                        self.copy_arrow_reader_metrics();
-                        let result = self
-                            .projection
-                            .map(&batch)
-                            .map_err(|err| self.decode_error(err));
-                        if result.is_err() {
-                            self.active_reader = None;
-                            self.decoder = None;
-                        }
-                        return Some((result, self));
-                    }
-                    Some(Err(err)) => {
-                        self.active_reader = None;
-                        self.decoder = None;
-                        let err = self.decode_error(DataFusionError::from(err));
-                        return Some((Err(err), self));
-                    }
-                    None => {
-                        self.active_reader = None;
-                    }
-                }
-            }
-
-            let decoder = self.decoder.as_mut()?;
-            match decoder.try_next_reader() {
-                Ok(DecodeResult::NeedsData(ranges)) => {
-                    timer.stop();
-                    let fetched = self.fetcher.get_byte_ranges(ranges.clone()).await;
-                    timer.restart();
-                    match fetched {
-                        Ok(bytes) => {
-                            if let Err(err) = self
-                                .decoder
-                                .as_mut()
-                                .expect("decoder present")
-                                .push_ranges(ranges, bytes)
-                            {
-                                self.decoder = None;
-                                let err = self.decode_error(DataFusionError::from(err));
-                                return Some((Err(err), self));
-                            }
-                        }
-                        Err(err) => {
-                            self.decoder = None;
-                            let err = self.decode_error(err);
-                            return Some((Err(err), self));
-                        }
-                    }
-                }
-                Ok(DecodeResult::Data(reader)) => {
-                    self.active_reader = Some(reader);
-                }
-                Ok(DecodeResult::Finished) => {
-                    self.copy_arrow_reader_metrics();
-                    self.decoder = None;
-                    return None;
-                }
-                Err(err) => {
-                    self.decoder = None;
-                    let err = self.decode_error(DataFusionError::from(err));
-                    return Some((Err(err), self));
-                }
-            }
-        }
-    }
-}
-
-impl Morsel for FilteredBufferedReader {
-    fn buffered_bytes_estimate(&self) -> usize {
-        self.buffered_bytes
-    }
-
-    fn into_stream(self: Box<Self>) -> stream::BoxStream<'static, Result<RecordBatch>> {
-        let state = FilteredStreamState {
-            decoder: Some(self.decoder),
-            active_reader: None,
-            fetcher: self.fetcher,
-            projection: self.projection,
-            file_name: self.file_name,
-            elapsed_compute: self.elapsed_compute,
-            arrow_reader_metrics: self.arrow_reader_metrics,
-            predicate_cache_inner_records: self.predicate_cache_inner_records,
-            predicate_cache_records: self.predicate_cache_records,
-        };
-        stream::unfold(state, |state| state.next_batch())
-            .fuse()
-            .boxed()
     }
 }

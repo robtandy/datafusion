@@ -40,8 +40,8 @@ mod ready;
 #[cfg(test)]
 mod tests;
 
-use ready::Publisher;
-pub(super) use ready::ReadyReaders;
+pub(super) use ready::{ClaimedWork, ReadyReaders};
+use ready::{Phase2Queue, Phase2Task, Publisher};
 
 const MAX_READ_AHEAD: usize = 16;
 
@@ -400,6 +400,10 @@ impl ParquetScan {
         Ok(())
     }
 
+    pub(super) fn pushed_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.config.as_ref()?.file_source().exact_filter()
+    }
+
     pub(super) fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -415,12 +419,12 @@ impl ParquetScan {
         context: &TaskContext,
         tasks: &mut JoinSet<Result<Option<CountState>>>,
         workers: NonZeroUsize,
-        measurement: Option<Arc<RunMetrics>>,
+        measurement: Option<&Arc<RunMetrics>>,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
-        let (publish, ready) = ready::channel(
+        let (publish, phase2, ready) = ready::channel(
             read_ahead,
-            measurement.clone(),
+            measurement.cloned(),
             MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
         );
         if let Some(config) = &self.config {
@@ -430,12 +434,13 @@ impl ParquetScan {
                 .ok_or_else(|| {
                     internal_datafusion_err!("Expected the admitted ParquetSource")
                 })?;
+            let has_pushed_filter = self.pushed_predicate().is_some();
             let work = Arc::new(FileWork {
                 morselizer: parquet.create_buffered_morselizer(config, context)?,
                 files: Arc::clone(&self.files),
                 next: AtomicUsize::new(0),
                 publish,
-                measurement,
+                measurement: measurement.cloned(),
             });
             // Each lane owns one planner and can drive at most one pending I/O
             // phase or hold one reader waiting to publish.
@@ -446,9 +451,73 @@ impl ParquetScan {
                     Ok(None)
                 });
             }
+            if has_pushed_filter && !self.files.is_empty() {
+                // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
+                // by workers so workers never await object-store I/O.
+                for _ in 0..read_ahead {
+                    let phase2 = phase2.clone();
+                    let measurement = measurement.cloned();
+                    tasks.spawn(async move {
+                        run_phase2_lane(phase2, measurement).await?;
+                        Ok(None)
+                    });
+                }
+            }
         }
         Ok(ready)
     }
+}
+
+async fn run_phase2_lane(
+    phase2: Phase2Queue,
+    measurement: Option<Arc<RunMetrics>>,
+) -> Result<()> {
+    while let Some(Phase2Task {
+        mut io,
+        permit,
+        filter_guard,
+    }) = phase2.claim().await
+    {
+        loop {
+            let next = match &measurement {
+                Some(run) => Arc::clone(run).io(io).await?,
+                None => io.await?,
+            };
+            let Some(mut step) = next.plan()? else {
+                break;
+            };
+            let mut morsels = step.take_morsels();
+            let mut ready = step.take_ready_planners();
+            let pending = step.take_pending_planner();
+            if let Some(morsel) = morsels.pop() {
+                if !morsels.is_empty() || !ready.is_empty() || pending.is_some() {
+                    return internal_err!(
+                        "Expected a single decode-only Parquet morsel from Phase-2 planner"
+                    );
+                }
+                phase2.publish_morsel(morsel, permit, filter_guard);
+                break;
+            }
+            if ready.len() == 2 && pending.is_none() {
+                let rg_filter = ready.pop().unwrap();
+                phase2.publish_filter(rg_filter, permit, filter_guard);
+                break;
+            }
+            if let Some(more_io) = pending {
+                if !ready.is_empty() {
+                    return internal_err!(
+                        "Unexpected ready planner alongside Phase-2 pending I/O"
+                    );
+                }
+                io = more_io;
+                continue;
+            }
+            return internal_err!(
+                "Unexpected MorselPlan from Phase-2 Parquet continuation"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct FileWork {
@@ -480,6 +549,13 @@ impl FileWork {
             let mut morsels = step.take_morsels();
             let mut ready = step.take_ready_planners();
             let pending = step.take_pending_planner();
+            if ready.len() == 2 && morsels.is_empty() && pending.is_none() {
+                let rg_filter = ready.pop().unwrap();
+                let file_continuation = ready.pop().unwrap();
+                self.publish.send_filter(rg_filter).await;
+                planner = file_continuation;
+                continue;
+            }
             if morsels.len() > 1 || ready.len() + usize::from(pending.is_some()) > 1 {
                 return internal_err!(
                     "Expected at most one Parquet reader and one file continuation per step"
