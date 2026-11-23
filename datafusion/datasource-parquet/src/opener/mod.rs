@@ -1552,11 +1552,16 @@ impl RowGroupsPrunedParquetOpen {
 
     /// Load the page index if pruning requires it and metadata did not include it.
     async fn load_page_index(mut self) -> Result<Self> {
+        // Keep stock `FileStream` (`split_context == None`) unchanged; only
+        // buffered split-candidate loads skip Column Index on fully matched RGs.
+        let skip_col_index_for_split_only =
+            self.prepared.loaded.prepared.split_context.is_some()
+                && self
+                    .row_groups
+                    .row_group_indexes()
+                    .all(|idx| self.row_groups.is_fully_matched()[idx]);
         let need_column_index = self.prepared.page_pruning_predicate.is_some()
-            && !self
-                .row_groups
-                .row_group_indexes()
-                .all(|idx| self.row_groups.is_fully_matched()[idx]);
+            && !skip_col_index_for_split_only;
         self.prepared.loaded.reader_metadata = load_page_index(
             self.prepared.loaded.reader_metadata.clone(),
             &mut self.prepared.loaded.prepared.async_file_reader,
