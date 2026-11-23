@@ -55,9 +55,16 @@ def warm(files):
     return prepare_cache(files, "warm")
 
 
-def validate(report, mode, mixed_first, partitions):
-    if report["build_revision"] != REVISION:
-        raise ValueError(f"expected a binary built against {REVISION}")
+def validate(
+    report,
+    mode,
+    mixed_first,
+    partitions,
+    revision=REVISION,
+    pushdown_filters=False,
+):
+    if report["build_revision"] != revision:
+        raise ValueError(f"expected a binary built against {revision}")
     if report["runtime"]["morsel_mode"] != mode or not report["valid"]:
         raise ValueError(f"invalid {mode} report")
     phases = ["mixed", "isolated"] if mixed_first else ["isolated", "mixed"]
@@ -66,12 +73,12 @@ def validate(report, mode, mixed_first, partitions):
     for table in ("small", "large"):
         plan = report[table]["plan"]
         if mode == "required":
-            expected = (
-                plan.startswith(
-                    f"MorselExec: workers={partitions}, NativeParquet[{table}]"
-                )
-                and "CountSink" in plan
+            prefix = (
+                f"MorselExec: workers={partitions}, NativeParquet[{table}, predicate="
+                if pushdown_filters
+                else f"MorselExec: workers={partitions}, NativeParquet[{table}]"
             )
+            expected = plan.startswith(prefix) and "CountSink" in plan
         else:
             expected = "MorselExec:" not in plan and re.search(
                 r"DataSourceExec: .*file_type=parquet", plan
@@ -98,7 +105,9 @@ def compare(args):
     emit(
         {
             "kind": "setup",
-            "build_revision": REVISION,
+            "build_revision": args.revision,
+            "pushdown_filters": args.pushdown_filters,
+            "morsel_metrics": args.morsel_metrics,
             "host": platform.node(),
             "kernel": platform.release(),
             "arch": platform.machine(),
@@ -113,6 +122,10 @@ def compare(args):
         }
     )
     command = [str(args.runner.resolve()), "--repetitions", "1"]
+    if args.pushdown_filters:
+        command.append("--pushdown-filters")
+    if args.morsel_metrics:
+        command.append("--morsel-metrics")
     for option in (
         "requests", "workers", "blocking_threads", "partitions", "background_lanes"
     ):
@@ -145,7 +158,14 @@ def compare(args):
                     sys.stderr.buffer.write(completed.stdout)
                     completed.check_returncode()
                 report = json.loads(completed.stdout)
-                validate(report, mode, mixed_first, args.partitions)
+                validate(
+                    report,
+                    mode,
+                    mixed_first,
+                    args.partitions,
+                    revision=args.revision,
+                    pushdown_filters=args.pushdown_filters,
+                )
                 for run in report["runs"]:
                     background = run["background"]
                     background["input_rows_per_second"] = (
@@ -185,6 +205,21 @@ def main():
     parser.add_argument("--blocking-threads", type=positive, default=2)
     parser.add_argument("--partitions", type=positive, default=4)
     parser.add_argument("--background-lanes", type=positive, default=3)
+    parser.add_argument(
+        "--revision",
+        default=REVISION,
+        help="expected MORSEL_BENCH_REVISION embedded in the runner binary",
+    )
+    parser.add_argument(
+        "--pushdown-filters",
+        action="store_true",
+        help="enable Parquet row-level filter pushdown on both backends",
+    )
+    parser.add_argument(
+        "--morsel-metrics",
+        action="store_true",
+        help="collect #138 detailed morsel metrics on native runs",
+    )
     parser.add_argument(
         "--timeout", type=positive, default=60, help="seconds per harness invocation"
     )

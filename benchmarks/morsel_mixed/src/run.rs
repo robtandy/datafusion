@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::physical_plan::metrics::MetricsSet;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -44,7 +45,55 @@ pub(crate) struct Report {
     service_time: Distribution,
     planning: Distribution,
     background: BackgroundReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    morsel_metrics: Option<MorselMetricsReport>,
     requests: Vec<Request>,
+}
+
+#[derive(Serialize)]
+struct MorselMetricsReport {
+    foreground: Vec<MorselExecutionMetrics>,
+    background: Vec<MorselExecutionMetrics>,
+}
+
+#[derive(Serialize)]
+struct MorselExecutionMetrics {
+    pending_io_ns: usize,
+    ready_wait_ns: usize,
+    decode_work_ns: usize,
+    process_work_ns: usize,
+    output_wait_ns: usize,
+    morsels_claimed: usize,
+    morsels_completed: usize,
+    peak_ready_depth: usize,
+    peak_ready_compressed_bytes_estimate: usize,
+    peak_output_depth: usize,
+    peak_output_arrow_bytes: usize,
+}
+
+impl MorselExecutionMetrics {
+    fn from_metrics_set(set: &MetricsSet) -> Self {
+        let sum = |name: &str| {
+            set.sum_by_name(name)
+                .map(|value| value.as_usize())
+                .unwrap_or(0)
+        };
+        Self {
+            pending_io_ns: sum("morsel_pending_io"),
+            ready_wait_ns: sum("morsel_ready_wait"),
+            decode_work_ns: sum("morsel_decode_work"),
+            process_work_ns: sum("morsel_process_work"),
+            output_wait_ns: sum("morsel_output_wait"),
+            morsels_claimed: sum("morsels_claimed"),
+            morsels_completed: sum("morsels_completed"),
+            peak_ready_depth: sum("morsel_peak_ready_depth"),
+            peak_ready_compressed_bytes_estimate: sum(
+                "morsel_peak_ready_compressed_bytes_estimate",
+            ),
+            peak_output_depth: sum("morsel_peak_output_depth"),
+            peak_output_arrow_bytes: sum("morsel_peak_output_arrow_bytes"),
+        }
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -220,6 +269,27 @@ pub(crate) async fn measure(
     while let Some(lane) = lanes.join_next().await {
         drained_lanes.push(lane.context("joining background lane")?);
     }
+    let morsel_metrics = if args.morsel_metrics {
+        tokio::task::yield_now().await;
+        let foreground = small
+            .take_metrics()
+            .unwrap_or_default()
+            .iter()
+            .map(MorselExecutionMetrics::from_metrics_set)
+            .collect();
+        let background = large
+            .and_then(Query::take_metrics)
+            .unwrap_or_default()
+            .iter()
+            .map(MorselExecutionMetrics::from_metrics_set)
+            .collect();
+        Some(MorselMetricsReport {
+            foreground,
+            background,
+        })
+    } else {
+        None
+    };
 
     let mut foreground_end = end;
     for Service {
@@ -341,6 +411,7 @@ pub(crate) async fn measure(
             successful().filter_map(|r| Some(r.plan_ready_ns? - r.started_ns?)),
         ),
         background,
+        morsel_metrics,
         requests,
     })
 }

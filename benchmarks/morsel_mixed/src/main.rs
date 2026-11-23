@@ -87,6 +87,12 @@ struct Args {
     /// Start the first pair with the mixed phase rather than the isolated phase.
     #[arg(long)]
     mixed_first: bool,
+    /// Enable Parquet row-level filter pushdown on registered fixtures.
+    #[arg(long)]
+    pushdown_filters: bool,
+    /// Collect detailed morsel wait/buffering metrics (#138) on native runs.
+    #[arg(long)]
+    morsel_metrics: bool,
     /// Foreground requests scheduled per run (including drops).
     #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..=50_000))]
     requests: u32,
@@ -150,6 +156,8 @@ async fn benchmark(args: Args) -> Result<()> {
         let warmup = args.warmup;
         SpawnedTask::spawn(async move { query.warm_up(warmup, timeout).await }).await??;
     }
+    small.take_metrics();
+    large.take_metrics();
 
     let mut runs = Vec::new();
     for repetition in 0..args.repetitions {

@@ -14,6 +14,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::config::MorselMode;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SQLOptions;
+use datafusion::morsel::MorselMetrics;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -30,6 +32,7 @@ const LARGE_SQL: &str = "SELECT SUM((v * v + v * 13) % 1000033) FROM large";
 pub(crate) struct Query {
     ctx: SessionContext,
     backend: Backend,
+    metrics: Option<Arc<MorselMetrics>>,
     metadata: QueryMetadata,
 }
 
@@ -107,9 +110,15 @@ impl Query {
                 .with_repartition_file_scans(false);
             let parquet = &mut config.options_mut().execution.parquet;
             parquet.pruning = false;
-            parquet.pushdown_filters = false;
+            parquet.pushdown_filters = args.pushdown_filters;
             parquet.enable_page_index = false;
             parquet.bloom_filter_on_read = false;
+        }
+        let metrics = args
+            .morsel_metrics
+            .then(|| Arc::new(MorselMetrics::default()));
+        if let Some(metrics) = &metrics {
+            config = config.with_extension(Arc::clone(metrics));
         }
         config.options_mut().execution.morsel_mode = match args.morsel_mode {
             Backend::Off => MorselMode::Off,
@@ -128,6 +137,7 @@ impl Query {
         let mut query = Self {
             ctx,
             backend: args.morsel_mode,
+            metrics,
             metadata: QueryMetadata {
                 sql: sql.clone().unwrap_or_else(|| default_sql.to_owned()),
                 fixture: fixture.clone(),
@@ -147,6 +157,10 @@ impl Query {
 
     pub(crate) fn metadata(&self) -> &QueryMetadata {
         &self.metadata
+    }
+
+    pub(crate) fn take_metrics(&self) -> Option<Vec<MetricsSet>> {
+        self.metrics.as_ref().map(|metrics| metrics.take_runs())
     }
 
     pub(crate) async fn warm_up(&self, count: u32, timeout: Duration) -> Result<()> {

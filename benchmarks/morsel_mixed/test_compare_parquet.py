@@ -7,21 +7,27 @@ import unittest
 from compare_parquet import REVISION, pair_schedule, validate
 
 
-def report_for(mode, mixed_first=False):
+def report_for(mode, mixed_first=False, revision=REVISION, pushdown_filters=False):
     phases = ("mixed", "isolated") if mixed_first else ("isolated", "mixed")
     report = {
-        "build_revision": REVISION,
+        "build_revision": revision,
         "valid": True,
         "runtime": {"morsel_mode": mode},
         "runs": [{"mode": phase} for phase in phases],
     }
     for table in ("small", "large"):
-        plan = (
-            "AggregateExec: mode=Final\n"
-            f"  DataSourceExec: file_groups={table}, file_type=parquet\n"
-            if mode == "off"
-            else f"MorselExec: workers=4, NativeParquet[{table}] -> CountSink\n"
-        )
+        if mode == "off":
+            plan = (
+                "AggregateExec: mode=Final\n"
+                f"  DataSourceExec: file_groups={table}, file_type=parquet\n"
+            )
+        elif pushdown_filters:
+            plan = (
+                f"MorselExec: workers=4, NativeParquet[{table}, "
+                "predicate=gate@0 < 10] -> CountSink\n"
+            )
+        else:
+            plan = f"MorselExec: workers=4, NativeParquet[{table}] -> CountSink\n"
         report[table] = {"plan": plan}
     return report
 
@@ -88,6 +94,33 @@ class ComparisonTest(unittest.TestCase):
                     ValueError, f"unexpected required/{table} plan"
                 ):
                     validate({**report, table: {"plan": plan}}, "required", False, 4)
+
+    def test_valid_reports_with_custom_revision_and_pushdown_filters(self):
+        custom_rev = "9" * 40
+        for mode in ("off", "required"):
+            for mixed_first in (False, True):
+                with self.subTest(mode=mode, mixed_first=mixed_first):
+                    validate(
+                        report_for(
+                            mode,
+                            mixed_first,
+                            revision=custom_rev,
+                            pushdown_filters=True,
+                        ),
+                        mode,
+                        mixed_first,
+                        4,
+                        revision=custom_rev,
+                        pushdown_filters=True,
+                    )
+
+    def test_rejects_mismatched_pushdown_plan_shape(self):
+        plain = report_for("required", pushdown_filters=False)
+        pushed = report_for("required", pushdown_filters=True)
+        with self.assertRaisesRegex(ValueError, "unexpected required/small plan"):
+            validate(plain, "required", False, 4, pushdown_filters=True)
+        with self.assertRaisesRegex(ValueError, "unexpected required/small plan"):
+            validate(pushed, "required", False, 4, pushdown_filters=False)
 
     def test_pair_schedule_balances_backend_and_phase_order(self):
         self.assertEqual(
