@@ -1,0 +1,293 @@
+diff --git a/datafusion/core/src/morsel.rs b/datafusion/core/src/morsel.rs
+index 97dd4aac0..f0f0f9c36 100644
+--- a/datafusion/core/src/morsel.rs
++++ b/datafusion/core/src/morsel.rs
+@@ -533,6 +533,10 @@ fn with_filter_mask<T>(
+     predicate: &Arc<dyn PhysicalExpr>,
+     apply: impl FnOnce(RecordBatch, &BooleanArray) -> Result<T>,
+ ) -> Result<T> {
++    if std::env::var_os("MORSEL_SCRATCH_SHORT_CIRCUIT").is_some() {
++        let mask = count::eval_short_circuit_mask(&batch, predicate)?;
++        return apply(batch, &mask);
++    }
+     let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+     let Ok(mask) = as_boolean_array(&mask) else {
+         return internal_err!("Cannot create filter_array from non-boolean predicates");
+@@ -939,6 +943,7 @@ impl Pipeline {
+                     }
+                 }
+             };
++            let batch_yield = std::env::var_os("MORSEL_SCRATCH_NO_YIELD").is_none();
+             let mut reader = worker.decode(|| morsel.into_stream());
+             while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
+                 if tx.is_closed()
+@@ -946,7 +951,9 @@ impl Pipeline {
+                 {
+                     return Ok(None);
+                 }
+-                tokio::task::yield_now().await;
++                if batch_yield {
++                    tokio::task::yield_now().await;
++                }
+             }
+             worker.complete();
+             tokio::task::yield_now().await;
+diff --git a/datafusion/core/src/morsel/count.rs b/datafusion/core/src/morsel/count.rs
+index df64a511a..874ffaeac 100644
+--- a/datafusion/core/src/morsel/count.rs
++++ b/datafusion/core/src/morsel/count.rs
+@@ -4,9 +4,9 @@
+
+ use std::sync::Arc;
+
+-use arrow::array::{BooleanArray, Int64Array, RecordBatch};
+-use arrow::compute::filter_record_batch;
+-use arrow::datatypes::SchemaRef;
++use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch};
++use arrow::compute::{filter as filter_array, filter_record_batch};
++use arrow::datatypes::{DataType, Schema, SchemaRef};
+ use arrow::error::ArrowError;
+ use datafusion_common::cast::as_boolean_array;
+ use datafusion_common::{Result, ScalarValue, exec_datafusion_err, internal_err};
+@@ -15,7 +15,8 @@ use datafusion_expr::logical_plan::Aggregate;
+ use datafusion_expr::utils::COUNT_STAR_EXPANSION;
+ use datafusion_expr::{ColumnarValue, Expr};
+ use datafusion_functions_aggregate::count::Count;
+-use datafusion_physical_expr::PhysicalExpr;
++use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns, split_conjunction};
++use datafusion_physical_expr::{PhysicalExpr, conjunction};
+
+ pub(super) fn count_star(aggregate: &Aggregate) -> Option<&Expr> {
+     let [expr] = aggregate.aggr_expr.as_slice() else {
+@@ -116,6 +117,9 @@ pub(super) fn count_filtered_rows(
+     batch: &RecordBatch,
+     predicate: &Arc<dyn PhysicalExpr>,
+ ) -> Result<usize> {
++    if std::env::var_os("MORSEL_SCRATCH_SHORT_CIRCUIT").is_some() {
++        return count_filtered_rows_short_circuit(batch, predicate);
++    }
+     match predicate.evaluate(batch)? {
+         ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => Ok(batch.num_rows()),
+         ColumnarValue::Scalar(ScalarValue::Boolean(Some(false) | None)) => Ok(0),
+@@ -133,6 +137,179 @@ pub(super) fn count_filtered_rows(
+     }
+ }
+
++fn group_and_order_conjuncts(
++    schema: &Schema,
++    predicate: &Arc<dyn PhysicalExpr>,
++) -> Vec<(Vec<usize>, Arc<dyn PhysicalExpr>)> {
++    let mut groups: Vec<(Vec<usize>, Vec<Arc<dyn PhysicalExpr>>)> = Vec::new();
++    for expr in split_conjunction(predicate) {
++        let mut cols: Vec<usize> = collect_columns(expr)
++            .into_iter()
++            .map(|c| c.index())
++            .collect();
++        cols.sort_unstable();
++        cols.dedup();
++        if let Some((_, list)) = groups.iter_mut().find(|(c, _)| *c == cols) {
++            list.push(Arc::clone(expr));
++        } else {
++            groups.push((cols, vec![Arc::clone(expr)]));
++        }
++    }
++    // Order cheapest / narrowest column groups first (Date32/Int32 before Decimal128).
++    groups.sort_by_key(|(cols, exprs)| {
++        let max_width: usize = cols
++            .iter()
++            .map(|&i| match schema.field(i).data_type() {
++                DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 16,
++                DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
++                _ => 4,
++            })
++            .max()
++            .unwrap_or(0);
++        // Prefer multi-bound ranges (e.g. BETWEEN / date range) at the same width.
++        (max_width, std::cmp::Reverse(exprs.len()), cols.len())
++    });
++    groups
++        .into_iter()
++        .map(|(cols, exprs)| (cols, conjunction(exprs)))
++        .collect()
++}
++
++fn eval_bool_mask(
++    batch: &RecordBatch,
++    predicate: &Arc<dyn PhysicalExpr>,
++) -> Result<Option<BooleanArray>> {
++    match predicate.evaluate(batch)? {
++        ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => Ok(None),
++        ColumnarValue::Scalar(ScalarValue::Boolean(Some(false) | None)) => {
++            Ok(Some(BooleanArray::from(vec![false; batch.num_rows()])))
++        }
++        ColumnarValue::Scalar(_) => {
++            internal_err!("Cannot create filter_array from non-boolean predicates")
++        }
++        ColumnarValue::Array(array) => {
++            let Ok(mask) = as_boolean_array(&array) else {
++                return internal_err!(
++                    "Cannot create filter_array from non-boolean predicates"
++                );
++            };
++            Ok(Some(mask.clone()))
++        }
++    }
++}
++
++fn count_filtered_rows_short_circuit(
++    batch: &RecordBatch,
++    predicate: &Arc<dyn PhysicalExpr>,
++) -> Result<usize> {
++    let groups = group_and_order_conjuncts(batch.schema().as_ref(), predicate);
++    if groups.len() <= 1 {
++        let mask = eval_bool_mask(batch, predicate)?;
++        return Ok(match mask {
++            None => batch.num_rows(),
++            Some(m) => count_mask_rows(batch, &m)?,
++        });
++    }
++    let mut current_mask: Option<BooleanArray> = None;
++    let mut surviving = batch.num_rows();
++    let last_idx = groups.len() - 1;
++    for (gidx, (cols, group_expr)) in groups.iter().enumerate() {
++        if surviving == 0 {
++            return Ok(0);
++        }
++        if let Some(mask) = &current_mask {
++            let sub_fields: Vec<_> = cols
++                .iter()
++                .map(|&i| batch.schema().field(i).clone())
++                .collect();
++            let sub_schema = Arc::new(Schema::new(sub_fields));
++            let sub_cols: Vec<_> = cols
++                .iter()
++                .map(|&i| filter_array(batch.column(i).as_ref(), mask))
++                .collect::<std::result::Result<_, _>>()?;
++            let sub_batch = RecordBatch::try_new(Arc::clone(&sub_schema), sub_cols)?;
++            let remapped =
++                reassign_expr_columns(Arc::clone(group_expr), &sub_schema)?;
++            if let Some(sub_mask) = eval_bool_mask(&sub_batch, &remapped)? {
++                surviving = sub_mask.true_count();
++                if surviving == 0 || gidx == last_idx {
++                    return Ok(surviving);
++                }
++                let mut builder = BooleanBufferBuilder::new(batch.num_rows());
++                builder.append_n(batch.num_rows(), false);
++                let mut sub_idx = 0usize;
++                for row_idx in mask.values().set_indices() {
++                    if mask.is_valid(row_idx) {
++                        if sub_mask.is_valid(sub_idx) && sub_mask.value(sub_idx) {
++                            builder.set_bit(row_idx, true);
++                        }
++                        sub_idx += 1;
++                    }
++                }
++                current_mask = Some(BooleanArray::new(builder.finish(), None));
++            }
++        } else if let Some(mask) = eval_bool_mask(batch, group_expr)? {
++            surviving = mask.true_count();
++            if surviving == 0 {
++                return Ok(0);
++            }
++            current_mask = Some(mask);
++        }
++    }
++    Ok(surviving)
++}
++
++pub(super) fn eval_short_circuit_mask(
++    batch: &RecordBatch,
++    predicate: &Arc<dyn PhysicalExpr>,
++) -> Result<BooleanArray> {
++    let groups = group_and_order_conjuncts(batch.schema().as_ref(), predicate);
++    if groups.len() <= 1 {
++        let mask = predicate.evaluate(batch)?.into_array(batch.num_rows())?;
++        let Ok(mask) = as_boolean_array(&mask) else {
++            return internal_err!("Cannot create filter_array from non-boolean predicates");
++        };
++        return Ok(mask.clone());
++    }
++    let mut current_mask: Option<BooleanArray> = None;
++    for (cols, group_expr) in &groups {
++        if let Some(mask) = &current_mask {
++            if mask.true_count() == 0 {
++                return Ok(mask.clone());
++            }
++            let sub_fields: Vec<_> = cols
++                .iter()
++                .map(|&i| batch.schema().field(i).clone())
++                .collect();
++            let sub_schema = Arc::new(Schema::new(sub_fields));
++            let sub_cols: Vec<_> = cols
++                .iter()
++                .map(|&i| filter_array(batch.column(i).as_ref(), mask))
++                .collect::<std::result::Result<_, _>>()?;
++            let sub_batch = RecordBatch::try_new(Arc::clone(&sub_schema), sub_cols)?;
++            let remapped =
++                reassign_expr_columns(Arc::clone(group_expr), &sub_schema)?;
++            if let Some(sub_mask) = eval_bool_mask(&sub_batch, &remapped)? {
++                let mut builder = BooleanBufferBuilder::new(batch.num_rows());
++                builder.append_n(batch.num_rows(), false);
++                let mut sub_idx = 0usize;
++                for row_idx in mask.values().set_indices() {
++                    if mask.is_valid(row_idx) {
++                        if sub_mask.is_valid(sub_idx) && sub_mask.value(sub_idx) {
++                            builder.set_bit(row_idx, true);
++                        }
++                        sub_idx += 1;
++                    }
++                }
++                current_mask = Some(BooleanArray::new(builder.finish(), None));
++            }
++        } else if let Some(mask) = eval_bool_mask(batch, group_expr)? {
++            current_mask = Some(mask);
++        }
++    }
++    Ok(current_mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()])))
++}
++
+ pub(super) struct FinalizedCount(RecordBatch);
+
+ impl FinalizedCount {
+diff --git a/datafusion/datasource-parquet/src/row_filter.rs b/datafusion/datasource-parquet/src/row_filter.rs
+index f07e01a36..0b843c8f0 100644
+--- a/datafusion/datasource-parquet/src/row_filter.rs
++++ b/datafusion/datasource-parquet/src/row_filter.rs
+@@ -495,6 +495,37 @@ pub(crate) fn prebuild_row_filter_candidates(
+         return Ok(None);
+     }
+
++    let candidates = if std::env::var_os("MORSEL_SCRATCH_GROUP_ROW_FILTER").is_some() {
++        let mut grouped: Vec<FilterCandidate> = Vec::new();
++        for cand in candidates {
++            let key: Vec<&str> = cand
++                .read_plan
++                .projected_schema
++                .fields()
++                .iter()
++                .map(|f| f.name().as_str())
++                .collect();
++            if let Some(existing) = grouped.iter_mut().find(|g| {
++                g.read_plan
++                    .projected_schema
++                    .fields()
++                    .iter()
++                    .map(|f| f.name().as_str())
++                    .eq(key.iter().copied())
++            }) {
++                existing.expr = datafusion_physical_expr::conjunction([
++                    Arc::clone(&existing.expr),
++                    cand.expr,
++                ]);
++            } else {
++                grouped.push(cand);
++            }
++        }
++        grouped
++    } else {
++        candidates
++    };
++
+     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
+         .into_iter()
+         .map(|candidate| {
