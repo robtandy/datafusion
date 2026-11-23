@@ -91,6 +91,7 @@ struct Args {
     #[arg(long)]
     pushdown_filters: bool,
     /// Collect detailed morsel wait/buffering metrics (#138) on native runs.
+    #[cfg(feature = "morsel-metrics")]
     #[arg(long)]
     morsel_metrics: bool,
     /// Foreground requests scheduled per run (including drops).
@@ -156,8 +157,11 @@ async fn benchmark(args: Args) -> Result<()> {
         let warmup = args.warmup;
         SpawnedTask::spawn(async move { query.warm_up(warmup, timeout).await }).await??;
     }
-    small.take_metrics();
-    large.take_metrics();
+    #[cfg(feature = "morsel-metrics")]
+    {
+        small.take_metrics();
+        large.take_metrics();
+    }
 
     let mut runs = Vec::new();
     for repetition in 0..args.repetitions {

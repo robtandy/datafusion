@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use datafusion::common::runtime::SpawnedTask;
+#[cfg(feature = "morsel-metrics")]
 use datafusion::physical_plan::metrics::MetricsSet;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
@@ -45,17 +46,20 @@ pub(crate) struct Report {
     service_time: Distribution,
     planning: Distribution,
     background: BackgroundReport,
+    #[cfg(feature = "morsel-metrics")]
     #[serde(skip_serializing_if = "Option::is_none")]
     morsel_metrics: Option<MorselMetricsReport>,
     requests: Vec<Request>,
 }
 
+#[cfg(feature = "morsel-metrics")]
 #[derive(Serialize)]
 struct MorselMetricsReport {
     foreground: Vec<MorselExecutionMetrics>,
     background: Vec<MorselExecutionMetrics>,
 }
 
+#[cfg(feature = "morsel-metrics")]
 #[derive(Serialize)]
 struct MorselExecutionMetrics {
     pending_io_ns: usize,
@@ -71,6 +75,7 @@ struct MorselExecutionMetrics {
     peak_output_arrow_bytes: usize,
 }
 
+#[cfg(feature = "morsel-metrics")]
 impl MorselExecutionMetrics {
     fn from_metrics_set(set: &MetricsSet) -> Self {
         let sum = |name: &str| {
@@ -269,6 +274,7 @@ pub(crate) async fn measure(
     while let Some(lane) = lanes.join_next().await {
         drained_lanes.push(lane.context("joining background lane")?);
     }
+    #[cfg(feature = "morsel-metrics")]
     let morsel_metrics = if args.morsel_metrics {
         tokio::task::yield_now().await;
         let foreground = small
@@ -411,6 +417,7 @@ pub(crate) async fn measure(
             successful().filter_map(|r| Some(r.plan_ready_ns? - r.started_ns?)),
         ),
         background,
+        #[cfg(feature = "morsel-metrics")]
         morsel_metrics,
         requests,
     })

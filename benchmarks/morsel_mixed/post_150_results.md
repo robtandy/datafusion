@@ -219,40 +219,48 @@ yielding after every 8,192-row batch (~0.30 ms).
 
 ## Separate #138 wait and buffering metrics check
 
-Collected in a separate instrumented run (`--morsel-metrics`, 1 pair per load
-level on CPUs 12–15, warm page cache verified at 76,219 / 76,219 pages) so
-instrumentation stayed off during the paired timings above. Values are medians
-of per-query sums across the 4 workers (overlapping monotonic durations, not
-partitions of wall time), with max queue peaks observed across all executions
-in the run.
+Collected in a separate instrumented run (`--morsel-metrics`, built with
+`--features morsel-metrics`, 1 pair per load level on CPUs 12–15, warm page
+cache verified at 76,219 / 76,219 pages) so instrumentation stayed off during
+the paired timings above. Values are medians of per-query sums across the 4
+workers (overlapping monotonic durations, not partitions of wall time), with
+max queue peaks observed across all executions in the run.
+
+Note on the `Peak ready depth (bytes)` column: both paths project and fetch
+only `score` and `delta`, but `pushdown_filters = false` (`PlainBufferedReaders`)
+accounts each queued row group by its full on-disk `compressed_size()` across
+all 5 columns, whereas `pushdown_filters = true` (`FilteredBufferedReaders`)
+accounts only the compressed bytes actually fetched. The byte figures in the
+two tables therefore reflect different accounting bases and are not directly
+comparable.
 
 ### `pushdown_filters = false`
 
-| Offers/s | Phase    | Role       | Executions | Pending I/O ms | Ready wait ms | Decode work ms | Process work ms | Output wait ms | Morsels | Peak ready depth (bytes) | Peak output depth (bytes) |
-| -------: | :------- | :--------- | ---------: | -------------: | ------------: | -------------: | --------------: | -------------: | ------: | -----------------------: | ------------------------: |
-|       20 | Isolated | Foreground |        200 |           1.47 |          1.45 |           0.94 |            0.35 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|       20 | Mixed    | Foreground |        200 |           1.93 |          1.58 |           0.93 |            0.32 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|       20 | Mixed    | Background |         63 |          55.78 |          4.56 |         446.53 |          159.26 |           0.00 |     128 |             4 (9.32 MiB) |                   1 (8 B) |
-|       50 | Isolated | Foreground |        600 |           1.33 |          1.38 |           0.95 |            0.35 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|       50 | Mixed    | Foreground |        600 |           1.90 |          1.58 |           0.96 |            0.32 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|       50 | Mixed    | Background |         72 |          58.86 |          4.53 |         456.70 |          163.41 |           0.00 |     128 |             4 (9.32 MiB) |                   1 (8 B) |
-|      200 | Isolated | Foreground |        600 |           1.24 |          1.26 |           0.91 |            0.33 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|      200 | Mixed    | Foreground |        496 |           2.27 |          1.58 |           0.92 |            0.31 |           0.00 |       8 |             4 (0.30 MiB) |                   1 (8 B) |
-|      200 | Mixed    | Background |         18 |          65.33 |          5.54 |         454.31 |          163.85 |           0.00 |     128 |             4 (9.32 MiB) |                   1 (8 B) |
+| Offers/s | Phase    | Role       | Executions | Pending I/O ms | Ready wait ms | Decode work ms | Process work ms | Output wait ms | Morsels | Peak ready depth (full-RG est.) | Peak output depth (bytes) |
+| -------: | :------- | :--------- | ---------: | -------------: | ------------: | -------------: | --------------: | -------------: | ------: | ------------------------------: | ------------------------: |
+|       20 | Isolated | Foreground |        200 |           1.47 |          1.45 |           0.94 |            0.35 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|       20 | Mixed    | Foreground |        200 |           1.93 |          1.58 |           0.93 |            0.32 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|       20 | Mixed    | Background |         63 |          55.78 |          4.56 |         446.53 |          159.26 |           0.00 |     128 |                    4 (9.32 MiB) |                   1 (8 B) |
+|       50 | Isolated | Foreground |        600 |           1.33 |          1.38 |           0.95 |            0.35 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|       50 | Mixed    | Foreground |        600 |           1.90 |          1.58 |           0.96 |            0.32 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|       50 | Mixed    | Background |         72 |          58.86 |          4.53 |         456.70 |          163.41 |           0.00 |     128 |                    4 (9.32 MiB) |                   1 (8 B) |
+|      200 | Isolated | Foreground |        600 |           1.24 |          1.26 |           0.91 |            0.33 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|      200 | Mixed    | Foreground |        496 |           2.27 |          1.58 |           0.92 |            0.31 |           0.00 |       8 |                    4 (0.30 MiB) |                   1 (8 B) |
+|      200 | Mixed    | Background |         18 |          65.33 |          5.54 |         454.31 |          163.85 |           0.00 |     128 |                    4 (9.32 MiB) |                   1 (8 B) |
 
 ### `pushdown_filters = true`
 
-| Offers/s | Phase    | Role       | Executions | Pending I/O ms | Ready wait ms | Decode work ms | Process work ms | Output wait ms | Morsels | Peak ready depth (bytes) | Peak output depth (bytes) |
-| -------: | :------- | :--------- | ---------: | -------------: | ------------: | -------------: | --------------: | -------------: | ------: | -----------------------: | ------------------------: |
-|       20 | Isolated | Foreground |        200 |           1.63 |          1.83 |           1.51 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|       20 | Mixed    | Foreground |        200 |           1.75 |          0.67 |           1.50 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|       20 | Mixed    | Background |         63 |         131.70 |          8.53 |         612.26 |            0.30 |           0.00 |     128 |             4 (2.25 MiB) |                   1 (8 B) |
-|       50 | Isolated | Foreground |        600 |           1.59 |          1.67 |           1.46 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|       50 | Mixed    | Foreground |        600 |           1.64 |          0.55 |           1.45 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|       50 | Mixed    | Background |         72 |         130.37 |          8.08 |         621.68 |            0.30 |           0.00 |     128 |             4 (2.25 MiB) |                   1 (8 B) |
-|      200 | Isolated | Foreground |        600 |           1.34 |          1.43 |           1.46 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|      200 | Mixed    | Foreground |        374 |           1.68 |          0.00 |           1.39 |            0.00 |           0.00 |       8 |             4 (0.07 MiB) |                   1 (8 B) |
-|      200 | Mixed    | Background |         18 |         114.07 |          9.03 |         614.88 |            0.32 |           0.00 |     128 |             4 (2.25 MiB) |                   1 (8 B) |
+| Offers/s | Phase    | Role       | Executions | Pending I/O ms | Ready wait ms | Decode work ms | Process work ms | Output wait ms | Morsels | Peak ready depth (fetched bytes) | Peak output depth (bytes) |
+| -------: | :------- | :--------- | ---------: | -------------: | ------------: | -------------: | --------------: | -------------: | ------: | -------------------------------: | ------------------------: |
+|       20 | Isolated | Foreground |        200 |           1.63 |          1.83 |           1.51 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|       20 | Mixed    | Foreground |        200 |           1.75 |          0.67 |           1.50 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|       20 | Mixed    | Background |         63 |         131.70 |          8.53 |         612.26 |            0.30 |           0.00 |     128 |                     4 (2.25 MiB) |                   1 (8 B) |
+|       50 | Isolated | Foreground |        600 |           1.59 |          1.67 |           1.46 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|       50 | Mixed    | Foreground |        600 |           1.64 |          0.55 |           1.45 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|       50 | Mixed    | Background |         72 |         130.37 |          8.08 |         621.68 |            0.30 |           0.00 |     128 |                     4 (2.25 MiB) |                   1 (8 B) |
+|      200 | Isolated | Foreground |        600 |           1.34 |          1.43 |           1.46 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|      200 | Mixed    | Foreground |        374 |           1.68 |          0.00 |           1.39 |            0.00 |           0.00 |       8 |                     4 (0.07 MiB) |                   1 (8 B) |
+|      200 | Mixed    | Background |         18 |         114.07 |          9.03 |         614.88 |            0.32 |           0.00 |     128 |                     4 (2.25 MiB) |                   1 (8 B) |
 
 Key takeaways from #138 metrics:
 
@@ -267,17 +275,23 @@ Key takeaways from #138 metrics:
    `decode_work` (`446.5 → 612.3 ms`, ~4.78 ms per 131,072-row group), holding
    Tokio worker threads 16× longer between yields than the ~0.30 ms per-batch
    slice in `pushdown_filters = false`.
-3. **Queued compressed-byte estimate drops 4.1× under #150**
-   (`9.32 → 2.25 MiB` for `large`, `0.30 → 0.07 MiB` for `small`) because
-   `FilteredBufferedReaders` fetches only predicate columns (`score`, `delta`)
-   and tracks actual fetched bytes rather than full row-group compressed size.
+3. **The `9.32 → 2.25 MiB` (`large`) and `0.30 → 0.07 MiB` (`small`) difference
+   in `Peak ready depth` bytes is a metric-accounting difference, not a 4.1×
+   buffering cut:** both `pushdown_filters = false` and `pushdown_filters = true`
+   project and fetch only `score` and `delta` (the same projection mask).
+   `PlainBufferedReaders` (`pushdown_filters = false`) reports the whole row
+   group's on-disk `compressed_size()` across all 5 columns, whereas
+   `FilteredBufferedReaders` (`pushdown_filters = true`) reports the compressed
+   bytes actually fetched.
 
 ## Reproduction
 
 Following the [#139 pinned-build pattern](README.md#pinned-parquet-comparison-139),
 build the standalone harness inside a detached worktree at
 `98b2c851653b8525d4386d380556030a510f12e4` so `MORSEL_BENCH_REVISION` comes
-from the checked-out commit:
+from the checked-out commit. Pass `--features morsel-metrics` to enable the
+opt-in `--morsel-metrics` flag (left off by default so the harness still builds
+against `#139`'s pre-`#138` pin `d649cacf0`):
 
 ```bash
 set -e
@@ -293,7 +307,8 @@ cp -r "$b"/{Cargo.toml,Cargo.lock,src,tests} "$work/pinned/$b/"
   cd "$work/pinned"
   MORSEL_BENCH_REVISION="$(git rev-parse HEAD)" CARGO_TARGET_DIR="$work/target" \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=2 timeout --kill-after=15s 1200s \
-    cargo build -j 10 --release --locked --manifest-path "$b/Cargo.toml"
+    cargo build -j 10 --release --locked --features morsel-metrics \
+    --manifest-path "$b/Cargo.toml"
 )
 
 timeout 60s uv venv --python 3.12.10 "$work/venv"
