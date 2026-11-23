@@ -15,7 +15,7 @@ use datafusion_datasource_parquet::{
     DefaultParquetFileReaderFactory, ParquetFileReaderFactory,
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
-use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_plan::metrics::MetricsSet;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
@@ -207,6 +207,7 @@ impl ControlledScan {
                     schema,
                     config: Some(Box::new(config)),
                     files,
+                    pushdown_filters: false,
                     metrics,
                 }),
                 operators: vec![],
@@ -581,5 +582,198 @@ async fn stock_morsel_drives_data_io_when_polled() -> Result<()> {
         timeout(DEADLINE, batch).await.unwrap().unwrap()?.num_rows(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
+-> Result<()> {
+    // RG 0 has one match for `gate % 10 = 5` (requires Phase-1 gate + Phase-2 payload);
+    // RG 1 has zero matches (stats cannot prune modulo; Phase-2 payload must be skipped).
+    let batch = RecordBatch::try_from_iter([
+        ("gate", Arc::new(Int32Array::from(vec![5, 6, 1, 2])) as _),
+        (
+            "payload",
+            Arc::new(Int32Array::from(vec![100, 200, 300, 400])) as _,
+        ),
+    ])?;
+    let mut bytes = Vec::new();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    let bytes = Bytes::from(bytes);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let file = PartitionedFile::new("filtered.parquet".to_string(), bytes.len() as u64);
+    store.put(&file.object_meta.location, bytes.into()).await?;
+
+    // Predicate: `gate % 10 = 5`
+    let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("gate", 0)),
+            datafusion_expr::Operator::Modulo,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+        )),
+        datafusion_expr::Operator::Eq,
+        Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+    ));
+
+    let make_scan = |count: bool| -> Result<(
+        MorselExec,
+        Arc<TaskContext>,
+        mpsc::UnboundedReceiver<Request>,
+        Arc<Gates>,
+    )> {
+        let (send, requests) = mpsc::unbounded_channel();
+        let gates = Arc::new(Gates {
+            requests: send,
+            opened: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+        });
+        let parquet = ParquetSource::new(batch.schema())
+            .with_predicate(Arc::clone(&predicate))
+            .with_pushdown_filters(true)
+            .with_parquet_file_reader_factory(Arc::new(GatedFactory {
+                inner: DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
+                gates: Arc::clone(&gates),
+            }));
+        let metrics = parquet.metrics().clone();
+        let context = Arc::new(TaskContext::default());
+        let url = ObjectStoreUrl::parse("memory://morsel-pushdown")?;
+        context
+            .runtime_env()
+            .register_object_store(url.as_ref(), Arc::clone(&store));
+        let config = FileScanConfigBuilder::new(url, Arc::new(parquet))
+            .with_file_groups(vec![FileGroup::new(vec![file.clone()])])
+            .with_projection_indices(Some(vec![1]))?
+            .build();
+        let files = config.file_groups[0].files().to_vec().into();
+        let schema = config.projected_schema()?;
+        let (sink, output_schema) = if count {
+            let output_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    "n",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            (
+                Sink::Count {
+                    sink: CountSink::new(Arc::clone(&output_schema)),
+                    result_operators: vec![],
+                },
+                output_schema,
+            )
+        } else {
+            (Sink::Result, Arc::clone(&schema))
+        };
+        let plan = MorselExec::new(
+            Pipeline {
+                source: Source::Parquet(ParquetScan {
+                    table: "filtered".into(),
+                    schema,
+                    config: Some(Box::new(config)),
+                    files,
+                    pushdown_filters: true,
+                    metrics,
+                }),
+                operators: vec![],
+                workers: NonZeroUsize::new(1).unwrap(),
+                sink,
+                sink_capacity: SINK_CAPACITY,
+            },
+            output_schema,
+        );
+        Ok((plan, context, requests, gates))
+    };
+
+    // Part 1: verify exact I/O count (2 Phase-1 + 1 Phase-2 = 3; RG 1 skips Phase-2).
+    {
+        let (plan, context, mut requests, gates) = make_scan(false)?;
+        let mut run = Arc::clone(&plan.pipeline).start(
+            Arc::clone(&context),
+            plan.metrics.clone(),
+            None,
+        );
+        let (rows, io_count) = timeout(DEADLINE, async {
+            let mut io_count = 0usize;
+            let (rows, ()) = tokio::try_join!(
+                async {
+                    let mut out = Vec::new();
+                    while let Some(batch) = run.next().await? {
+                        let arr = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        out.extend_from_slice(arr.values());
+                    }
+                    Ok::<_, datafusion_common::DataFusionError>(out)
+                },
+                async {
+                    for _ in 0..3 {
+                        let req = requests.recv().await.unwrap();
+                        io_count += 1;
+                        req.send(Ok(())).unwrap();
+                    }
+                    assert!(timeout(QUIET, requests.recv()).await.is_err());
+                    Ok(())
+                }
+            )?;
+            Ok::<_, datafusion_common::DataFusionError>((rows, io_count))
+        })
+        .await
+        .expect("filtered scan did not finish")?;
+        assert_eq!(rows, vec![100]);
+        assert_eq!(io_count, 3);
+        assert_eq!(gates.opened.load(Ordering::SeqCst), 1);
+        let m = plan.metrics.clone_inner();
+        assert_eq!(m.sum_by_name("pushdown_rows_pruned").unwrap().as_usize(), 3);
+        assert_eq!(
+            m.sum_by_name("pushdown_rows_matched").unwrap().as_usize(),
+            1
+        );
+    }
+
+    // Part 2: drop stream while Phase-2 worker I/O is pending; verify cancellation.
+    {
+        let (plan, context, mut requests, gates) = make_scan(true)?;
+        let mut run = Arc::clone(&plan.pipeline).start(
+            Arc::clone(&context),
+            plan.metrics.clone(),
+            None,
+        );
+        // Release Phase-1 for RG 0 and wait for the next request (either Phase-1 RG 1
+        // or Phase-2 RG 0), release one more so Phase-2 is in-flight, then cancel.
+        let req1 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
+        req1.send(Ok(())).unwrap();
+        let req2 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
+        req2.send(Ok(())).unwrap();
+        let mut req3 = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
+        assert!(timeout(QUIET, run.next()).await.is_err());
+        drop(run);
+        timeout(DEADLINE, req3.closed())
+            .await
+            .expect("pending Phase-2 I/O was not cancelled on drop");
+        timeout(DEADLINE, async {
+            while Arc::strong_count(&plan.pipeline) != 1
+                || gates.active.load(Ordering::SeqCst) != 0
+                || Arc::strong_count(&gates) != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tasks did not stop after cancellation");
+        assert_eq!(
+            plan.metrics
+                .clone_inner()
+                .sum_by_name("count_finalizations")
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+    }
     Ok(())
 }
