@@ -87,18 +87,24 @@ over stock.
 Splitting also applies to `FilteredBufferedReaders` (with `AsyncRangeBroker`
 deduplicating shared boundary pages across Phase-1 and concurrent Phase-2 lanes,
 `RowGroupCache` batch-boundary expansion scoped strictly to cached leaves, and
-atomic Phase-2 budget pre-reservation at slice admission).
+atomic Phase-2 budget pre-reservation at slice admission). Measured with 1
+warmup and 10 paired repeats:
 
 | Query        | Stock ms, median (range) | Legacy native ms (4/8 workers) | Split native ms (8/8 workers) | Split vs legacy | Split vs stock | Split claims (round 1)      | `bytes_scanned` (all arms) | Peak unique bytes |
 | ------------ | -----------------------: | -----------------------------: | ----------------------------: | --------------: | -------------: | --------------------------- | -------------------------: | ----------------: |
-| `scan_low`   |      328.9 (326.5–337.3) |            177.2 (174.7–178.1) |           175.1 (171.6–179.9) |           -1.2% |         -46.8% | `[8, 8, 9, 8, 8, 4, 6, 9]`  |                 98,214,742 |        28,687,416 |
-| `count_low`  |      159.8 (158.6–160.2) |              89.5 (88.5–90.2)  |             68.2 (65.1–78.0)  |          -23.8% |         -57.3% | `[5, 4, 4, 4, 4, 3, 4, 4]`  |                 37,495,813 |        13,565,828 |
-| `scan_high`  |      344.4 (343.7–345.5) |            183.2 (183.1–183.5) |           178.1 (174.8–196.8) |           -2.8% |         -48.3% | `[6, 10, 7, 5, 7, 7, 8, 10]`|                 98,214,742 |        29,176,464 |
-| `count_high` |      160.1 (159.6–161.5) |              90.2 (89.7–90.6)  |             85.9 (82.7–96.1)  |           -4.8% |         -46.3% | `[4, 4, 4, 4, 4, 4, 4, 4]`  |                 37,495,813 |        13,960,903 |
+| `scan_low`   |      335.6 (330.5–338.3) |            180.4 (178.7–183.3) |           175.9 (171.9–189.8) |           -2.5% |         -47.6% | `[7, 9, 9, 6, 7, 10, 6, 6]` |                 98,214,742 |        29,575,609 |
+| `count_low`  |      162.8 (161.2–163.6) |              91.1 (90.0–92.4)  |             71.3 (65.3–75.0)  |          -21.7% |         -56.2% | `[4, 4, 3, 4, 5, 4, 5, 3]`  |                 37,495,813 |        14,576,713 |
+| `scan_high`  |      351.0 (347.4–356.7) |            186.0 (184.8–188.0) |           185.8 (179.4–188.2) |           -0.1% |         -47.1% | `[7, 10, 7, 8, 9, 9, 6, 4]` |                 98,214,742 |        28,437,567 |
+| `count_high` |      162.6 (159.8–165.2) |              92.1 (90.2–92.9)  |             87.9 (80.3–101.9) |           -4.6% |         -45.9% | `[4, 4, 4, 4, 4, 4, 4, 4]`  |                 37,495,813 |        14,357,437 |
 
 All 8 workers claim work across all 4 queries with zero duplicate storage I/O
-(`bytes_scanned` identical across all arms), beating both stock (**46.3–57.3%**
-faster) and legacy native (**1.2–23.8%** faster) across all four queries.
+(`bytes_scanned` identical across all arms), staying **45.9–56.2% faster than
+stock**. Compared to legacy native, `count_low` shows a clear **21.7%** speedup
+(`91.1 → 71.3 ms`) and `count_high` is modestly faster on median (`92.1 →
+87.9 ms`, with overlapping ranges), whereas `scan_low` and `scan_high` are
+roughly a tie to slightly slower depending on run-to-run scheduling (with
+per-slice `RowFilter` + `RowGroupCache` boundary-page decompression overhead
+largely offsetting the 4→8 worker concurrency gain on the 4-column scan).
 
 ## 4. `#156` `file-skew` indexed control (`pushdown_filters = false`)
 
@@ -125,6 +131,27 @@ and zero regression (all four queries beat paired stock).
 | `count_low`  |        93.3 (90.9–95.6)  |                        93.6 (91.8–106.1) |                       91.4 (89.2–93.1)  |         0 |
 | `scan_high`  |      197.7 (195.2–199.3) |                      196.4 (194.0–198.1) |                     195.0 (194.2–202.5) |         0 |
 | `count_high` |        93.2 (90.5–93.9)  |                        92.5 (91.5–94.5)  |                       90.1 (88.9–93.7)  |         0 |
+
+## 6. Bounded-pool trade-off
+
+Because only split slices reserve compressed and decoded workspace memory in
+the query `MemoryPool` (legacy unsplit Parquet readers do not reserve against
+the pool), a very tight bounded pool intentionally paces split concurrency to
+stay within budget rather than failing. On `large-row-groups-indexed` with
+`MORSEL_MEMORY_POOL_BYTES=16777216` (`GreedyMemoryPool(16 MiB)`, 8 workers, 1
+warmup + 5 measured runs):
+
+| `pushdown_filters` | Query       | Legacy native (`split=0`) ms, median (range) | Split native (`split=1`) ms, median (range) | Split vs legacy | Split peak unique bytes |
+| ------------------ | ----------- | -------------------------------------------: | ------------------------------------------: | --------------: | ----------------------: |
+| `false`            | `scan_low`  |                          185.7 (184.0–186.7) |                         516.2 (515.4–523.3) |           2.78× |               7,528,132 |
+| `false`            | `count_low` |                            93.6 (93.0–94.9)  |                         115.7 (113.1–116.0) |           1.24× |               6,957,114 |
+| `true`             | `scan_low`  |                          183.6 (182.2–184.3) |                         600.2 (582.7–608.2) |           3.27× |               7,395,622 |
+| `true`             | `count_low` |                            92.2 (92.1–93.0)  |                         117.3 (116.8–119.5) |           1.27× |               6,782,324 |
+
+On wider projections (e.g. 6-column `SELECT *`), per-slice reservations further
+reduce concurrent in-flight slices under a 16 MiB pool (making split native
+~3–7× slower than unsplit legacy native), whereas pools too small to fit even
+one slice fall back cleanly to the unsplit reader before publishing slice 0.
 
 ## Reproduction
 
@@ -159,7 +186,8 @@ MORSEL_PARQUET_RUNNER="$runner" MORSEL_BENCH_REVISION="$rev" \
 "$py" -B "$b/bench.py" generate large-row-groups "$work/large-row-groups-noindex"
 "$py" -B "$b/bench.py" generate large-row-groups "$work/large-row-groups-indexed" --page-index
 "$py" -B "$b/bench.py" generate file-skew "$work/file-skew-indexed" --page-index
-"$py" -B benchmarks/morsel_parquet/harness.py generate "$work/uniform-128rg"
+"$py" -B benchmarks/morsel_parquet/harness.py generate "$work/uniform-128rg" \
+  --files 16 --groups 8 --group-rows 131072
 
 # 1. No-index control
 taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-noindex" \
@@ -172,7 +200,7 @@ taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-group
 # 3. Indexed large-row-groups (pushdown_filters = true): stock vs legacy native vs split native
 taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-indexed" \
   --runner "$runner" --revision "$rev" --enable-page-index --pushdown-filters --compare-split \
-  --warmups 1 --repeats 5 > "$work/lrg-pd1.jsonl"
+  --warmups 1 --repeats 10 > "$work/lrg-pd1.jsonl"
 
 # 4. Indexed file-skew control
 taskset -c 0-7 "$py" -B "$b/bench.py" ab file-skew "$work/file-skew-indexed" \
