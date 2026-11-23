@@ -9,7 +9,9 @@ mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 
-use self::buffered::BufferedReaders;
+use self::buffered::{
+    BufferedReaders, FilteredBufferedReadersConfig, PlainBufferedReaders,
+};
 use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
 use self::encryption::EncryptionContext;
@@ -69,6 +71,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use log::debug;
+use object_store::ObjectStore;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
@@ -310,6 +313,7 @@ pub(super) struct ParquetMorselizer {
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
     pub(super) buffered: bool,
+    pub(super) direct_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -452,6 +456,7 @@ struct PreparedParquetOpen {
     metadata_size_hint: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+    direct_store: Option<Arc<dyn ObjectStore>>,
     schema_provider: Option<Arc<dyn crate::ParquetFileSchemaProvider>>,
     async_file_reader: Box<dyn AsyncFileReader>,
     batch_size: usize,
@@ -1010,6 +1015,7 @@ impl ParquetMorselizer {
             metadata_size_hint,
             metrics: self.metrics.clone(),
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
+            direct_store: self.direct_store.clone(),
             schema_provider: self.schema_provider.clone(),
             async_file_reader,
             batch_size: self.batch_size,
@@ -1799,6 +1805,77 @@ impl RowGroupsPrunedParquetOpen {
                 prepared.partition_index,
                 &prepared.file_name,
             );
+        let prepared_access_plan = prepare_access_plan(access_plan)?;
+        let has_row_selection = prepared_access_plan.has_row_selection;
+
+        // Track how much of this file range the scan has finished with. Credit
+        // up front every row group it will not read: those pruning removed, and
+        // — for a file split into ranges for parallelism — those belonging to
+        // another range. Without this the metric would sit at zero until the
+        // first row group finishes decoding, reporting no progress for a scan
+        // that may have just proved most of its work unnecessary.
+        let mut byte_progress = prepared.byte_progress;
+        // Every row group still in `prepared_access_plan` is one this range owns,
+        // since the plan it was built from was pruned by range with the same
+        // assignment. The planned row groups are therefore a subset of the
+        // in-range ones, and subtracting leaves exactly those the scan will skip.
+        let in_range_bytes: u64 = rg_metadata
+            .iter()
+            .filter(|rg_meta| {
+                prepared.file_range.as_ref().is_none_or(|range| {
+                    row_group_in_range(
+                        rg_meta,
+                        range,
+                        prepared.row_group_range_assignment,
+                    )
+                })
+            })
+            .map(row_group_bytes)
+            .sum();
+        let planned_bytes: u64 = prepared_access_plan
+            .row_groups
+            .iter()
+            .map(|rg| row_group_bytes(&rg_metadata[rg.selection.row_group_index()]))
+            .sum();
+        byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
+
+        if buffered && let Some(row_filter_context) = precomputed_context {
+            let pending: VecDeque<_> = prepared_access_plan
+                .row_groups
+                .into_iter()
+                .map(|rg| {
+                    let rg_index = rg.selection.row_group_index();
+                    let entry = RgPlanEntry {
+                        rg_index,
+                        bytes: row_group_bytes(&rg_metadata[rg_index]),
+                        fully_matched: rg.fully_matched,
+                    };
+                    (rg.selection, entry)
+                })
+                .collect();
+            return Ok(ParquetOpenState::Buffered(Box::new(
+                BufferedReaders::filtered(FilteredBufferedReadersConfig {
+                    pending,
+                    reader_metadata,
+                    projection: Arc::new(decoder_projection),
+                    row_filter_context,
+                    row_filter_skipped_fully_matched,
+                    batch_size: prepared.batch_size,
+                    force_filter_selections: prepared.force_filter_selections,
+                    max_predicate_cache_size: prepared.max_predicate_cache_size,
+                    arrow_reader_metrics,
+                    file_metrics: prepared.file_metrics,
+                    file_name: prepared.file_name.into(),
+                    file_location: prepared.partitioned_file.object_meta.location,
+                    file_size: prepared.partitioned_file.object_meta.size,
+                    baseline: prepared.baseline_metrics,
+                    byte_progress,
+                    async_file_reader: prepared.async_file_reader,
+                    direct_store: prepared.direct_store,
+                }),
+            )));
+        }
+
         let InitialDecoderState {
             decoder,
             rg_plan,
@@ -1821,8 +1898,6 @@ impl RowGroupsPrunedParquetOpen {
                 decoder_limit: decode_order_limit,
             };
 
-            let prepared_access_plan = prepare_access_plan(access_plan)?;
-            let has_row_selection = prepared_access_plan.has_row_selection;
             // Move selections into the decoder, retaining only the metadata
             // needed for pruning, filter toggles, and byte accounting.
             let (selections, rg_plan): (Vec<_>, VecDeque<RgPlanEntry>) =
@@ -1889,44 +1964,19 @@ impl RowGroupsPrunedParquetOpen {
             }
         };
 
-        // Track how much of this file range the scan has finished with. Credit
-        // up front every row group it will not read: those pruning removed, and
-        // — for a file split into ranges for parallelism — those belonging to
-        // another range. Without this the metric would sit at zero until the
-        // first row group finishes decoding, reporting no progress for a scan
-        // that may have just proved most of its work unnecessary.
-        let mut byte_progress = prepared.byte_progress;
-        // Every row group still in `rg_plan` is one this range owns, since the
-        // plan it was built from was pruned by range with the same assignment.
-        // The planned row groups are therefore a subset of the in-range ones,
-        // and subtracting leaves exactly those the scan will skip.
-        let in_range_bytes: u64 = rg_metadata
-            .iter()
-            .filter(|rg_meta| {
-                prepared.file_range.as_ref().is_none_or(|range| {
-                    row_group_in_range(
-                        rg_meta,
-                        range,
-                        prepared.row_group_range_assignment,
-                    )
-                })
-            })
-            .map(row_group_bytes)
-            .sum();
-        let planned_bytes: u64 = rg_plan.iter().map(|entry| entry.bytes).sum();
-        byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
-
         if buffered {
-            return Ok(ParquetOpenState::Buffered(Box::new(BufferedReaders {
-                decoder,
-                reader: prepared.async_file_reader,
-                projection: Arc::new(decoder_projection),
-                file_name: prepared.file_name.into(),
-                baseline: prepared.baseline_metrics,
-                rg_plan,
-                byte_progress,
-                ranges: None,
-            })));
+            return Ok(ParquetOpenState::Buffered(Box::new(
+                BufferedReaders::Plain(PlainBufferedReaders {
+                    decoder,
+                    reader: prepared.async_file_reader,
+                    projection: Arc::new(decoder_projection),
+                    file_name: prepared.file_name.into(),
+                    baseline: prepared.baseline_metrics,
+                    rg_plan,
+                    byte_progress,
+                    ranges: None,
+                }),
+            )));
         }
 
         let predicate_cache_inner_records =
@@ -2775,6 +2825,7 @@ mod test {
                 sort_order_for_reorder: None,
                 virtual_state,
                 buffered: false,
+                direct_store: None,
             })
         }
     }
