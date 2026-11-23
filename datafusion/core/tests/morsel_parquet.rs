@@ -1851,3 +1851,230 @@ async fn intra_rg_splitting_cancellation_and_mid_rg_error_cleanup() -> Result<()
 
     Ok(())
 }
+
+fn wide_six_col_split_fixture(
+    files: usize,
+    rgs_per_file: usize,
+    rows_per_rg: usize,
+) -> Result<TempDir> {
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int64, true),
+        Field::new("c", DataType::Int64, false),
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int64, true),
+    ]));
+    let mut row_start = 0i64;
+    for file in 0..files {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_rg))
+            .set_write_batch_size(40)
+            .set_data_page_row_count_limit(80)
+            .set_data_page_size_limit(512)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("part-{file:03}.parquet")))?,
+            Arc::clone(&schema),
+            Some(props),
+        )?;
+        for _ in 0..rgs_per_file {
+            let ids: Vec<i64> = (row_start..row_start + rows_per_rg as i64).collect();
+            let a: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&i| (i % 19 != 0).then_some(((i * 37) % 1000) as i32))
+                .collect();
+            let b: Vec<Option<i64>> = ids
+                .iter()
+                .map(|&i| (i % 17 != 0).then_some(i * 13 + 5))
+                .collect();
+            let c: Vec<i64> = ids.iter().map(|&i| i * 29 - 11).collect();
+            let d: Vec<Option<i32>> = ids
+                .iter()
+                .map(|&i| (i % 23 != 0).then_some((i % 5) as i32))
+                .collect();
+            let e: Vec<Option<i64>> = ids
+                .iter()
+                .map(|&i| (i % 11 != 0).then_some(i * 41 + 3))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(Int64Array::from(b)),
+                    Arc::new(Int64Array::from(c)),
+                    Arc::new(Int32Array::from(d)),
+                    Arc::new(Int64Array::from(e)),
+                ],
+            )?;
+            writer.write(&batch)?;
+            writer.flush()?;
+            row_start += rows_per_rg as i64;
+        }
+        writer.close()?;
+    }
+    Ok(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_bounded_memory_pool_both_pushdown_modes() -> Result<()> {
+    // 2 files x 2 RGs x 4800 rows, 6 fixed-width columns, 8 workers.
+    let dir = wide_six_col_split_fixture(2, 2, 4800)?;
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+    let queries = [
+        "SELECT * FROM t WHERE a > 100",
+        "SELECT COUNT(*) AS n FROM t WHERE a > 500 AND d = 1",
+    ];
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&dir, "off", 8, pushdown, true, None, None, None).await?;
+        for sql in queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+
+            // 1. Bounded pool smaller than all in-flight slice estimates combined
+            //    (only ~2-3 slices fit at once across 8 workers) must pace cleanly
+            //    via backpressure, split all 4 RGs, and match stock.
+            for round in 0..3 {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(48 << 10));
+                let native = split_context(
+                    &dir,
+                    "required",
+                    8,
+                    pushdown,
+                    true,
+                    Some(split_cfg.clone()),
+                    None,
+                    Some(Arc::clone(&pool)),
+                )
+                .await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let actual = timeout(
+                    Duration::from_secs(15),
+                    collect(Arc::clone(&plan), native.task_ctx()),
+                )
+                .await
+                .expect("timed out under bounded memory pool")?;
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "bounded pool pushdown={pushdown} round={round}: {sql}"
+                );
+                assert_eq!(
+                    metric(plan.as_ref(), "parquet_split_row_groups"),
+                    4,
+                    "expected all 4 RGs to split under 48 KiB pool (pushdown={pushdown}): {sql}"
+                );
+                assert_eq!(pool.reserved(), 0);
+            }
+
+            // 2. Pool smaller than even a single slice must fall back cleanly to
+            //    the unsplit reader before publishing slice 0 instead of erroring.
+            let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+            let native = split_context(
+                &dir,
+                "required",
+                8,
+                pushdown,
+                true,
+                Some(split_cfg.clone()),
+                None,
+                Some(Arc::clone(&tiny_pool)),
+            )
+            .await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            let actual = timeout(
+                Duration::from_secs(15),
+                collect(Arc::clone(&plan), native.task_ctx()),
+            )
+            .await
+            .expect("timed out on tiny-pool fallback")?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "tiny pool fallback pushdown={pushdown}: {sql}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "parquet_split_row_groups"),
+                0,
+                "expected clean unsplit fallback under 1 KiB pool (pushdown={pushdown}): {sql}"
+            );
+            assert_eq!(tiny_pool.reserved(), 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_tight_buffer_cap_both_pushdown_modes() -> Result<()> {
+    // 2 files x 2 RGs x 4800 rows, 6 fixed-width columns, 8 workers.
+    // Tight split_buffer_cap_bytes forces frontier serialization across file
+    // lanes AND slice-by-slice cap backpressure across ready/worker/last-slice
+    // transitions for both plain and multi-conjunct pushed filter paths.
+    let dir = wide_six_col_split_fixture(2, 2, 4800)?;
+    let queries = [
+        ("SELECT * FROM t WHERE a > 100", 48 << 10),
+        (
+            "SELECT COUNT(*) AS n FROM t WHERE a > 500 AND d = 1",
+            16 << 10,
+        ),
+    ];
+
+    for pushdown in [false, true] {
+        let stock =
+            split_context(&dir, "off", 8, pushdown, true, None, None, None).await?;
+        for (sql, tight_cap) in queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let split_cfg = ParquetSplitConfig {
+                enabled: true,
+                min_row_group_rows: 800,
+                target_slice_rows: 300,
+                split_buffer_cap_bytes: tight_cap,
+                ..Default::default()
+            };
+            for round in 0..5 {
+                let pool: Arc<dyn MemoryPool> =
+                    Arc::new(GreedyMemoryPool::new(128 << 10));
+                let native = split_context(
+                    &dir,
+                    "required",
+                    8,
+                    pushdown,
+                    true,
+                    Some(split_cfg.clone()),
+                    None,
+                    Some(Arc::clone(&pool)),
+                )
+                .await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let actual = timeout(
+                    Duration::from_secs(15),
+                    collect(Arc::clone(&plan), native.task_ctx()),
+                )
+                .await
+                .expect("timed out under tight split_buffer_cap_bytes")?;
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "tight cap={tight_cap} pushdown={pushdown} round={round}: {sql}"
+                );
+                assert_eq!(
+                    metric(plan.as_ref(), "parquet_split_row_groups"),
+                    4,
+                    "expected all 4 RGs to split under tight cap={tight_cap} (pushdown={pushdown}, round={round}): {sql}"
+                );
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+    }
+    Ok(())
+}
