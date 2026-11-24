@@ -1623,12 +1623,18 @@ impl ResultBuffer {
                         projector.project_batch(&batch)?
                     }
                 };
-                self.push_view_from(
-                    operators,
-                    index + 1,
-                    BatchView::all(projected),
-                    false,
-                )?;
+                if index + 1 == operators.len() {
+                    if projected.num_rows() != 0 {
+                        return Ok(Some(projected));
+                    }
+                } else {
+                    self.push_view_from(
+                        operators,
+                        index + 1,
+                        BatchView::all(projected),
+                        false,
+                    )?;
+                }
             } else if let Some(batch) = self
                 .source_coalescer
                 .as_mut()
@@ -1837,7 +1843,7 @@ impl Pipeline {
         batch_size: usize,
         worker: WorkerMetrics,
     ) -> impl Stream<Item = Result<RecordBatch>> {
-        let buffer = ResultBuffer::new(&self.operators, batch_size, false);
+        let buffer = Box::new(ResultBuffer::new(&self.operators, batch_size, false));
         stream::try_unfold(
             (self, 0usize, worker, buffer),
             |(pipeline, mut next, mut worker, mut buffer)| async move {

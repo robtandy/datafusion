@@ -592,6 +592,12 @@ impl BatchView {
         // share compacted pass-through columns, and evaluate expressions on
         // compacted rows only.
         let needed_cols = projector.projection().column_indices();
+        let is_identity = needed_cols.len() == self.batch.num_columns()
+            && needed_cols.iter().enumerate().all(|(i, &c)| i == c);
+        if is_identity {
+            let compact = self.materialize()?;
+            return Ok(Self::all(projector.project_batch(&compact)?));
+        }
         let compact = self.materialize_columns(&needed_cols)?;
         let selected_rows = compact.num_rows();
         let mut out_cols = Vec::with_capacity(exprs.len());
@@ -657,10 +663,20 @@ impl BatchView {
                 &RecordBatchOptions::new().with_row_count(Some(selected)),
             )?);
         }
+        let is_identity = columns.len() == self.batch.num_columns()
+            && columns.iter().enumerate().all(|(i, &c)| i == c);
         if self.is_all() {
-            return Ok(self.batch.project(columns)?);
+            return if is_identity {
+                Ok(self.batch.clone())
+            } else {
+                Ok(self.batch.project(columns)?)
+            };
         }
-        let narrowed = self.batch.project(columns)?;
+        let narrowed = if is_identity {
+            self.batch.clone()
+        } else {
+            self.batch.project(columns)?
+        };
         if selected == 0 {
             return Ok(RecordBatch::new_empty(narrowed.schema()));
         }
