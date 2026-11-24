@@ -88,6 +88,18 @@ impl RunMetrics {
         })
     }
 
+    pub(super) fn record_pipeline_time(
+        &self,
+        pipeline: &str,
+        name: &'static str,
+        duration: Duration,
+    ) {
+        MetricBuilder::new(&self.metrics)
+            .with_label(Label::new("pipeline", pipeline.to_owned()))
+            .subset_time(name, 0)
+            .add_duration_exact(duration);
+    }
+
     #[cfg(feature = "parquet")]
     pub(super) async fn io<T>(self: Arc<Self>, future: impl Future<Output = T>) -> T {
         struct IoWait {
@@ -133,6 +145,7 @@ impl Drop for RunMetrics {
 pub(super) struct WorkerMetrics {
     run: Option<Arc<RunMetrics>>,
     id: usize,
+    pipeline: Option<String>,
     claimed: usize,
     completed: usize,
     decode: Duration,
@@ -146,7 +159,31 @@ impl WorkerMetrics {
         Self {
             run,
             id,
-            ..Self::default()
+            pipeline: None,
+            claimed: 0,
+            completed: 0,
+            decode: Duration::ZERO,
+            process: Duration::ZERO,
+            ready_wait: Duration::ZERO,
+            output_wait: Duration::ZERO,
+        }
+    }
+
+    pub(super) fn for_pipeline(
+        run: Option<Arc<RunMetrics>>,
+        id: usize,
+        pipeline: impl Into<String>,
+    ) -> Self {
+        Self {
+            run,
+            id,
+            pipeline: Some(pipeline.into()),
+            claimed: 0,
+            completed: 0,
+            decode: Duration::ZERO,
+            process: Duration::ZERO,
+            ready_wait: Duration::ZERO,
+            output_wait: Duration::ZERO,
         }
     }
 
@@ -193,8 +230,12 @@ impl Drop for WorkerMetrics {
     fn drop(&mut self) {
         let Some(run) = &self.run else { return };
         let builder = || {
-            MetricBuilder::new(&run.metrics)
-                .with_label(Label::new("worker", self.id.to_string()))
+            let mut b = MetricBuilder::new(&run.metrics)
+                .with_label(Label::new("worker", self.id.to_string()));
+            if let Some(pipeline) = &self.pipeline {
+                b = b.with_label(Label::new("pipeline", pipeline.clone()));
+            }
+            b
         };
         builder().counter("morsels_claimed", 0).add(self.claimed);
         builder()

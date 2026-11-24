@@ -341,6 +341,7 @@ impl ParquetScan {
                     first_projection = Some(idx);
                     break;
                 }
+                Operator::HashProbe(_) => break,
             }
         }
         if first_projection.is_some() || is_count_sink {
@@ -384,6 +385,7 @@ impl ParquetScan {
                                         )?;
                                     remapped.push(Operator::Projection(proj));
                                 }
+                                Operator::HashProbe(_) => unreachable!(),
                             }
                         }
                         for (slot, op) in operators[..end].iter_mut().zip(remapped) {
@@ -402,6 +404,17 @@ impl ParquetScan {
 
     pub(super) fn pushed_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.config.as_ref()?.file_source().exact_filter()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub(super) fn total_file_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .map(|f| f.object_meta.size)
+            .fold(0u64, u64::saturating_add)
     }
 
     pub(super) fn apply_expressions(
