@@ -168,6 +168,17 @@ class RunnerTest(unittest.TestCase):
                         (stock["mode"], native["mode"]), ("off", "required")
                     )
                     self.assertIsNone(stock["worker_claims"])
+                    for field in (
+                        "morsel_decode_work_ms",
+                        "morsel_process_work_ms",
+                        "morsel_ready_wait_ms",
+                        "morsel_output_wait_ms",
+                        "morsel_pending_io_ms",
+                        "morsel_peak_ready_depth",
+                        "morsel_peak_output_depth",
+                    ):
+                        self.assertIsNone(stock[field])
+                        self.assertGreaterEqual(native[field], 0)
                     claims = native["worker_claims"]
                     self.assertEqual(len(claims), WORKERS)
                     self.assertEqual(sum(claims), sum(groups))

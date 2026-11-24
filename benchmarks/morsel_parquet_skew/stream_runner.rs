@@ -125,25 +125,17 @@ async fn run(
     drop(stream);
     if !csv {
         let runs = metrics.take_runs();
-        let (claims, completions, decode_ms, process_ms, ready_wait_ms, pending_io_ms) =
-            match (mode, runs.as_slice()) {
-                (MorselMode::Required, [run]) => (
-                    Some(worker_counts(run, "morsels_claimed", workers)?),
-                    Some(worker_counts(run, "morsels_completed", workers)?),
-                    Some(run_time_ms(run, "morsel_decode_work")),
-                    Some(run_time_ms(run, "morsel_process_work")),
-                    Some(run_time_ms(run, "morsel_ready_wait")),
-                    Some(run_time_ms(run, "morsel_pending_io")),
-                ),
-                (MorselMode::Off, []) => (None, None, None, None, None, None),
-                _ => {
-                    return Err(format!(
-                        "unexpected number of native reports: {}",
-                        runs.len()
-                    )
-                    .into());
-                }
-            };
+        let native = match (mode, runs.as_slice()) {
+            (MorselMode::Required, [run]) => Some(NativeReport::from_run(run, workers)?),
+            (MorselMode::Off, []) => None,
+            _ => {
+                return Err(format!(
+                    "unexpected number of native reports: {}",
+                    runs.len()
+                )
+                .into());
+            }
+        };
         println!(
             "{}",
             json!({
@@ -163,22 +155,57 @@ async fn run(
                 "parquet_split_reused_bytes": metric(plan.as_ref(), "parquet_split_reused_bytes"),
                 "parquet_split_peak_unique_compressed_bytes": metric(plan.as_ref(), "parquet_split_peak_unique_compressed_bytes"),
                 "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
-                "worker_claims": claims,
-                "worker_completions": completions,
-                "morsel_decode_work_ms": decode_ms,
-                "morsel_process_work_ms": process_ms,
-                "morsel_ready_wait_ms": ready_wait_ms,
-                "morsel_pending_io_ms": pending_io_ms,
+                "worker_claims": native.as_ref().map(|r| &r.claims),
+                "worker_completions": native.as_ref().map(|r| &r.completions),
+                "morsel_decode_work_ms": native.as_ref().map(|r| r.decode_ms),
+                "morsel_process_work_ms": native.as_ref().map(|r| r.process_ms),
+                "morsel_ready_wait_ms": native.as_ref().map(|r| r.ready_wait_ms),
+                "morsel_output_wait_ms": native.as_ref().map(|r| r.output_wait_ms),
+                "morsel_pending_io_ms": native.as_ref().map(|r| r.pending_io_ms),
+                "morsel_peak_ready_depth": native.as_ref().map(|r| r.peak_ready_depth),
+                "morsel_peak_output_depth": native.as_ref().map(|r| r.peak_output_depth),
             })
         );
     }
     Ok(())
 }
 
-fn run_time_ms(
-    run: &datafusion::physical_plan::metrics::MetricsSet,
-    name: &str,
-) -> f64 {
+struct NativeReport {
+    claims: Vec<usize>,
+    completions: Vec<usize>,
+    decode_ms: f64,
+    process_ms: f64,
+    ready_wait_ms: f64,
+    output_wait_ms: f64,
+    pending_io_ms: f64,
+    peak_ready_depth: usize,
+    peak_output_depth: usize,
+}
+
+impl NativeReport {
+    fn from_run(
+        run: &datafusion::physical_plan::metrics::MetricsSet,
+        workers: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            claims: worker_counts(run, "morsels_claimed", workers)?,
+            completions: worker_counts(run, "morsels_completed", workers)?,
+            decode_ms: run_time_ms(run, "morsel_decode_work"),
+            process_ms: run_time_ms(run, "morsel_process_work"),
+            ready_wait_ms: run_time_ms(run, "morsel_ready_wait"),
+            output_wait_ms: run_time_ms(run, "morsel_output_wait"),
+            pending_io_ms: run_time_ms(run, "morsel_pending_io"),
+            peak_ready_depth: run_usize(run, "morsel_peak_ready_depth"),
+            peak_output_depth: run_usize(run, "morsel_peak_output_depth"),
+        })
+    }
+}
+
+fn run_usize(run: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> usize {
+    run.sum_by_name(name).map_or(0, |v| v.as_usize())
+}
+
+fn run_time_ms(run: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> f64 {
     run.sum_by_name(name)
         .map_or(0.0, |v| v.as_usize() as f64 / 1e6)
 }
