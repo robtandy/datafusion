@@ -719,7 +719,7 @@ async fn high_cardinality_skewed_concurrent_and_metrics() -> Result<()> {
         Field::new("gate", DataType::Int32, false),
     ]));
     let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); 4];
-    for b in 0..24usize {
+    for b in 0..32usize {
         let n = 1024usize;
         let start = b * n;
         let skewed: Vec<Option<String>> = (start..start + n)
@@ -734,7 +734,7 @@ async fn high_cardinality_skewed_concurrent_and_metrics() -> Result<()> {
             })
             .collect();
         let high_card: Vec<String> = (start..start + n)
-            .map(|i| format!("grp_{:05}", (i * 2654435761) % 15_000))
+            .map(|i| format!("grp_{:05}", (i * 2654435761) % 25_000))
             .collect();
         let k2: Vec<i32> = (start..start + n).map(|i| (i % 3) as i32).collect();
         let val: Vec<Option<i128>> = (start..start + n)
@@ -754,56 +754,94 @@ async fn high_cardinality_skewed_concurrent_and_metrics() -> Result<()> {
         partitions[b % 4].push(batch);
     }
 
-    let table = Arc::new(MemTable::try_new(Arc::clone(&schema), partitions.clone())?);
-    let metrics = Arc::new(MorselMetrics::default());
-    let stock =
-        SessionContext::new_with_config(SessionConfig::new().with_batch_size(512));
-    let native = morsel_context_with_config(
-        4,
-        SessionConfig::new()
-            .with_batch_size(512)
-            .with_extension(Arc::clone(&metrics)),
-    );
-    native
-        .sql("SET datafusion.execution.morsel_mode = 'required'")
-        .await?;
-    for ctx in [&stock, &native] {
-        ctx.register_table("big", table.clone())?;
-    }
-
-    for sql in [
+    let queries = [
         "SELECT skewed, COUNT(*) AS n, COUNT(val) AS nv, SUM(val) AS s, AVG(val) AS a, MIN(val) AS lo, MAX(val) AS hi FROM big WHERE gate < 7 GROUP BY skewed",
+        "SELECT high_card, COUNT(*) AS n, SUM(val) AS s, AVG(val) AS a FROM big GROUP BY high_card",
         "SELECT high_card, k2, COUNT(*) AS n, SUM(val) AS s, AVG(val) AS a FROM big GROUP BY high_card, k2",
         "SELECT COUNT(*) AS n, SUM(val) AS s, AVG(val) AS a, MIN(val) AS lo, MAX(val) AS hi FROM big WHERE gate >= 2",
+    ];
+
+    let table = Arc::new(MemTable::try_new(Arc::clone(&schema), partitions.clone())?);
+    let dir = TempDir::new()?;
+    write_parquet_files(&dir, &schema, &partitions, 2048)?;
+
+    for (label, is_parquet, pushdown) in [
+        ("memtable", false, false),
+        ("parquet_no_pushdown", true, false),
+        ("parquet_pushdown", true, true),
     ] {
-        let stock_plan = physical(&stock, sql).await?;
-        let native_plan = physical(&native, sql).await?;
-        assert_eq!(native_plan.name(), "MorselExec");
-        let expected = sorted_rows(&collect(stock_plan, stock.task_ctx()).await?)?;
-        let (a, b) = tokio::try_join!(
-            collect(Arc::clone(&native_plan), native.task_ctx()),
-            collect(Arc::clone(&native_plan), native.task_ctx()),
-        )?;
-        assert_eq!(sorted_rows(&a)?, expected, "{sql}");
-        assert_eq!(sorted_rows(&b)?, expected, "{sql}");
-        let runs = metrics.take_runs();
-        assert_eq!(runs.len(), 2, "{sql}");
-        for run in &runs {
+        let metrics = Arc::new(MorselMetrics::default());
+        let mut stock_cfg = SessionConfig::new()
+            .with_batch_size(512)
+            .with_target_partitions(4);
+        stock_cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+        stock_cfg.options_mut().execution.collect_statistics = false;
+        let native_cfg = stock_cfg.clone().with_extension(Arc::clone(&metrics));
+
+        let stock = SessionContext::new_with_config(stock_cfg);
+        let native = morsel_context_with_config(4, native_cfg);
+        native
+            .sql("SET datafusion.execution.morsel_mode = 'required'")
+            .await?;
+        for ctx in [&stock, &native] {
+            if is_parquet {
+                ctx.register_parquet(
+                    "big",
+                    dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            } else {
+                ctx.register_table("big", table.clone())?;
+            }
+        }
+
+        for sql in queries {
+            let stock_plan = physical(&stock, sql).await?;
+            let native_plan = physical(&native, sql).await?;
+            assert_eq!(native_plan.name(), "MorselExec", "{label}: {sql}");
+            let display = displayable(native_plan.as_ref()).indent(false).to_string();
             assert!(
-                run.sum_by_name("morsels_claimed").unwrap().as_usize() > 0,
-                "{sql}"
+                display.contains("AggregateSink"),
+                "{label}: {sql}: {display}"
             );
-            assert!(
-                run.sum_by_name("morsels_completed").unwrap().as_usize() > 0,
-                "{sql}"
+            if is_parquet {
+                assert!(
+                    display.contains("NativeParquet[big"),
+                    "{label}: {sql}: {display}"
+                );
+            }
+            let expected = sorted_rows(&collect(stock_plan, stock.task_ctx()).await?)?;
+            let (a, b) = tokio::try_join!(
+                collect(Arc::clone(&native_plan), native.task_ctx()),
+                collect(Arc::clone(&native_plan), native.task_ctx()),
+            )?;
+            assert_eq!(sorted_rows(&a)?, expected, "{label}: {sql}");
+            assert_eq!(sorted_rows(&b)?, expected, "{label}: {sql}");
+            assert_eq!(
+                metric(native_plan.as_ref(), "aggregate_finalizations"),
+                2,
+                "{label}: {sql}"
             );
-            assert!(
-                run.sum_by_name("morsel_peak_output_depth")
-                    .unwrap()
-                    .as_usize()
-                    > 0,
-                "{sql}"
-            );
+            let runs = metrics.take_runs();
+            assert_eq!(runs.len(), 2, "{label}: {sql}");
+            for run in &runs {
+                assert!(
+                    run.sum_by_name("morsels_claimed").unwrap().as_usize() > 0,
+                    "{label}: {sql}"
+                );
+                assert!(
+                    run.sum_by_name("morsels_completed").unwrap().as_usize() > 0,
+                    "{label}: {sql}"
+                );
+                assert!(
+                    run.sum_by_name("morsel_peak_output_depth")
+                        .unwrap()
+                        .as_usize()
+                        > 0,
+                    "{label}: {sql}"
+                );
+            }
         }
     }
     Ok(())

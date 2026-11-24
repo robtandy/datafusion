@@ -62,9 +62,8 @@ source (`NativeParquet[lineitem]`) full multi-file parallelism.
 
 ### Roadmap TPC-H Queries (Stock DataFusion vs DuckDB; Morsel Not Yet Admitted)
 
-These four standard TPC-H queries match `benchmarks/queries/{q6,q1,q3,q12}.sql`:
+These three standard TPC-H queries match `benchmarks/queries/{q1,q3,q12}.sql`:
 
-- **`q6`**: Filtered `SUM(l_extendedprice * l_discount)` over `lineitem`.
 - **`q1`**: Filtered grouped multi-aggregate (`SUM`, `AVG`, `COUNT`) + `ORDER BY`
   over `lineitem`.
 - **`q3`**: 3-way join (`customer`, `orders`, `lineitem`) + filter + `GROUP BY` +
@@ -73,22 +72,28 @@ These four standard TPC-H queries match `benchmarks/queries/{q6,q1,q3,q12}.sql`:
   `GROUP BY` + `ORDER BY`.
 
 `harness.py verify` checks that `morsel_mode=required` explicitly rejects these
-four queries at planning time (until ungrouped `SUM`, multi-aggregate `GROUP BY`,
-`HashJoin`, and `Sort`/`TopN` land in the morsel planner):
+three queries at planning time (until `HashJoin` and `Sort`/`TopN` land in the
+morsel planner):
 
-- `q6`: `only an ungrouped COUNT(*) over filtered input is supported`
 - `q1`: `unsupported logical operator: Sort: lineitem.l_returnflag ASC NULLS LAST, lineitem.l_linestatus ASC NULLS LAST`
 - `q3`: `unsupported logical operator: Sort: revenue DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=10`
 - `q12`: `unsupported logical operator: Sort: lineitem.l_shipmode ASC NULLS LAST`
 
 ### Currently-Admitted Morsel-Native Queries (Live 3-Way Comparison)
 
-Both queries run directly over the real TPC-H `lineitem` Parquet schema
-(`l_quantity`, `l_extendedprice`, `l_discount` as `DECIMAL(15,2)`, `l_shipdate`
-as `DATE32`, `l_orderkey` as `INT64`) — no casts or schema workarounds are
-needed; `morsel_mode=required` admits both natively under `MorselExec` +
-`NativeParquet[lineitem]`:
+All four queries run directly over the real TPC-H `lineitem` Parquet schema
+(`l_quantity`, `l_extendedprice`, `l_discount`, `l_tax` as `DECIMAL(15,2)`,
+`l_shipdate` as `DATE32`, `l_orderkey` as `INT64`, `l_returnflag` /
+`l_linestatus` as `Utf8View`) — no casts or schema workarounds are needed;
+`morsel_mode=required` admits all four natively under `MorselExec` +
+`NativeParquet[lineitem]` (see [morsel_aggregate.md](morsel_aggregate.md) for
+SF1 Q6 and unordered Q1 results):
 
+- **`q6`**: Standard TPC-H Q6 (matching `benchmarks/queries/q6.sql`) — filtered
+  ungrouped `SUM(l_extendedprice * l_discount)` over `lineitem`.
+- **`q1_unordered`**: TPC-H Q1 without `ORDER BY` — filtered grouped
+  multi-aggregate (`4× SUM`, `3× AVG`, `COUNT(*)`) over
+  `(l_returnflag, l_linestatus)` on `lineitem`.
 - **`q6_count`**:
 
   ```sql
@@ -121,20 +126,22 @@ even rounds.
 
 ### Scan Profiles and Arm Labels
 
-| Arm                  | Engine     | `morsel_mode` | Scan profile settings                                                                                                                                          |
-| -------------------- | ---------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stock_no_pushdown`  | DataFusion | `off`         | `pushdown_filters=false`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false`, `repartition_file_scans=false`, `collect_statistics=false` |
-| `morsel_no_pushdown` | DataFusion | `required`    | Same as `stock_no_pushdown` (exact apples-to-apples scan configuration matching `benchmarks/morsel_parquet`)                                                   |
-| `morsel_pruning`     | DataFusion | `required`    | `pushdown_filters=false`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`     |
-| `stock_default`      | DataFusion | `off`         | DataFusion defaults (`pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `repartition_file_scans=true`, `collect_statistics=true`)             |
-| `stock_pushdown`     | DataFusion | `off`         | DataFusion defaults + `pushdown_filters=true`, `reorder_filters=true`                                                                                          |
-| `duckdb_default`     | DuckDB     | —             | DuckDB defaults (`SET threads = 8`, `read_parquet(...)` with built-in pruning and filter pushdown)                                                             |
+| Arm                  | Engine     | `morsel_mode` | Scan profile settings                                                                                                                                                              |
+| -------------------- | ---------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stock_no_pushdown`  | DataFusion | `off`         | `pushdown_filters=false`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false`, `repartition_file_scans=false`, `collect_statistics=false`                     |
+| `morsel_no_pushdown` | DataFusion | `required`    | Same as `stock_no_pushdown` (exact apples-to-apples scan configuration matching `benchmarks/morsel_parquet`)                                                                       |
+| `morsel_pruning`     | DataFusion | `required`    | `pushdown_filters=false`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`                         |
+| `morsel_pushdown`    | DataFusion | `required`    | `pushdown_filters=true`, `reorder_filters=true`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`  |
+| `stock_default`      | DataFusion | `off`         | DataFusion defaults (`pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `repartition_file_scans=true`, `collect_statistics=true`)                                 |
+| `stock_pushdown`     | DataFusion | `off`         | DataFusion defaults + `pushdown_filters=true`, `reorder_filters=true`                                                                                                              |
+| `duckdb_default`     | DuckDB     | —             | DuckDB defaults (`SET threads = 8`, `read_parquet(...)` with built-in pruning and filter pushdown)                                                                                 |
 
 Note on `repartition_file_scans`: `morsel_mode=required` currently rejects
 byte-range split Parquet files (`file.range.is_some()`), which `stock_default`
-enables via `repartition_file_scans=true`. Therefore `morsel_no_pushdown` and
-`morsel_pruning` both set `repartition_file_scans=false`, while `stock_default`
-and `stock_pushdown` retain DataFusion's unmodified defaults.
+enables via `repartition_file_scans=true`. Therefore `morsel_no_pushdown`,
+`morsel_pruning`, and `morsel_pushdown` all set `repartition_file_scans=false`,
+while `stock_default` and `stock_pushdown` retain DataFusion's unmodified
+defaults.
 
 ### Timing Boundary and Warm Page Cache
 
@@ -163,19 +170,21 @@ lossless Arrow IPC streams (`arrow::ipc::writer::StreamWriter` in Rust,
 
 - Ordered queries (`q6`, `q1`, `q3`, `q12`, `q6_count`) require exact row order
   and exact values.
-- Unordered `q6_scan` checks exact multiset equality across all rows (sorted by
-  exact numeric keys, verifying multiplicity and exact `DECIMAL` revenue values).
+- Unordered queries (`q1_unordered`, `q6_scan`) check exact multiset equality
+  across all rows (sorted by exact keys, verifying multiplicity and exact
+  `DECIMAL` values).
 - Cross-engine type normalization is restricted to two documented cases:
-  - `q1` `AVG(DECIMAL(15,2))`: DuckDB returns `float64`, while DataFusion
-    returns `DECIMAL(19,6)`; verified within the Decimal's 6-digit scale
-    (`abs_tol=1e-6`, `rel_tol=1e-9`).
+  - `q1` / `q1_unordered` `AVG(DECIMAL(15,2))`: DuckDB returns `float64`, while
+    DataFusion returns `DECIMAL(19,6)`; verified within the Decimal's 6-digit
+    scale (`abs_tol=1e-6`, `rel_tol=1e-9`).
   - `q12` `SUM(CASE ... THEN 1 ELSE 0 END)`: DuckDB returns `DECIMAL(38,0)`
     while DataFusion returns `INT64`; verified by exact integer/Decimal
     equality.
 - Every timed DataFusion trial re-validates the runner git revision, drained row
   count, and physical plan (`DataSourceExec` without `MorselExec` for `off`;
-  `MorselExec` + `NativeParquet[lineitem]`, row-group claims, and `CountSink` /
-  `count_finalizations` matching `q6_count` vs `q6_scan` for `required`).
+  `MorselExec` + `NativeParquet[lineitem...]`, row-group claims, `CountSink` /
+  `count_finalizations`, and `AggregateSink` / `aggregate_finalizations`
+  matching the workload for `required`).
 
 ## Reproduction Commands
 
@@ -339,6 +348,7 @@ same `bytes_scanned` as Stock DataFusion (`16,509,334` bytes for `q6_count`;
     (`to_arrow_reader(8192)`), which includes Parquet footer reads and Arrow
     conversion; DataFusion's `total ms` includes `register_parquet` + planning +
     `execute_stream` drain without Arrow IPC serialization.
-  - `q6`, `q1`, `q3`, and `q12` will become eligible for 3-way morsel
-    comparison once ungrouped `SUM`, multi-aggregate `GROUP BY`, `HashJoin`, and
-    `Sort`/`TopN` are implemented in `MorselQueryPlanner`.
+  - `q6` and `q1_unordered` are now natively admitted in `morsel_mode=required`
+    (see [morsel_aggregate.md](morsel_aggregate.md)); `q1` (with `ORDER BY`),
+    `q3`, and `q12` remain roadmap queries until `HashJoin` and `Sort`/`TopN`
+    are implemented in `MorselQueryPlanner`.
