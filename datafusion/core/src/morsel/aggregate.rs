@@ -1123,18 +1123,28 @@ impl DirectAggState {
             }
             Self::CountCol { col, counts } => {
                 let array = batch.column(*col);
-                if array.null_count() == 0 {
+                if matches!(array.data_type(), DataType::Null) {
+                    // Every element of a NullArray is logically NULL.
+                } else if let Some(nulls) = array.logical_nulls() {
+                    let null_count = nulls.null_count();
+                    if null_count == 0 {
+                        for &gid in group_indices {
+                            counts[gid] =
+                                counts[gid].checked_add(1).ok_or_else(count_overflow)?;
+                        }
+                    } else if null_count < array.len() {
+                        for_each_selected_row!(row, gid => {
+                            if nulls.is_valid(row) {
+                                counts[gid] =
+                                    counts[gid].checked_add(1).ok_or_else(count_overflow)?;
+                            }
+                        });
+                    }
+                } else {
                     for &gid in group_indices {
                         counts[gid] =
                             counts[gid].checked_add(1).ok_or_else(count_overflow)?;
                     }
-                } else if array.null_count() < array.len() {
-                    let nulls = array.nulls().unwrap();
-                    for_each_selected_row!(row, gid => {
-                        if nulls.is_valid(row) {
-                            counts[gid] = counts[gid].checked_add(1).ok_or_else(count_overflow)?;
-                        }
-                    });
                 }
             }
             Self::SumInt64 { col, sums, has_val } => {
@@ -2390,6 +2400,89 @@ mod tests {
             );
         }
         assert_eq!(tight.reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_grouped_count_col_handles_null_type_and_dict_logical_nulls_across_selections()
+    -> Result<()> {
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("n", DataType::Null, true),
+            Field::new("d", dict_type, true),
+        ]));
+        let ctx = crate::prelude::SessionContext::new();
+        let mem = Arc::new(crate::datasource::MemTable::try_new(
+            Arc::clone(&input_schema),
+            vec![vec![]],
+        )?);
+        ctx.register_table("t", mem)?;
+        let logical = ctx
+            .table("t")
+            .await?
+            .aggregate(vec![col("k")], vec![count(col("n")), count(col("d"))])?
+            .into_unoptimized_plan();
+        let LogicalPlan::Aggregate(aggregate) = logical else {
+            unreachable!();
+        };
+        let sink = AggregateSink::try_new(&aggregate, &input_schema, &ctx.state())?
+            .expect("valid aggregate sink");
+        assert!(sink.direct_grouped.is_some());
+
+        let dict_values = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+        let dict_keys = Int32Array::from(vec![
+            Some(0), // k=1, "a" -> counted
+            Some(1), // k=1, NULL in dict -> NOT counted
+            None,    // k=1, NULL key -> NOT counted
+            Some(2), // k=2, "b" -> counted
+            Some(1), // k=2, NULL in dict -> NOT counted
+        ]);
+        let dict_arr =
+            arrow::array::DictionaryArray::<Int32Type>::try_new(dict_keys, dict_values)?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2])),
+                Arc::new(arrow::array::NullArray::new(5)),
+                Arc::new(dict_arr),
+            ],
+        )?;
+
+        let mask = arrow::array::BooleanArray::from(vec![true, true, false, true, true]);
+        let view_all = BatchView::all(batch.clone());
+        let view_mask = BatchView::from_boolean_array(batch, &mask)?;
+        let view_idx = view_mask.clone().with_indices_selection();
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        for (label, view) in [
+            ("all", view_all),
+            ("mask", view_mask),
+            ("indices", view_idx),
+        ] {
+            let mut state = sink.new_state(test_reservation(&pool))?;
+            state.add_view(&view)?;
+            let (tx, mut rx) = mpsc::channel(4);
+            let finalized = sink.finalize(state);
+            let emit =
+                SpawnedTask::spawn(
+                    async move { finalized.emit(&[], 16, tx, None).await },
+                );
+            let mut map = std::collections::BTreeMap::new();
+            while let Some(b) = rx.recv().await {
+                let ks = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let cn = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let cd = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    map.insert(ks.value(i), (cn.value(i), cd.value(i)));
+                }
+            }
+            emit.join_unwind().await.unwrap()?;
+            assert_eq!(map[&1], (0, 1), "{label}");
+            assert_eq!(map[&2], (0, 1), "{label}");
+        }
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 }
