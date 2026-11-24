@@ -296,6 +296,13 @@ ARMS: dict[str, Arm] = {
         profile="pushdown",
         label="Stock DataFusion (pushdown_filters=true, reorder_filters=true)",
     ),
+    "stock_pushdown_no_repartition": Arm(
+        name="stock_pushdown_no_repartition",
+        engine="datafusion",
+        mode="off",
+        profile="pushdown_no_repartition",
+        label="Stock DataFusion (pushdown_filters=true, reorder_filters=true, repartition_file_scans=false)",
+    ),
     "duckdb_default": Arm(
         name="duckdb_default",
         engine="duckdb",
@@ -312,6 +319,7 @@ DEFAULT_MORSEL_ARMS = (
     "morsel_pruning",
     "stock_default",
     "stock_pushdown",
+    "morsel_pushdown",
     "duckdb_default",
 )
 
@@ -559,6 +567,7 @@ def _duckdb_exec(
 
     if operation == "measure":
         start = time.perf_counter()
+        cpu_start = time.process_time()
         reader = con.sql(sql).to_arrow_reader(batch_size=BATCH_SIZE)
         output_rows = 0
         output_batches = 0
@@ -577,6 +586,7 @@ def _duckdb_exec(
                     if reached_8192:
                         first_8192_seconds = elapsed
         seconds = time.perf_counter() - start
+        exec_cpu_seconds = time.process_time() - cpu_start
         plan_rows = con.execute(f"EXPLAIN {sql}").fetchall()
         plan = "\n".join(str(r[1]) for r in plan_rows)
         print(
@@ -588,6 +598,7 @@ def _duckdb_exec(
                     "register_seconds": None,
                     "plan_seconds": None,
                     "exec_seconds": None,
+                    "exec_cpu_seconds": exec_cpu_seconds,
                     "first_output_seconds": first_output_seconds,
                     "first_8192_seconds": first_8192_seconds,
                     "seconds": seconds,
@@ -596,6 +607,16 @@ def _duckdb_exec(
                     "count_finalizations": None,
                     "aggregate_finalizations": None,
                     "bytes_scanned": None,
+                    "worker_claims": None,
+                    "worker_completions": None,
+                    "morsel_decode_work_ms": None,
+                    "morsel_process_work_ms": None,
+                    "morsel_ready_wait_ms": None,
+                    "morsel_output_wait_ms": None,
+                    "morsel_pending_io_ms": None,
+                    "morsel_peak_ready_depth": None,
+                    "morsel_peak_output_depth": None,
+                    "operator_compute_ms": None,
                 }
             )
         )
@@ -989,6 +1010,60 @@ def summarize_jsonl(path: Path):
             f"{exec_str} | {rows[0]['output_rows']:,} | "
             f"{rows[0]['output_batches']:,} | {morsels_str} |"
         )
+
+    morsel_groups = [
+        ((case, arm), rows)
+        for (case, arm), rows in grouped.items()
+        if any(r.get("morsel_decode_work_ms") is not None for r in rows)
+    ]
+    if morsel_groups:
+        print()
+        print(
+            "| Query | Arm | Decode work ms | Process work ms | Ready wait ms | "
+            "Output wait ms | Pending IO ms | Peak ready/out |"
+        )
+        print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for (case, arm), rows in morsel_groups:
+            decode = statistics.median(
+                r["morsel_decode_work_ms"]
+                for r in rows
+                if r.get("morsel_decode_work_ms") is not None
+            )
+            process = statistics.median(
+                r["morsel_process_work_ms"]
+                for r in rows
+                if r.get("morsel_process_work_ms") is not None
+            )
+            ready = statistics.median(
+                r["morsel_ready_wait_ms"]
+                for r in rows
+                if r.get("morsel_ready_wait_ms") is not None
+            )
+            output = statistics.median(
+                r["morsel_output_wait_ms"]
+                for r in rows
+                if r.get("morsel_output_wait_ms") is not None
+            )
+            pending_io = statistics.median(
+                r["morsel_pending_io_ms"]
+                for r in rows
+                if r.get("morsel_pending_io_ms") is not None
+            )
+            peak_ready = max(
+                r["morsel_peak_ready_depth"]
+                for r in rows
+                if r.get("morsel_peak_ready_depth") is not None
+            )
+            peak_out = max(
+                r["morsel_peak_output_depth"]
+                for r in rows
+                if r.get("morsel_peak_output_depth") is not None
+            )
+            print(
+                f"| `{case}` | `{arm}` | {decode:.1f} | {process:.1f} | "
+                f"{ready:.1f} | {output:.1f} | {pending_io:.1f} | "
+                f"{peak_ready}/{peak_out} |"
+            )
 
 
 def positive_int(value: str) -> int:

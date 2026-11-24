@@ -242,8 +242,23 @@ class TpchHarnessTest(unittest.TestCase):
                 for e in report["evidence"]
                 if e["mode"] == "required"
             }
-            self.assertIn(("q6_count", "morsel_no_pushdown"), morsel_ev)
-            self.assertIn(("q6_scan", "morsel_no_pushdown"), morsel_ev)
+            for qname in ("q6", "q1_unordered", "q6_count", "q6_scan"):
+                for arm_name in (
+                    "morsel_no_pushdown",
+                    "morsel_pruning",
+                    "morsel_pushdown",
+                ):
+                    self.assertIn((qname, arm_name), morsel_ev)
+            self.assertEqual(
+                morsel_ev[("q6", "morsel_no_pushdown")]["aggregate_finalizations"],
+                1,
+            )
+            self.assertEqual(
+                morsel_ev[("q1_unordered", "morsel_pushdown")][
+                    "aggregate_finalizations"
+                ],
+                1,
+            )
             self.assertEqual(
                 morsel_ev[("q6_count", "morsel_no_pushdown")][
                     "parquet_morsels_claimed"
@@ -327,6 +342,32 @@ class TpchHarnessTest(unittest.TestCase):
                 self.assertGreater(before["total"], 0)
                 self.assertEqual(before["resident"], before["total"])
                 self.assertEqual(after["resident"], after["total"])
+                morsel_metric_fields = (
+                    "morsel_decode_work_ms",
+                    "morsel_process_work_ms",
+                    "morsel_ready_wait_ms",
+                    "morsel_output_wait_ms",
+                    "morsel_pending_io_ms",
+                    "morsel_peak_ready_depth",
+                    "morsel_peak_output_depth",
+                )
+                if trial["mode"] == "required":
+                    for field in morsel_metric_fields:
+                        self.assertIsNotNone(trial[field], msg=field)
+                        self.assertGreaterEqual(trial[field], 0, msg=field)
+                    self.assertEqual(len(trial["worker_claims"]), 2)
+                    self.assertEqual(
+                        sum(trial["worker_claims"]), trial["parquet_morsels_claimed"]
+                    )
+                    self.assertEqual(
+                        sum(trial["worker_completions"]),
+                        trial["parquet_morsels_claimed"],
+                    )
+                else:
+                    for field in morsel_metric_fields:
+                        self.assertIsNone(trial[field], msg=field)
+                    self.assertIsNone(trial["worker_claims"])
+                    self.assertIsNone(trial["worker_completions"])
 
             # Verify alternating arm order on q6_count between rep 1 and rep 2.
             rep1_arms = [
@@ -353,10 +394,13 @@ class TpchHarnessTest(unittest.TestCase):
             )
             for expected_token in (
                 "`q6`",
+                "`q1_unordered`",
                 "`q6_count`",
                 "`q6_scan`",
                 "`stock_no_pushdown`",
                 "`morsel_no_pushdown`",
                 "`duckdb_default`",
+                "Decode work ms",
+                "Process work ms",
             ):
                 self.assertIn(expected_token, summary)
