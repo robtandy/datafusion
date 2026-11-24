@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io;
 use std::path::Path;
@@ -425,6 +425,7 @@ fn worker_counts(
     name: &str,
     workers: usize,
 ) -> Result<Vec<usize>, Box<dyn Error>> {
+    let mut seen: BTreeSet<(Option<String>, usize)> = BTreeSet::new();
     let mut counts = vec![None; workers];
     for metric in run.iter().filter(|metric| metric.value().name() == name) {
         let worker: usize = metric
@@ -434,10 +435,19 @@ fn worker_counts(
             .ok_or("missing worker label")?
             .value()
             .parse()?;
-        let count = counts.get_mut(worker).ok_or("worker index out of bounds")?;
-        if count.replace(metric.value().as_usize()).is_some() {
-            return Err(format!("duplicate {name} for worker {worker}").into());
+        let pipeline = metric
+            .labels()
+            .iter()
+            .find(|label| label.name() == "pipeline")
+            .map(|label| label.value().to_owned());
+        if !seen.insert((pipeline.clone(), worker)) {
+            return Err(format!(
+                "duplicate {name} for worker {worker} (pipeline={pipeline:?})"
+            )
+            .into());
         }
+        let count = counts.get_mut(worker).ok_or("worker index out of bounds")?;
+        *count = Some(count.unwrap_or(0) + metric.value().as_usize());
     }
     counts
         .into_iter()
