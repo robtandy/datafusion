@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::path::Path;
@@ -10,12 +11,22 @@ use std::sync::Arc;
 use arrow::ipc::writer::StreamWriter;
 use datafusion::common::config::MorselMode;
 use datafusion::common::instant::Instant;
+use datafusion::morsel::MorselMetrics;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use serde_json::json;
 
 const BATCH_SIZE: usize = 8192;
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "TRUE") => true,
+        Some("0" | "false" | "FALSE") => false,
+        _ => default,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -41,6 +52,7 @@ enum ScanProfile {
     Default,
     Pruning,
     Pushdown,
+    PushdownNoRepartition,
 }
 
 impl ScanProfile {
@@ -50,8 +62,9 @@ impl ScanProfile {
             "default" => Ok(Self::Default),
             "pruning" => Ok(Self::Pruning),
             "pushdown" => Ok(Self::Pushdown),
+            "pushdown_no_repartition" => Ok(Self::PushdownNoRepartition),
             _ => Err(format!(
-                "unknown profile '{value}'; expected no_pushdown, default, pruning, or pushdown"
+                "unknown profile '{value}'; expected no_pushdown, default, pruning, pushdown, or pushdown_no_repartition"
             )
             .into()),
         }
@@ -63,6 +76,7 @@ impl ScanProfile {
             Self::Default => "default",
             Self::Pruning => "pruning",
             Self::Pushdown => "pushdown",
+            Self::PushdownNoRepartition => "pushdown_no_repartition",
         }
     }
 }
@@ -72,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let [operation, mode, profile, workers, data_dir, tables_csv, sql] = args.as_slice()
     else {
         return Err(
-            "usage: morsel_tpch_runner <query|measure|plan> <off|required> <no_pushdown|default|pruning|pushdown> <workers> <data_dir> <tables_csv> <sql>"
+            "usage: morsel_tpch_runner <query|measure|plan> <off|required> <no_pushdown|default|pruning|pushdown|pushdown_no_repartition> <workers> <data_dir> <tables_csv> <sql>"
                 .into(),
         );
     };
@@ -117,10 +131,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }))
 }
 
-fn build_config(mode: MorselMode, profile: ScanProfile, workers: usize) -> SessionConfig {
+fn build_config(
+    mode: MorselMode,
+    profile: ScanProfile,
+    workers: usize,
+    metrics: Option<Arc<MorselMetrics>>,
+) -> SessionConfig {
     let mut config = SessionConfig::new()
         .with_batch_size(BATCH_SIZE)
         .with_target_partitions(workers);
+    if let Some(metrics) = metrics {
+        config = config.with_extension(metrics);
+    }
     match profile {
         ScanProfile::NoPushdown => {
             config = config
@@ -146,6 +168,13 @@ fn build_config(mode: MorselMode, profile: ScanProfile, workers: usize) -> Sessi
             if mode == MorselMode::Required {
                 config = config.with_repartition_file_scans(false);
             }
+            let execution = &mut config.options_mut().execution;
+            execution.morsel_mode = mode;
+            execution.parquet.pushdown_filters = true;
+            execution.parquet.reorder_filters = true;
+        }
+        ScanProfile::PushdownNoRepartition => {
+            config = config.with_repartition_file_scans(false);
             let execution = &mut config.options_mut().execution;
             execution.morsel_mode = mode;
             execution.parquet.pushdown_filters = true;
@@ -187,7 +216,15 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
         tables,
         sql,
     } = req;
-    let ctx = SessionContext::new_with_config(build_config(mode, profile, workers));
+    let collect_metrics =
+        matches!(operation, Operation::Measure) && env_bool("MORSEL_METRICS", true);
+    let metrics = collect_metrics.then(|| Arc::new(MorselMetrics::default()));
+    let ctx = SessionContext::new_with_config(build_config(
+        mode,
+        profile,
+        workers,
+        metrics.clone(),
+    ));
 
     if matches!(operation, Operation::Plan) {
         register_tables(&ctx, data_dir, tables).await?;
@@ -235,6 +272,7 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
     let plan_seconds = plan_done - register_seconds;
 
     let exec_start = Instant::now();
+    let exec_cpu_start = process_cpu_seconds();
     let mut stream = execute_stream(Arc::clone(&plan), task_ctx)?;
     let mut writer = match operation {
         Operation::Query => {
@@ -272,7 +310,43 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let exec_seconds = exec_start.elapsed().as_secs_f64();
+    let exec_cpu_seconds = match (exec_cpu_start, process_cpu_seconds()) {
+        (Some(before), Some(after)) => Some(after - before),
+        _ => None,
+    };
     let seconds = start.elapsed().as_secs_f64();
+    drop(stream);
+
+    let native = match (mode, metrics.as_ref()) {
+        (MorselMode::Required, Some(metrics)) => {
+            let runs = metrics.take_runs();
+            match runs.as_slice() {
+                [run] => Some(NativeReport::from_run(run, workers)?),
+                _ => {
+                    return Err(format!(
+                        "unexpected number of native reports: {}",
+                        runs.len()
+                    )
+                    .into());
+                }
+            }
+        }
+        (MorselMode::Off, Some(metrics)) => {
+            let runs = metrics.take_runs();
+            if !runs.is_empty() {
+                return Err(format!(
+                    "unexpected native reports under morsel_mode=off: {}",
+                    runs.len()
+                )
+                .into());
+            }
+            None
+        }
+        (MorselMode::Prefer, _) => unreachable!("runner only accepts off or required"),
+        (_, None) => None,
+    };
+    let mut operator_compute_ms = BTreeMap::new();
+    collect_operator_compute_ms(plan.as_ref(), &mut operator_compute_ms);
 
     println!(
         "{}",
@@ -285,6 +359,7 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "register_seconds": register_seconds,
             "plan_seconds": plan_seconds,
             "exec_seconds": exec_seconds,
+            "exec_cpu_seconds": exec_cpu_seconds,
             "first_output_seconds": first_output_seconds,
             "first_8192_seconds": first_8192_seconds,
             "seconds": seconds,
@@ -293,9 +368,119 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "count_finalizations": metric(plan.as_ref(), "count_finalizations"),
             "aggregate_finalizations": metric(plan.as_ref(), "aggregate_finalizations"),
             "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
+            "worker_claims": native.as_ref().map(|r| &r.claims),
+            "worker_completions": native.as_ref().map(|r| &r.completions),
+            "morsel_decode_work_ms": native.as_ref().map(|r| r.decode_ms),
+            "morsel_process_work_ms": native.as_ref().map(|r| r.process_ms),
+            "morsel_ready_wait_ms": native.as_ref().map(|r| r.ready_wait_ms),
+            "morsel_output_wait_ms": native.as_ref().map(|r| r.output_wait_ms),
+            "morsel_pending_io_ms": native.as_ref().map(|r| r.pending_io_ms),
+            "morsel_peak_ready_depth": native.as_ref().map(|r| r.peak_ready_depth),
+            "morsel_peak_output_depth": native.as_ref().map(|r| r.peak_output_depth),
+            "operator_compute_ms": operator_compute_ms,
         })
     );
     Ok(())
+}
+
+struct NativeReport {
+    claims: Vec<usize>,
+    completions: Vec<usize>,
+    decode_ms: f64,
+    process_ms: f64,
+    ready_wait_ms: f64,
+    output_wait_ms: f64,
+    pending_io_ms: f64,
+    peak_ready_depth: usize,
+    peak_output_depth: usize,
+}
+
+impl NativeReport {
+    fn from_run(run: &MetricsSet, workers: usize) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            claims: worker_counts(run, "morsels_claimed", workers)?,
+            completions: worker_counts(run, "morsels_completed", workers)?,
+            decode_ms: run_time_ms(run, "morsel_decode_work"),
+            process_ms: run_time_ms(run, "morsel_process_work"),
+            ready_wait_ms: run_time_ms(run, "morsel_ready_wait"),
+            output_wait_ms: run_time_ms(run, "morsel_output_wait"),
+            pending_io_ms: run_time_ms(run, "morsel_pending_io"),
+            peak_ready_depth: run_usize(run, "morsel_peak_ready_depth"),
+            peak_output_depth: run_usize(run, "morsel_peak_output_depth"),
+        })
+    }
+}
+
+fn run_usize(run: &MetricsSet, name: &str) -> usize {
+    run.sum_by_name(name).map_or(0, |v| v.as_usize())
+}
+
+fn run_time_ms(run: &MetricsSet, name: &str) -> f64 {
+    run.sum_by_name(name)
+        .map_or(0.0, |v| v.as_usize() as f64 / 1e6)
+}
+
+fn worker_counts(
+    run: &MetricsSet,
+    name: &str,
+    workers: usize,
+) -> Result<Vec<usize>, Box<dyn Error>> {
+    let mut counts = vec![None; workers];
+    for metric in run.iter().filter(|metric| metric.value().name() == name) {
+        let worker: usize = metric
+            .labels()
+            .iter()
+            .find(|label| label.name() == "worker")
+            .ok_or("missing worker label")?
+            .value()
+            .parse()?;
+        let count = counts.get_mut(worker).ok_or("worker index out of bounds")?;
+        if count.replace(metric.value().as_usize()).is_some() {
+            return Err(format!("duplicate {name} for worker {worker}").into());
+        }
+    }
+    counts
+        .into_iter()
+        .collect::<Option<_>>()
+        .ok_or_else(|| format!("missing {name} for one or more workers").into())
+}
+
+fn collect_operator_compute_ms(
+    plan: &dyn ExecutionPlan,
+    out: &mut BTreeMap<String, f64>,
+) {
+    if let Some(metrics) = plan.metrics()
+        && let Some(elapsed) = metrics.elapsed_compute()
+    {
+        *out.entry(plan.name().to_owned()).or_insert(0.0) += elapsed as f64 / 1e6;
+    }
+    for child in plan.children() {
+        collect_operator_compute_ms(child.as_ref(), out);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn process_cpu_seconds() -> Option<f64> {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(id: i32, tp: *mut Timespec) -> i32;
+    }
+    // Linux CLOCK_PROCESS_CPUTIME_ID (2): process CPU across all worker threads.
+    let mut tp = Timespec { sec: 0, nsec: 0 };
+    if unsafe { clock_gettime(2, &raw mut tp) } == 0 {
+        Some(tp.sec as f64 + tp.nsec as f64 / 1e9)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn process_cpu_seconds() -> Option<f64> {
+    None
 }
 
 fn metric(plan: &dyn ExecutionPlan, name: &str) -> usize {

@@ -86,8 +86,10 @@ All four queries run directly over the real TPC-H `lineitem` Parquet schema
 `l_shipdate` as `DATE32`, `l_orderkey` as `INT64`, `l_returnflag` /
 `l_linestatus` as `Utf8View`) — no casts or schema workarounds are needed;
 `morsel_mode=required` admits all four natively under `MorselExec` +
-`NativeParquet[lineitem]` (see [morsel_aggregate.md](morsel_aggregate.md) for
-SF1 Q6 and unordered Q1 results):
+`NativeParquet[lineitem]` (see [checkpoint_a_results.md](checkpoint_a_results.md)
+for the idle-`dduck2` Checkpoint A 3-way scorecard across all four queries, and
+[morsel_aggregate.md](morsel_aggregate.md) for the `#168` `dduck1` aggregate
+note):
 
 - **`q6`**: Standard TPC-H Q6 (matching `benchmarks/queries/q6.sql`) — filtered
   ungrouped `SUM(l_extendedprice * l_discount)` over `lineitem`.
@@ -126,15 +128,16 @@ even rounds.
 
 ### Scan Profiles and Arm Labels
 
-| Arm                  | Engine     | `morsel_mode` | Scan profile settings                                                                                                                                                              |
-| -------------------- | ---------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stock_no_pushdown`  | DataFusion | `off`         | `pushdown_filters=false`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false`, `repartition_file_scans=false`, `collect_statistics=false`                     |
-| `morsel_no_pushdown` | DataFusion | `required`    | Same as `stock_no_pushdown` (exact apples-to-apples scan configuration matching `benchmarks/morsel_parquet`)                                                                       |
-| `morsel_pruning`     | DataFusion | `required`    | `pushdown_filters=false`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`                         |
-| `morsel_pushdown`    | DataFusion | `required`    | `pushdown_filters=true`, `reorder_filters=true`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`  |
-| `stock_default`      | DataFusion | `off`         | DataFusion defaults (`pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `repartition_file_scans=true`, `collect_statistics=true`)                                 |
-| `stock_pushdown`     | DataFusion | `off`         | DataFusion defaults + `pushdown_filters=true`, `reorder_filters=true`                                                                                                              |
-| `duckdb_default`     | DuckDB     | —             | DuckDB defaults (`SET threads = 8`, `read_parquet(...)` with built-in pruning and filter pushdown)                                                                                 |
+| Arm                             | Engine     | `morsel_mode` | Scan profile settings                                                                                                                                                             |
+| ------------------------------- | ---------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stock_no_pushdown`             | DataFusion | `off`         | `pushdown_filters=false`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false`, `repartition_file_scans=false`, `collect_statistics=false`                    |
+| `morsel_no_pushdown`            | DataFusion | `required`    | Same as `stock_no_pushdown` (exact apples-to-apples scan configuration matching `benchmarks/morsel_parquet`)                                                                      |
+| `morsel_pruning`                | DataFusion | `required`    | `pushdown_filters=false`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true`                        |
+| `morsel_pushdown`               | DataFusion | `required`    | `pushdown_filters=true`, `reorder_filters=true`, `repartition_file_scans=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true`, `collect_statistics=true` |
+| `stock_default`                 | DataFusion | `off`         | DataFusion defaults (`pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `repartition_file_scans=true`, `collect_statistics=true`)                                |
+| `stock_pushdown`                | DataFusion | `off`         | DataFusion defaults + `pushdown_filters=true`, `reorder_filters=true`                                                                                                             |
+| `stock_pushdown_no_repartition` | DataFusion | `off`         | Same as `morsel_pushdown` (`pushdown_filters=true`, `reorder_filters=true`, `repartition_file_scans=false`) for apples-to-apples pushdown comparison                              |
+| `duckdb_default`                | DuckDB     | —             | DuckDB defaults (`SET threads = 8`, `read_parquet(...)` with built-in pruning and filter pushdown)                                                                                |
 
 Note on `repartition_file_scans`: `morsel_mode=required` currently rejects
 byte-range split Parquet files (`file.range.is_some()`), which `stock_default`
@@ -150,7 +153,12 @@ defaults.
   DuckDB's lazy view binding), then runs SQL planning, physical planning, and
   drains `execute_stream` at batch size `8,192` without serializing output.
   Reports `register_seconds`, `plan_seconds`, `exec_seconds`,
-  `first_output_seconds`, `first_8192_seconds`, and total `seconds`.
+  `exec_cpu_seconds`, `first_output_seconds`, `first_8192_seconds`, total
+  `seconds`, Stock `operator_compute_ms`, and (when `MORSEL_METRICS=1`, the
+  default on `measure`) `MorselMetrics` wait/work breakdowns
+  (`morsel_decode_work_ms`, `morsel_process_work_ms`, `morsel_ready_wait_ms`,
+  `morsel_output_wait_ms`, `morsel_pending_io_ms`, peak queue depths, and
+  per-worker `worker_claims` / `worker_completions`).
 - **DuckDB (`harness.py _duckdb-exec`)**: Opens a fresh in-memory connection,
   sets `threads`, preloads `LOAD parquet`, warms the Arrow C-stream bridge with
   `SELECT 1` (so one-time dynamic extension loading does not penalize DuckDB vs

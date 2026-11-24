@@ -16,6 +16,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 import duckdb
@@ -296,6 +297,13 @@ ARMS: dict[str, Arm] = {
         profile="pushdown",
         label="Stock DataFusion (pushdown_filters=true, reorder_filters=true)",
     ),
+    "stock_pushdown_no_repartition": Arm(
+        name="stock_pushdown_no_repartition",
+        engine="datafusion",
+        mode="off",
+        profile="pushdown_no_repartition",
+        label="Stock DataFusion (pushdown_filters=true, reorder_filters=true, repartition_file_scans=false)",
+    ),
     "duckdb_default": Arm(
         name="duckdb_default",
         engine="duckdb",
@@ -312,6 +320,7 @@ DEFAULT_MORSEL_ARMS = (
     "morsel_pruning",
     "stock_default",
     "stock_pushdown",
+    "morsel_pushdown",
     "duckdb_default",
 )
 
@@ -535,6 +544,17 @@ class DuckDbRunner:
     def measure(self, workload: Workload) -> dict:
         return json.loads(self._run("measure", workload))
 
+    def profile(self, workload: Workload) -> dict:
+        return json.loads(self._run("profile", workload))
+
+
+def _sum_duckdb_operator_timings(nodes: list[dict], out: dict[str, float]):
+    for node in nodes:
+        op = node.get("type") or node.get("name")
+        if op and "timing" in node:
+            out[op] = out.get(op, 0.0) + float(node["timing"]) * 1000.0
+        _sum_duckdb_operator_timings(node.get("children", []), out)
+
 
 def _duckdb_exec(
     operation: str, threads: int, data_dir: Path, tables: list[str], sql: str
@@ -559,6 +579,7 @@ def _duckdb_exec(
 
     if operation == "measure":
         start = time.perf_counter()
+        cpu_start = time.process_time()
         reader = con.sql(sql).to_arrow_reader(batch_size=BATCH_SIZE)
         output_rows = 0
         output_batches = 0
@@ -577,6 +598,7 @@ def _duckdb_exec(
                     if reached_8192:
                         first_8192_seconds = elapsed
         seconds = time.perf_counter() - start
+        exec_cpu_seconds = time.process_time() - cpu_start
         plan_rows = con.execute(f"EXPLAIN {sql}").fetchall()
         plan = "\n".join(str(r[1]) for r in plan_rows)
         print(
@@ -588,6 +610,7 @@ def _duckdb_exec(
                     "register_seconds": None,
                     "plan_seconds": None,
                     "exec_seconds": None,
+                    "exec_cpu_seconds": exec_cpu_seconds,
                     "first_output_seconds": first_output_seconds,
                     "first_8192_seconds": first_8192_seconds,
                     "seconds": seconds,
@@ -596,6 +619,41 @@ def _duckdb_exec(
                     "count_finalizations": None,
                     "aggregate_finalizations": None,
                     "bytes_scanned": None,
+                    "worker_claims": None,
+                    "worker_completions": None,
+                    "morsel_decode_work_ms": None,
+                    "morsel_process_work_ms": None,
+                    "morsel_ready_wait_ms": None,
+                    "morsel_output_wait_ms": None,
+                    "morsel_pending_io_ms": None,
+                    "morsel_peak_ready_depth": None,
+                    "morsel_peak_output_depth": None,
+                    "operator_compute_ms": None,
+                }
+            )
+        )
+        return
+
+    if operation == "profile":
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "duckdb_profile.json"
+            escaped = profile_path.as_posix().replace("'", "''")
+            con.execute("PRAGMA enable_profiling = 'json'")
+            con.execute(f"PRAGMA profiling_output = '{escaped}'")
+            rows = con.execute(sql).fetchall()
+            con.close()
+            prof = json.loads(profile_path.read_text())
+        operator_timing_ms: dict[str, float] = {}
+        _sum_duckdb_operator_timings(prof.get("operator", []), operator_timing_ms)
+        total_operator_ms = sum(operator_timing_ms.values())
+        print(
+            json.dumps(
+                {
+                    "duckdb_version": duckdb.__version__,
+                    "output_rows": len(rows),
+                    "bytes_read": prof.get("io", {}).get("total_bytes_read"),
+                    "total_operator_ms": total_operator_ms,
+                    "operator_timing_ms": dict(sorted(operator_timing_ms.items())),
                 }
             )
         )
@@ -990,6 +1048,162 @@ def summarize_jsonl(path: Path):
             f"{rows[0]['output_batches']:,} | {morsels_str} |"
         )
 
+    morsel_groups = [
+        ((case, arm), rows)
+        for (case, arm), rows in grouped.items()
+        if any(r.get("morsel_decode_work_ms") is not None for r in rows)
+    ]
+    if morsel_groups:
+        print()
+        print(
+            "| Query | Arm | Decode work ms | Process work ms | Ready wait ms | "
+            "Output wait ms | Pending IO ms | Peak ready/out |"
+        )
+        print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for (case, arm), rows in morsel_groups:
+            decode = statistics.median(
+                r["morsel_decode_work_ms"]
+                for r in rows
+                if r.get("morsel_decode_work_ms") is not None
+            )
+            process = statistics.median(
+                r["morsel_process_work_ms"]
+                for r in rows
+                if r.get("morsel_process_work_ms") is not None
+            )
+            ready = statistics.median(
+                r["morsel_ready_wait_ms"]
+                for r in rows
+                if r.get("morsel_ready_wait_ms") is not None
+            )
+            output = statistics.median(
+                r["morsel_output_wait_ms"]
+                for r in rows
+                if r.get("morsel_output_wait_ms") is not None
+            )
+            pending_io = statistics.median(
+                r["morsel_pending_io_ms"]
+                for r in rows
+                if r.get("morsel_pending_io_ms") is not None
+            )
+            peak_ready = max(
+                r["morsel_peak_ready_depth"]
+                for r in rows
+                if r.get("morsel_peak_ready_depth") is not None
+            )
+            peak_out = max(
+                r["morsel_peak_output_depth"]
+                for r in rows
+                if r.get("morsel_peak_output_depth") is not None
+            )
+            print(
+                f"| `{case}` | `{arm}` | {decode:.1f} | {process:.1f} | "
+                f"{ready:.1f} | {output:.1f} | {pending_io:.1f} | "
+                f"{peak_ready}/{peak_out} |"
+            )
+
+
+def run_duckdb_profile(args):
+    data_dir = args.path.resolve(strict=True)
+    query_names = args.queries or [
+        name for name, w in WORKLOADS.items() if w.morsel_admitted
+    ]
+    if args.cache == "warm" and platform.system() != "Linux":
+        raise ValueError("--cache warm requires Linux mincore page-cache verification")
+
+    referenced_tables = sorted({t for q in query_names for t in WORKLOADS[q].tables})
+    all_referenced_files = [
+        f for t in referenced_tables for f in table_files(data_dir, t)
+    ]
+    if args.cache == "warm":
+        warm_files(all_referenced_files)
+        require_warm_cache(all_referenced_files)
+
+    runner = DuckDbRunner(data_dir, args.threads, args.timeout)
+    results = {}
+    for qname in query_names:
+        workload = WORKLOADS[qname]
+        q_files = [f for t in workload.tables for f in table_files(data_dir, t)]
+        samples = []
+        for rep in range(1 - args.warmups, args.repeats + 1):
+            if rep > 0 and args.cache == "warm":
+                require_warm_cache(q_files)
+            sample = runner.profile(workload)
+            if rep > 0:
+                if args.cache == "warm":
+                    require_warm_cache(q_files)
+                samples.append(sample)
+
+        op_names = sorted({op for s in samples for op in s["operator_timing_ms"]})
+        op_medians = {
+            op: statistics.median(s["operator_timing_ms"].get(op, 0.0) for s in samples)
+            for op in op_names
+        }
+        totals = [s["total_operator_ms"] for s in samples]
+        bytes_reads = [s["bytes_read"] for s in samples if s["bytes_read"] is not None]
+        results[qname] = {
+            "output_rows": samples[0]["output_rows"],
+            "bytes_read_median": (
+                int(statistics.median(bytes_reads)) if bytes_reads else None
+            ),
+            "total_operator_ms_median": statistics.median(totals),
+            "total_operator_ms_min": min(totals),
+            "total_operator_ms_max": max(totals),
+            "operator_timing_ms_median": op_medians,
+        }
+
+    report = {
+        "duckdb_version": duckdb.__version__,
+        "host": platform.node(),
+        "arch": platform.machine(),
+        "kernel": platform.release(),
+        "cpu_affinity": (
+            sorted(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else None
+        ),
+        "threads": args.threads,
+        "cache_regime": args.cache,
+        "warmups": args.warmups,
+        "repeats": args.repeats,
+        "methodology": {
+            "isolation": "fresh_process_and_connection",
+            "execution": "con.execute(sql).fetchall()",
+            "json_field": "operator[].timing summed in ms grouped by type",
+            "aggregation": "median",
+        },
+        "queries": results,
+    }
+    if args.format == "markdown":
+        print(
+            f"DuckDB {report['duckdb_version']} operator profile on {report['host']} "
+            f"(threads={args.threads}, cache={args.cache}, fresh process/connection, "
+            f"warmups={args.warmups}, repeats={args.repeats}, median of operator[].timing by type)"
+        )
+        print()
+        print(
+            "| Query | Output rows | Bytes read | Total op ms (min-max) | Operator breakdown (median ms) |"
+        )
+        print("| --- | ---: | ---: | ---: | --- |")
+        for qname, info in results.items():
+            ops_str = ", ".join(
+                f"`{op}`={ms:.1f}"
+                for op, ms in info["operator_timing_ms_median"].items()
+            )
+            bytes_str = (
+                f"{info['bytes_read_median']:,}"
+                if info["bytes_read_median"] is not None
+                else "—"
+            )
+            print(
+                f"| `{qname}` | {info['output_rows']:,} | {bytes_str} | "
+                f"{info['total_operator_ms_median']:.1f} "
+                f"({info['total_operator_ms_min']:.1f}-{info['total_operator_ms_max']:.1f}) | "
+                f"{ops_str} |"
+            )
+        return
+    print(json.dumps(report, indent=2))
+
 
 def positive_int(value: str) -> int:
     num = int(value)
@@ -1057,9 +1271,26 @@ def main():
     )
     summ.add_argument("jsonl", type=Path)
 
+    dprof = sub.add_parser(
+        "duckdb-profile",
+        help="Collect fresh-process DuckDB JSON operator timing breakdowns",
+    )
+    dprof.add_argument("path", type=Path)
+    dprof.add_argument("--threads", type=positive_int, default=8)
+    dprof.add_argument("--timeout", type=positive_int, default=120)
+    dprof.add_argument(
+        "--cache",
+        choices=("warm", "none"),
+        default="warm" if platform.system() == "Linux" else "none",
+    )
+    dprof.add_argument("--warmups", type=int, default=1)
+    dprof.add_argument("--repeats", type=positive_int, default=7)
+    dprof.add_argument("--queries", nargs="+", choices=list(WORKLOADS.keys()))
+    dprof.add_argument("--format", choices=("json", "markdown"), default="json")
+
     # Internal subprocess entrypoint for isolated DuckDB runs.
     dk = sub.add_parser("_duckdb-exec")
-    dk.add_argument("operation", choices=("query", "measure"))
+    dk.add_argument("operation", choices=("query", "measure", "profile"))
     dk.add_argument("threads", type=positive_int)
     dk.add_argument("data_dir", type=Path)
     dk.add_argument("tables_csv")
@@ -1107,6 +1338,11 @@ def main():
         return
     if args.command == "summarize":
         summarize_jsonl(args.jsonl)
+        return
+    if args.command == "duckdb-profile":
+        if args.warmups < 0:
+            parser.error("--warmups must be non-negative")
+        run_duckdb_profile(args)
         return
     if args.command == "_duckdb-exec":
         tables = [t.strip() for t in args.tables_csv.split(",") if t.strip()]

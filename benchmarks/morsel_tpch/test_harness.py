@@ -193,6 +193,83 @@ class TpchHarnessTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot verify warm"):
                 require_warm_cache([])
 
+    def test_sf001_duckdb_profile_reports_operator_timings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "tpch sf001 dprof"
+            generate(data_dir, sf=0.01, row_group_size=131_072)
+            cache_mode = "warm" if sys.platform == "linux" else "none"
+            out = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).with_name("harness.py")),
+                    "duckdb-profile",
+                    str(data_dir),
+                    "--threads",
+                    "2",
+                    "--timeout",
+                    "60",
+                    "--cache",
+                    cache_mode,
+                    "--warmups",
+                    "0",
+                    "--repeats",
+                    "2",
+                    "--queries",
+                    "q6",
+                    "q1_unordered",
+                ],
+                text=True,
+                timeout=120,
+            )
+            report = json.loads(out)
+            self.assertEqual(
+                report["methodology"]["isolation"], "fresh_process_and_connection"
+            )
+            self.assertEqual(report["methodology"]["aggregation"], "median")
+            self.assertEqual(set(report["queries"].keys()), {"q6", "q1_unordered"})
+            self.assertEqual(report["queries"]["q6"]["output_rows"], 1)
+            self.assertEqual(report["queries"]["q1_unordered"]["output_rows"], 4)
+            self.assertIn(
+                "TABLE_SCAN", report["queries"]["q6"]["operator_timing_ms_median"]
+            )
+            self.assertIn(
+                "HASH_GROUP_BY",
+                report["queries"]["q1_unordered"]["operator_timing_ms_median"],
+            )
+            self.assertGreater(report["queries"]["q6"]["total_operator_ms_median"], 0.0)
+            self.assertGreater(
+                report["queries"]["q1_unordered"]["total_operator_ms_median"], 0.0
+            )
+
+            md = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).with_name("harness.py")),
+                    "duckdb-profile",
+                    str(data_dir),
+                    "--threads",
+                    "2",
+                    "--timeout",
+                    "60",
+                    "--cache",
+                    cache_mode,
+                    "--warmups",
+                    "0",
+                    "--repeats",
+                    "1",
+                    "--queries",
+                    "q6",
+                    "--format",
+                    "markdown",
+                ],
+                text=True,
+                timeout=120,
+            )
+            self.assertIn("`q6`", md)
+            self.assertIn("`TABLE_SCAN`", md)
+
     @unittest.skipUnless(
         os.getenv("MORSEL_TPCH_RUNNER") and os.getenv("MORSEL_BENCH_REVISION"),
         "set MORSEL_TPCH_RUNNER and MORSEL_BENCH_REVISION for the end-to-end SF0.01 smoke test",
@@ -242,8 +319,23 @@ class TpchHarnessTest(unittest.TestCase):
                 for e in report["evidence"]
                 if e["mode"] == "required"
             }
-            self.assertIn(("q6_count", "morsel_no_pushdown"), morsel_ev)
-            self.assertIn(("q6_scan", "morsel_no_pushdown"), morsel_ev)
+            for qname in ("q6", "q1_unordered", "q6_count", "q6_scan"):
+                for arm_name in (
+                    "morsel_no_pushdown",
+                    "morsel_pruning",
+                    "morsel_pushdown",
+                ):
+                    self.assertIn((qname, arm_name), morsel_ev)
+            self.assertEqual(
+                morsel_ev[("q6", "morsel_no_pushdown")]["aggregate_finalizations"],
+                1,
+            )
+            self.assertEqual(
+                morsel_ev[("q1_unordered", "morsel_pushdown")][
+                    "aggregate_finalizations"
+                ],
+                1,
+            )
             self.assertEqual(
                 morsel_ev[("q6_count", "morsel_no_pushdown")][
                     "parquet_morsels_claimed"
@@ -305,6 +397,7 @@ class TpchHarnessTest(unittest.TestCase):
                     "duckdb_default",
                     "--morsel-arms",
                     "stock_no_pushdown",
+                    "stock_pushdown_no_repartition",
                     "morsel_no_pushdown",
                     "duckdb_default",
                 ],
@@ -318,15 +411,49 @@ class TpchHarnessTest(unittest.TestCase):
             self.assertEqual(header["record_type"], "header")
             self.assertEqual(header["cache_regime"], "warm")
             self.assertIn("q1", header["morsel_rejections"])
-            # 2 arms * 2 reps for q1 + 3 arms * 2 reps for (q6, q1_unordered, q6_count, q6_scan) = 28
-            self.assertEqual(len(trials), 28)
+            # 2 arms * 2 reps for q1 + 4 arms * 2 reps for (q6, q1_unordered, q6_count, q6_scan) = 36
+            self.assertEqual(len(trials), 36)
             for trial in trials:
                 self.assertGreater(trial["seconds"], 0)
+                if sys.platform == "linux" and sys.maxsize > 2**32:
+                    self.assertIsNotNone(trial["exec_cpu_seconds"])
+                    self.assertGreater(trial["exec_cpu_seconds"], 0)
+                if trial["engine"] == "datafusion":
+                    self.assertIsInstance(trial["operator_compute_ms"], dict)
+                    self.assertGreater(len(trial["operator_compute_ms"]), 0)
+                else:
+                    self.assertIsNone(trial["operator_compute_ms"])
                 before = trial["cache_pages_before"]
                 after = trial["cache_pages_after"]
                 self.assertGreater(before["total"], 0)
                 self.assertEqual(before["resident"], before["total"])
                 self.assertEqual(after["resident"], after["total"])
+                morsel_metric_fields = (
+                    "morsel_decode_work_ms",
+                    "morsel_process_work_ms",
+                    "morsel_ready_wait_ms",
+                    "morsel_output_wait_ms",
+                    "morsel_pending_io_ms",
+                    "morsel_peak_ready_depth",
+                    "morsel_peak_output_depth",
+                )
+                if trial["mode"] == "required":
+                    for field in morsel_metric_fields:
+                        self.assertIsNotNone(trial[field], msg=field)
+                        self.assertGreaterEqual(trial[field], 0, msg=field)
+                    self.assertEqual(len(trial["worker_claims"]), 2)
+                    self.assertEqual(
+                        sum(trial["worker_claims"]), trial["parquet_morsels_claimed"]
+                    )
+                    self.assertEqual(
+                        sum(trial["worker_completions"]),
+                        trial["parquet_morsels_claimed"],
+                    )
+                else:
+                    for field in morsel_metric_fields:
+                        self.assertIsNone(trial[field], msg=field)
+                    self.assertIsNone(trial["worker_claims"])
+                    self.assertIsNone(trial["worker_completions"])
 
             # Verify alternating arm order on q6_count between rep 1 and rep 2.
             rep1_arms = [
@@ -336,7 +463,13 @@ class TpchHarnessTest(unittest.TestCase):
                 t["arm"] for t in trials if t["case"] == "q6_count" and t["rep"] == 2
             ]
             self.assertEqual(
-                rep1_arms, ["stock_no_pushdown", "morsel_no_pushdown", "duckdb_default"]
+                rep1_arms,
+                [
+                    "stock_no_pushdown",
+                    "stock_pushdown_no_repartition",
+                    "morsel_no_pushdown",
+                    "duckdb_default",
+                ],
             )
             self.assertEqual(rep2_arms, list(reversed(rep1_arms)))
 
@@ -353,10 +486,60 @@ class TpchHarnessTest(unittest.TestCase):
             )
             for expected_token in (
                 "`q6`",
+                "`q1_unordered`",
                 "`q6_count`",
                 "`q6_scan`",
                 "`stock_no_pushdown`",
+                "`stock_pushdown_no_repartition`",
                 "`morsel_no_pushdown`",
                 "`duckdb_default`",
+                "Decode work ms",
+                "Process work ms",
             ):
                 self.assertIn(expected_token, summary)
+
+    @unittest.skipUnless(
+        os.getenv("MORSEL_TPCH_RUNNER") and os.getenv("MORSEL_BENCH_REVISION"),
+        "set MORSEL_TPCH_RUNNER and MORSEL_BENCH_REVISION for the MORSEL_METRICS=0 test",
+    )
+    def test_sf001_morsel_metrics_disabled_emits_null_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "tpch sf001 metrics off"
+            generate(data_dir, sf=0.01, row_group_size=131_072)
+            env = dict(os.environ, MORSEL_METRICS="0")
+            out = subprocess.check_output(
+                [
+                    os.environ["MORSEL_TPCH_RUNNER"],
+                    "measure",
+                    "required",
+                    "no_pushdown",
+                    "2",
+                    str(data_dir),
+                    "lineitem",
+                    WORKLOADS["q6"].sql,
+                ],
+                text=True,
+                env=env,
+                timeout=60,
+            )
+            sample = json.loads(out)
+            self.assertEqual(sample["mode"], "required")
+            self.assertEqual(sample["parquet_morsels_claimed"], 16)
+            self.assertEqual(sample["aggregate_finalizations"], 1)
+            self.assertIsInstance(sample["operator_compute_ms"], dict)
+            self.assertGreater(len(sample["operator_compute_ms"]), 0)
+            if sys.platform == "linux" and sys.maxsize > 2**32:
+                self.assertIsNotNone(sample["exec_cpu_seconds"])
+                self.assertGreater(sample["exec_cpu_seconds"], 0)
+            for field in (
+                "worker_claims",
+                "worker_completions",
+                "morsel_decode_work_ms",
+                "morsel_process_work_ms",
+                "morsel_ready_wait_ms",
+                "morsel_output_wait_ms",
+                "morsel_pending_io_ms",
+                "morsel_peak_ready_depth",
+                "morsel_peak_output_depth",
+            ):
+                self.assertIsNone(sample[field], msg=field)
