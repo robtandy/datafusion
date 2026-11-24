@@ -13,14 +13,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{
-    Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::util::display::array_value_to_string;
 use datafusion::common::config::MorselMode;
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::physical_plan::{collect, displayable};
@@ -542,5 +543,191 @@ async fn parquet_filtered_join_group_by_and_projection_parity() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_count_col_logical_nulls_for_null_type_and_dictionary_values() -> Result<()>
+{
+    // 1. Exact DataType::Null repro via CREATE TABLE t AS VALUES ...
+    for workers in [1usize, 4usize] {
+        let stock_ctx = session(MorselMode::Off, workers, 8);
+        let morsel_ctx = session(MorselMode::Off, workers, 8);
+        for ctx in [&stock_ctx, &morsel_ctx] {
+            ctx.sql("CREATE TABLE t AS VALUES (1, NULL, 5), (1, NULL, 6), (2, NULL, 7)")
+                .await?
+                .collect()
+                .await?;
+        }
+        morsel_ctx
+            .sql("SET datafusion.execution.morsel_mode = 'required'")
+            .await?
+            .collect()
+            .await?;
+        for sql in [
+            "SELECT column1, COUNT(column2) FROM t GROUP BY column1",
+            "SELECT column1, COUNT(column2) FROM t WHERE column3 > 5 GROUP BY column1",
+            "SELECT column1, COUNT(column2) FROM t WHERE column3 > 6 GROUP BY column1",
+        ] {
+            let stock_plan = stock_ctx.sql(sql).await?.create_physical_plan().await?;
+            let morsel_plan = morsel_ctx.sql(sql).await?.create_physical_plan().await?;
+            assert_eq!(morsel_plan.name(), "MorselExec", "workers={workers} {sql}");
+            assert_eq!(morsel_plan.schema(), stock_plan.schema());
+            let expected = collect(stock_plan, stock_ctx.task_ctx()).await?;
+            let actual = collect(morsel_plan, morsel_ctx.task_ctx()).await?;
+            assert_eq!(
+                sorted_rows(&actual)?,
+                sorted_rows(&expected)?,
+                "workers={workers} {sql}"
+            );
+        }
+    }
+
+    // 2. MemTable with Dictionary(Int32, Utf8) whose dictionary values include NULL,
+    //    grouped by an Int32 key.
+    let dict_type =
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, true),
+        Field::new("d", dict_type, true),
+        Field::new("gate", DataType::Int32, true),
+    ]));
+    // Dictionary values: index 0 -> "a", index 1 -> NULL, index 2 -> "b".
+    // Keys include valid keys pointing to NULL dict value (index 1) AND null keys.
+    let dict_values = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+    let dict_keys = Int32Array::from(vec![
+        Some(0), // k=1, "a"  (non-null)
+        Some(1), // k=1, NULL (null in dict values!)
+        None,    // k=1, NULL (null key)
+        Some(2), // k=2, "b"  (non-null)
+        Some(1), // k=2, NULL (null in dict values!)
+        Some(1), // k=NULL, NULL (null in dict values!)
+        Some(0), // k=NULL, "a" (non-null)
+        Some(1), // k=3, NULL (all logically null for k=3!)
+    ]);
+    let dict_array = DictionaryArray::<Int32Type>::try_new(dict_keys, dict_values)?;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                None,
+                None,
+                Some(3),
+            ])),
+            Arc::new(dict_array),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(30),
+                Some(5),
+                Some(25),
+                Some(15),
+                None,
+                Some(40),
+            ])),
+        ],
+    )?;
+    let table = Arc::new(MemTable::try_new(
+        schema,
+        vec![vec![batch.slice(0, 4)], vec![batch.slice(4, 4)]],
+    )?);
+
+    for workers in [1usize, 4usize] {
+        let stock_ctx = session(MorselMode::Off, workers, 4);
+        let morsel_ctx = session(MorselMode::Required, workers, 4);
+        stock_ctx.register_table("dict_t", table.clone())?;
+        morsel_ctx.register_table("dict_t", table.clone())?;
+
+        for sql in [
+            "SELECT k, COUNT(d), COUNT(*) FROM dict_t GROUP BY k",
+            "SELECT k, COUNT(d), COUNT(*) FROM dict_t WHERE gate > 10 GROUP BY k",
+            "SELECT k, COUNT(d), COUNT(*) FROM dict_t WHERE gate >= 10 AND gate <= 30 GROUP BY k",
+        ] {
+            let stock_plan = stock_ctx.sql(sql).await?.create_physical_plan().await?;
+            let morsel_plan = morsel_ctx.sql(sql).await?.create_physical_plan().await?;
+            assert_eq!(morsel_plan.name(), "MorselExec", "workers={workers} {sql}");
+            assert_eq!(morsel_plan.schema(), stock_plan.schema());
+            let expected = collect(stock_plan, stock_ctx.task_ctx()).await?;
+            let actual = collect(morsel_plan, morsel_ctx.task_ctx()).await?;
+            assert_eq!(
+                sorted_rows(&actual)?,
+                sorted_rows(&expected)?,
+                "workers={workers} {sql}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn filtered_hash_join_probe_compacts_under_tight_memory_pool() -> Result<()> {
+    // Build table is tiny (16 rows); probe table is 1 batch of 4096 rows with 256-byte
+    // strings (~1.1 MiB backing buffer). Filter selects 25% (~1024 rows, ~280 KiB compacted):
+    // 4x retention ratio is below the 16x proactive compaction threshold, so succeeding under
+    // a 512 KiB GreedyMemoryPool exercises reservation-triggered compaction in start_probe_view.
+    let build_schema = Arc::new(Schema::new(vec![
+        Field::new("bk", DataType::Int64, false),
+        Field::new("bval", DataType::Int64, false),
+    ]));
+    let build_batch = RecordBatch::try_new(
+        Arc::clone(&build_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..16)),
+            Arc::new(Int64Array::from_iter_values((0..16).map(|i| i * 10))),
+        ],
+    )?;
+
+    let probe_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int64, false),
+        Field::new("gate", DataType::Int64, false),
+        Field::new("wide", DataType::Utf8, false),
+    ]));
+    let n = 4096usize;
+    let wide_str = "p".repeat(256);
+    let probe_batch = RecordBatch::try_new(
+        Arc::clone(&probe_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..n as i64)),
+            Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| i % 4))),
+            Arc::new(StringArray::from(vec![wide_str.as_str(); n])),
+        ],
+    )?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let mut config = SessionConfig::new()
+        .with_target_partitions(1)
+        .with_batch_size(512);
+    config.options_mut().execution.morsel_mode = MorselMode::Required;
+    let state = datafusion::execution::SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table(
+        "b",
+        Arc::new(MemTable::try_new(build_schema, vec![vec![build_batch]])?),
+    )?;
+    ctx.register_table(
+        "p",
+        Arc::new(MemTable::try_new(probe_schema, vec![vec![probe_batch]])?),
+    )?;
+
+    // gate = 0 selects 1024 probe rows (0, 4, 8, 12, ...), of which 4 match b (0, 4, 8, 12).
+    let sql = "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk WHERE p.gate = 0";
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    assert_eq!(plan.name(), "MorselExec");
+    let out = collect(plan, ctx.task_ctx()).await?;
+    let total: usize = out.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 4);
+    assert_eq!(pool.reserved(), 0);
     Ok(())
 }
