@@ -2582,8 +2582,9 @@ async fn parquet_group_count_high_cardinality_concurrent_oom_error_and_cancellat
     let prefer = context(&dir, "prefer", false).await?;
     let required = context(&dir, "required", false).await?;
     for bad_sql in [
-        "SELECT payload, COUNT(*) FROM t GROUP BY payload",
-        "SELECT k, gate, COUNT(*) FROM t GROUP BY k, gate",
+        "SELECT k, COUNT(DISTINCT gate) FROM t GROUP BY k",
+        "SELECT k, COUNT(*) FILTER (WHERE gate > 0) FROM t GROUP BY k",
+        "SELECT k, MEDIAN(gate) FROM t GROUP BY k",
         "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",
     ] {
         let err = required

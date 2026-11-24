@@ -522,11 +522,10 @@ async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
     for sql in [
         "SELECT id FROM items ORDER BY id DESC",
         "SELECT id FROM items LIMIT 3",
-        "SELECT COUNT(*) FROM items",
-        "SELECT COUNT(label) FROM items WHERE threshold > 0",
+        "SELECT MEDIAN(id) FROM items WHERE threshold > 0",
         "SELECT COUNT(DISTINCT id) FROM items WHERE threshold > 0",
         "SELECT COUNT(*) FILTER (WHERE id > 0) FROM items WHERE threshold > 0",
-        "SELECT label, COUNT(*) FROM items WHERE threshold > 0 GROUP BY label",
+        "SELECT label, COUNT(DISTINCT id) FROM items WHERE threshold > 0 GROUP BY label",
         "SELECT id + 1 FROM unknown WHERE id > 0",
         "SELECT id, (SELECT MAX(id) FROM items) FROM items",
     ] {
@@ -1057,23 +1056,15 @@ async fn unsupported_group_by_shapes_reject_in_required_and_fallback_in_prefer()
     }
 
     for sql in [
-        "SELECT label, COUNT(*) FROM t GROUP BY label",
-        "SELECT score, COUNT(*) FROM t GROUP BY score",
-        "SELECT flag, COUNT(*) FROM t GROUP BY flag",
-        "SELECT id, threshold, COUNT(*) FROM t GROUP BY id, threshold",
-        "SELECT id + 1, COUNT(*) FROM t GROUP BY id + 1",
-        "SELECT id, COUNT(threshold) FROM t GROUP BY id",
-        "SELECT id, SUM(threshold) FROM t GROUP BY id",
         "SELECT id, COUNT(DISTINCT threshold) FROM t GROUP BY id",
         "SELECT id, COUNT(*) FILTER (WHERE threshold > 0) FROM t GROUP BY id",
-        "SELECT id FROM t GROUP BY id",
+        "SELECT id, MEDIAN(threshold) FROM t GROUP BY id",
         "SELECT id, COUNT(*) FROM t GROUP BY GROUPING SETS ((id), ())",
         "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)",
         "SELECT id, COUNT(*) FROM t GROUP BY CUBE(id)",
         "SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 1",
         "SELECT id, COUNT(*) FROM t GROUP BY id ORDER BY id",
         "SELECT id, COUNT(*) FROM t GROUP BY id LIMIT 2",
-        "SELECT COUNT(*) FROM t",
     ] {
         let err = physical(&required, sql).await.unwrap_err().to_string();
         assert!(err.contains("morsel_mode=required"), "{sql}: {err}");

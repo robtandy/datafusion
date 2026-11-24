@@ -1220,3 +1220,272 @@ async fn group_count_strategy_selection_for_lowered_sql() -> Result<()> {
     ));
     Ok(())
 }
+
+#[cfg(feature = "sql")]
+struct ObservedAggregate {
+    plan: MorselExec,
+    scans: Observations,
+    finalizing: mpsc::UnboundedReceiver<()>,
+    resume: Arc<Semaphore>,
+    results: mpsc::UnboundedReceiver<usize>,
+}
+
+#[cfg(feature = "sql")]
+async fn observed_aggregate(
+    grouped: bool,
+    fail_on: Option<usize>,
+) -> Result<ObservedAggregate> {
+    let (mut pipeline, scans) = observed_pipeline(fail_on)?;
+    let input_schema = Arc::clone(pipeline.source.schema());
+    let ctx = crate::prelude::SessionContext::new();
+    let mem = Arc::new(MemTable::try_new(Arc::clone(&input_schema), vec![vec![]])?);
+    ctx.register_table("t", mem)?;
+    let sql = if grouped {
+        "SELECT id, SUM(id) AS s FROM t GROUP BY id"
+    } else {
+        "SELECT SUM(id) AS s, MIN(id) AS lo, MAX(id) AS hi FROM t"
+    };
+    let logical = ctx.sql(sql).await?.into_optimized_plan()?;
+    let agg_node = match &logical {
+        LogicalPlan::Projection(p) => match p.input.as_ref() {
+            LogicalPlan::Aggregate(a) => a,
+            other => panic!("unexpected plan: {other:?}"),
+        },
+        LogicalPlan::Aggregate(a) => a,
+        other => panic!("unexpected plan: {other:?}"),
+    };
+    let mut sink = AggregateSink::try_new(agg_node, &input_schema, &ctx.state())?
+        .expect("valid aggregate sink");
+    let agg_schema = Arc::clone(sink.schema());
+    let (entered, finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    sink.finalize_gate = Some(FinalizeGate {
+        entered,
+        resume: Arc::clone(&resume),
+    });
+
+    let sum_col_index = usize::from(grouped);
+    let (started, results) = mpsc::unbounded_channel();
+    let observe = create_udf(
+        "observe_agg",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            let ColumnarValue::Array(sums) = &args[0] else {
+                unreachable!()
+            };
+            started.send(sums.len()).unwrap();
+            Ok(ColumnarValue::Array(Arc::clone(sums)))
+        }),
+    );
+    let observe_expr = Arc::new(ScalarFunctionExpr::try_new(
+        Arc::new(observe),
+        vec![Arc::new(Column::new(
+            agg_schema.field(sum_col_index).name(),
+            sum_col_index,
+        ))],
+        &agg_schema,
+        Arc::default(),
+    )?);
+    let projector = ProjectionExprs::new([ProjectionExpr::new(observe_expr, "s")])
+        .make_projector(&agg_schema)?;
+    let result_schema = Arc::clone(projector.output_schema());
+    pipeline.sink = Sink::Aggregate {
+        sink,
+        result_operators: vec![Operator::Projection(projector)],
+    };
+    pipeline.sink_capacity = AGGREGATE_RESULT_CAPACITY;
+    Ok(ObservedAggregate {
+        plan: MorselExec::new(pipeline, result_schema),
+        scans,
+        finalizing,
+        resume,
+        results,
+    })
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn aggregate_result_waits_for_finalization_emits_bounded_batches_and_cleans_up()
+-> Result<()> {
+    for grouped in [false, true] {
+        let ObservedAggregate {
+            plan,
+            mut scans,
+            mut finalizing,
+            resume,
+            mut results,
+        } = observed_aggregate(grouped, None).await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert_eq!(
+            timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+            Some(())
+        );
+        let seen = observe_n(&mut scans, INPUT_BATCHES).await;
+        assert_eq!(seen.len(), INPUT_BATCHES);
+        assert_eq!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "grouped={grouped}: result pipeline started before finalization"
+        );
+        if grouped {
+            assert!(pool.reserved() > 0);
+        }
+
+        resume.add_permits(1);
+        let mut total_rows = 0;
+        let mut total_sum = 0i64;
+        let mut batches = 0;
+        while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+            let batch = batch?;
+            assert!(batch.num_rows() <= 4);
+            total_rows += batch.num_rows();
+            total_sum += as_int64_array(batch.column(0))?
+                .values()
+                .iter()
+                .sum::<i64>();
+            batches += 1;
+        }
+        let expected_rows = if grouped { INPUT_BATCHES } else { 1 };
+        let expected_sum: i64 = (0..INPUT_BATCHES as i64).sum();
+        assert_eq!(total_rows, expected_rows, "grouped={grouped}");
+        assert_eq!(total_sum, expected_sum, "grouped={grouped}");
+        if grouped {
+            assert_eq!(batches, INPUT_BATCHES.div_ceil(4));
+        } else {
+            assert_eq!(batches, 1);
+        }
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            1
+        );
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn dropping_aggregate_before_finalization_never_starts_result_and_frees_memory()
+-> Result<()> {
+    for grouped in [false, true] {
+        let ObservedAggregate {
+            plan,
+            mut finalizing,
+            mut results,
+            scans: _scans,
+            ..
+        } = observed_aggregate(grouped, None).await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert_eq!(
+            timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+            Some(())
+        );
+        drop(stream);
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            finalizing.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn dropping_grouped_aggregate_mid_emission_frees_all_memory() -> Result<()> {
+    let ObservedAggregate {
+        plan,
+        mut finalizing,
+        resume,
+        scans: _scans,
+        results: _results,
+    } = observed_aggregate(true, None).await?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 2)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+    drop(plan);
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    resume.add_permits(1);
+    let first = timeout(DEADLINE, stream.next()).await.unwrap().unwrap()?;
+    assert_eq!(first.num_rows(), 2);
+    drop(stream);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn aggregate_worker_error_skips_finalization_and_frees_memory() -> Result<()> {
+    for grouped in [false, true] {
+        let ObservedAggregate {
+            plan,
+            mut finalizing,
+            mut results,
+            scans: _scans,
+            ..
+        } = observed_aggregate(grouped, Some(3)).await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let error = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("test morsel failure"), "{error}");
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(
+            finalizing.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+    Ok(())
+}
