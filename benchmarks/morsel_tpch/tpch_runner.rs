@@ -459,7 +459,7 @@ fn collect_operator_compute_ms(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 fn process_cpu_seconds() -> Option<f64> {
     #[repr(C)]
     struct Timespec {
@@ -478,7 +478,7 @@ fn process_cpu_seconds() -> Option<f64> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 fn process_cpu_seconds() -> Option<f64> {
     None
 }

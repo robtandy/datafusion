@@ -8,12 +8,12 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 
 This scorecard records the controlled idle-host **TPC-H Checkpoint A** 3-way
 comparison on standard **TPC-H SF1 Parquet** (`lineitem`: 6,001,215 rows,
-16 Zstd files, 48 row groups of 131,072 rows, 177,150,918 bytes) on
-`rob-tandy-dduck2` after `#149` (worker-local coalescing), `#150` (Parquet
-`RowFilter` pushdown), `#166` (direct mask-bit `COUNT(*)` + filter-column
-pruning), `#167` (intra-row-group Parquet splitting), `#140` (grouped
-`COUNT(*)`), and `#168` (multi-aggregate `GROUP BY` + multi-column/string
-keys).
+16 Zstd files, 48 row groups — 32 full 131,072-row groups and 16 tail groups of
+~112,932 rows, 3 per file — totaling 177,150,918 bytes) on `rob-tandy-dduck2`
+after `#149` (worker-local coalescing), `#150` (Parquet `RowFilter` pushdown),
+`#166` (direct mask-bit `COUNT(*)` + filter-column pruning), `#167`
+(intra-row-group Parquet splitting), `#140` (grouped `COUNT(*)`), and `#168`
+(multi-aggregate `GROUP BY` + multi-column/string keys).
 
 This scorecard does not replace the pinned pre-`#150` baseline in
 [README.md](README.md#sf1-warm-cache-baseline-rob-tandy-dduck2-2026-11-22-utc).
@@ -26,12 +26,19 @@ natively under `MorselExec: workers=8, NativeParquet[lineitem...]` with
 `morsel_mode=required` (zero fallback, all 48 row groups claimed, exact
 `bytes_scanned` parity with Stock DataFusion).
 
-| Query          |           Best Morsel (`required`) | Stock Default (`off`) |                  Best Stock (`off`, tuned) | DuckDB 2.0.1 |    Morsel vs. Stock Default | Morsel vs. Best Stock | Morsel vs. DuckDB |
+| Query          |         Best Morsel (`required`)\* | Stock Default (`off`) |                  Best Stock (`off`, tuned) | DuckDB 2.0.1 |    Morsel vs. Stock Default | Morsel vs. Best Stock | Morsel vs. DuckDB |
 | -------------- | ---------------------------------: | --------------------: | -----------------------------------------: | -----------: | --------------------------: | --------------------: | ----------------: |
 | `q6`           | **88.3 ms** (`morsel_no_pushdown`) |              102.4 ms |              87.7 ms (`stock_no_pushdown`) |      59.3 ms | **1.16× faster (−14.1 ms)** |       0.99× (+0.6 ms) |  1.49× (+29.0 ms) |
 | `q1_unordered` |   **170.4 ms** (`morsel_pushdown`) |              218.4 ms | 171.1 ms (`stock_pushdown_no_repartition`) |     112.7 ms | **1.28× faster (−48.0 ms)** |   **1.00× (−0.7 ms)** |  1.51× (+57.7 ms) |
-| `q6_count`     | **48.3 ms** (`morsel_no_pushdown`) |               56.9 ms |              49.2 ms (`stock_no_pushdown`) |      26.6 ms |  **1.18× faster (−8.6 ms)** |   **1.02× (−0.9 ms)** |  1.81× (+21.7 ms) |
+| `q6_count`     | **48.3 ms** (`morsel_no_pushdown`) |               56.9 ms |              49.2 ms (`stock_no_pushdown`) |      26.6 ms |  **1.18× faster (−8.6 ms)** |   **1.02× (−0.9 ms)** |  1.82× (+21.7 ms) |
 | `q6_scan`      | **97.6 ms** (`morsel_no_pushdown`) |              111.9 ms |              94.0 ms (`stock_no_pushdown`) |      67.2 ms | **1.15× faster (−14.3 ms)** |       0.96× (+3.6 ms) |  1.45× (+30.4 ms) |
+
+\*Morsel timings in the main 224-trial run were recorded with `MORSEL_METRICS=1`
+enabled so every trial captures wait/work breakdowns; a separate
+(non-interleaved) `MORSEL_METRICS=0` follow-up run was `0–3 ms` faster on most
+arms (`q6`: `86.0 ms`, `q1_unordered`: `166.9 ms`, `q6_count`: `48.1 ms`,
+`q6_scan`: `96.5 ms`), which is comparable to the `+0.6 ms` and `+3.6 ms`
+"Morsel vs. Best Stock" differences on `q6` and `q6_scan`.
 
 Key takeaways:
 
@@ -39,17 +46,18 @@ Key takeaways:
   `stock_pushdown`) by 1.15–1.28× on all four queries** (`−8.6` to `−48.0 ms`
   vs. `stock_default`; `−7.8` to `−32.7 ms` for `morsel_pushdown` vs.
   `stock_pushdown`).
-- **Why unmodified Stock DataFusion loses 15–42 ms on SF1 `lineitem`:**
-  Even on this balanced 16-file / 48-row-group dataset, Stock's default
-  `repartition_file_scans=true` combined with
-  `RowGroupRangeAssignment::StartOffset` slices files blindly by byte offset
-  (e.g., assigning `part-000008.parquet:0..3520` to partition 3), producing a
-  static **`[6, 6, 6, 7, 6, 6, 6, 5]`** row-group skew across 8 partitions and
-  creating a `7/6 = 1.17×` tail straggler despite identical aggregate CPU work.
-  Morsel's dynamic row-group claiming automatically balances all 8 workers
-  (`6..6` per worker on `q1_unordered` `morsel_no_pushdown`/`morsel_pruning`)
-  without requiring manual `repartition_file_scans=false`. When Stock is
-  manually tuned with `repartition_file_scans=false` (`stock_no_pushdown` /
+- **Why unmodified Stock DataFusion loses 7.7–42.1 ms on SF1 `lineitem`
+  (`stock_default` vs. `stock_no_pushdown`):** Even on this balanced 16-file /
+  48-row-group dataset, Stock's default `repartition_file_scans=true` combined
+  with `RowGroupRangeAssignment::StartOffset` slices files blindly by byte
+  offset (e.g., assigning `part-000008.parquet:0..3520` to partition 3),
+  producing a static **`[6, 6, 6, 7, 6, 6, 6, 5]`** row-group skew across 8
+  partitions and creating a `7/6 = 1.17×` tail straggler despite identical
+  aggregate CPU work. Morsel's dynamic row-group claiming automatically
+  balances all 8 workers (`6..6` per worker on `q1_unordered`
+  `morsel_no_pushdown`/`morsel_pruning`) without requiring manual
+  `repartition_file_scans=false`. When Stock is manually tuned with
+  `repartition_file_scans=false` (`stock_no_pushdown` /
   `stock_pushdown_no_repartition`), Morsel matches or edges out Stock on
   `q6_count` (`48.3` vs. `49.2 ms`) and `q1_unordered` pushdown (`170.4` vs.
   `171.1 ms`) and stays within `0.7–3.8%` on `q6` and `q6_scan`.
@@ -63,26 +71,35 @@ Key takeaways:
   - `q6_count` remains steady at **`48.3 ms`** (`47.3 ms` in `#165`), ahead of
     every Stock arm (`49.2–71.3 ms`), because `decode_work` already accounts for
     `87.9%` of worker time at 1.90% selectivity.
-- **What explains the remaining 1.45–1.81× gap to DuckDB:**
+- **What explains the remaining 1.45–1.82× gap to DuckDB:**
   - **Parquet `FLBA(7)` → `Decimal128` decode is the #1 bottleneck across all
-    four queries (`65–88%` of the execution gap).** Comparing Morsel
-    `decode_work` against DuckDB's `TABLE_SCAN` operator CPU across 8 cores:
-    `q6` `513.3` vs. `345.0 ms` (`+168.3 ms` CPU / `+21.0 ms` wall),
-    `q1_unordered` `718.3` vs. `416.7 ms` (`+301.6 ms` CPU / `+37.7 ms` wall),
-    `q6_count` `242.7` vs. `132.0 ms` (`+110.7 ms` CPU / `+13.8 ms` wall), and
-    `q6_scan` `568.4` vs. `410.4 ms` (`+158.0 ms` CPU / `+19.8 ms` wall). As
-    isolated in `#180`, `parquet 60.1.0` `FixedLenByteArrayReader` performs
-    two-pass 7-byte `memcpy` + `sign_extend_be` per row instead of pre-decoding
-    small dictionary pages into `i128`.
-  - **Expression evaluation + 8-aggregate hash aggregation explains ~25% of the
-    `q1_unordered` gap** (`401.0 ms` Morsel `process_work` under
-    `morsel_pushdown` vs. `306.2 ms` DuckDB `PROJECTION + HASH_GROUP_BY`,
-    `+94.8 ms` CPU / `+11.9 ms` wall). DuckDB's optimizer rewrites
-    `AVG(l_quantity)` and `AVG(l_extendedprice)` into `SUM / COUNT` reusing the
-    already-computed `SUM` accumulators (avoiding 2 redundant 128-bit sums over
-    5.92M rows), whereas DataFusion maintains 7 independent `Decimal128` sums
-    and hashes `(Utf8View, Utf8View)` keys through Arrow `RowConverter` /
-    `GroupValuesRows`.
+    four queries, explaining `76.5–79.7%` of the aggregate operator-CPU gap
+    (`Morsel (decode + process) − DuckDB total_operator_ms`, or `48.9–59.6%` of
+    the total fresh-process wall-clock gap dividing aggregate CPU delta by 8
+    cores).** Comparing Morsel `decode_work` against DuckDB's fresh-process
+    `TABLE_SCAN` operator CPU across 8 cores: `q6` `513.3` vs. `392.5 ms`
+    (`+120.8 ms` CPU / `+15.1 ms` over 8 cores = `76.9%` of the `157.0 ms`
+    operator-CPU gap, `52.1%` of the `29.0 ms` wall gap), `q1_unordered`
+    `718.3` vs. `443.4 ms` (`+274.9 ms` CPU / `+34.4 ms` over 8 cores = `79.7%`
+    of the `344.8 ms` operator-CPU gap, `59.6%` of the `57.7 ms` wall gap),
+    `q6_count` `242.7` vs. `140.0 ms` (`+102.7 ms` CPU / `+12.8 ms` over 8
+    cores = `76.5%` of the `134.3 ms` operator-CPU gap, `59.2%` of the
+    `21.7 ms` wall gap), and `q6_scan` `568.4` vs. `449.5 ms` (`+118.9 ms` CPU
+    / `+14.9 ms` over 8 cores = `78.0%` of the `152.5 ms` operator-CPU gap,
+    `48.9%` of the `30.4 ms` wall gap). As isolated in `#180`, `parquet 60.1.0`
+    `FixedLenByteArrayReader` performs two-pass 7-byte `memcpy` +
+    `sign_extend_be` per row instead of pre-decoding small dictionary pages
+    into `i128`.
+  - **Expression evaluation + 8-aggregate hash aggregation explains `21.5%` of
+    the `q1_unordered` aggregate operator-CPU gap (`16.1%` of the `57.7 ms`
+    wall-clock gap)** (`401.0 ms` Morsel `process_work` under `morsel_pushdown`
+    vs. `326.9 ms` DuckDB `PROJECTION 73.0 + HASH_GROUP_BY 253.8 +
+RESULT_COLLECTOR 0.1`, `+74.1 ms` CPU / `+9.3 ms` over 8 cores). DuckDB's
+    optimizer rewrites `AVG(l_quantity)` and `AVG(l_extendedprice)` into
+    `SUM / COUNT` reusing the already-computed `SUM` accumulators (avoiding 2
+    redundant 128-bit sums over 5.92M rows), whereas DataFusion maintains 7
+    independent `Decimal128` sums and hashes `(Utf8View, Utf8View)` keys
+    through Arrow `RowConverter` / `GroupValuesRows`.
   - **Morsel scheduling / wait overhead is minimal:** aggregate
     `morsel_ready_wait` across all 8 workers is `7.3–24.2 ms` (`0.9–3.0 ms` per
     worker) on the fastest arms, and `morsel_output_wait` is `0.0 ms` on every
@@ -119,14 +136,14 @@ Key takeaways:
   parentheses.
 - **Morsel metrics instrumentation check:** All 224 scorecard trials ran with
   `MORSEL_METRICS=1` enabled so every Morsel trial emits wait/work breakdowns.
-  A paired `MORSEL_METRICS=0` check (`1 warmup + 7 repeats`) confirmed
-  negligible instrumentation impact across all 4 queries: `q6` `86.0` vs.
-  `88.3 ms` (`morsel_no_pushdown`), `119.4` vs. `122.7 ms` (`morsel_pushdown`);
-  `q1_unordered` `182.7` vs. `181.8 ms` (`morsel_no_pushdown`), `166.9` vs.
-  `170.4 ms` (`morsel_pushdown`); `q6_count` `48.1` vs. `48.3 ms`
-  (`morsel_no_pushdown`), `61.3` vs. `63.5 ms` (`morsel_pushdown`); `q6_scan`
-  `96.5` vs. `97.6 ms` (`morsel_no_pushdown`), `134.1` vs. `132.2 ms`
-  (`morsel_pushdown`).
+  A separate (non-interleaved) `MORSEL_METRICS=0` follow-up run
+  (`1 warmup + 7 repeats`) showed `0–3 ms` lower medians on most arms across
+  the 4 queries: `q6` `86.0` vs. `88.3 ms` (`morsel_no_pushdown`), `119.4` vs.
+  `122.7 ms` (`morsel_pushdown`); `q1_unordered` `182.7` vs. `181.8 ms`
+  (`morsel_no_pushdown`), `166.9` vs. `170.4 ms` (`morsel_pushdown`); `q6_count`
+  `48.1` vs. `48.3 ms` (`morsel_no_pushdown`), `61.3` vs. `63.5 ms`
+  (`morsel_pushdown`); `q6_scan` `96.5` vs. `97.6 ms` (`morsel_no_pushdown`),
+  `134.1` vs. `132.2 ms` (`morsel_pushdown`).
 
 ## 1. Full 3-Way SF1 Scorecard (Fresh Process, Warm Page Cache, 8 Threads)
 
@@ -224,27 +241,32 @@ Both campaigns ran on the same host (`rob-tandy-dduck2`, 8 pinned cores
 
 ### Cross-Engine Operator CPU Decomposition (Aggregate ms Across 8 Threads)
 
-Stock operator timings are `elapsed_compute` summed across plan nodes; DuckDB
-operator timings were collected in a dedicated profiling pass
-(`PRAGMA enable_profiling = 'json'`, `SET threads = 8`, `taskset -c 0-7`,
-1 warmup + 7 repeats, warm cache) over the exact same SF1 `lineitem` files.
+Stock operator timings are median `elapsed_compute` summed across plan nodes
+from the main scorecard run. DuckDB operator timings were collected with
+`harness.py duckdb-profile` (fresh process and fresh `:memory:` connection per
+repetition, `SET threads = 8`, `taskset -c 0-7`, `con.execute(sql).fetchall()`
+with `PRAGMA enable_profiling = 'json'`, warm page cache verified via
+`mincore`, 1 warmup + 7 repeats, taking the median of `operator[].timing`
+summed in ms grouped by `type`, idle host `vmstat` 92–93% before / 95–99%
+after; note that the median of per-run totals can differ slightly from the sum
+of per-operator medians).
 
-| Query          | Engine / Arm                          |                           Scan + Decode ms |                            Filter + Proj + Agg ms | Total Op Work ms | Wall ms |
-| -------------- | ------------------------------------- | -----------------------------------------: | ------------------------------------------------: | ---------------: | ------: |
-| `q6`           | Stock `stock_no_pushdown`             |                   486.9 (`DataSourceExec`) |                  41.0 (`Filter` 40.2 + `Agg` 0.8) |            527.9 |    87.7 |
-| `q6`           | Morsel `morsel_no_pushdown`           |                      513.3 (`decode_work`) |                             43.4 (`process_work`) |            556.7 |    88.3 |
-| `q6`           | DuckDB `duckdb_default`               |                       345.0 (`TABLE_SCAN`) |            7.1 (`PROJ` 5.5 + `UNGROUPED_AGG` 1.6) |            352.1 |    59.3 |
-| `q1_unordered` | Stock `stock_no_pushdown`             |                   704.5 (`DataSourceExec`) | 485.9 (`Filter` 98.8 + `Proj` 71.9 + `Agg` 315.2) |          1,190.4 |   176.3 |
-| `q1_unordered` | Stock `stock_pushdown_no_repartition` | 793.8 (`DataSourceExec`, incl. fused proj) |                           323.9 (`AggregateExec`) |          1,117.8 |   171.1 |
-| `q1_unordered` | Morsel `morsel_no_pushdown`           |                      715.3 (`decode_work`) |                            526.9 (`process_work`) |          1,242.2 |   181.8 |
-| `q1_unordered` | Morsel `morsel_pushdown`              |                      718.3 (`decode_work`) |                            401.0 (`process_work`) |          1,119.3 |   170.4 |
-| `q1_unordered` | DuckDB `duckdb_default`               |                       416.7 (`TABLE_SCAN`) |       306.2 (`PROJ` 66.0 + `HASH_GROUP_BY` 240.2) |            723.0 |   112.7 |
-| `q6_count`     | Stock `stock_no_pushdown`             |                   229.6 (`DataSourceExec`) |                  34.1 (`Filter` 34.0 + `Agg` 0.1) |            263.8 |    49.2 |
-| `q6_count`     | Morsel `morsel_no_pushdown`           |                      242.7 (`decode_work`) |                             33.3 (`process_work`) |            276.0 |    48.3 |
-| `q6_count`     | DuckDB `duckdb_default`               |                       132.0 (`TABLE_SCAN`) |            1.7 (`PROJ` 1.0 + `UNGROUPED_AGG` 0.7) |            133.7 |    26.6 |
-| `q6_scan`      | Stock `stock_no_pushdown`             |                   539.6 (`DataSourceExec`) |                 42.0 (`Filter` 41.5 + `Proj` 0.5) |            581.6 |    94.0 |
-| `q6_scan`      | Morsel `morsel_no_pushdown`           |                      568.4 (`decode_work`) |                             50.8 (`process_work`) |            619.2 |    97.6 |
-| `q6_scan`      | DuckDB `duckdb_default`               |                       410.4 (`TABLE_SCAN`) |              17.3 (`PROJ` 6.1 + `COLLECTOR` 11.2) |            427.7 |    67.2 |
+| Query          | Engine / Arm                          |                           Scan + Decode ms |                                        Filter + Proj + Agg ms | Total Op Work ms | Wall ms |
+| -------------- | ------------------------------------- | -----------------------------------------: | ------------------------------------------------------------: | ---------------: | ------: |
+| `q6`           | Stock `stock_no_pushdown`             |                   486.9 (`DataSourceExec`) |                              41.0 (`Filter` 40.2 + `Agg` 0.8) |            527.9 |    87.7 |
+| `q6`           | Morsel `morsel_no_pushdown`           |                      513.3 (`decode_work`) |                                         43.4 (`process_work`) |            556.7 |    88.3 |
+| `q6`           | DuckDB `duckdb_default`               |                       392.5 (`TABLE_SCAN`) |                        7.2 (`PROJ` 5.6 + `UNGROUPED_AGG` 1.5) |            399.7 |    59.3 |
+| `q1_unordered` | Stock `stock_no_pushdown`             |                   704.5 (`DataSourceExec`) |             485.9 (`Filter` 98.8 + `Proj` 71.9 + `Agg` 315.2) |          1,190.4 |   176.3 |
+| `q1_unordered` | Stock `stock_pushdown_no_repartition` | 793.8 (`DataSourceExec`, incl. fused proj) |                                       323.9 (`AggregateExec`) |          1,117.8 |   171.1 |
+| `q1_unordered` | Morsel `morsel_no_pushdown`           |                      715.3 (`decode_work`) |                                        526.9 (`process_work`) |          1,242.2 |   181.8 |
+| `q1_unordered` | Morsel `morsel_pushdown`              |                      718.3 (`decode_work`) |                                        401.0 (`process_work`) |          1,119.3 |   170.4 |
+| `q1_unordered` | DuckDB `duckdb_default`               |                       443.4 (`TABLE_SCAN`) | 326.9 (`PROJ` 73.0 + `HASH_GROUP_BY` 253.8 + `COLLECTOR` 0.1) |            774.5 |   112.7 |
+| `q6_count`     | Stock `stock_no_pushdown`             |                   229.6 (`DataSourceExec`) |                              34.1 (`Filter` 34.0 + `Agg` 0.1) |            263.8 |    49.2 |
+| `q6_count`     | Morsel `morsel_no_pushdown`           |                      242.7 (`decode_work`) |                                         33.3 (`process_work`) |            276.0 |    48.3 |
+| `q6_count`     | DuckDB `duckdb_default`               |                       140.0 (`TABLE_SCAN`) |                        1.7 (`PROJ` 1.0 + `UNGROUPED_AGG` 0.7) |            141.7 |    26.6 |
+| `q6_scan`      | Stock `stock_no_pushdown`             |                   539.6 (`DataSourceExec`) |                             42.0 (`Filter` 41.5 + `Proj` 0.5) |            581.6 |    94.0 |
+| `q6_scan`      | Morsel `morsel_no_pushdown`           |                      568.4 (`decode_work`) |                                         50.8 (`process_work`) |            619.2 |    97.6 |
+| `q6_scan`      | DuckDB `duckdb_default`               |                       449.5 (`TABLE_SCAN`) |                          18.1 (`PROJ` 6.3 + `COLLECTOR` 11.8) |            466.7 |    67.2 |
 
 ## 4. Analysis: Where Morsel Wins, Where DuckDB Leads, and Why
 
@@ -288,8 +310,9 @@ Aggregate` plan and emits a single finalized output batch (`1` batch vs.
 
 ### Where DuckDB Is Still Ahead — Root-Cause Attribution
 
-1. **Parquet `FLBA(7)` → `Decimal128` decoding (`~65–88%` of the remaining
-   execution gap on every query).**
+1. **Parquet `FLBA(7)` → `Decimal128` decoding (`76.5–79.7%` of the aggregate
+   operator-CPU gap; `48.9–59.6%` of the total wall-clock gap divided across 8
+   cores).**
    - All four TPC-H `lineitem` monetary/quantity columns (`l_quantity`,
      `l_extendedprice`, `l_discount`, `l_tax`) are stored as dictionary-encoded
      `FIXED_LEN_BYTE_ARRAY(7)` in standard PyArrow Parquet.
@@ -297,15 +320,16 @@ Aggregate` plan and emits a single finalized output batch (`1` batch vs.
      7-byte `memcpy` + `sign_extend_be` per row (`18M` rows on `q6`, `24M` rows
      on `q1_unordered`), rather than decoding the tiny dictionary pages once
      into `Vec<i128>`.
-   - This single gap accounts for **`+168 ms` CPU (`+21 ms` wall)** on `q6`,
-     **`+302 ms` CPU (`+38 ms` wall)** on `q1_unordered`, **`+111 ms` CPU
-     (`+14 ms` wall)** on `q6_count`, and **`+158 ms` CPU (`+20 ms` wall)** on
-     `q6_scan`. On `q6`, DuckDB's late materialization inside `TABLE_SCAN` also
-     avoids decoding `l_extendedprice` (31.2 MB compressed) for filtered-out
-     vectors.
+   - Comparing Morsel `decode_work` vs. DuckDB fresh-process `TABLE_SCAN`, this
+     gap is **`+120.8 ms` CPU (`+15.1 ms` over 8 cores)** on `q6`,
+     **`+274.9 ms` CPU (`+34.4 ms` over 8 cores)** on `q1_unordered`,
+     **`+102.7 ms` CPU (`+12.8 ms` over 8 cores)** on `q6_count`, and
+     **`+118.9 ms` CPU (`+14.9 ms` over 8 cores)** on `q6_scan`. On `q6`,
+     DuckDB's late materialization inside `TABLE_SCAN` also avoids decoding
+     `l_extendedprice` (31.2 MB compressed) for filtered-out vectors.
 2. **Expression evaluation and 8-aggregate hash aggregation on `q1_unordered`
-   (`~25%` of the remaining `q1_unordered` gap, `+94.8 ms` CPU / `+11.9 ms`
-   wall).**
+   (`21.5%` of the aggregate operator-CPU gap; `16.1%` of the `57.7 ms`
+   wall-clock gap, `+74.1 ms` CPU / `+9.3 ms` over 8 cores).**
    - DuckDB's `EXPLAIN` / JSON profile shows two structural advantages on Q1's
      5.92M surviving rows:
      1. **Aggregate CSE:** DuckDB rewrites `AVG(l_quantity)` and
@@ -316,16 +340,21 @@ Aggregate` plan and emits a single finalized output batch (`1` batch vs.
         independent `Decimal128` sums + 4 counts).
      2. **Compact string group keys & vectorized accumulation:** DuckDB hashes
         the 1-byte `(l_returnflag, l_linestatus)` keys directly in its tight
-        vectorized `HASH_GROUP_BY` (`240.2 ms`), whereas DataFusion encodes
+        vectorized `HASH_GROUP_BY` (`253.8 ms`, plus `73.0 ms` `PROJECTION` and
+        `0.1 ms` `RESULT_COLLECTOR` = `326.9 ms`), whereas DataFusion encodes
         `(Utf8View, Utf8View)` through Arrow `RowConverter` / `GroupValuesRows`
         and evaluates checked `Decimal128` arithmetic (`401.0 ms` in Morsel
-        `process_work`; `~399 ms` in Stock `stock_pushdown_no_repartition`).
+        `morsel_pushdown` `process_work`; in Stock `stock_no_pushdown`,
+        `ProjectionExec 71.9 + AggregateExec 315.2 = 387.1 ms` excluding
+        `FilterExec`, while in `stock_pushdown_no_repartition`, `AggregateExec`
+        is `323.9 ms` with the `__common_expr_1` projection fused into
+        `DataSourceExec`'s `793.8 ms`).
 3. **Post-decode filter evaluation when `pushdown_filters=false` on Q6-family
-   queries (`+32–36 ms` CPU / `+4–4.5 ms` wall).**
+   queries (`+31.6–36.2 ms` CPU / `+4.0–4.5 ms` over 8 cores).**
    - Because `RowFilter` regresses on Q6's 4-conjunct predicate, Morsel's best
-     Q6 arm runs with `pushdown_filters=false`, paying `33–51 ms` of post-decode
-     `process_work` compared to DuckDB's `1.7–7.1 ms` post-scan work (where the
-     filter ran inside `TABLE_SCAN`).
+     Q6 arm runs with `pushdown_filters=false`, paying `33.3–50.8 ms` of
+     post-decode `process_work` compared to DuckDB's `1.7–18.1 ms` post-scan
+     work (where the filter ran inside `TABLE_SCAN`).
 4. **Fresh-process registration + planning (`7.4–9.7 ms`).**
    - DataFusion spends `4.7–5.0 ms` in `register_parquet` (reading 16 Parquet
      footers for schema inference) plus `2.6–5.0 ms` in logical/physical
@@ -334,8 +363,10 @@ Aggregate` plan and emits a single finalized output batch (`1` batch vs.
 
 ## 5. Reproduction Commands
 
-From the repository root at `dd782ac575c6635635eb472936f0e4c3bcdde449` on Linux
-(`rob-tandy-dduck2`):
+From the repository root on Linux (`rob-tandy-dduck2`; main 224-trial scorecard
+recorded at `dd782ac575c6635635eb472936f0e4c3bcdde449`, DuckDB operator profile
+recorded using `harness.py duckdb-profile` on this branch with identical engine
+code):
 
 ```bash
 set -euo pipefail
@@ -387,7 +418,15 @@ vmstat -y 1 3
 # 6. Print timing + wait/work summary tables.
 "$py" -B "$b/harness.py" summarize "$work/sf1_checkpoint_a.jsonl"
 
-# 7. Optional instrumentation-overhead check (MORSEL_METRICS=0).
+# 7. Collect fresh-process DuckDB JSON operator timing breakdown (Section 3).
+vmstat -y 1 3
+timeout --kill-after=10s 180s taskset -c 0-7 "$py" -B "$b/harness.py" duckdb-profile \
+  "$data_dir" --threads 8 --timeout 120 --cache warm --warmups 1 --repeats 7 \
+  --queries q6 q1_unordered q6_count q6_scan \
+  > "$work/sf1_duckdb_profile.json"
+vmstat -y 1 3
+
+# 8. Separate (non-interleaved) instrumentation-overhead check (MORSEL_METRICS=0).
 MORSEL_METRICS=0 timeout --kill-after=10s 180s taskset -c 0-7 "$py" -B "$b/harness.py" bench \
   "$data_dir" --runner "$runner" --revision "$revision" \
   --threads 8 --timeout 120 --cache warm --warmups 1 --repeats 7 \
@@ -396,6 +435,6 @@ MORSEL_METRICS=0 timeout --kill-after=10s 180s taskset -c 0-7 "$py" -B "$b/harne
   > "$work/sf1_metrics_off.jsonl"
 "$py" -B "$b/harness.py" summarize "$work/sf1_metrics_off.jsonl"
 
-# 8. Clean up the detached worktree when finished.
+# 9. Clean up the detached worktree when finished.
 git worktree remove --force "$work/pinned"
 ```
