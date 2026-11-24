@@ -4,7 +4,7 @@
 
 import argparse
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import json
 import math
@@ -26,6 +26,9 @@ import pyarrow.parquet as pq
 
 BATCH_SIZE = 8192
 DEFAULT_ROW_GROUP_SIZE = 131_072
+QUERIES_DIR = Path(__file__).resolve().parent.parent / "queries"
+Q11_FRACTION_SENTINEL = "0.0001 /* __TPCH_Q11_FRACTION__ */"
+STANDARD_TPCH_QUERIES: tuple[str, ...] = tuple(f"q{i}" for i in range(1, 23))
 
 # Standard TPC-H tables with deterministic primary-key ordering and multi-file splits.
 TPCH_TABLES: dict[str, tuple[str, int]] = {
@@ -38,6 +41,50 @@ TPCH_TABLES: dict[str, tuple[str, int]] = {
     "nation": ("n_nationkey", 1),
     "region": ("r_regionkey", 1),
 }
+
+_Q15_VIEW_RE = re.compile(
+    r"^\s*create\s+view\s+(\w+)\s*\(([^)]+)\)\s*as\s*(.+?);\s*(select\b.+?);\s*drop\s+view\s+\1\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def load_tpch_query(query_num: int, queries_dir: Path = QUERIES_DIR) -> str:
+    """Load a standard TPC-H query from benchmarks/queries/q<N>.sql.
+
+    Rewrites Q15's CREATE VIEW / SELECT / DROP VIEW script into a single-statement
+    CTE so every engine executes the exact same statement in a fresh session with
+    no cross-trial view state leakage.
+    """
+    sql_path = queries_dir / f"q{query_num}.sql"
+    raw = sql_path.read_text().strip()
+    if query_num == 15:
+        match = _Q15_VIEW_RE.match(raw)
+        if match is None:
+            raise ValueError(
+                f"unexpected Q15 SQL structure in {sql_path}; expected CREATE VIEW / SELECT / DROP VIEW"
+            )
+        view_name, view_cols, view_sql, main_sql = match.groups()
+        return f"WITH {view_name} ({view_cols}) AS (\n{view_sql.strip()}\n)\n{main_sql.strip()}"
+    return raw.rstrip(";").strip()
+
+
+def infer_scale_factor(summary: dict) -> float:
+    """Infer TPC-H scale factor from the standard `part` table cardinality (200k * SF)."""
+    part_rows = summary["tables"]["part"]["rows"]
+    if part_rows <= 0:
+        raise ValueError(f"invalid part row count for SF inference: {part_rows}")
+    return part_rows / 200_000.0
+
+
+def render_workload_sql(workload: "Workload", scale_factor: float | None = None) -> str:
+    """Apply scale-factor parameter substitution (TPC-H Q11 FRACTION = 0.0001 / SF)."""
+    if scale_factor is not None and Q11_FRACTION_SENTINEL in workload.sql:
+        if not (math.isfinite(scale_factor) and scale_factor > 0):
+            raise ValueError(f"invalid scale factor: {scale_factor}")
+        return workload.sql.replace(
+            Q11_FRACTION_SENTINEL, f"(0.0001 / {scale_factor:g})"
+        )
+    return workload.sql
 
 
 @dataclass(frozen=True)
@@ -52,28 +99,201 @@ class Workload:
     is_aggregate: bool = False
 
 
-WORKLOADS: dict[str, Workload] = {
-    "q6": Workload(
-        name="q6",
-        tables=("lineitem",),
-        sql=(
-            "SELECT\n"
-            "    SUM(l_extendedprice * l_discount) AS revenue\n"
-            "FROM\n"
-            "    lineitem\n"
-            "WHERE\n"
-            "    l_shipdate >= DATE '1994-01-01'\n"
-            "    AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR\n"
-            "    AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01\n"
-            "    AND l_quantity < 24"
-        ),
-        ordered=True,
-        morsel_admitted=True,
-        is_count=False,
-        is_aggregate=True,
-        description="Standard TPC-H Q6 (filtered SUM over lineitem)",
+_STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], ...] = (
+    (
+        1,
+        ("lineitem",),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q1 (grouped multi-aggregate + ORDER BY over lineitem)",
     ),
-    "q1_unordered": Workload(
+    (
+        2,
+        ("part", "supplier", "partsupp", "nation", "region"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q2 (5-way join + correlated MIN subquery + TopN)",
+    ),
+    (
+        3,
+        ("customer", "orders", "lineitem"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q3 (3-way join + filter + GROUP BY + ORDER BY LIMIT 10)",
+    ),
+    (
+        4,
+        ("orders", "lineitem"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q4 (EXISTS semi-join + GROUP BY + ORDER BY)",
+    ),
+    (
+        5,
+        ("customer", "orders", "lineitem", "supplier", "nation", "region"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q5 (6-way join + GROUP BY + ORDER BY)",
+    ),
+    (
+        6,
+        ("lineitem",),
+        True,
+        True,
+        True,
+        "Standard TPC-H Q6 (filtered SUM over lineitem)",
+    ),
+    (
+        7,
+        ("supplier", "lineitem", "orders", "customer", "nation"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q7 (6-way join with self-joined nation + EXTRACT + GROUP BY + ORDER BY)",
+    ),
+    (
+        8,
+        ("part", "supplier", "lineitem", "orders", "customer", "nation", "region"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q8 (8-way join + CASE ratio aggregate + ORDER BY)",
+    ),
+    (
+        9,
+        ("part", "supplier", "lineitem", "partsupp", "orders", "nation"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q9 (6-way join + LIKE filter + GROUP BY + ORDER BY)",
+    ),
+    (
+        10,
+        ("customer", "orders", "lineitem", "nation"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q10 (4-way join + GROUP BY + TopN 20)",
+    ),
+    (
+        11,
+        ("partsupp", "supplier", "nation"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q11 (3-way join + HAVING scalar subquery + ORDER BY)",
+    ),
+    (
+        12,
+        ("lineitem", "orders"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q12 (join + filter + conditional SUM + GROUP BY + ORDER BY)",
+    ),
+    (
+        13,
+        ("customer", "orders"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q13 (LEFT OUTER JOIN + 2-stage GROUP BY + ORDER BY)",
+    ),
+    (
+        14,
+        ("lineitem", "part"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q14 (2-way join + conditional SUM ratio)",
+    ),
+    (
+        15,
+        ("lineitem", "supplier"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q15 (CTE revenue0 + MAX subquery + join + ORDER BY)",
+    ),
+    (
+        16,
+        ("partsupp", "part", "supplier"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q16 (NOT IN anti-join + COUNT DISTINCT + GROUP BY + ORDER BY)",
+    ),
+    (
+        17,
+        ("lineitem", "part"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q17 (2-way join + correlated AVG subquery + ungrouped SUM)",
+    ),
+    (
+        18,
+        ("customer", "orders", "lineitem"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q18 (3-way join + IN HAVING semi-join + GROUP BY + TopN 100)",
+    ),
+    (
+        19,
+        ("lineitem", "part"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q19 (2-way join with disjunctive OR predicates + SUM)",
+    ),
+    (
+        20,
+        ("supplier", "nation", "partsupp", "part", "lineitem"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q20 (nested IN semi-joins + correlated SUM subquery + ORDER BY)",
+    ),
+    (
+        21,
+        ("supplier", "lineitem", "orders", "nation"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q21 (4-way join + EXISTS semi-join + NOT EXISTS anti-join + TopN 100)",
+    ),
+    (
+        22,
+        ("customer", "orders"),
+        True,
+        False,
+        False,
+        "Standard TPC-H Q22 (SUBSTRING + scalar AVG subquery + NOT EXISTS anti-join + GROUP BY + ORDER BY)",
+    ),
+)
+
+
+def _build_workloads() -> dict[str, Workload]:
+    workloads: dict[str, Workload] = {}
+    for qnum, tables, ordered, admitted, is_agg, desc in _STANDARD_TPCH_SPECS:
+        name = f"q{qnum}"
+        workloads[name] = Workload(
+            name=name,
+            tables=tables,
+            sql=load_tpch_query(qnum),
+            ordered=ordered,
+            morsel_admitted=admitted,
+            is_count=False,
+            is_aggregate=is_agg,
+            description=desc,
+        )
+    workloads["q1_unordered"] = Workload(
         name="q1_unordered",
         tables=("lineitem",),
         sql=(
@@ -101,109 +321,8 @@ WORKLOADS: dict[str, Workload] = {
         is_count=False,
         is_aggregate=True,
         description="Unordered TPC-H Q1 (grouped multi-aggregate without ORDER BY over lineitem)",
-    ),
-    "q1": Workload(
-        name="q1",
-        tables=("lineitem",),
-        sql=(
-            "SELECT\n"
-            "    l_returnflag,\n"
-            "    l_linestatus,\n"
-            "    SUM(l_quantity) AS sum_qty,\n"
-            "    SUM(l_extendedprice) AS sum_base_price,\n"
-            "    SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n"
-            "    SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n"
-            "    AVG(l_quantity) AS avg_qty,\n"
-            "    AVG(l_extendedprice) AS avg_price,\n"
-            "    AVG(l_discount) AS avg_disc,\n"
-            "    COUNT(*) AS count_order\n"
-            "FROM\n"
-            "    lineitem\n"
-            "WHERE\n"
-            "    l_shipdate <= DATE '1998-09-02'\n"
-            "GROUP BY\n"
-            "    l_returnflag,\n"
-            "    l_linestatus\n"
-            "ORDER BY\n"
-            "    l_returnflag,\n"
-            "    l_linestatus"
-        ),
-        ordered=True,
-        morsel_admitted=False,
-        is_count=False,
-        description="Standard TPC-H Q1 (grouped multi-aggregate + ORDER BY over lineitem)",
-    ),
-    "q3": Workload(
-        name="q3",
-        tables=("customer", "orders", "lineitem"),
-        sql=(
-            "SELECT\n"
-            "    l_orderkey,\n"
-            "    SUM(l_extendedprice * (1 - l_discount)) AS revenue,\n"
-            "    o_orderdate,\n"
-            "    o_shippriority\n"
-            "FROM\n"
-            "    customer,\n"
-            "    orders,\n"
-            "    lineitem\n"
-            "WHERE\n"
-            "    c_mktsegment = 'BUILDING'\n"
-            "    AND c_custkey = o_custkey\n"
-            "    AND l_orderkey = o_orderkey\n"
-            "    AND o_orderdate < DATE '1995-03-15'\n"
-            "    AND l_shipdate > DATE '1995-03-15'\n"
-            "GROUP BY\n"
-            "    l_orderkey,\n"
-            "    o_orderdate,\n"
-            "    o_shippriority\n"
-            "ORDER BY\n"
-            "    revenue DESC,\n"
-            "    o_orderdate\n"
-            "LIMIT 10"
-        ),
-        ordered=True,
-        morsel_admitted=False,
-        is_count=False,
-        description="Standard TPC-H Q3 (3-way join + filter + GROUP BY + ORDER BY LIMIT 10)",
-    ),
-    "q12": Workload(
-        name="q12",
-        tables=("lineitem", "orders"),
-        sql=(
-            "SELECT\n"
-            "    l_shipmode,\n"
-            "    SUM(CASE\n"
-            "        WHEN o_orderpriority = '1-URGENT'\n"
-            "            OR o_orderpriority = '2-HIGH'\n"
-            "            THEN 1\n"
-            "        ELSE 0\n"
-            "    END) AS high_line_count,\n"
-            "    SUM(CASE\n"
-            "        WHEN o_orderpriority <> '1-URGENT'\n"
-            "            AND o_orderpriority <> '2-HIGH'\n"
-            "            THEN 1\n"
-            "        ELSE 0\n"
-            "    END) AS low_line_count\n"
-            "FROM\n"
-            "    lineitem\n"
-            "    JOIN orders ON l_orderkey = o_orderkey\n"
-            "WHERE\n"
-            "    l_shipmode IN ('MAIL', 'SHIP')\n"
-            "    AND l_commitdate < l_receiptdate\n"
-            "    AND l_shipdate < l_commitdate\n"
-            "    AND l_receiptdate >= DATE '1994-01-01'\n"
-            "    AND l_receiptdate < DATE '1994-01-01' + INTERVAL '1' YEAR\n"
-            "GROUP BY\n"
-            "    l_shipmode\n"
-            "ORDER BY\n"
-            "    l_shipmode"
-        ),
-        ordered=True,
-        morsel_admitted=False,
-        is_count=False,
-        description="Standard TPC-H Q12 (join + filter + GROUP BY + ORDER BY)",
-    ),
-    "q6_count": Workload(
+    )
+    workloads["q6_count"] = Workload(
         name="q6_count",
         tables=("lineitem",),
         sql=(
@@ -221,8 +340,8 @@ WORKLOADS: dict[str, Workload] = {
         morsel_admitted=True,
         is_count=True,
         description="Morsel-admitted filtered COUNT(*) on TPC-H lineitem (Q6 predicate)",
-    ),
-    "q6_scan": Workload(
+    )
+    workloads["q6_scan"] = Workload(
         name="q6_scan",
         tables=("lineitem",),
         sql=(
@@ -241,8 +360,69 @@ WORKLOADS: dict[str, Workload] = {
         morsel_admitted=True,
         is_count=False,
         description="Morsel-admitted unordered scan + filter + projection on TPC-H lineitem",
-    ),
-}
+    )
+    return workloads
+
+
+WORKLOADS: dict[str, Workload] = _build_workloads()
+MORSEL_ADMITTED_QUERIES: tuple[str, ...] = tuple(
+    name for name, w in WORKLOADS.items() if w.morsel_admitted
+)
+
+
+def resolve_queries(
+    raw_queries: list[str] | None, default: tuple[str, ...]
+) -> list[str]:
+    """Expand CLI --queries tokens supporting space/comma lists, 'all', and 'morsel'."""
+    if not raw_queries:
+        return list(default)
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for item in raw_queries:
+        for token in item.split(","):
+            name = token.strip()
+            if not name:
+                continue
+            if name == "all":
+                expanded = STANDARD_TPCH_QUERIES
+            elif name == "morsel":
+                expanded = MORSEL_ADMITTED_QUERIES
+            elif name in WORKLOADS:
+                expanded = (name,)
+            else:
+                valid = ", ".join(("all", "morsel", *WORKLOADS.keys()))
+                raise ValueError(f"unknown query '{name}'; expected one of: {valid}")
+            for q in expanded:
+                if q not in seen:
+                    seen.add(q)
+                    resolved.append(q)
+    if not resolved:
+        raise ValueError("--queries must select at least one query")
+    return resolved
+
+
+def resolve_arms(
+    raw_arms: list[str] | None, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Expand CLI arm tokens supporting space- or comma-separated names."""
+    if not raw_arms:
+        return default
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for item in raw_arms:
+        for token in item.split(","):
+            name = token.strip()
+            if not name:
+                continue
+            if name not in ARMS:
+                valid = ", ".join(ARMS.keys())
+                raise ValueError(f"unknown arm '{name}'; expected one of: {valid}")
+            if name not in seen:
+                seen.add(name)
+                resolved.append(name)
+    if not resolved:
+        raise ValueError("arm list must select at least one arm")
+    return tuple(resolved)
 
 
 @dataclass(frozen=True)
@@ -325,6 +505,85 @@ DEFAULT_MORSEL_ARMS = (
 )
 
 
+def _write_ordered_table_shards(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    pk_cols: str,
+    nfiles: int,
+    table_dir: Path,
+    row_group_size: int,
+) -> dict[str, int]:
+    total_rows = con.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
+    actual_files = min(nfiles, max(1, total_rows))
+    bounds = [
+        ((idx * total_rows) // actual_files, ((idx + 1) * total_rows) // actual_files)
+        for idx in range(actual_files)
+    ]
+    bounds = [(lo, hi) for lo, hi in bounds if lo < hi]
+
+    reader = con.sql(f"SELECT * FROM {table} ORDER BY {pk_cols}").to_arrow_reader(
+        batch_size=row_group_size
+    )
+    schema = reader.schema
+    written_files = 0
+    written_rgs = 0
+    written_bytes = 0
+
+    shard_idx = 0
+    shard_batches: list[pa.RecordBatch] = []
+    shard_rows = 0
+    row_pos = 0
+
+    def flush_shard(idx: int, batches: list[pa.RecordBatch]):
+        nonlocal written_files, written_rgs, written_bytes
+        shard = pa.Table.from_batches(batches, schema=schema)
+        out_file = table_dir / f"part-{idx:06d}.parquet"
+        with pq.ParquetWriter(
+            out_file,
+            schema,
+            compression="zstd",
+            compression_level=3,
+            use_dictionary=True,
+            write_statistics=True,
+            version="2.6",
+            data_page_version="1.0",
+        ) as writer:
+            writer.write_table(shard, row_group_size=row_group_size)
+        meta = pq.read_metadata(out_file)
+        written_files += 1
+        written_rgs += meta.num_row_groups
+        written_bytes += out_file.stat().st_size
+
+    for batch in reader:
+        if batch.num_rows == 0:
+            continue
+        offset = 0
+        while offset < batch.num_rows:
+            lo, hi = bounds[shard_idx]
+            need = (hi - lo) - shard_rows
+            take = min(need, batch.num_rows - offset)
+            shard_batches.append(batch.slice(offset, take))
+            shard_rows += take
+            offset += take
+            row_pos += take
+            if shard_rows == hi - lo:
+                flush_shard(shard_idx, shard_batches)
+                shard_batches = []
+                shard_rows = 0
+                shard_idx += 1
+
+    if row_pos != total_rows or shard_idx != len(bounds):
+        raise RuntimeError(
+            f"table {table}: wrote {row_pos}/{total_rows} rows across {shard_idx}/{len(bounds)} shards"
+        )
+    return {
+        "files": written_files,
+        "rows": total_rows,
+        "row_groups": written_rgs,
+        "parquet_bytes": written_bytes,
+    }
+
+
 def generate(path: Path, sf: float, row_group_size: int = DEFAULT_ROW_GROUP_SIZE):
     """Deterministically generate standard TPC-H Parquet tables via DuckDB dbgen."""
     if path.exists():
@@ -338,42 +597,11 @@ def generate(path: Path, sf: float, row_group_size: int = DEFAULT_ROW_GROUP_SIZE
     for table, (pk_cols, nfiles) in TPCH_TABLES.items():
         table_dir = path / table
         table_dir.mkdir()
-        arrow_table = con.sql(
-            f"SELECT * FROM {table} ORDER BY {pk_cols}"
-        ).to_arrow_table()
-        total_rows = arrow_table.num_rows
-        actual_files = min(nfiles, max(1, total_rows))
-        written_files = 0
-        written_rgs = 0
-        written_bytes = 0
-        for idx in range(actual_files):
-            lo = (idx * total_rows) // actual_files
-            hi = ((idx + 1) * total_rows) // actual_files
-            if lo == hi:
-                continue
-            shard = arrow_table.slice(lo, hi - lo)
-            out_file = table_dir / f"part-{idx:06d}.parquet"
-            with pq.ParquetWriter(
-                out_file,
-                shard.schema,
-                compression="zstd",
-                compression_level=3,
-                use_dictionary=True,
-                write_statistics=True,
-                version="2.6",
-                data_page_version="1.0",
-            ) as writer:
-                writer.write_table(shard, row_group_size=row_group_size)
-            meta = pq.read_metadata(out_file)
-            written_files += 1
-            written_rgs += meta.num_row_groups
-            written_bytes += out_file.stat().st_size
-        summary[table] = {
-            "files": written_files,
-            "rows": total_rows,
-            "row_groups": written_rgs,
-            "parquet_bytes": written_bytes,
-        }
+        summary[table] = _write_ordered_table_shards(
+            con, table, pk_cols, nfiles, table_dir, row_group_size
+        )
+        # Drop exported tables promptly to bound peak memory at SF=5+.
+        con.execute(f"DROP TABLE {table}")
     con.close()
     return summary
 
@@ -701,11 +929,20 @@ def _sort_key(row: tuple):
     return tuple(key)
 
 
+_QUALIFIED_AGG_RE = re.compile(r"\(\s*[a-z_][a-z0-9_]*\.([a-z_][a-z0-9_]*)\s*\)")
+
+
+def _normalize_col_name(name: str) -> str:
+    # DataFusion qualifies column names inside unaliased aggregates (e.g., Q18's
+    # `sum(lineitem.l_quantity)` vs DuckDB's `sum(l_quantity)`).
+    return _QUALIFIED_AGG_RE.sub(r"(\1)", name.lower())
+
+
 def compare_tables(
     oracle: pa.Table, actual: pa.Table, ordered: bool, case_name: str, arm_name: str
 ):
-    oracle_names = [n.lower() for n in oracle.schema.names]
-    actual_names = [n.lower() for n in actual.schema.names]
+    oracle_names = [_normalize_col_name(n) for n in oracle.schema.names]
+    actual_names = [_normalize_col_name(n) for n in actual.schema.names]
     if oracle_names != actual_names:
         raise ValueError(
             f"{arm_name}/{case_name}: column mismatch: expected {oracle_names}, got {actual_names}"
@@ -797,6 +1034,14 @@ def make_runner(arm: Arm, runner_bin: Path, data_dir: Path, threads: int, timeou
     )
 
 
+def _resolve_workload(qname: str, scale_factor: float) -> Workload:
+    workload = WORKLOADS[qname]
+    rendered_sql = render_workload_sql(workload, scale_factor)
+    if rendered_sql == workload.sql:
+        return workload
+    return replace(workload, sql=rendered_sql)
+
+
 def verify_suite(
     data_dir: Path,
     runner_bin: Path,
@@ -807,6 +1052,7 @@ def verify_suite(
     roadmap_arms: tuple[str, ...] = DEFAULT_ROADMAP_ARMS,
 ) -> dict:
     summary = dataset_summary(data_dir)
+    scale_factor = infer_scale_factor(summary)
     table_rgs = {name: info["row_groups"] for name, info in summary["tables"].items()}
     duckdb_oracle = DuckDbRunner(data_dir, threads, timeout)
 
@@ -815,7 +1061,7 @@ def verify_suite(
     evidence = []
 
     for qname in query_names:
-        workload = WORKLOADS[qname]
+        workload = _resolve_workload(qname, scale_factor)
         oracle_table = duckdb_oracle.query(workload)
         verified[qname] = {"rows": oracle_table.num_rows, "arms": []}
 
@@ -866,6 +1112,7 @@ def verify_suite(
             morsel_rejections[qname] = plan_result["error"]
 
     return {
+        "scale_factor": scale_factor,
         "verified": verified,
         "morsel_rejections": morsel_rejections,
         "evidence": evidence,
@@ -875,12 +1122,11 @@ def verify_suite(
 def run_bench(args):
     data_dir = args.path.resolve(strict=True)
     summary = dataset_summary(data_dir)
+    scale_factor = infer_scale_factor(summary)
     table_rgs = {name: info["row_groups"] for name, info in summary["tables"].items()}
-    query_names = args.queries or list(WORKLOADS.keys())
-    morsel_arms = tuple(args.morsel_arms) if args.morsel_arms else DEFAULT_MORSEL_ARMS
-    roadmap_arms = (
-        tuple(args.roadmap_arms) if args.roadmap_arms else DEFAULT_ROADMAP_ARMS
-    )
+    query_names = resolve_queries(args.queries, tuple(WORKLOADS.keys()))
+    morsel_arms = resolve_arms(args.morsel_arms, DEFAULT_MORSEL_ARMS)
+    roadmap_arms = resolve_arms(args.roadmap_arms, DEFAULT_ROADMAP_ARMS)
 
     if args.cache == "warm" and platform.system() != "Linux":
         raise ValueError("--cache warm requires Linux mincore page-cache verification")
@@ -899,7 +1145,7 @@ def run_bench(args):
     df_checker = DataFusionRunner(
         args.runner, data_dir, args.threads, args.timeout, "off", "default"
     )
-    rev_check = df_checker.plan(WORKLOADS[query_names[0]])
+    rev_check = df_checker.plan(_resolve_workload(query_names[0], scale_factor))
     if rev_check["build_revision"] != args.revision:
         raise ValueError(
             f"runner revision {rev_check['build_revision']} != --revision {args.revision}"
@@ -908,6 +1154,7 @@ def run_bench(args):
     header = {
         "record_type": "header",
         "build_revision": args.revision,
+        "scale_factor": scale_factor,
         "duckdb_version": duckdb.__version__,
         "pyarrow_version": pa.__version__,
         "python_version": platform.python_version(),
@@ -942,7 +1189,7 @@ def run_bench(args):
         require_warm_cache(all_referenced_files)
 
     for qname in query_names:
-        workload = WORKLOADS[qname]
+        workload = _resolve_workload(qname, scale_factor)
         expected_rows = verification["verified"][qname]["rows"]
         arm_names = morsel_arms if workload.morsel_admitted else roadmap_arms
         runners = {
@@ -1102,12 +1349,52 @@ def summarize_jsonl(path: Path):
                 f"{peak_ready}/{peak_out} |"
             )
 
+    # Pairwise geometric mean for Stock DataFusion vs DuckDB on shared queries.
+    cases_in_order = list(dict.fromkeys(case for case, _ in grouped))
+    medians = {
+        key: statistics.median(r["seconds"] * 1000.0 for r in rows)
+        for key, rows in grouped.items()
+    }
+    shared_sd = [
+        c
+        for c in cases_in_order
+        if (c, "stock_default") in medians and (c, "duckdb_default") in medians
+    ]
+    if shared_sd:
+        stock_gmean = statistics.geometric_mean(
+            medians[(c, "stock_default")] for c in shared_sd
+        )
+        duck_gmean = statistics.geometric_mean(
+            medians[(c, "duckdb_default")] for c in shared_sd
+        )
+        ratio_gmean = statistics.geometric_mean(
+            medians[(c, "stock_default")] / medians[(c, "duckdb_default")]
+            for c in shared_sd
+        )
+        stock_sum = sum(medians[(c, "stock_default")] for c in shared_sd)
+        duck_sum = sum(medians[(c, "duckdb_default")] for c in shared_sd)
+        print()
+        print(
+            f"Geometric mean across {len(shared_sd)} shared queries "
+            f"(`stock_default` vs `duckdb_default`): "
+            f"`stock_default`={stock_gmean:.1f} ms, `duckdb_default`={duck_gmean:.1f} ms, "
+            f"geomean ratio={ratio_gmean:.2f}x "
+            f"(sum of medians: {stock_sum:.1f} ms vs {duck_sum:.1f} ms, {stock_sum / duck_sum:.2f}x)"
+        )
+
+    rejections = header.get("morsel_rejections") or {}
+    if rejections:
+        print()
+        print("| Query | Morsel (`morsel_mode=required`) status |")
+        print("| --- | --- |")
+        for qname, err in rejections.items():
+            print(f"| `{qname}` | `{err}` |")
+
 
 def run_duckdb_profile(args):
     data_dir = args.path.resolve(strict=True)
-    query_names = args.queries or [
-        name for name, w in WORKLOADS.items() if w.morsel_admitted
-    ]
+    scale_factor = infer_scale_factor(dataset_summary(data_dir))
+    query_names = resolve_queries(args.queries, MORSEL_ADMITTED_QUERIES)
     if args.cache == "warm" and platform.system() != "Linux":
         raise ValueError("--cache warm requires Linux mincore page-cache verification")
 
@@ -1122,7 +1409,7 @@ def run_duckdb_profile(args):
     runner = DuckDbRunner(data_dir, args.threads, args.timeout)
     results = {}
     for qname in query_names:
-        workload = WORKLOADS[qname]
+        workload = _resolve_workload(qname, scale_factor)
         q_files = [f for t in workload.tables for f in table_files(data_dir, t)]
         samples = []
         for rep in range(1 - args.warmups, args.repeats + 1):
@@ -1245,9 +1532,13 @@ def main():
     ver.add_argument("--runner", type=Path, required=True)
     ver.add_argument("--threads", type=positive_int, default=4)
     ver.add_argument("--timeout", type=positive_int, default=120)
-    ver.add_argument("--queries", nargs="+", choices=list(WORKLOADS.keys()))
-    ver.add_argument("--morsel-arms", nargs="+", choices=list(ARMS.keys()))
-    ver.add_argument("--roadmap-arms", nargs="+", choices=list(ARMS.keys()))
+    ver.add_argument(
+        "--queries",
+        nargs="+",
+        help="Queries (space/comma separated), 'all' (q1-q22), or 'morsel'",
+    )
+    ver.add_argument("--morsel-arms", nargs="+")
+    ver.add_argument("--roadmap-arms", nargs="+")
 
     bench = sub.add_parser("bench", help="Run controlled 3-way TPC-H benchmark")
     bench.add_argument("path", type=Path)
@@ -1262,9 +1553,13 @@ def main():
     )
     bench.add_argument("--warmups", type=int, default=1)
     bench.add_argument("--repeats", type=positive_int, default=5)
-    bench.add_argument("--queries", nargs="+", choices=list(WORKLOADS.keys()))
-    bench.add_argument("--morsel-arms", nargs="+", choices=list(ARMS.keys()))
-    bench.add_argument("--roadmap-arms", nargs="+", choices=list(ARMS.keys()))
+    bench.add_argument(
+        "--queries",
+        nargs="+",
+        help="Queries (space/comma separated), 'all' (q1-q22), or 'morsel'",
+    )
+    bench.add_argument("--morsel-arms", nargs="+")
+    bench.add_argument("--roadmap-arms", nargs="+")
 
     summ = sub.add_parser(
         "summarize", help="Print Markdown summary of a benchmark JSONL"
@@ -1285,7 +1580,11 @@ def main():
     )
     dprof.add_argument("--warmups", type=int, default=1)
     dprof.add_argument("--repeats", type=positive_int, default=7)
-    dprof.add_argument("--queries", nargs="+", choices=list(WORKLOADS.keys()))
+    dprof.add_argument(
+        "--queries",
+        nargs="+",
+        help="Queries (space/comma separated), 'all' (q1-q22), or 'morsel'",
+    )
     dprof.add_argument("--format", choices=("json", "markdown"), default="json")
 
     # Internal subprocess entrypoint for isolated DuckDB runs.
@@ -1316,24 +1615,32 @@ def main():
         print(json.dumps(dataset_summary(args.path), indent=2))
         return
     if args.command == "verify":
+        try:
+            query_names = resolve_queries(args.queries, tuple(WORKLOADS.keys()))
+            morsel_arms = resolve_arms(args.morsel_arms, DEFAULT_MORSEL_ARMS)
+            roadmap_arms = resolve_arms(args.roadmap_arms, DEFAULT_ROADMAP_ARMS)
+        except ValueError as err:
+            parser.error(str(err))
         report = verify_suite(
             args.path,
             args.runner,
             args.threads,
             args.timeout,
-            args.queries or list(WORKLOADS.keys()),
-            morsel_arms=(
-                tuple(args.morsel_arms) if args.morsel_arms else DEFAULT_MORSEL_ARMS
-            ),
-            roadmap_arms=(
-                tuple(args.roadmap_arms) if args.roadmap_arms else DEFAULT_ROADMAP_ARMS
-            ),
+            query_names,
+            morsel_arms=morsel_arms,
+            roadmap_arms=roadmap_arms,
         )
         print(json.dumps(report, indent=2))
         return
     if args.command == "bench":
         if args.warmups < 0:
             parser.error("--warmups must be non-negative")
+        try:
+            resolve_queries(args.queries, tuple(WORKLOADS.keys()))
+            resolve_arms(args.morsel_arms, DEFAULT_MORSEL_ARMS)
+            resolve_arms(args.roadmap_arms, DEFAULT_ROADMAP_ARMS)
+        except ValueError as err:
+            parser.error(str(err))
         run_bench(args)
         return
     if args.command == "summarize":
@@ -1342,6 +1649,10 @@ def main():
     if args.command == "duckdb-profile":
         if args.warmups < 0:
             parser.error("--warmups must be non-negative")
+        try:
+            resolve_queries(args.queries, MORSEL_ADMITTED_QUERIES)
+        except ValueError as err:
+            parser.error(str(err))
         run_duckdb_profile(args)
         return
     if args.command == "_duckdb-exec":

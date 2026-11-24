@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+import io
+from contextlib import redirect_stdout
 from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,12 +20,19 @@ import pyarrow.parquet as pq
 
 from harness import (
     ARMS,
+    MORSEL_ADMITTED_QUERIES,
+    STANDARD_TPCH_QUERIES,
     TPCH_TABLES,
     WORKLOADS,
     compare_tables,
     dataset_summary,
     generate,
+    infer_scale_factor,
+    render_workload_sql,
     require_warm_cache,
+    resolve_arms,
+    resolve_queries,
+    summarize_jsonl,
     table_files,
     validate_plan,
 )
@@ -36,6 +46,34 @@ EXPECTED_SF001_ROWS = {
     "supplier": 100,
     "nation": 25,
     "region": 5,
+}
+
+EXPECTED_SF001_QUERY_ROWS = {
+    "q1": 4,
+    "q2": 4,
+    "q3": 10,
+    "q4": 5,
+    "q5": 5,
+    "q6": 1,
+    "q7": 4,
+    "q8": 2,
+    "q9": 173,
+    "q10": 20,
+    "q11": 1,
+    "q12": 2,
+    "q13": 33,
+    "q14": 1,
+    "q15": 1,
+    "q16": 296,
+    "q17": 1,
+    "q18": 2,
+    "q19": 1,
+    "q20": 1,
+    "q21": 1,
+    "q22": 7,
+    "q1_unordered": 4,
+    "q6_count": 1,
+    "q6_scan": 1191,
 }
 
 
@@ -188,6 +226,165 @@ class TpchHarnessTest(unittest.TestCase):
         df_sum = pa.table({"cnt": pa.array([64], type=pa.int64())})
         compare_tables(duck_sum, df_sum, ordered=True, case_name="q12", arm_name="t")
 
+    def test_all_22_tpch_queries_loaded_and_q15_rewritten_as_cte(self):
+        self.assertEqual(len(STANDARD_TPCH_QUERIES), 22)
+        for qname in STANDARD_TPCH_QUERIES:
+            self.assertIn(qname, WORKLOADS)
+            workload = WORKLOADS[qname]
+            self.assertTrue(workload.sql)
+            self.assertFalse(workload.sql.endswith(";"))
+            for table in workload.tables:
+                self.assertIn(table, TPCH_TABLES)
+                self.assertRegex(
+                    workload.sql.lower(),
+                    rf"\b{re.escape(table)}\b",
+                    msg=f"{qname} declares unused table {table}",
+                )
+
+        # Q15 must be rewritten to a single-statement CTE with no DDL view state.
+        q15_sql = WORKLOADS["q15"].sql
+        self.assertNotIn("create view", q15_sql.lower())
+        self.assertNotIn("drop view", q15_sql.lower())
+        self.assertTrue(q15_sql.startswith("WITH revenue0"))
+
+        # Q11 must substitute TPC-H FRACTION = 0.0001 / SF cleanly.
+        q11_sf5 = render_workload_sql(WORKLOADS["q11"], 5.0)
+        self.assertIn("(0.0001 / 5)", q11_sf5)
+        self.assertNotIn("__TPCH_Q11_FRACTION__", q11_sf5)
+        self.assertEqual(
+            infer_scale_factor({"tables": {"part": {"rows": 1_000_000}}}), 5.0
+        )
+
+    def test_resolve_queries_and_arms_support_all_morsel_and_comma_lists(self):
+        self.assertEqual(
+            resolve_queries(["all"], ("q6",)),
+            list(STANDARD_TPCH_QUERIES),
+        )
+        self.assertEqual(
+            resolve_queries(["morsel"], ("q1",)),
+            list(MORSEL_ADMITTED_QUERIES),
+        )
+        self.assertEqual(
+            resolve_queries(["q1,q3,q6,q12", "q6_count,q6_scan", "q1_unordered"], ()),
+            ["q1", "q3", "q6", "q12", "q6_count", "q6_scan", "q1_unordered"],
+        )
+        # Deduplication preserves first-seen order.
+        self.assertEqual(
+            resolve_queries(["q6,q1", "q6", "q1,q3"], ()),
+            ["q6", "q1", "q3"],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown query"):
+            resolve_queries(["q99"], ())
+
+        self.assertEqual(
+            resolve_arms(["stock_default,duckdb_default"], ()),
+            ("stock_default", "duckdb_default"),
+        )
+        with self.assertRaisesRegex(ValueError, "unknown arm"):
+            resolve_arms(["not_an_arm"], ())
+
+    def test_compare_tables_normalizes_unaliased_q18_aggregate_name(self):
+        duck_q18 = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(l_quantity)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(38, 2)
+                ),
+            }
+        )
+        df_q18 = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(lineitem.l_quantity)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(25, 2)
+                ),
+            }
+        )
+        compare_tables(duck_q18, df_q18, ordered=True, case_name="q18", arm_name="t")
+
+        wrong_col = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(other_col)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(25, 2)
+                ),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "column mismatch"):
+            compare_tables(
+                duck_q18, wrong_col, ordered=True, case_name="q18", arm_name="t"
+            )
+
+    def test_summarize_jsonl_reports_geomean_and_morsel_rejections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "sample.jsonl"
+            records = [
+                {
+                    "record_type": "header",
+                    "host": "test-host",
+                    "arch": "aarch64",
+                    "kernel": "7.0",
+                    "threads": 8,
+                    "cache_regime": "warm",
+                    "warmups": 1,
+                    "repeats": 1,
+                    "build_revision": "deadbeef",
+                    "duckdb_version": "2.0.1",
+                    "pyarrow_version": "26.0.1",
+                    "morsel_rejections": {
+                        "q1": "morsel_mode=required: unsupported logical operator: Sort"
+                    },
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "stock_default",
+                    "seconds": 0.2,
+                    "exec_seconds": 0.18,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "duckdb_default",
+                    "seconds": 0.1,
+                    "exec_seconds": None,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "stock_default",
+                    "seconds": 0.4,
+                    "exec_seconds": 0.38,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "duckdb_default",
+                    "seconds": 0.05,
+                    "exec_seconds": None,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+            ]
+            jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                summarize_jsonl(jsonl)
+            out = buf.getvalue()
+            # Geomean ratio of (2.0, 8.0) is 4.00x.
+            self.assertIn("geomean ratio=4.00x", out)
+            self.assertIn("unsupported logical operator: Sort", out)
+
     def test_require_warm_cache_rejects_partial_residency(self):
         with patch("harness.cache_pages", return_value={"resident": 1, "total": 2}):
             with self.assertRaisesRegex(ValueError, "cannot verify warm"):
@@ -296,21 +493,15 @@ class TpchHarnessTest(unittest.TestCase):
                 timeout=180,
             )
             report = json.loads(out)
+            self.assertEqual(report["scale_factor"], 0.01)
             self.assertEqual(
                 {k: v["rows"] for k, v in report["verified"].items()},
-                {
-                    "q6": 1,
-                    "q1_unordered": 4,
-                    "q1": 4,
-                    "q3": 10,
-                    "q12": 2,
-                    "q6_count": 1,
-                    "q6_scan": 1191,
-                },
+                EXPECTED_SF001_QUERY_ROWS,
             )
-            self.assertEqual(
-                set(report["morsel_rejections"].keys()), {"q1", "q3", "q12"}
+            expected_rejected = set(STANDARD_TPCH_QUERIES) - set(
+                MORSEL_ADMITTED_QUERIES
             )
+            self.assertEqual(set(report["morsel_rejections"].keys()), expected_rejected)
             for qname, err in report["morsel_rejections"].items():
                 self.assertIn("morsel_mode=required", err, msg=qname)
 
@@ -319,7 +510,7 @@ class TpchHarnessTest(unittest.TestCase):
                 for e in report["evidence"]
                 if e["mode"] == "required"
             }
-            for qname in ("q6", "q1_unordered", "q6_count", "q6_scan"):
+            for qname in MORSEL_ADMITTED_QUERIES:
                 for arm_name in (
                     "morsel_no_pushdown",
                     "morsel_pruning",
