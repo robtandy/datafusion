@@ -794,6 +794,80 @@ impl MorselQueryPlanner {
                 let out_schema = Arc::clone(projector.output_schema());
                 post_ops.remove(0);
                 (payload_cols, output_proj, out_schema)
+            } else if let Some(Operator::Projection(projector)) = post_ops.first_mut()
+                && projector.projection().column_indices().len()
+                    < join_output_schema.fields().len()
+            {
+                let needed = projector.projection().column_indices();
+                let narrow = ProjectionExprs::from_indices(&needed, &join_output_schema);
+                let narrowed_schema = Arc::new(join_output_schema.project(&needed)?);
+                let remapped = projector
+                    .projection()
+                    .clone()
+                    .try_map_exprs(|expr| narrow.project_expr(&expr))?
+                    .make_projector_with_schema_metadata(
+                        &narrowed_schema,
+                        projector.output_schema(),
+                    )?;
+                if remapped.output_schema() == projector.output_schema() {
+                    let mut payload_cols: Vec<usize> = Vec::new();
+                    let mut output_proj = Vec::with_capacity(needed.len());
+                    for &join_col in &needed {
+                        let col = match (build_side, join_col < left_len) {
+                            (BuildSide::Left, true) => {
+                                let pos = payload_cols
+                                    .iter()
+                                    .position(|&c| c == join_col)
+                                    .unwrap_or_else(|| {
+                                        payload_cols.push(join_col);
+                                        payload_cols.len() - 1
+                                    });
+                                JoinOutputCol::Build(pos)
+                            }
+                            (BuildSide::Left, false) => {
+                                JoinOutputCol::Probe(join_col - left_len)
+                            }
+                            (BuildSide::Right, true) => JoinOutputCol::Probe(join_col),
+                            (BuildSide::Right, false) => {
+                                let build_col = join_col - left_len;
+                                let pos = payload_cols
+                                    .iter()
+                                    .position(|&c| c == build_col)
+                                    .unwrap_or_else(|| {
+                                        payload_cols.push(build_col);
+                                        payload_cols.len() - 1
+                                    });
+                                JoinOutputCol::Build(pos)
+                            }
+                        };
+                        output_proj.push(col);
+                    }
+                    *projector = remapped;
+                    (payload_cols, output_proj, narrowed_schema)
+                } else {
+                    let payload_cols: Vec<usize> =
+                        (0..build_schema.fields().len()).collect();
+                    let mut output_proj = Vec::with_capacity(left_len + right_len);
+                    match build_side {
+                        BuildSide::Left => {
+                            for i in 0..left_len {
+                                output_proj.push(JoinOutputCol::Build(i));
+                            }
+                            for i in 0..right_len {
+                                output_proj.push(JoinOutputCol::Probe(i));
+                            }
+                        }
+                        BuildSide::Right => {
+                            for i in 0..left_len {
+                                output_proj.push(JoinOutputCol::Probe(i));
+                            }
+                            for i in 0..right_len {
+                                output_proj.push(JoinOutputCol::Build(i));
+                            }
+                        }
+                    }
+                    (payload_cols, output_proj, Arc::clone(&join_output_schema))
+                }
             } else {
                 let payload_cols: Vec<usize> = (0..build_schema.fields().len()).collect();
                 let mut output_proj = Vec::with_capacity(left_len + right_len);
@@ -1936,6 +2010,11 @@ impl Pipeline {
                 Ok(true)
             }),
             WorkerSink::Result(buffer) => {
+                // Avoid copying already-large join output batches through the coalescer;
+                // only coalesce sparse/small batches while keeping output unordered.
+                if batch.num_rows() >= (buffer.batch_size / 2).max(1) {
+                    return Ok(worker.send(tx, batch).await);
+                }
                 let mut output = worker.process(|| {
                     buffer.push_input(&[], batch)?;
                     buffer.next(&[], false)

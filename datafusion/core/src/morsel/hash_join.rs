@@ -347,9 +347,6 @@ impl HashJoinBuildSink {
         }
 
         let bucket_count = num_rows.saturating_mul(2).next_power_of_two().max(16);
-        let dir_bytes = bucket_count
-            .saturating_add(num_rows)
-            .saturating_mul(size_of::<u32>());
         let payload_concat_bytes =
             if self.payload_columns.is_empty() || batches.len() <= 1 {
                 0
@@ -359,10 +356,27 @@ impl HashJoinBuildSink {
                     .map(get_record_batch_memory_size)
                     .fold(0usize, usize::saturating_add)
             };
-        let keys_peak_bytes = match self.key_kind {
-            KeyKind::Int32 | KeyKind::UInt32 => num_rows.saturating_mul(size_of::<u32>()),
-            KeyKind::Int64 | KeyKind::UInt64 => num_rows.saturating_mul(size_of::<u64>()),
+        let is_flat_int = matches!(
+            self.key_kind,
+            KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+        );
+        let (dir_bytes, keys_peak_bytes) = match self.key_kind {
+            KeyKind::Int32 | KeyKind::UInt32 => (
+                0usize,
+                bucket_count
+                    .saturating_mul(size_of::<IntSlot<u32>>())
+                    .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+            ),
+            KeyKind::Int64 | KeyKind::UInt64 => (
+                0usize,
+                bucket_count
+                    .saturating_mul(size_of::<IntSlot<u64>>())
+                    .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+            ),
             KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View => {
+                let dir = bucket_count
+                    .saturating_add(num_rows)
+                    .saturating_mul(size_of::<u32>());
                 let concat_bytes = if key_batches.len() <= 1 {
                     0
                 } else {
@@ -371,17 +385,27 @@ impl HashJoinBuildSink {
                         .map(|kb| kb[0].get_array_memory_size())
                         .fold(0usize, usize::saturating_add)
                 };
-                concat_bytes.saturating_add(num_rows.saturating_mul(size_of::<u64>()))
+                (
+                    dir,
+                    concat_bytes
+                        .saturating_add(num_rows.saturating_mul(size_of::<u64>())),
+                )
             }
             KeyKind::Rows => {
+                let dir = bucket_count
+                    .saturating_add(num_rows)
+                    .saturating_mul(size_of::<u32>());
                 let raw_key_bytes = key_batches
                     .iter()
                     .flat_map(|kb| kb.iter())
                     .map(|a| a.get_array_memory_size())
                     .fold(0usize, usize::saturating_add);
-                raw_key_bytes
-                    .saturating_add(num_rows.saturating_mul(16))
-                    .saturating_add(num_rows.saturating_mul(size_of::<u64>()))
+                (
+                    dir,
+                    raw_key_bytes
+                        .saturating_add(num_rows.saturating_mul(16))
+                        .saturating_add(num_rows.saturating_mul(size_of::<u64>())),
+                )
             }
         };
 
@@ -407,32 +431,52 @@ impl HashJoinBuildSink {
         };
         drop(batches);
 
-        let build_keys = self.build_keys(&mut key_batches, &hash_chunks, num_rows)?;
-        drop(key_batches);
-
         let mask = bucket_count - 1;
-        let mut buckets = vec![0u32; bucket_count];
-        let mut next = vec![0u32; num_rows];
-        let mut row_idx = 0usize;
-        let mut since_yield = 0usize;
-        for chunk in &hash_chunks {
-            for &h in chunk {
-                let bucket = (h as usize) & mask;
-                let entry = (row_idx + 1) as u32;
-                next[row_idx] = buckets[bucket];
-                buckets[bucket] = entry;
-                row_idx += 1;
-                since_yield += 1;
-                if since_yield >= FINALIZE_YIELD_CHUNK {
-                    since_yield = 0;
-                    if tx.is_closed() {
-                        return Ok(None);
+        let (build_keys, buckets, next) = if is_flat_int {
+            let Some(keys) = self
+                .build_flat_int_keys(
+                    &mut key_batches,
+                    &hash_chunks,
+                    num_rows,
+                    bucket_count,
+                    tx,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            drop(key_batches);
+            drop(hash_chunks);
+            (keys, Vec::new(), Vec::new())
+        } else {
+            let build_keys =
+                self.build_chained_keys(&mut key_batches, &hash_chunks, num_rows)?;
+            drop(key_batches);
+
+            let mut buckets = vec![0u32; bucket_count];
+            let mut next = vec![0u32; num_rows];
+            let mut row_idx = 0usize;
+            let mut since_yield = 0usize;
+            for chunk in &hash_chunks {
+                for &h in chunk {
+                    let bucket = (h as usize) & mask;
+                    let entry = (row_idx + 1) as u32;
+                    next[row_idx] = buckets[bucket];
+                    buckets[bucket] = entry;
+                    row_idx += 1;
+                    since_yield += 1;
+                    if since_yield >= FINALIZE_YIELD_CHUNK {
+                        since_yield = 0;
+                        if tx.is_closed() {
+                            return Ok(None);
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
                 }
             }
-        }
-        drop(hash_chunks);
+            drop(hash_chunks);
+            (build_keys, buckets, next)
+        };
 
         let final_bytes = get_record_batch_memory_size(&payload)
             .saturating_add(build_keys.memory_bytes())
@@ -450,7 +494,75 @@ impl HashJoinBuildSink {
         })))
     }
 
-    fn build_keys(
+    async fn build_flat_int_keys(
+        &self,
+        key_batches: &mut Vec<Vec<ArrayRef>>,
+        hash_chunks: &[Vec<u64>],
+        num_rows: usize,
+        slot_count: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<Option<BuildKeys>> {
+        macro_rules! build_flat {
+            ($Arr:ty, $K:ty, $Variant:ident) => {{
+                let mask = slot_count - 1;
+                let mut slots = vec![IntSlot::<$K>::empty(); slot_count];
+                let mut dup_next: Vec<u32> = Vec::new();
+                let mut row_idx = 0usize;
+                let mut since_yield = 0usize;
+                for (kb, hashes) in key_batches.drain(..).zip(hash_chunks.iter()) {
+                    let arr = kb[0].as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected integer join key array"
+                        )
+                    })?;
+                    for (&key, &h) in arr.values().iter().zip(hashes.iter()) {
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let slot = &mut slots[pos];
+                            if slot.first_row == 0 {
+                                slot.key = key;
+                                slot.first_row = (row_idx + 1) as u32;
+                                break;
+                            }
+                            if slot.key == key {
+                                if dup_next.is_empty() {
+                                    dup_next.resize(num_rows, 0);
+                                }
+                                dup_next[row_idx] = slot.dup_head;
+                                slot.dup_head = (row_idx + 1) as u32;
+                                break;
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                        row_idx += 1;
+                        since_yield += 1;
+                        if since_yield >= FINALIZE_YIELD_CHUNK {
+                            since_yield = 0;
+                            if tx.is_closed() {
+                                return Ok(None);
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                Ok(Some(BuildKeys::$Variant(FlatIntTable {
+                    slots,
+                    mask,
+                    dup_next,
+                })))
+            }};
+        }
+
+        match self.key_kind {
+            KeyKind::Int32 => build_flat!(Int32Array, i32, Int32),
+            KeyKind::Int64 => build_flat!(Int64Array, i64, Int64),
+            KeyKind::UInt32 => build_flat!(UInt32Array, u32, UInt32),
+            KeyKind::UInt64 => build_flat!(UInt64Array, u64, UInt64),
+            _ => unreachable!(),
+        }
+    }
+
+    fn build_chained_keys(
         &self,
         key_batches: &mut Vec<Vec<ArrayRef>>,
         hash_chunks: &[Vec<u64>],
@@ -465,59 +577,8 @@ impl HashJoinBuildSink {
         };
 
         match self.key_kind {
-            KeyKind::Int32 => {
-                let mut vals = Vec::with_capacity(num_rows);
-                for kb in key_batches.drain(..) {
-                    let arr =
-                        kb[0].as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected Int32 join key array"
-                            )
-                        })?;
-                    vals.extend_from_slice(arr.values());
-                }
-                Ok(BuildKeys::Int32(vals))
-            }
-            KeyKind::Int64 => {
-                let mut vals = Vec::with_capacity(num_rows);
-                for kb in key_batches.drain(..) {
-                    let arr =
-                        kb[0].as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected Int64 join key array"
-                            )
-                        })?;
-                    vals.extend_from_slice(arr.values());
-                }
-                Ok(BuildKeys::Int64(vals))
-            }
-            KeyKind::UInt32 => {
-                let mut vals = Vec::with_capacity(num_rows);
-                for kb in key_batches.drain(..) {
-                    let arr = kb[0].as_any().downcast_ref::<UInt32Array>().ok_or_else(
-                        || {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected UInt32 join key array"
-                            )
-                        },
-                    )?;
-                    vals.extend_from_slice(arr.values());
-                }
-                Ok(BuildKeys::UInt32(vals))
-            }
-            KeyKind::UInt64 => {
-                let mut vals = Vec::with_capacity(num_rows);
-                for kb in key_batches.drain(..) {
-                    let arr = kb[0].as_any().downcast_ref::<UInt64Array>().ok_or_else(
-                        || {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected UInt64 join key array"
-                            )
-                        },
-                    )?;
-                    vals.extend_from_slice(arr.values());
-                }
-                Ok(BuildKeys::UInt64(vals))
+            KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64 => {
+                unreachable!()
             }
             KeyKind::Utf8 => {
                 let arr_ref = concat_single_key(key_batches)?;
@@ -698,12 +759,44 @@ impl HashJoinBuildState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct IntSlot<K: Default + Copy> {
+    key: K,
+    first_row: u32,
+    dup_head: u32,
+}
+
+impl<K: Default + Copy> IntSlot<K> {
+    fn empty() -> Self {
+        Self {
+            key: K::default(),
+            first_row: 0,
+            dup_head: 0,
+        }
+    }
+}
+
+struct FlatIntTable<K: Default + Copy> {
+    slots: Vec<IntSlot<K>>,
+    mask: usize,
+    dup_next: Vec<u32>,
+}
+
+impl<K: Default + Copy> FlatIntTable<K> {
+    fn memory_bytes(&self) -> usize {
+        self.slots
+            .capacity()
+            .saturating_mul(size_of::<IntSlot<K>>())
+            .saturating_add(self.dup_next.capacity().saturating_mul(size_of::<u32>()))
+    }
+}
+
 enum BuildKeys {
     Empty,
-    Int32(Vec<i32>),
-    Int64(Vec<i64>),
-    UInt32(Vec<u32>),
-    UInt64(Vec<u64>),
+    Int32(FlatIntTable<i32>),
+    Int64(FlatIntTable<i64>),
+    UInt32(FlatIntTable<u32>),
+    UInt64(FlatIntTable<u64>),
     Utf8 {
         array: StringArray,
         hashes: Vec<u64>,
@@ -727,10 +820,10 @@ impl BuildKeys {
     fn memory_bytes(&self) -> usize {
         match self {
             Self::Empty => 0,
-            Self::Int32(v) => v.capacity().saturating_mul(size_of::<i32>()),
-            Self::Int64(v) => v.capacity().saturating_mul(size_of::<i64>()),
-            Self::UInt32(v) => v.capacity().saturating_mul(size_of::<u32>()),
-            Self::UInt64(v) => v.capacity().saturating_mul(size_of::<u64>()),
+            Self::Int32(t) => t.memory_bytes(),
+            Self::Int64(t) => t.memory_bytes(),
+            Self::UInt32(t) => t.memory_bytes(),
+            Self::UInt64(t) => t.memory_bytes(),
             Self::Utf8 { array, hashes } => array
                 .get_array_memory_size()
                 .saturating_add(hashes.capacity().saturating_mul(size_of::<u64>())),
@@ -1113,6 +1206,73 @@ impl HashJoinProbe {
     }
 }
 
+macro_rules! probe_flat_int_core {
+    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $num_rows:expr, $hash_key:expr, $on_match:expr) => {{
+        let slots = $flat.slots.as_slice();
+        let dup_next = $flat.dup_next.as_slice();
+        let mask = $flat.mask;
+        let mut matched = 0usize;
+
+        while $cursor.probe_row < $num_rows && matched < $limit {
+            let probe_row = $cursor.probe_row;
+            if $cursor.next_entry == 0 {
+                if let Some(valid) = &$cursor.valid_mask
+                    && !valid.value(probe_row)
+                {
+                    $cursor.probe_row += 1;
+                    continue;
+                }
+                let pk = $p_vals[probe_row];
+                let mut pos = ($hash_key(pk) as usize) & mask;
+                let dup_head = loop {
+                    let slot = &slots[pos];
+                    if slot.first_row == 0 {
+                        break None;
+                    }
+                    if slot.key == pk {
+                        $on_match(slot.first_row - 1, probe_row as u32);
+                        matched += 1;
+                        break Some(slot.dup_head);
+                    }
+                    pos = (pos + 1) & mask;
+                };
+                match dup_head {
+                    None | Some(0) => {
+                        $cursor.probe_row += 1;
+                        continue;
+                    }
+                    Some(head) => {
+                        $cursor.next_entry = head;
+                        if matched == $limit {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let mut entry = $cursor.next_entry;
+            while entry != 0 {
+                let build_row = (entry - 1) as usize;
+                entry = dup_next[build_row];
+                $on_match(build_row as u32, probe_row as u32);
+                matched += 1;
+                if matched == $limit {
+                    $cursor.next_entry = entry;
+                    if entry == 0 {
+                        $cursor.probe_row += 1;
+                    }
+                    break;
+                }
+            }
+            if matched < $limit {
+                $cursor.next_entry = 0;
+                $cursor.probe_row += 1;
+            }
+        }
+        matched
+    }};
+}
+
 macro_rules! probe_loop_core {
     ($cursor:expr, $table:expr, $limit:expr, $num_rows:expr, $get_hash:expr, $is_match:expr, $on_match:expr) => {{
         let buckets = $table.buckets.as_slice();
@@ -1175,60 +1335,60 @@ fn probe_collect_matches(
     let probe_out = &mut scratch.probe_indices;
 
     match (&cursor.keys, &table.keys) {
-        (ProbeKeys::Int32(p_arr), BuildKeys::Int32(b_vals)) => {
+        (ProbeKeys::Int32(p_arr), BuildKeys::Int32(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u32 as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: i32| mix_u64(v as u32 as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
                     probe_out.push(p);
                 }
             );
         }
-        (ProbeKeys::Int64(p_arr), BuildKeys::Int64(b_vals)) => {
+        (ProbeKeys::Int64(p_arr), BuildKeys::Int64(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: i64| mix_u64(v as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
                     probe_out.push(p);
                 }
             );
         }
-        (ProbeKeys::UInt32(p_arr), BuildKeys::UInt32(b_vals)) => {
+        (ProbeKeys::UInt32(p_arr), BuildKeys::UInt32(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: u32| mix_u64(v as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
                     probe_out.push(p);
                 }
             );
         }
-        (ProbeKeys::UInt64(p_arr), BuildKeys::UInt64(b_vals)) => {
+        (ProbeKeys::UInt64(p_arr), BuildKeys::UInt64(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p]),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: u64| mix_u64(v),
                 |b: u32, p: u32| {
                     build_out.push(b);
                     probe_out.push(p);
@@ -1348,51 +1508,51 @@ fn probe_count_matches(
 ) -> Result<usize> {
     let num_rows = cursor.batch.num_rows();
     let matched = match (&cursor.keys, &table.keys) {
-        (ProbeKeys::Int32(p_arr), BuildKeys::Int32(b_vals)) => {
+        (ProbeKeys::Int32(p_arr), BuildKeys::Int32(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u32 as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: i32| mix_u64(v as u32 as u64),
                 |_b: u32, _p: u32| {}
             )
         }
-        (ProbeKeys::Int64(p_arr), BuildKeys::Int64(b_vals)) => {
+        (ProbeKeys::Int64(p_arr), BuildKeys::Int64(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: i64| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
             )
         }
-        (ProbeKeys::UInt32(p_arr), BuildKeys::UInt32(b_vals)) => {
+        (ProbeKeys::UInt32(p_arr), BuildKeys::UInt32(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p] as u64),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: u32| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
             )
         }
-        (ProbeKeys::UInt64(p_arr), BuildKeys::UInt64(b_vals)) => {
+        (ProbeKeys::UInt64(p_arr), BuildKeys::UInt64(flat)) => {
             let p_vals = p_arr.values();
-            probe_loop_core!(
+            probe_flat_int_core!(
                 cursor,
-                table,
+                flat,
+                p_vals,
                 limit,
                 num_rows,
-                |p: usize| mix_u64(p_vals[p]),
-                |b: usize, p: usize, _h: u64| b_vals[b] == p_vals[p],
+                |v: u64| mix_u64(v),
                 |_b: u32, _p: u32| {}
             )
         }
