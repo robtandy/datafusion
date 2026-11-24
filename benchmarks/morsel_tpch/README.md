@@ -30,13 +30,19 @@ Writer settings (standard analytical Parquet layout):
 - Default row-group size: `131,072` rows (`16 × 8,192` DataFusion batch size,
   configurable via `--row-group-size`)
 
-Two scale modes are supported (or any positive `--sf`):
+Three common scale modes are supported (or any positive `--sf`):
 
 - **Smoke mode (`--sf 0.01`):** 86,805 total rows across 35 files; generates in
   under one second and is used by `test_harness.py` to verify byte-for-byte
-  determinism, result parity, and `morsel_mode=required` plans.
-- **Benchmark mode (`--sf 1`):** 8,661,245 total rows across 35 files and 79 row
-  groups (266,865,655 bytes / 254.5 MiB on disk).
+  determinism, exact DuckDB vs. Stock DataFusion parity across all 22 standard
+  TPC-H queries (`q1`–`q22`), and `morsel_mode=required` plans/rejections.
+- **SF1 benchmark mode (`--sf 1`):** 8,661,245 total rows across 35 files and
+  79 row groups (266,865,655 bytes / 254.5 MiB on disk).
+- **SF5 benchmark mode (`--sf 5`):** 43,299,825 total rows across 35 files and
+  353 row groups (1,400,570,073 bytes / 1.30 GiB on disk; 29,999,795 `lineitem`
+  rows across 16 files / 240 row groups; see
+  [sf5_baseline_22q.md](sf5_baseline_22q.md) for the idle-`dduck2` 22-query
+  Stock vs. DuckDB 2.0.1 baseline and live Morsel admission matrix).
 
 ### SF1 Dataset Layout (`--sf 1 --row-group-size 131072`)
 
@@ -60,9 +66,23 @@ source (`NativeParquet[lineitem]`) full multi-file parallelism.
 
 ## Workloads
 
+All 22 standard TPC-H queries (`q1`–`q22`) are loaded directly from
+`benchmarks/queries/q1.sql`..`q22.sql` (rewriting `q15`'s `CREATE VIEW
+revenue0` / `DROP VIEW revenue0` into a single-statement CTE for clean fresh
+sessions across engines, and substituting TPC-H clause 2.4.11.3 `0.0001 / SF`
+in `q11`). Use `--queries all` for all 22 standard queries, `--queries morsel`
+for currently-admitted Morsel workloads, or space-/comma-separated subsets such
+as `--queries q1,q3,q6,q12` or `--queries q6_count q6_scan q1_unordered`.
+
 ### Roadmap TPC-H Queries (Stock DataFusion vs DuckDB; Morsel Not Yet Admitted)
 
-These three standard TPC-H queries match `benchmarks/queries/{q1,q3,q12}.sql`:
+19 of the 22 standard TPC-H queries (`q1`–`q5`, `q7`–`q13`, `q15`–`q18`,
+`q20`–`q22`) are currently rejected at planning time under `morsel_mode=required`
+(see
+[sf5_baseline_22q.md](sf5_baseline_22q.md#3-live-22-query-morsel-admission--operator-capability-checklist)
+for the complete 22-query rejection and operator-capability checklist). The
+original SF1 roadmap subset (`q1`, `q3`, `q12`) remains directly runnable via
+`--queries q1,q3,q6,q12`:
 
 - **`q1`**: Filtered grouped multi-aggregate (`SUM`, `AVG`, `COUNT`) + `ORDER BY`
   over `lineitem`.
@@ -81,18 +101,25 @@ morsel planner):
 
 ### Currently-Admitted Morsel-Native Queries (Live 3-Way Comparison)
 
-All four queries run directly over the real TPC-H `lineitem` Parquet schema
-(`l_quantity`, `l_extendedprice`, `l_discount`, `l_tax` as `DECIMAL(15,2)`,
-`l_shipdate` as `DATE32`, `l_orderkey` as `INT64`, `l_returnflag` /
-`l_linestatus` as `Utf8View`) — no casts or schema workarounds are needed;
-`morsel_mode=required` admits all four natively under `MorselExec` +
-`NativeParquet[lineitem]` (see [checkpoint_a_results.md](checkpoint_a_results.md)
-for the idle-`dduck2` Checkpoint A 3-way scorecard across all four queries, and
-[morsel_aggregate.md](morsel_aggregate.md) for the `#168` `dduck1` aggregate
-note):
+Six workloads (`q6`, `q14`, `q19`, `q1_unordered`, `q6_count`, `q6_scan`) run
+directly over the real TPC-H Parquet schemas (`l_quantity`, `l_extendedprice`,
+`l_discount`, `l_tax` as `DECIMAL(15,2)`, `l_shipdate` as `DATE32`,
+`l_orderkey` / `p_partkey` as `INT64`, string columns as `Utf8View`) — no casts
+or schema workarounds are needed; `morsel_mode=required` admits all six natively
+under `MorselExec` (see [sf5_baseline_22q.md](sf5_baseline_22q.md) for the
+post-`#188` SF5 5-arm comparison including `q14` and `q19`,
+[checkpoint_a_results.md](checkpoint_a_results.md) for the idle-`dduck2`
+Checkpoint A SF1 3-way scorecard, and [morsel_aggregate.md](morsel_aggregate.md)
+for the `#168` `dduck1` aggregate note):
 
 - **`q6`**: Standard TPC-H Q6 (matching `benchmarks/queries/q6.sql`) — filtered
   ungrouped `SUM(l_extendedprice * l_discount)` over `lineitem`.
+- **`q14`**: Standard TPC-H Q14 (matching `benchmarks/queries/q14.sql`) —
+  two-pipeline native Inner `HashJoin` (`part` build, filtered `lineitem` probe)
+  - conditional `SUM` ratio (`#188`).
+- **`q19`**: Standard TPC-H Q19 (matching `benchmarks/queries/q19.sql`) —
+  two-pipeline native Inner `HashJoin` (`part` build, `lineitem` probe) with
+  disjunctive 3-branch `OR` join filter + ungrouped `SUM` (`#188`).
 - **`q1_unordered`**: TPC-H Q1 without `ORDER BY` — filtered grouped
   multi-aggregate (`4× SUM`, `3× AVG`, `COUNT(*)`) over
   `(l_returnflag, l_linestatus)` on `lineitem`.
@@ -181,13 +208,22 @@ lossless Arrow IPC streams (`arrow::ipc::writer::StreamWriter` in Rust,
 - Unordered queries (`q1_unordered`, `q6_scan`) check exact multiset equality
   across all rows (sorted by exact keys, verifying multiplicity and exact
   `DECIMAL` values).
-- Cross-engine type normalization is restricted to two documented cases:
-  - `q1` / `q1_unordered` `AVG(DECIMAL(15,2))`: DuckDB returns `float64`, while
-    DataFusion returns `DECIMAL(19,6)`; verified within the Decimal's 6-digit
-    scale (`abs_tol=1e-6`, `rel_tol=1e-9`).
+- Cross-engine type/name normalization is restricted to documented cases:
+  - `q1` / `q1_unordered` `AVG(DECIMAL(15,2))` and `q8` `mkt_share`: DuckDB
+    returns `float64`, while DataFusion returns `DECIMAL(19,6)` /
+    `DECIMAL(38,8)`; verified within the Decimal's scale (`abs_tol=10^-scale`,
+    `rel_tol=1e-9`).
+  - `q14` / `q17` floating-point ratios: `math.isclose(..., rel_tol=1e-9,
+abs_tol=1e-9)`.
   - `q12` `SUM(CASE ... THEN 1 ELSE 0 END)`: DuckDB returns `DECIMAL(38,0)`
     while DataFusion returns `INT64`; verified by exact integer/Decimal
     equality.
+  - `q7` / `q8` / `q9` `EXTRACT(YEAR FROM ...)`: DuckDB returns `INT64` while
+    DataFusion returns `INT32`; verified by exact integer equality.
+  - `q18` unaliased `sum(l_quantity)`: DuckDB names the column
+    `sum(l_quantity)` while DataFusion qualifies it as
+    `sum(lineitem.l_quantity)`; normalized by stripping table qualifiers inside
+    unaliased aggregate names.
 - Every timed DataFusion trial re-validates the runner git revision, drained row
   count, and physical plan (`DataSourceExec` without `MorselExec` for `off`;
   `MorselExec` + `NativeParquet[lineitem...]`, row-group claims, `CountSink` /
@@ -214,7 +250,8 @@ cp "$b/tpch_runner.rs" "$work/pinned/datafusion/core/examples/morsel_tpch_runner
   MORSEL_BENCH_REVISION="$revision" CARGO_TARGET_DIR="$work/target" \
     RUSTC_WRAPPER=sccache \
     timeout --kill-after=20s 35m cargo build --locked --profile release-nonlto -j 10 \
-      -p datafusion --no-default-features --features parquet,sql \
+      -p datafusion --no-default-features \
+      --features parquet,sql,datetime_expressions,unicode_expressions \
       --example morsel_tpch_runner
 )
 # Omit RUSTC_WRAPPER=sccache if sccache is not installed.
@@ -234,11 +271,13 @@ data_dir="$work/tpch_sf1"
 timeout 180s "$py" -B "$b/harness.py" generate "$data_dir" \
   --sf 1 --row-group-size 131072
 
-# 5. Run the controlled warm-cache 3-way SF1 benchmark on 8 pinned cores.
+# 5. Run the controlled warm-cache 3-way SF1 benchmark on 8 pinned cores
+#    (7-workload SF1 suite; see sf5_baseline_22q.md for the all-22-query SF5 command).
 vmstat -y 1 3
 timeout --kill-after=10s 300s taskset -c 0-7 "$py" -B "$b/harness.py" bench \
   "$data_dir" --runner "$runner" --revision "$revision" \
   --threads 8 --timeout 120 --cache warm --warmups 1 --repeats 7 \
+  --queries q6,q1_unordered,q1,q3,q12,q6_count,q6_scan \
   > "$work/sf1_warm.jsonl"
 vmstat -y 1 3
 

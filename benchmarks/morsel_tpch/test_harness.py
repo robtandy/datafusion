@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+import io
+from contextlib import redirect_stdout
 from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,12 +20,19 @@ import pyarrow.parquet as pq
 
 from harness import (
     ARMS,
+    MORSEL_ADMITTED_QUERIES,
+    STANDARD_TPCH_QUERIES,
     TPCH_TABLES,
     WORKLOADS,
     compare_tables,
     dataset_summary,
     generate,
+    infer_scale_factor,
+    render_workload_sql,
     require_warm_cache,
+    resolve_arms,
+    resolve_queries,
+    summarize_jsonl,
     table_files,
     validate_plan,
 )
@@ -36,6 +46,34 @@ EXPECTED_SF001_ROWS = {
     "supplier": 100,
     "nation": 25,
     "region": 5,
+}
+
+EXPECTED_SF001_QUERY_ROWS = {
+    "q1": 4,
+    "q2": 4,
+    "q3": 10,
+    "q4": 5,
+    "q5": 5,
+    "q6": 1,
+    "q7": 4,
+    "q8": 2,
+    "q9": 173,
+    "q10": 20,
+    "q11": 1,
+    "q12": 2,
+    "q13": 33,
+    "q14": 1,
+    "q15": 1,
+    "q16": 296,
+    "q17": 1,
+    "q18": 2,
+    "q19": 1,
+    "q20": 1,
+    "q21": 1,
+    "q22": 7,
+    "q1_unordered": 4,
+    "q6_count": 1,
+    "q6_scan": 1191,
 }
 
 
@@ -72,6 +110,36 @@ class TpchHarnessTest(unittest.TestCase):
                 lineitem_schema.field("l_quantity").type, pa.decimal128(15, 2)
             )
             self.assertEqual(lineitem_schema.field("l_shipdate").type, pa.date32())
+
+    def test_generate_sf001_small_row_group_exercises_multi_batch_sharding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "sf001_rg1000"
+            generate(out_dir, sf=0.01, row_group_size=1000)
+            summary = dataset_summary(out_dir)
+
+            self.assertEqual(summary["total_rows"], sum(EXPECTED_SF001_ROWS.values()))
+            for table, expected_rows in EXPECTED_SF001_ROWS.items():
+                self.assertEqual(summary["tables"][table]["rows"], expected_rows)
+
+            # 60,175 rows / 16 files = 3,760 or 3,761 rows/file -> 4 RGs/file = 64 RGs.
+            self.assertEqual(summary["tables"]["lineitem"]["files"], 16)
+            self.assertEqual(summary["tables"]["lineitem"]["row_groups"], 64)
+
+            # Verify strict primary-key order is preserved across streamed shards.
+            prev_key = None
+            for part in table_files(out_dir, "lineitem"):
+                tbl = pq.read_table(part, columns=["l_orderkey", "l_linenumber"])
+                keys = list(
+                    zip(
+                        tbl.column("l_orderkey").to_pylist(),
+                        tbl.column("l_linenumber").to_pylist(),
+                    )
+                )
+                self.assertTrue(keys)
+                if prev_key is not None:
+                    self.assertLess(prev_key, keys[0])
+                self.assertEqual(keys, sorted(keys))
+                prev_key = keys[-1]
 
     def test_validate_plan_enforces_stock_and_morsel_invariants(self):
         stock_ev = {"plan": "DataSourceExec: file_type=parquet\n"}
@@ -131,6 +199,64 @@ class TpchHarnessTest(unittest.TestCase):
                 morsel_count_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q6_scan"], rgs
             )
 
+    def test_validate_plan_handles_multi_table_join_plans(self):
+        join_ev = {
+            "plan": (
+                "MorselExec: workers=4, [Build: NativeParquet[part] -> HashJoinBuildSink]; "
+                "NativeParquet[lineitem] -> Filter[...] -> HashJoinProbe[...] -> "
+                "AggregateSink[aggr=[sum(...)]]; FinalizedAggregateSource"
+            ),
+            "parquet_morsels_claimed": 18,
+            "count_finalizations": 0,
+            "aggregate_finalizations": 1,
+        }
+        rgs = {"lineitem": 16, "part": 2}
+
+        validate_plan(join_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q14"], rgs)
+        validate_plan(join_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q19"], rgs)
+        validate_plan(
+            dict(join_ev, parquet_morsels_claimed=10),
+            ARMS["morsel_pruning"],
+            WORKLOADS["q14"],
+            rgs,
+        )
+        validate_plan(
+            dict(join_ev, parquet_morsels_claimed=18),
+            ARMS["morsel_pushdown"],
+            WORKLOADS["q19"],
+            rgs,
+        )
+
+        # Missing build-side NativeParquet[part] must fail.
+        missing_part = dict(
+            join_ev,
+            plan="MorselExec: workers=4, NativeParquet[lineitem] -> AggregateSink; FinalizedAggregateSource",
+        )
+        with self.assertRaisesRegex(ValueError, "missing"):
+            validate_plan(
+                missing_part, ARMS["morsel_no_pushdown"], WORKLOADS["q14"], rgs
+            )
+
+        # Under no_pushdown, claims must equal the sum across all scanned tables (16 + 2 = 18).
+        for bad_claims in (16, 17, 19):
+            with self.subTest(bad_claims=bad_claims), self.assertRaises(ValueError):
+                validate_plan(
+                    dict(join_ev, parquet_morsels_claimed=bad_claims),
+                    ARMS["morsel_no_pushdown"],
+                    WORKLOADS["q14"],
+                    rgs,
+                )
+
+        # Under pruning/pushdown, claims must be in 1..=sum.
+        for bad_claims in (0, 19):
+            with self.subTest(pruning_bad=bad_claims), self.assertRaises(ValueError):
+                validate_plan(
+                    dict(join_ev, parquet_morsels_claimed=bad_claims),
+                    ARMS["morsel_pruning"],
+                    WORKLOADS["q14"],
+                    rgs,
+                )
+
     def test_compare_tables_handles_decimal_and_order_semantics(self):
         oracle = pa.table(
             {
@@ -187,6 +313,190 @@ class TpchHarnessTest(unittest.TestCase):
         )
         df_sum = pa.table({"cnt": pa.array([64], type=pa.int64())})
         compare_tables(duck_sum, df_sum, ordered=True, case_name="q12", arm_name="t")
+
+    def test_all_22_tpch_queries_loaded_and_q15_rewritten_as_cte(self):
+        self.assertEqual(len(STANDARD_TPCH_QUERIES), 22)
+        for qname in STANDARD_TPCH_QUERIES:
+            self.assertIn(qname, WORKLOADS)
+            workload = WORKLOADS[qname]
+            self.assertTrue(workload.sql)
+            self.assertFalse(workload.sql.endswith(";"))
+            for table in workload.tables:
+                self.assertIn(table, TPCH_TABLES)
+                self.assertRegex(
+                    workload.sql.lower(),
+                    rf"\b{re.escape(table)}\b",
+                    msg=f"{qname} declares unused table {table}",
+                )
+
+        # Q15 must be rewritten to a single-statement CTE with no DDL view state.
+        q15_sql = WORKLOADS["q15"].sql
+        self.assertNotIn("create view", q15_sql.lower())
+        self.assertNotIn("drop view", q15_sql.lower())
+        self.assertTrue(q15_sql.startswith("WITH revenue0"))
+
+        # Q11 must substitute TPC-H FRACTION = 0.0001 / SF cleanly.
+        q11_sf5 = render_workload_sql(WORKLOADS["q11"], 5.0)
+        self.assertIn("(0.0001 / 5)", q11_sf5)
+        self.assertNotIn("__TPCH_Q11_FRACTION__", q11_sf5)
+        self.assertEqual(
+            infer_scale_factor({"tables": {"part": {"rows": 1_000_000}}}), 5.0
+        )
+
+    def test_resolve_queries_and_arms_support_all_morsel_and_comma_lists(self):
+        self.assertEqual(
+            resolve_queries(["all"], ("q6",)),
+            list(STANDARD_TPCH_QUERIES),
+        )
+        self.assertEqual(
+            resolve_queries(["morsel"], ("q1",)),
+            list(MORSEL_ADMITTED_QUERIES),
+        )
+        self.assertEqual(
+            resolve_queries(["q1,q3,q6,q12", "q6_count,q6_scan", "q1_unordered"], ()),
+            ["q1", "q3", "q6", "q12", "q6_count", "q6_scan", "q1_unordered"],
+        )
+        # Deduplication preserves first-seen order.
+        self.assertEqual(
+            resolve_queries(["q6,q1", "q6", "q1,q3"], ()),
+            ["q6", "q1", "q3"],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown query"):
+            resolve_queries(["q99"], ())
+
+        self.assertEqual(
+            resolve_arms(["stock_default,duckdb_default"], ()),
+            ("stock_default", "duckdb_default"),
+        )
+        with self.assertRaisesRegex(ValueError, "unknown arm"):
+            resolve_arms(["not_an_arm"], ())
+
+    def test_compare_tables_normalizes_unaliased_q18_aggregate_name(self):
+        duck_q18 = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(l_quantity)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(38, 2)
+                ),
+            }
+        )
+        df_q18 = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(lineitem.l_quantity)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(25, 2)
+                ),
+            }
+        )
+        compare_tables(duck_q18, df_q18, ordered=True, case_name="q18", arm_name="t")
+
+        wrong_col = pa.table(
+            {
+                "c_name": pa.array(["Customer#0001"]),
+                "sum(other_col)": pa.array(
+                    [Decimal("312.00")], type=pa.decimal128(25, 2)
+                ),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "column mismatch"):
+            compare_tables(
+                duck_q18, wrong_col, ordered=True, case_name="q18", arm_name="t"
+            )
+
+    def test_summarize_jsonl_reports_geomean_and_morsel_rejections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "sample.jsonl"
+            records = [
+                {
+                    "record_type": "header",
+                    "host": "test-host",
+                    "arch": "aarch64",
+                    "kernel": "7.0",
+                    "threads": 8,
+                    "cache_regime": "warm",
+                    "warmups": 1,
+                    "repeats": 1,
+                    "build_revision": "deadbeef",
+                    "duckdb_version": "2.0.1",
+                    "pyarrow_version": "26.0.1",
+                    "morsel_rejections": {
+                        "q1": "morsel_mode=required: unsupported logical operator: Sort"
+                    },
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "stock_default",
+                    "seconds": 0.2,
+                    "exec_seconds": 0.18,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "duckdb_default",
+                    "seconds": 0.1,
+                    "exec_seconds": None,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "stock_default",
+                    "seconds": 0.4,
+                    "exec_seconds": 0.38,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "duckdb_default",
+                    "seconds": 0.05,
+                    "exec_seconds": None,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+                # Non-standard slice with both arms must be excluded from standard-query
+                # geomean and sum so q1/q6 slices are never double-counted.
+                {
+                    "record_type": "trial",
+                    "case": "q6_count",
+                    "arm": "stock_default",
+                    "seconds": 9.9,
+                    "exec_seconds": 9.8,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6_count",
+                    "arm": "duckdb_default",
+                    "seconds": 0.01,
+                    "exec_seconds": None,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+            ]
+            jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                summarize_jsonl(jsonl)
+            out = buf.getvalue()
+            # Only q1 (2.0x) and q6 (8.0x) count -> 2/22 standard queries, geomean=4.00x,
+            # sum=600.0 ms vs 150.0 ms (q6_count's 9900 ms must be excluded).
+            self.assertIn("2/22 standard queries", out)
+            self.assertIn("geomean ratio=4.00x", out)
+            self.assertIn("sum of medians: 600.0 ms vs 150.0 ms", out)
+            self.assertIn("unsupported logical operator: Sort", out)
 
     def test_require_warm_cache_rejects_partial_residency(self):
         with patch("harness.cache_pages", return_value={"resident": 1, "total": 2}):
@@ -296,21 +606,16 @@ class TpchHarnessTest(unittest.TestCase):
                 timeout=180,
             )
             report = json.loads(out)
+            self.assertEqual(report["scale_factor"], 0.01)
             self.assertEqual(
                 {k: v["rows"] for k, v in report["verified"].items()},
-                {
-                    "q6": 1,
-                    "q1_unordered": 4,
-                    "q1": 4,
-                    "q3": 10,
-                    "q12": 2,
-                    "q6_count": 1,
-                    "q6_scan": 1191,
-                },
+                EXPECTED_SF001_QUERY_ROWS,
             )
-            self.assertEqual(
-                set(report["morsel_rejections"].keys()), {"q1", "q3", "q12"}
+            expected_rejected = set(STANDARD_TPCH_QUERIES) - set(
+                MORSEL_ADMITTED_QUERIES
             )
+            self.assertEqual(len(expected_rejected), 19)
+            self.assertEqual(set(report["morsel_rejections"].keys()), expected_rejected)
             for qname, err in report["morsel_rejections"].items():
                 self.assertIn("morsel_mode=required", err, msg=qname)
 
@@ -319,7 +624,7 @@ class TpchHarnessTest(unittest.TestCase):
                 for e in report["evidence"]
                 if e["mode"] == "required"
             }
-            for qname in ("q6", "q1_unordered", "q6_count", "q6_scan"):
+            for qname in MORSEL_ADMITTED_QUERIES:
                 for arm_name in (
                     "morsel_no_pushdown",
                     "morsel_pruning",
@@ -330,6 +635,22 @@ class TpchHarnessTest(unittest.TestCase):
                 morsel_ev[("q6", "morsel_no_pushdown")]["aggregate_finalizations"],
                 1,
             )
+            for join_q in ("q14", "q19"):
+                self.assertEqual(
+                    morsel_ev[(join_q, "morsel_no_pushdown")][
+                        "parquet_morsels_claimed"
+                    ],
+                    18,
+                )
+                self.assertEqual(
+                    morsel_ev[(join_q, "morsel_no_pushdown")][
+                        "aggregate_finalizations"
+                    ],
+                    1,
+                )
+                self.assertIn(
+                    "HashJoinProbe", morsel_ev[(join_q, "morsel_no_pushdown")]["plan"]
+                )
             self.assertEqual(
                 morsel_ev[("q1_unordered", "morsel_pushdown")][
                     "aggregate_finalizations"
@@ -389,6 +710,7 @@ class TpchHarnessTest(unittest.TestCase):
                     "--queries",
                     "q1",
                     "q6",
+                    "q14",
                     "q1_unordered",
                     "q6_count",
                     "q6_scan",
@@ -411,8 +733,8 @@ class TpchHarnessTest(unittest.TestCase):
             self.assertEqual(header["record_type"], "header")
             self.assertEqual(header["cache_regime"], "warm")
             self.assertIn("q1", header["morsel_rejections"])
-            # 2 arms * 2 reps for q1 + 4 arms * 2 reps for (q6, q1_unordered, q6_count, q6_scan) = 36
-            self.assertEqual(len(trials), 36)
+            # 2 arms * 2 reps for q1 + 4 arms * 2 reps for (q6, q14, q1_unordered, q6_count, q6_scan) = 44
+            self.assertEqual(len(trials), 44)
             for trial in trials:
                 self.assertGreater(trial["seconds"], 0)
                 if sys.platform == "linux" and sys.maxsize > 2**32:
