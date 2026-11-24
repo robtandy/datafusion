@@ -1489,3 +1489,588 @@ async fn aggregate_worker_error_skips_finalization_and_frees_memory() -> Result<
     }
     Ok(())
 }
+
+#[cfg(feature = "sql")]
+struct ObservedJoin {
+    plan: MorselExec,
+    finalizing: mpsc::UnboundedReceiver<()>,
+    resume: Arc<Semaphore>,
+    build_scans: Observations,
+    probe_scans: Observations,
+}
+
+#[cfg(feature = "sql")]
+async fn observed_hash_join(
+    build_batches: Vec<RecordBatch>,
+    probe_batches: Vec<RecordBatch>,
+    sql: &str,
+    build_fail_on: Option<usize>,
+    probe_fail_on: Option<usize>,
+    attach_gate: bool,
+) -> Result<ObservedJoin> {
+    let build_schema = build_batches
+        .first()
+        .map(RecordBatch::schema)
+        .unwrap_or_else(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("bv", DataType::Int32, false),
+            ]))
+        });
+    let probe_schema = probe_batches
+        .first()
+        .map(RecordBatch::schema)
+        .unwrap_or_else(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("pv", DataType::Int32, false),
+            ]))
+        });
+    let build_table = Arc::new(MemTable::try_new(build_schema, vec![build_batches])?);
+    let probe_table = Arc::new(MemTable::try_new(probe_schema, vec![probe_batches])?);
+
+    let (build_tx, build_scans) = mpsc::unbounded_channel();
+    let (probe_tx, probe_scans) = mpsc::unbounded_channel();
+
+    let make_observe_udf = |name: &str,
+                            tx: mpsc::UnboundedSender<(i32, Option<Id>)>,
+                            fail_on: Option<usize>| {
+        let count = AtomicUsize::new(0);
+        create_udf(
+            name,
+            vec![DataType::Int32],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args| {
+                let ColumnarValue::Array(vals) = &args[0] else {
+                    unreachable!()
+                };
+                let first = as_int32_array(vals.as_ref())?.value(0);
+                let step = count.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = tx.send((first, tokio::task::try_id()));
+                if fail_on == Some(step) {
+                    return exec_err!("test join worker failure");
+                }
+                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
+            }),
+        )
+    };
+
+    let ctx = crate::prelude::SessionContext::new();
+    ctx.register_table("build_t", build_table)?;
+    ctx.register_table("probe_t", probe_table)?;
+    ctx.register_udf(make_observe_udf("observe_build", build_tx, build_fail_on));
+    ctx.register_udf(make_observe_udf("observe_probe", probe_tx, probe_fail_on));
+
+    let logical = ctx.sql(sql).await?.into_optimized_plan()?;
+    let planner = MorselQueryPlanner::new(NonZeroUsize::new(WORKERS).unwrap());
+    let Lowering::Native(mut plan) = planner.try_lower(&logical, &ctx.state()).await?
+    else {
+        panic!("expected native morsel hash join plan for {sql}: {logical:?}");
+    };
+
+    let (entered, finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    if attach_gate {
+        let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+        let probe = pipeline
+            .operators
+            .iter_mut()
+            .find_map(|op| match op {
+                Operator::HashProbe(p) => Some(Arc::get_mut(p).unwrap()),
+                _ => None,
+            })
+            .expect("expected HashProbe operator");
+        let bp = Arc::get_mut(&mut probe.build_pipeline).unwrap();
+        let Sink::HashJoinBuild(build_sink) = &mut bp.sink else {
+            panic!("expected HashJoinBuild sink");
+        };
+        Arc::get_mut(build_sink).unwrap().finalize_gate = Some(FinalizeGate {
+            entered,
+            resume: Arc::clone(&resume),
+        });
+    }
+
+    Ok(ObservedJoin {
+        plan,
+        finalizing,
+        resume,
+        build_scans,
+        probe_scans,
+    })
+}
+
+#[cfg(feature = "sql")]
+fn join_test_batches(
+    val_col: &str,
+    keys_per_batch: &[Vec<Option<i32>>],
+) -> Result<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, true),
+        Field::new(val_col, DataType::Int32, false),
+    ]));
+    let mut seq = 0i32;
+    keys_per_batch
+        .iter()
+        .map(|keys| {
+            let vals: Vec<i32> = keys
+                .iter()
+                .map(|_| {
+                    let v = seq;
+                    seq += 1;
+                    v
+                })
+                .collect();
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(keys.clone())),
+                    Arc::new(Int32Array::from(vals)),
+                ],
+            )?)
+        })
+        .collect()
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_probe_cannot_start_before_build_finalization() -> Result<()> {
+    // 4 build batches (4 rows) vs 10 probe batches (20 rows) so build_t is chosen as build.
+    let build_batches = join_test_batches(
+        "bv",
+        &[vec![Some(1)], vec![Some(2)], vec![Some(3)], vec![Some(4)]],
+    )?;
+    let probe_keys: Vec<Vec<Option<i32>>> =
+        (0..10).map(|i| vec![Some((i % 5) + 1), Some(2)]).collect();
+    let probe_batches = join_test_batches("pv", &probe_keys)?;
+    let sql = "SELECT probe_t.k, build_t.bv, probe_t.pv \
+               FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+               WHERE observe_build(build_t.bv) AND observe_probe(probe_t.pv)";
+
+    let ObservedJoin {
+        plan,
+        mut finalizing,
+        resume,
+        mut build_scans,
+        mut probe_scans,
+    } = observed_hash_join(build_batches, probe_batches, sql, None, None, true).await?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+
+    // Start execution: build finishes scanning and pauses at finalize gate.
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    // All 4 build batches were observed, build has NOT finalized yet, and probe
+    // MUST NOT have evaluated a single batch.
+    let mut build_observed = 0;
+    while build_scans.try_recv().is_ok() {
+        build_observed += 1;
+    }
+    assert_eq!(build_observed, 4);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("join_build_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    assert_eq!(
+        probe_scans.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "probe started before build finalization!"
+    );
+
+    // Release build finalization and drain output.
+    resume.add_permits(1);
+    let mut total_rows = 0usize;
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        total_rows += batch?.num_rows();
+    }
+    // Probe has 10 rows with k=2 (all match) + 8 rows with k in {1,2,3,4} (match) + 2 rows with k=5 (no match) = 18.
+    assert_eq!(total_rows, 18);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("join_build_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        1
+    );
+    let mut probe_observed = 0;
+    while probe_scans.try_recv().is_ok() {
+        probe_observed += 1;
+    }
+    assert_eq!(probe_observed, 10);
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_empty_build_short_circuits_probe_across_sinks() -> Result<()> {
+    let probe_keys: Vec<Vec<Option<i32>>> =
+        (0..12).map(|i| vec![Some(i), Some(i + 1)]).collect();
+
+    // Test three empty-build causes: empty table, filtered-out build, and all-NULL build keys.
+    let build_cases = [
+        ("empty_table", vec![]),
+        (
+            "filtered_out",
+            join_test_batches("bv", &[vec![Some(1)], vec![Some(2)]])?,
+        ),
+        (
+            "all_null_keys",
+            join_test_batches("bv", &[vec![None, None], vec![None]])?,
+        ),
+    ];
+
+    for (case_name, build_batches) in build_cases {
+        let extra_build_pred = if case_name == "filtered_out" {
+            " AND build_t.bv < 0"
+        } else {
+            ""
+        };
+        let probe_batches = join_test_batches("pv", &probe_keys)?;
+        let queries = [
+            (
+                "result",
+                format!(
+                    "SELECT probe_t.k, build_t.bv \
+                     FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+                     WHERE observe_probe(probe_t.pv){extra_build_pred}"
+                ),
+            ),
+            (
+                "count",
+                format!(
+                    "SELECT COUNT(*) AS n \
+                     FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+                     WHERE observe_probe(probe_t.pv){extra_build_pred}"
+                ),
+            ),
+            (
+                "group_count",
+                format!(
+                    "SELECT probe_t.k, COUNT(*) AS n \
+                     FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+                     WHERE observe_probe(probe_t.pv){extra_build_pred} \
+                     GROUP BY probe_t.k"
+                ),
+            ),
+            (
+                "ungrouped_sum",
+                format!(
+                    "SELECT SUM(probe_t.pv) AS s \
+                     FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+                     WHERE observe_probe(probe_t.pv){extra_build_pred}"
+                ),
+            ),
+        ];
+
+        for (sink_name, sql) in queries {
+            let ObservedJoin {
+                plan,
+                mut probe_scans,
+                ..
+            } = observed_hash_join(
+                build_batches.clone(),
+                probe_batches.clone(),
+                &sql,
+                None,
+                None,
+                false,
+            )
+            .await?;
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+            let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+            let pipeline = Arc::downgrade(&plan.pipeline);
+            let mut stream = plan.execute(0, ctx)?;
+            let mut out = Vec::new();
+            while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+                out.push(batch?);
+            }
+
+            // Probe MUST have been short-circuited: zero probe batches observed!
+            assert_eq!(
+                probe_scans.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty),
+                "case={case_name} sink={sink_name}: probe should never have scanned"
+            );
+            assert_eq!(
+                plan.metrics()
+                    .and_then(|m| m.sum_by_name("join_empty_build_short_circuits"))
+                    .map_or(0, |v| v.as_usize()),
+                1,
+                "case={case_name} sink={sink_name}"
+            );
+
+            match sink_name {
+                "result" | "group_count" => {
+                    let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(rows, 0, "case={case_name} sink={sink_name}");
+                }
+                "count" => {
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(as_int64_array(out[0].column(0))?.value(0), 0);
+                }
+                "ungrouped_sum" => {
+                    assert_eq!(out.len(), 1);
+                    assert!(out[0].column(0).is_null(0));
+                }
+                _ => unreachable!(),
+            }
+
+            drop(stream);
+            drop(plan);
+            assert_workers_stopped(&pipeline).await;
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_mid_build_drop_stops_workers_skips_probe_and_frees_memory()
+-> Result<()> {
+    let build_batches = join_test_batches(
+        "bv",
+        &[vec![Some(1)], vec![Some(2)], vec![Some(3)], vec![Some(4)]],
+    )?;
+    let probe_batches = join_test_batches(
+        "pv",
+        &(0..10).map(|i| vec![Some(i % 4 + 1)]).collect::<Vec<_>>(),
+    )?;
+    let sql = "SELECT probe_t.k, build_t.bv \
+               FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+               WHERE observe_probe(probe_t.pv)";
+
+    let ObservedJoin {
+        plan,
+        mut finalizing,
+        mut probe_scans,
+        ..
+    } = observed_hash_join(build_batches, probe_batches, sql, None, None, true).await?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    // Build has reserved memory before finalization.
+    assert!(pool.reserved() > 0);
+    drop(stream);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("join_build_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    drop(plan);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        probe_scans.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_mid_probe_drop_on_high_fanout_stops_workers_and_frees_memory()
+-> Result<()> {
+    // 20 duplicate build rows for k=1 × 40 probe rows for k=1 => 800 matched rows,
+    // chunked at batch_size=4 (200 output batches), well above channel capacity.
+    let build_batches = join_test_batches("bv", &[vec![Some(1); 20]])?;
+    let probe_batches = join_test_batches("pv", &vec![vec![Some(1); 10]; 4])?;
+    let sql = "SELECT probe_t.k, build_t.bv, probe_t.pv \
+               FROM probe_t JOIN build_t ON probe_t.k = build_t.k";
+
+    let ObservedJoin { plan, .. } =
+        observed_hash_join(build_batches, probe_batches, sql, None, None, false).await?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+    drop(plan);
+
+    let first = timeout(DEADLINE, stream.next()).await.unwrap().unwrap()?;
+    assert_eq!(first.num_rows(), 4);
+    drop(stream);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_mid_build_and_mid_probe_errors_stop_peers_and_free_memory()
+-> Result<()> {
+    let build_batches =
+        join_test_batches("bv", &(0..8).map(|i| vec![Some(i)]).collect::<Vec<_>>())?;
+    let probe_batches = join_test_batches(
+        "pv",
+        &(0..16).map(|i| vec![Some(i % 8)]).collect::<Vec<_>>(),
+    )?;
+    let sql = "SELECT probe_t.k, build_t.bv, probe_t.pv \
+               FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+               WHERE observe_build(build_t.bv) AND observe_probe(probe_t.pv)";
+
+    // 1. Mid-build error: skips finalization, never starts probe, frees all memory.
+    {
+        let ObservedJoin {
+            plan,
+            mut probe_scans,
+            ..
+        } = observed_hash_join(
+            build_batches.clone(),
+            probe_batches.clone(),
+            sql,
+            Some(3),
+            None,
+            false,
+        )
+        .await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let err = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("test join worker failure"),
+            "{err}"
+        );
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        assert_eq!(pool.reserved(), 0);
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(
+            probe_scans.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+
+    // 2. Mid-probe error: stops peer probe workers and drops finalized build table.
+    {
+        let ObservedJoin { plan, .. } =
+            observed_hash_join(build_batches, probe_batches, sql, None, Some(3), false)
+                .await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let mut saw_error = false;
+        while let Some(item) = timeout(DEADLINE, stream.next()).await.unwrap() {
+            if let Err(err) = item {
+                assert!(
+                    err.to_string().contains("test join worker failure"),
+                    "{err}"
+                );
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "expected mid-probe error");
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        assert_eq!(pool.reserved(), 0);
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn hash_join_memory_limit_failure_during_build_and_finalize_frees_all_memory()
+-> Result<()> {
+    // 256 build rows across 4 batches (~8 KiB build state, ~16+ KiB finalize peak).
+    let build_keys: Vec<Vec<Option<i32>>> = (0..4)
+        .map(|b| (0..64).map(|i| Some(b * 64 + i)).collect())
+        .collect();
+    let probe_keys: Vec<Vec<Option<i32>>> = (0..10)
+        .map(|b| (0..64).map(|i| Some((b * 64 + i) % 256)).collect())
+        .collect();
+    let build_batches = join_test_batches("bv", &build_keys)?;
+    let probe_batches = join_test_batches("pv", &probe_keys)?;
+    let sql = "SELECT probe_t.k, build_t.bv, probe_t.pv \
+               FROM probe_t JOIN build_t ON probe_t.k = build_t.k \
+               WHERE observe_probe(probe_t.pv)";
+
+    // Test very tight limit (fails during build accumulation), intermediate limit
+    // (fits accumulation, fails at finalize peak), and near-finalize limit.
+    for limit_bytes in [256usize, 4096usize, 5120usize] {
+        let ObservedJoin {
+            plan,
+            mut probe_scans,
+            ..
+        } = observed_hash_join(
+            build_batches.clone(),
+            probe_batches.clone(),
+            sql,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit_bytes));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 64)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let err = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                datafusion_common::DataFusionError::ResourcesExhausted(_)
+            ),
+            "limit={limit_bytes}: expected ResourcesExhausted, got {err}"
+        );
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            0,
+            "limit={limit_bytes}"
+        );
+        assert_eq!(pool.reserved(), 0, "limit={limit_bytes}");
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(
+            probe_scans.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "limit={limit_bytes}: probe must not start after build OOM"
+        );
+    }
+    Ok(())
+}
