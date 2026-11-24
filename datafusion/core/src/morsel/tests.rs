@@ -22,6 +22,8 @@ use tokio::time::timeout;
 
 use crate::datasource::provider_as_source;
 use crate::execution::SessionStateBuilder;
+use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 
 const INPUT_BATCHES: usize = 4 * BATCHES_PER_MORSEL + 1;
 const WORKERS: usize = 2;
@@ -894,5 +896,327 @@ async fn admitted_plan_reports_lowering_errors() -> Result<()> {
             "{error}"
         );
     }
+    Ok(())
+}
+
+struct ObservedGroupCount {
+    plan: MorselExec,
+    scans: Observations,
+    finalizing: mpsc::UnboundedReceiver<()>,
+    resume: Arc<Semaphore>,
+    results: mpsc::UnboundedReceiver<usize>,
+}
+
+fn task_with_pool_and_batch_size(
+    pool: Arc<dyn MemoryPool>,
+    batch_size: usize,
+) -> Result<Arc<TaskContext>> {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .build_arc()?;
+    let config = crate::prelude::SessionConfig::new().with_batch_size(batch_size);
+    Ok(Arc::new(
+        TaskContext::default()
+            .with_session_config(config)
+            .with_runtime(runtime),
+    ))
+}
+
+fn observed_group_count(fail_on: Option<usize>) -> Result<ObservedGroupCount> {
+    let (mut pipeline, scans) = observed_pipeline(fail_on)?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let (entered, finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    let mut sink =
+        GroupCountSink::new(Arc::clone(&schema), 0, IntKeyType::Int32, "id".into());
+    sink.finalize_gate = Some(FinalizeGate {
+        entered,
+        resume: Arc::clone(&resume),
+    });
+    let (started, results) = mpsc::unbounded_channel();
+    let observe = create_udf(
+        "observe_group_count",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            let ColumnarValue::Array(counts) = &args[0] else {
+                unreachable!()
+            };
+            started.send(counts.len()).unwrap();
+            Ok(args[0].clone())
+        }),
+    );
+    let expr = ScalarFunctionExpr::try_new(
+        Arc::new(observe),
+        vec![Arc::new(Column::new("count", 1))],
+        &schema,
+        Arc::default(),
+    )?;
+    let projector = ProjectionExprs::new([
+        ProjectionExpr::new(Arc::new(Column::new("id", 0)), "id"),
+        ProjectionExpr::new(Arc::new(expr), "count"),
+    ])
+    .make_projector(&schema)?;
+    let output_schema = Arc::clone(projector.output_schema());
+    pipeline.sink = Sink::GroupCount {
+        sink,
+        result_operators: vec![Operator::Projection(projector)],
+    };
+    pipeline.sink_capacity = GROUP_COUNT_RESULT_CAPACITY;
+    Ok(ObservedGroupCount {
+        plan: MorselExec::new(pipeline, output_schema),
+        scans,
+        finalizing,
+        resume,
+        results,
+    })
+}
+
+#[tokio::test]
+async fn group_count_result_waits_for_finalization_emits_bounded_batches_and_cleans_up()
+-> Result<()> {
+    let ObservedGroupCount {
+        plan,
+        mut scans,
+        mut finalizing,
+        resume,
+        mut results,
+    } = observed_group_count(None)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let mut stream = plan.execute(0, ctx)?;
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    let seen = observe_n(&mut scans, INPUT_BATCHES).await;
+    assert!(seen.iter().any(|&(_, worker)| worker != seen[0].1));
+    assert_eq!(results.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    assert!(
+        pool.reserved() > 0,
+        "expected combined group table memory reservation while parked before finalize"
+    );
+    assert!(futures::poll!(stream.next()).is_pending());
+
+    resume.add_permits(1);
+    let mut keys = Vec::new();
+    let mut batch_sizes = Vec::new();
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        let batch = batch?;
+        assert!(batch.num_rows() <= 4);
+        batch_sizes.push(batch.num_rows());
+        let ids = as_int32_array(batch.column(0))?;
+        let counts = as_int64_array(batch.column(1))?;
+        assert!(counts.values().iter().all(|&c| c == 1));
+        keys.extend(ids.values().iter().copied());
+    }
+    keys.sort_unstable();
+    assert_eq!(keys, (0..INPUT_BATCHES as i32).collect::<Vec<_>>());
+    assert_eq!(batch_sizes.len(), INPUT_BATCHES.div_ceil(4));
+    assert_eq!(
+        plan.metrics()
+            .unwrap()
+            .sum_by_name("group_count_finalizations")
+            .unwrap()
+            .as_usize(),
+        1
+    );
+    drop(plan);
+    assert_eq!(pool.reserved(), 0);
+    let mut observed_result_rows = 0;
+    while let Ok(rows) = results.try_recv() {
+        observed_result_rows += rows;
+    }
+    assert_eq!(observed_result_rows, INPUT_BATCHES);
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_group_count_before_finalization_never_starts_result_and_frees_memory()
+-> Result<()> {
+    let ObservedGroupCount {
+        plan,
+        mut finalizing,
+        mut results,
+        scans: _scans,
+        ..
+    } = observed_group_count(None)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    assert!(pool.reserved() > 0);
+    drop(stream);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("group_count_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    drop(plan);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    assert_eq!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_group_count_mid_emission_frees_all_memory() -> Result<()> {
+    let ObservedGroupCount {
+        plan,
+        mut finalizing,
+        resume,
+        scans: _scans,
+        results: _results,
+    } = observed_group_count(None)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 2)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+    drop(plan);
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    resume.add_permits(1);
+    let first = timeout(DEADLINE, stream.next()).await.unwrap().unwrap()?;
+    assert_eq!(first.num_rows(), 2);
+    drop(stream);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn group_count_worker_error_skips_finalization_and_frees_memory() -> Result<()> {
+    let ObservedGroupCount {
+        plan,
+        mut finalizing,
+        mut results,
+        scans: _scans,
+        ..
+    } = observed_group_count(Some(3))?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+    let error = timeout(DEADLINE, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("test morsel failure"), "{error}");
+    assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("group_count_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    assert_eq!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn group_count_mask_rejects_oversized_physical_mask() -> Result<()> {
+    let mut pipeline = oversized_mask_pipeline(None)?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    pipeline.sink = Sink::GroupCount {
+        sink: GroupCountSink::new(Arc::clone(&schema), 0, IntKeyType::Int32, "id".into()),
+        result_operators: vec![],
+    };
+    assert!(matches!(
+        pipeline.group_count_strategy(0),
+        GroupCountStrategy::DirectMask { key_index: 0, .. }
+    ));
+    assert_oversized_mask_error(pipeline, schema).await
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn group_count_strategy_selection_for_lowered_sql() -> Result<()> {
+    let ctx = crate::prelude::SessionContext::new();
+    ctx.register_batch(
+        "t",
+        RecordBatch::try_from_iter([
+            ("k", Arc::new(Int32Array::from(vec![1, 2])) as _),
+            ("v", Arc::new(Int32Array::from(vec![10, -5])) as _),
+        ])?,
+    )?;
+    let planner = MorselQueryPlanner::new(NonZeroUsize::new(2).unwrap());
+
+    let unfiltered = ctx
+        .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+        .await?
+        .into_optimized_plan()?;
+    let Lowering::Native(plan) = planner.try_lower(&unfiltered, &ctx.state()).await?
+    else {
+        panic!("expected native group count plan");
+    };
+    assert!(matches!(
+        plan.pipeline.group_count_strategy(0),
+        GroupCountStrategy::DirectColumn(0)
+    ));
+
+    let filtered = ctx
+        .sql("SELECT k, COUNT(*) FROM t WHERE v > 0 GROUP BY k")
+        .await?
+        .into_optimized_plan()?;
+    let Lowering::Native(mut plan) = planner.try_lower(&filtered, &ctx.state()).await?
+    else {
+        panic!("expected native filtered group count plan");
+    };
+    assert!(matches!(
+        plan.pipeline.group_count_strategy(0),
+        GroupCountStrategy::DirectMask { key_index: 0, .. }
+    ));
+    let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+    pipeline.operators.insert(
+        1,
+        Operator::Filter {
+            predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            projection: None,
+        },
+    );
+    assert!(matches!(
+        pipeline.group_count_strategy(0),
+        GroupCountStrategy::General(0)
+    ));
     Ok(())
 }

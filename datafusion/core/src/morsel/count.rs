@@ -17,7 +17,7 @@ use datafusion_expr::{ColumnarValue, Expr};
 use datafusion_functions_aggregate::count::Count;
 use datafusion_physical_expr::PhysicalExpr;
 
-pub(super) fn count_star(aggregate: &Aggregate) -> Option<&Expr> {
+pub(super) fn count_star_aggr_expr(aggregate: &Aggregate) -> Option<&Expr> {
     let [expr] = aggregate.aggr_expr.as_slice() else {
         return None;
     };
@@ -35,8 +35,7 @@ pub(super) fn count_star(aggregate: &Aggregate) -> Option<&Expr> {
         order_by,
         null_treatment,
     } = &function.params;
-    (aggregate.group_expr.is_empty()
-        && function.func.inner().is::<Count>()
+    (function.func.inner().is::<Count>()
         && matches!(args.as_slice(), [Expr::Literal(value, _)] if value == &COUNT_STAR_EXPANSION)
         && !distinct
         && filter.is_none()
@@ -60,7 +59,7 @@ impl CountState {
     }
 }
 
-fn count_overflow() -> datafusion_common::DataFusionError {
+pub(super) fn count_overflow() -> datafusion_common::DataFusionError {
     exec_datafusion_err!("Morsel COUNT(*) exceeds Int64")
 }
 

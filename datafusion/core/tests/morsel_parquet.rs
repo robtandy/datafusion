@@ -2243,3 +2243,372 @@ async fn intra_rg_splitting_small_pool_sweep_both_pushdown_modes() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parquet_group_count_parity_across_pushdown_nulls_empty_and_schema_adaptation()
+-> Result<()> {
+    let dir = TempDir::new()?;
+    let person_fields = Fields::from(vec![Field::new("name", DataType::Utf8, true)]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("gate", DataType::Int32, true),
+        Field::new("person", DataType::Struct(person_fields.clone()), true),
+    ]));
+    for file in 0..2i32 {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("{file}.parquet")))?,
+            Arc::clone(&schema),
+            Some(properties),
+        )?;
+        let base = file * 12;
+        let ids: Vec<i32> = (base..base + 12).collect();
+        let gates: Vec<Option<i32>> = vec![
+            None,
+            Some(12),
+            Some(12),
+            Some(5),
+            None,
+            Some(20),
+            Some(12),
+            Some(20),
+            Some(5),
+            None,
+            Some(30),
+            Some(5),
+        ];
+        let names = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            None,
+            Some("d"),
+            Some("e"),
+            Some("f"),
+            Some("g"),
+            Some("h"),
+            Some("i"),
+            Some("j"),
+            Some("k"),
+            Some("l"),
+        ]));
+        let person = StructArray::try_new(
+            person_fields.clone(),
+            vec![names],
+            Some(
+                vec![
+                    true, true, false, true, true, true, false, true, true, false, true,
+                    true,
+                ]
+                .into(),
+            ),
+        )?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(gates)),
+                Arc::new(person),
+            ],
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let empty = TempDir::new()?;
+    let queries = [
+        "SELECT gate, COUNT(*) AS n FROM t GROUP BY gate",
+        "SELECT gate, COUNT(*) AS n FROM t WHERE id >= 4 GROUP BY gate",
+        "SELECT gate, COUNT(*) AS n FROM t WHERE gate > 10 GROUP BY gate",
+        "SELECT COUNT(*) + 1 AS n, gate FROM t WHERE gate > 10 AND person IS NOT NULL GROUP BY gate",
+        "SELECT gate, COUNT(*) AS n FROM t WHERE gate > 10 AND random() >= 0.0 GROUP BY gate",
+        "SELECT gate, COUNT(*) AS n FROM t WHERE gate > 100 GROUP BY gate",
+        "SELECT gate, COUNT(*) AS n FROM empty GROUP BY gate",
+    ];
+
+    for pushdown in [false, true] {
+        for workers in [1, 4] {
+            let stock = context(&dir, "off", pushdown).await?;
+            let native = context(&dir, "required", pushdown).await?;
+            for ctx in [&stock, &native] {
+                ctx.sql(&format!(
+                    "SET datafusion.execution.target_partitions = {workers}"
+                ))
+                .await?;
+                ctx.sql("SET datafusion.execution.batch_size = 2").await?;
+                ctx.register_parquet(
+                    "empty",
+                    empty.path().to_str().unwrap(),
+                    ParquetReadOptions::default().schema(schema.as_ref()),
+                )
+                .await?;
+            }
+            for sql in queries {
+                let expected_plan = stock.sql(sql).await?.create_physical_plan().await?;
+                let actual_plan = native.sql(sql).await?.create_physical_plan().await?;
+                let display = displayable(actual_plan.as_ref()).indent(false).to_string();
+                assert!(
+                    display.contains("NativeParquet")
+                        && display.contains("GroupCountSink")
+                        && display.contains("FinalizedGroupCountSource"),
+                    "pushdown={pushdown}, workers={workers}, {sql}: {display}"
+                );
+                assert_eq!(actual_plan.schema(), expected_plan.schema(), "{sql}");
+                let expected = collect(expected_plan, stock.task_ctx()).await?;
+                let actual = collect(Arc::clone(&actual_plan), native.task_ctx()).await?;
+                assert!(actual.iter().all(|b| b.num_rows() <= 2), "{sql}");
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "pushdown={pushdown}, workers={workers}: {sql}"
+                );
+                assert_eq!(
+                    metric(actual_plan.as_ref(), "group_count_finalizations"),
+                    1,
+                    "{sql}"
+                );
+                if sql.contains("empty") || sql.contains("gate > 100") {
+                    assert_eq!(
+                        actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                        0
+                    );
+                }
+            }
+        }
+    }
+
+    // Schema adaptation (Int32 -> Int64 widening on GROUP BY key)
+    let adapted_schema = Schema::new(vec![
+        Field::new("gate", DataType::Int64, true),
+        Field::new("id", DataType::Int32, false),
+    ]);
+    for pushdown in [false, true] {
+        let stock = context(&dir, "off", pushdown).await?;
+        let native = context(&dir, "required", pushdown).await?;
+        for ctx in [&stock, &native] {
+            ctx.register_parquet(
+                "adapted",
+                dir.path().to_str().unwrap(),
+                ParquetReadOptions::default().schema(&adapted_schema),
+            )
+            .await?;
+        }
+        let sql = "SELECT gate, COUNT(*) AS n FROM adapted WHERE id >= 3 GROUP BY gate";
+        let expected_plan = stock.sql(sql).await?.create_physical_plan().await?;
+        let actual_plan = native.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(actual_plan.schema(), expected_plan.schema());
+        let expected = collect(expected_plan, stock.task_ctx()).await?;
+        let actual = collect(actual_plan, native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parquet_group_count_high_cardinality_concurrent_oom_error_and_cancellation()
+-> Result<()> {
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("gate", DataType::Int32, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    for file in 0..8i64 {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(500))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("{file}.parquet")))?,
+            Arc::clone(&schema),
+            Some(properties),
+        )?;
+        let base = file * 2_000;
+        let keys: Vec<Option<i64>> = (base..base + 2_000)
+            .map(|i| if i % 503 == 0 { None } else { Some(i) })
+            .collect();
+        let gates: Vec<i32> = (base..base + 2_000)
+            .map(|i| if i == 4_321 { 0 } else { (i % 7) as i32 + 1 })
+            .collect();
+        let payloads: Vec<&str> = vec!["p"; 2_000];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int32Array::from(gates)),
+                Arc::new(StringArray::from(payloads)),
+            ],
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let sql = "SELECT k, COUNT(*) AS n FROM t WHERE gate > 2 GROUP BY k";
+    let stock = context(&dir, "off", true).await?;
+    let expected = stock.sql(sql).await?.collect().await?;
+
+    // 1. Concurrent multi-worker execution with bounded output batches & pool cleanup.
+    for pushdown in [false, true] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let native = split_context(
+            &dir,
+            "required",
+            4,
+            pushdown,
+            false,
+            None,
+            None,
+            Some(Arc::clone(&pool)),
+        )
+        .await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        let (a, b) = tokio::try_join!(
+            collect(Arc::clone(&plan), native.task_ctx()),
+            collect(Arc::clone(&plan), native.task_ctx()),
+        )?;
+        for batches in [&a, &b] {
+            assert!(batches.len() > 1);
+            assert!(batches.iter().all(|batch| batch.num_rows() <= 128));
+            assert_eq!(
+                batches_to_sort_string(batches),
+                batches_to_sort_string(&expected),
+                "pushdown={pushdown}"
+            );
+        }
+        assert_eq!(metric(plan.as_ref(), "group_count_finalizations"), 2);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 2. Tight memory pool fails cleanly with ResourcesExhausted and releases all memory.
+    for pushdown in [false, true] {
+        let tight_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+        let native = split_context(
+            &dir,
+            "required",
+            4,
+            pushdown,
+            false,
+            None,
+            None,
+            Some(Arc::clone(&tight_pool)),
+        )
+        .await?;
+        let plan = native
+            .sql("SELECT k, COUNT(*) AS n FROM t GROUP BY k")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let err = collect(Arc::clone(&plan), native.task_ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+            ),
+            "pushdown={pushdown}: expected ResourcesExhausted, got: {err}"
+        );
+        assert_eq!(metric(plan.as_ref(), "group_count_finalizations"), 0);
+        assert_eq!(tight_pool.reserved(), 0);
+    }
+
+    // 3. Worker error during Parquet filter skips finalization and cleans up reservations.
+    for pushdown in [false, true] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let native = split_context(
+            &dir,
+            "required",
+            4,
+            pushdown,
+            false,
+            None,
+            None,
+            Some(Arc::clone(&pool)),
+        )
+        .await?;
+        let plan = native
+            .sql("SELECT k, COUNT(*) AS n FROM t WHERE 100 / gate > 1 GROUP BY k")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let err = collect(Arc::clone(&plan), native.task_ctx())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("divide by zero"),
+            "pushdown={pushdown}: {err}"
+        );
+        assert_eq!(metric(plan.as_ref(), "group_count_finalizations"), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 4. Early stream cancellation frees all memory reservations.
+    for pushdown in [false, true] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let native = split_context(
+            &dir,
+            "required",
+            4,
+            pushdown,
+            false,
+            None,
+            None,
+            Some(Arc::clone(&pool)),
+        )
+        .await?;
+        let plan = native
+            .sql("SELECT k, COUNT(*) AS n FROM t GROUP BY k")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let mut stream = execute_stream(Arc::clone(&plan), native.task_ctx())?;
+        let first = stream.next().await.expect("first batch")?;
+        assert_eq!(first.num_rows(), 128);
+        drop(stream);
+        timeout(Duration::from_secs(5), async {
+            while pool.reserved() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool reservation leaked after early cancellation");
+    }
+
+    // 5. Unsupported Parquet GROUP BY rejects in required mode and falls back in prefer mode.
+    let prefer = context(&dir, "prefer", false).await?;
+    let required = context(&dir, "required", false).await?;
+    for bad_sql in [
+        "SELECT payload, COUNT(*) FROM t GROUP BY payload",
+        "SELECT k, gate, COUNT(*) FROM t GROUP BY k, gate",
+        "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",
+    ] {
+        let err = required
+            .sql(bad_sql)
+            .await?
+            .create_physical_plan()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("morsel_mode=required"), "{bad_sql}: {err}");
+        let fallback = prefer.sql(bad_sql).await?.create_physical_plan().await?;
+        assert!(
+            !displayable(fallback.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec"),
+            "{bad_sql}"
+        );
+        let actual = collect(fallback, prefer.task_ctx()).await?;
+        let expected = stock.sql(bad_sql).await?.collect().await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "{bad_sql}"
+        );
+    }
+    Ok(())
+}
