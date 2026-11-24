@@ -34,7 +34,7 @@ use datafusion_session::Session;
 use crate::datasource::listing::ListingTable;
 
 use super::metrics::RunMetrics;
-use super::{CountState, Operator, supported_expr};
+use super::{Operator, WorkerState, supported_expr};
 
 mod ready;
 #[cfg(test)]
@@ -417,7 +417,7 @@ impl ParquetScan {
     pub(super) fn start(
         &self,
         context: &TaskContext,
-        tasks: &mut JoinSet<Result<Option<CountState>>>,
+        tasks: &mut JoinSet<Result<WorkerState>>,
         workers: NonZeroUsize,
         measurement: Option<&Arc<RunMetrics>>,
     ) -> Result<ReadyReaders> {
@@ -448,7 +448,7 @@ impl ParquetScan {
                 let work = Arc::clone(&work);
                 tasks.spawn(async move {
                     work.produce().await?;
-                    Ok(None)
+                    Ok(WorkerState::None)
                 });
             }
             if has_pushed_filter && !self.files.is_empty() {
@@ -459,7 +459,7 @@ impl ParquetScan {
                     let measurement = measurement.cloned();
                     tasks.spawn(async move {
                         run_phase2_lane(phase2, measurement).await?;
-                        Ok(None)
+                        Ok(WorkerState::None)
                     });
                 }
             }
