@@ -32,7 +32,11 @@ Generated deterministically by `benchmarks/morsel_join/join_runner.rs`:
 
 Workloads (all verified for exact row-count and column-checksum parity and
 verified `MorselExec` with `HashJoinBuildSink` + `HashJoinProbe` under
-`morsel_mode=required`, and stock `HashJoinExec` under `morsel_mode=off`):
+`morsel_mode=required`, and stock `HashJoinExec` under `morsel_mode=off`;
+build-side selection places statically empty inputs on build first and
+otherwise compares `MemTable` row counts or `ParquetScan` estimated bytes—using
+the probe-leaf source estimate for join subtrees, tie-breaking to the right
+side—so `dim` is always chosen as build):
 
 1. `mem_balanced_proj`: `SELECT f.id, d.weight + f.val AS total FROM fact_bal_mem f JOIN dim_mem d ON f.k = d.k`
 2. `mem_skewed_proj`: `SELECT f.id, d.weight + f.val AS total FROM fact_skew_mem f JOIN dim_mem d ON f.k = d.k`

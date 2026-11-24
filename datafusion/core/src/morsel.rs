@@ -93,6 +93,7 @@ fn result_capacity(workers: NonZeroUsize) -> usize {
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`]
 /// and supported Parquet listing scans (with the `parquet` feature).
 /// Lowers scans, filters, and projections with synchronous scalar expressions,
+/// `INNER` equi-joins (two-pipeline build sink + lock-free probe operator),
 /// and ungrouped or grouped aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`).
 /// Installing this planner explicitly opts in even when the session mode is off.
 /// Unsupported queries use [`DefaultPhysicalPlanner`] unless the mode is
@@ -309,7 +310,7 @@ impl MorselQueryPlanner {
                     .await?
                 {
                     Ok((source, mut operators, schema)) => {
-                        assign_join_build_ids(&mut operators);
+                        assign_join_build_ids(&mut operators)?;
                         (source, operators, schema)
                     }
                     Err(reason) => return Ok(Lowering::Unsupported(reason)),
@@ -906,7 +907,7 @@ impl MorselQueryPlanner {
             Err(reason) => return Ok(Err(reason)),
         };
 
-        assign_join_build_ids(&mut build_ops);
+        assign_join_build_ids(&mut build_ops)?;
         let build_pipeline = Arc::new(Pipeline {
             source: build_source,
             operators: build_ops,
@@ -1002,15 +1003,22 @@ fn unsupported_provider_reason(table: &datafusion_common::TableReference) -> Str
 #[derive(Debug, Clone, Copy)]
 struct SideEstimate {
     is_empty: bool,
-    has_join: bool,
     mem_rows: Option<usize>,
     approx_bytes: u64,
 }
 
 fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
-    let has_join = operators
-        .iter()
-        .any(|op| matches!(op, Operator::HashProbe(_)));
+    let nested_empty = operators.iter().any(|op| {
+        matches!(
+            op,
+            Operator::HashProbe(probe)
+                if estimate_side_size(
+                    &probe.build_pipeline.source,
+                    &probe.build_pipeline.operators,
+                )
+                .is_empty
+        )
+    });
     match source {
         Source::Memory(mem) => {
             let rows = mem.batches.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -1020,8 +1028,7 @@ fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
                 .map(get_record_batch_memory_size)
                 .fold(0usize, usize::saturating_add) as u64;
             SideEstimate {
-                is_empty: rows == 0,
-                has_join,
+                is_empty: rows == 0 || nested_empty,
                 mem_rows: Some(rows),
                 approx_bytes: bytes,
             }
@@ -1030,8 +1037,7 @@ fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
         Source::Parquet(pq) => {
             let file_bytes = pq.total_file_bytes();
             SideEstimate {
-                is_empty: pq.is_empty(),
-                has_join,
+                is_empty: pq.is_empty() || nested_empty,
                 mem_rows: None,
                 approx_bytes: file_bytes.saturating_mul(4),
             }
@@ -1045,12 +1051,6 @@ fn choose_build_side(left: SideEstimate, right: SideEstimate) -> BuildSide {
     }
     if right.is_empty && !left.is_empty {
         return BuildSide::Right;
-    }
-    if left.has_join && !right.has_join {
-        return BuildSide::Right;
-    }
-    if right.has_join && !left.has_join {
-        return BuildSide::Left;
     }
     if let (Some(l_rows), Some(r_rows)) = (left.mem_rows, right.mem_rows) {
         return if l_rows < r_rows {
@@ -1066,16 +1066,20 @@ fn choose_build_side(left: SideEstimate, right: SideEstimate) -> BuildSide {
     }
 }
 
-fn assign_join_build_ids(operators: &mut [Operator]) {
+fn assign_join_build_ids(operators: &mut [Operator]) -> Result<()> {
     let mut next_id = 0usize;
     for op in operators {
         if let Operator::HashProbe(probe) = op {
-            if let Some(p) = Arc::get_mut(probe) {
-                p.build_id = next_id;
-            }
+            let Some(p) = Arc::get_mut(probe) else {
+                return internal_err!(
+                    "Expected unique ownership of HashJoinProbe while assigning build IDs"
+                );
+            };
+            p.build_id = next_id;
             next_id += 1;
         }
     }
+    Ok(())
 }
 
 fn supported_expr(expr: &Expr) -> Result<bool> {

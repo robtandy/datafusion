@@ -891,3 +891,150 @@ async fn hash_join_metrics_concurrent_runs_and_parquet_oom_cleanup() -> Result<(
 
     Ok(())
 }
+
+fn extract_build_segments(plan_display: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut rest = plan_display;
+    while let Some(start) = rest.find("[Build:") {
+        let candidate = &rest[start..];
+        let mut depth = 0usize;
+        let mut end = candidate.len();
+        for (idx, ch) in candidate.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = idx + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        segments.push(&candidate[..end]);
+        rest = &candidate[end..];
+    }
+    segments
+}
+
+#[tokio::test]
+async fn three_way_join_keeps_largest_non_join_input_on_probe() -> Result<()> {
+    // TPC-H Q3-shaped 3-way join: small (10 rows) JOIN mid (80 rows) JOIN big (800 rows),
+    // where the non-join input `big` is the largest side and must stay on probe rather than
+    // being hashed into a `[Build: ...]` pipeline.
+    let small_rows: Vec<(Option<i32>, Option<&str>, i32)> =
+        (0..10).map(|i| (Some(i), Some("s"), i * 10)).collect();
+    let mid_rows: Vec<(Option<i32>, Option<&str>, i32)> =
+        (0..80).map(|i| (Some(i % 12), Some("m"), i)).collect();
+    let big_rows: Vec<(Option<i32>, Option<&str>, i32)> =
+        (0..800).map(|i| (Some(i % 90), Some("b"), i * 3)).collect();
+
+    let (small_schema, small_batches) = make_kv_table(&small_rows, 5)?;
+    let (mid_schema, mid_batches) = make_kv_table(&mid_rows, 16)?;
+    let (big_schema, big_batches) = make_kv_table(&big_rows, 64)?;
+    let small_dir = write_parquet_files(&small_batches, 1, 10)?;
+    let mid_dir = write_parquet_files(&mid_batches, 2, 40)?;
+    let big_dir = write_parquet_files(&big_batches, 4, 100)?;
+
+    let queries = [
+        "SELECT small.k AS sk, mid.v AS mv, big.v AS bv \
+         FROM small \
+         JOIN mid ON small.k = mid.k \
+         JOIN big ON mid.v = big.k",
+        "SELECT COUNT(*) AS n \
+         FROM small \
+         JOIN mid ON small.k = mid.k \
+         JOIN big ON mid.v = big.k",
+        "SELECT small.k AS sk, COUNT(*) AS n, SUM(big.v) AS total \
+         FROM small \
+         JOIN mid ON small.k = mid.k \
+         JOIN big ON mid.v = big.k \
+         WHERE big.v > 10 \
+         GROUP BY small.k",
+    ];
+
+    for is_parquet in [false, true] {
+        let stock = stock_context(4, 32);
+        let native = morsel_context(4, 32, MorselMode::Required, false);
+
+        if is_parquet {
+            for ctx in [&stock, &native] {
+                ctx.register_parquet(
+                    "small",
+                    small_dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+                ctx.register_parquet(
+                    "mid",
+                    mid_dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+                ctx.register_parquet(
+                    "big",
+                    big_dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            }
+        } else {
+            for ctx in [&stock, &native] {
+                ctx.register_table(
+                    "small",
+                    Arc::new(MemTable::try_new(
+                        Arc::clone(&small_schema),
+                        vec![small_batches.clone()],
+                    )?),
+                )?;
+                ctx.register_table(
+                    "mid",
+                    Arc::new(MemTable::try_new(
+                        Arc::clone(&mid_schema),
+                        vec![mid_batches.clone()],
+                    )?),
+                )?;
+                ctx.register_table(
+                    "big",
+                    Arc::new(MemTable::try_new(
+                        Arc::clone(&big_schema),
+                        vec![big_batches.clone()],
+                    )?),
+                )?;
+            }
+        }
+
+        for sql in queries {
+            let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+            let display = displayable(plan.as_ref()).indent(true).to_string();
+            let build_segments = extract_build_segments(&display);
+            assert_eq!(
+                build_segments.len(),
+                2,
+                "expected 2 build pipelines for 3-way join:\n{display}"
+            );
+            for segment in &build_segments {
+                assert!(
+                    !segment.contains("big"),
+                    "largest table `big` must not be placed in a [Build: ...] pipeline:\n{display}"
+                );
+            }
+            let after_builds = display
+                .rsplit_once("]; ")
+                .map(|(_, tail)| tail)
+                .unwrap_or(&display);
+            assert!(
+                after_builds.contains("big"),
+                "expected `big` on outer probe pipeline:\n{display}"
+            );
+            assert_eq!(
+                metric(plan.as_ref(), "join_build_finalizations"),
+                2,
+                "expected 2 build finalizations for 3-way join `{sql}`"
+            );
+        }
+    }
+
+    Ok(())
+}
