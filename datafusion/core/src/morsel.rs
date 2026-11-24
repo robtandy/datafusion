@@ -15,10 +15,13 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::MorselMode;
+use datafusion_common::instant::Instant;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{
-    Result, exec_datafusion_err, internal_err, plan_err, project_schema,
+    JoinType, NullEquality, Result, exec_datafusion_err, internal_err, plan_err,
+    project_schema,
 };
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -36,6 +39,7 @@ use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType, apply_expression_roots,
 };
+use datafusion_physical_plan::joins::utils::build_join_schema;
 use datafusion_physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -56,6 +60,7 @@ mod aggregate;
 mod count;
 mod fallback;
 mod group_count;
+mod hash_join;
 mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
@@ -63,6 +68,11 @@ mod parquet;
 use aggregate::{AggregateSink, AggregateState};
 use count::{CountSink, CountState, FinalizedCount};
 use group_count::{GroupCountSink, GroupCountState, IntKeyType};
+use hash_join::{
+    BuildSide, FinalizedHashTable, HashJoinBuildSink, HashJoinBuildState, HashJoinProbe,
+    HashJoinProbeConfig, JoinOutputCol, OperatorStep, ProbeCursor, ProbeScratch,
+    is_supported_join_key_type,
+};
 pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
@@ -105,6 +115,9 @@ pub struct MorselQueryPlanner {
     workers: NonZeroUsize,
 }
 
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type LoweredSide = std::result::Result<(Source, Vec<Operator>, SchemaRef), String>;
+
 enum Lowering {
     Native(MorselExec),
     Unsupported(String),
@@ -144,7 +157,11 @@ impl MorselQueryPlanner {
         let mut nodes = Vec::new();
         let mut lowered_aggregate = None;
         let mut node = plan;
-        let scan = loop {
+        enum Leaf<'a> {
+            Scan(&'a datafusion_expr::logical_plan::TableScan),
+            Join(&'a datafusion_expr::logical_plan::Join),
+        }
+        let leaf = loop {
             match node {
                 LogicalPlan::Filter(filter) => {
                     if !supported_expr(&filter.predicate)? {
@@ -224,7 +241,8 @@ impl MorselQueryPlanner {
                             .into(),
                     ));
                 }
-                LogicalPlan::TableScan(scan) => break scan,
+                LogicalPlan::TableScan(scan) => break Leaf::Scan(scan),
+                LogicalPlan::Join(join) => break Leaf::Join(join),
                 LogicalPlan::Limit(_) => {
                     return Ok(Lowering::Unsupported(format!(
                         "native morsels do not support LIMIT/OFFSET: {}",
@@ -239,84 +257,65 @@ impl MorselQueryPlanner {
                 }
             }
         };
-        for (present, feature) in [
-            (scan.fetch.is_some(), "LIMIT"),
-            (scan.skip.is_some(), "OFFSET"),
-            (!scan.statistics_requests.is_empty(), "statistics requests"),
-        ] {
-            if present {
-                return Ok(Lowering::Unsupported(format!(
-                    "native morsel scan of {} does not support {feature}",
-                    scan.table_name
-                )));
+        let (source, operators, mut schema) = match leaf {
+            Leaf::Scan(scan) => {
+                let source = match self.lower_scan_source(scan, session).await? {
+                    Ok(source) => source,
+                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                };
+                #[cfg(feature = "parquet")]
+                let mut source = source;
+                let (mut operators, schema) =
+                    Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
+                #[cfg(feature = "parquet")]
+                if let Source::Parquet(ref mut parquet_scan) = source {
+                    parquet_scan.pushdown_operators(
+                        &mut operators,
+                        matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. })),
+                        &scan.filters,
+                        &scan.projected_schema,
+                        session,
+                    )?;
+                }
+                let prune_filter = match source {
+                    Source::Memory(_) => {
+                        self.workers == NonZeroUsize::MIN
+                            || matches!(
+                                lowered_aggregate,
+                                Some(LoweredAggregate::General { .. })
+                            )
+                    }
+                    #[cfg(feature = "parquet")]
+                    Source::Parquet(_) => true,
+                };
+                if !matches!(
+                    lowered_aggregate,
+                    Some(
+                        LoweredAggregate::Count { .. }
+                            | LoweredAggregate::GroupCount { .. }
+                    )
+                ) && prune_filter
+                {
+                    prune_filter_input(&mut operators, source.schema());
+                }
+                (source, operators, schema)
             }
-        }
-        let Ok(provider) = source_as_provider(&scan.source) else {
-            return Ok(Lowering::Unsupported(format!(
-                "unsupported table source for {}",
-                scan.table_name
-            )));
-        };
-        let mut source = if let Some(table) = provider.downcast_ref::<MemTable>() {
-            if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
-                return Ok(Lowering::Unsupported(format!(
-                    "MemTable scan of {} has advertised ordering or scan filters",
-                    scan.table_name
-                )));
-            }
-            // Like MemTable::scan, snapshot the batch handles at planning time.
-            let mut batches = Vec::new();
-            for partition in &table.batches {
-                batches.extend(partition.read().await.iter().cloned());
-            }
-            Source::Memory(MemorySource {
-                table: scan.table_name.to_string(),
-                batches,
-                projection: scan.projection.clone(),
-                schema: project_schema(&provider.schema(), scan.projection.as_deref())?,
-            })
-        } else {
-            #[cfg(feature = "parquet")]
-            if let Some(table) =
-                provider.downcast_ref::<crate::datasource::listing::ListingTable>()
-            {
-                match ParquetScan::lower(table, scan, session).await? {
-                    Ok(source) => Source::Parquet(source),
+            Leaf::Join(join) => {
+                let count_only =
+                    matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. }))
+                        && nodes.is_empty();
+                match self
+                    .lower_join_plan(join, nodes, count_only, session)
+                    .await?
+                {
+                    Ok((source, mut operators, schema)) => {
+                        assign_join_build_ids(&mut operators);
+                        (source, operators, schema)
+                    }
                     Err(reason) => return Ok(Lowering::Unsupported(reason)),
                 }
-            } else {
-                return Ok(unsupported_provider(&scan.table_name));
             }
-            #[cfg(not(feature = "parquet"))]
-            return Ok(unsupported_provider(&scan.table_name));
         };
-        let (mut operators, mut schema) =
-            Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
-        #[cfg(feature = "parquet")]
-        if let Source::Parquet(ref mut parquet_scan) = source {
-            parquet_scan.pushdown_operators(
-                &mut operators,
-                matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. })),
-                &scan.filters,
-                &scan.projected_schema,
-                session,
-            )?;
-        }
-        let prune_filter = match source {
-            Source::Memory(_) => {
-                self.workers == NonZeroUsize::MIN
-                    || matches!(lowered_aggregate, Some(LoweredAggregate::General { .. }))
-            }
-            #[cfg(feature = "parquet")]
-            Source::Parquet(_) => true,
-        };
-        if !matches!(
-            lowered_aggregate,
-            Some(LoweredAggregate::Count { .. } | LoweredAggregate::GroupCount { .. })
-        ) && prune_filter
-        {
-            prune_filter_input(&mut operators, source.schema());
-        }
         let sink = match lowered_aggregate {
             Some(LoweredAggregate::Count {
                 aggregate,
@@ -435,6 +434,7 @@ impl MorselQueryPlanner {
             Sink::Count { .. } => COUNT_RESULT_CAPACITY,
             Sink::GroupCount { .. } => GROUP_COUNT_RESULT_CAPACITY,
             Sink::Aggregate { .. } => AGGREGATE_RESULT_CAPACITY,
+            Sink::HashJoinBuild(_) => unreachable!(),
         };
         Ok(Lowering::Native(MorselExec::new(
             Pipeline {
@@ -446,6 +446,414 @@ impl MorselQueryPlanner {
             },
             schema,
         )))
+    }
+
+    async fn lower_scan_source(
+        &self,
+        scan: &datafusion_expr::logical_plan::TableScan,
+        session: &dyn Session,
+    ) -> Result<std::result::Result<Source, String>> {
+        #[cfg(not(feature = "parquet"))]
+        let _ = session;
+        for (present, feature) in [
+            (scan.fetch.is_some(), "LIMIT"),
+            (scan.skip.is_some(), "OFFSET"),
+            (!scan.statistics_requests.is_empty(), "statistics requests"),
+        ] {
+            if present {
+                return Ok(Err(format!(
+                    "native morsel scan of {} does not support {feature}",
+                    scan.table_name
+                )));
+            }
+        }
+        let Ok(provider) = source_as_provider(&scan.source) else {
+            return Ok(Err(format!(
+                "unsupported table source for {}",
+                scan.table_name
+            )));
+        };
+        if let Some(table) = provider.downcast_ref::<MemTable>() {
+            if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
+                return Ok(Err(format!(
+                    "MemTable scan of {} has advertised ordering or scan filters",
+                    scan.table_name
+                )));
+            }
+            // Like MemTable::scan, snapshot the batch handles at planning time.
+            let mut batches = Vec::new();
+            for partition in &table.batches {
+                batches.extend(partition.read().await.iter().cloned());
+            }
+            Ok(Ok(Source::Memory(MemorySource {
+                table: scan.table_name.to_string(),
+                batches,
+                projection: scan.projection.clone(),
+                schema: project_schema(&provider.schema(), scan.projection.as_deref())?,
+            })))
+        } else {
+            #[cfg(feature = "parquet")]
+            if let Some(table) =
+                provider.downcast_ref::<crate::datasource::listing::ListingTable>()
+            {
+                ParquetScan::lower(table, scan, session)
+                    .await
+                    .map(|res| res.map(Source::Parquet))
+            } else {
+                Ok(Err(unsupported_provider_reason(&scan.table_name)))
+            }
+            #[cfg(not(feature = "parquet"))]
+            Ok(Err(unsupported_provider_reason(&scan.table_name)))
+        }
+    }
+
+    fn lower_side_plan<'a>(
+        &'a self,
+        plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> BoxFuture<'a, Result<LoweredSide>> {
+        Box::pin(async move {
+            let mut nodes = Vec::new();
+            let mut node = plan;
+            loop {
+                match node {
+                    LogicalPlan::SubqueryAlias(alias) => {
+                        node = &alias.input;
+                    }
+                    LogicalPlan::Filter(filter) => {
+                        if !supported_expr(&filter.predicate)? {
+                            return Ok(Err(format!(
+                                "unsupported filter predicate: {}",
+                                filter.predicate
+                            )));
+                        }
+                        nodes.push(node);
+                        node = &filter.input;
+                    }
+                    LogicalPlan::Projection(projection) => {
+                        for expr in &projection.expr {
+                            if !supported_expr(expr)? {
+                                return Ok(Err(format!(
+                                    "unsupported projection expression: {expr}"
+                                )));
+                            }
+                        }
+                        nodes.push(node);
+                        node = &projection.input;
+                    }
+                    LogicalPlan::TableScan(scan) => {
+                        let source = match self.lower_scan_source(scan, session).await? {
+                            Ok(source) => source,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                        #[cfg(feature = "parquet")]
+                        let mut source = source;
+                        let (mut operators, schema) = Self::lower_operators(
+                            nodes,
+                            Arc::clone(source.schema()),
+                            session,
+                        )?;
+                        #[cfg(feature = "parquet")]
+                        if let Source::Parquet(ref mut parquet_scan) = source {
+                            parquet_scan.pushdown_operators(
+                                &mut operators,
+                                false,
+                                &scan.filters,
+                                &scan.projected_schema,
+                                session,
+                            )?;
+                        }
+                        prune_filter_input(&mut operators, source.schema());
+                        return Ok(Ok((source, operators, schema)));
+                    }
+                    LogicalPlan::Join(join) => {
+                        return self.lower_join_plan(join, nodes, false, session).await;
+                    }
+                    LogicalPlan::Limit(_) => {
+                        return Ok(Err(format!(
+                            "native morsels do not support LIMIT/OFFSET: {}",
+                            node.display()
+                        )));
+                    }
+                    _ => {
+                        return Ok(Err(format!(
+                            "unsupported logical operator: {}",
+                            node.display()
+                        )));
+                    }
+                }
+            }
+        })
+    }
+
+    async fn lower_join_plan<'a>(
+        &'a self,
+        join: &'a datafusion_expr::logical_plan::Join,
+        post_nodes: Vec<&'a LogicalPlan>,
+        count_only: bool,
+        session: &'a dyn Session,
+    ) -> Result<std::result::Result<(Source, Vec<Operator>, SchemaRef), String>> {
+        if join.join_type != JoinType::Inner {
+            return Ok(Err(format!(
+                "unsupported join type {:?} in native morsel hash join (only INNER JOIN is supported)",
+                join.join_type
+            )));
+        }
+        if join.on.is_empty() {
+            return Ok(Err(
+                "cross join or join without equi-join keys is not supported in native morsel hash join"
+                    .into(),
+            ));
+        }
+        if join.null_equality != NullEquality::NullEqualsNothing {
+            return Ok(Err(
+                "null-equal join (IS NOT DISTINCT FROM) is not supported in native morsel hash join"
+                    .into(),
+            ));
+        }
+        if join.null_aware {
+            return Ok(Err(
+                "null-aware join is not supported in native morsel hash join".into(),
+            ));
+        }
+        for (l_expr, r_expr) in &join.on {
+            if !supported_expr(l_expr)? {
+                return Ok(Err(format!(
+                    "unsupported left join key expression: {l_expr}"
+                )));
+            }
+            if !supported_expr(r_expr)? {
+                return Ok(Err(format!(
+                    "unsupported right join key expression: {r_expr}"
+                )));
+            }
+        }
+        if let Some(filter) = &join.filter
+            && !supported_expr(filter)?
+        {
+            return Ok(Err(format!("unsupported join filter expression: {filter}")));
+        }
+
+        let (left_source, left_ops, left_schema) =
+            match self.lower_side_plan(&join.left, session).await? {
+                Ok(v) => v,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let (right_source, right_ops, right_schema) =
+            match self.lower_side_plan(&join.right, session).await? {
+                Ok(v) => v,
+                Err(reason) => return Ok(Err(reason)),
+            };
+
+        let props = session.execution_props();
+        let planning_ctx = PhysicalPlanningContext::default();
+        let mut left_key_exprs = Vec::with_capacity(join.on.len());
+        let mut right_key_exprs = Vec::with_capacity(join.on.len());
+        let mut left_key_names = Vec::with_capacity(join.on.len());
+        let mut right_key_names = Vec::with_capacity(join.on.len());
+        let mut key_types = Vec::with_capacity(join.on.len());
+
+        for (l_expr, r_expr) in &join.on {
+            let l_phys =
+                create_physical_expr(l_expr, join.left.schema(), props, &planning_ctx)?;
+            let r_phys =
+                create_physical_expr(r_expr, join.right.schema(), props, &planning_ctx)?;
+            let l_type = l_phys.data_type(&left_schema)?;
+            let r_type = r_phys.data_type(&right_schema)?;
+            if l_type != r_type {
+                return Ok(Err(format!(
+                    "mismatched join key types: left={l_type}, right={r_type}"
+                )));
+            }
+            if !is_supported_join_key_type(&l_type) {
+                return Ok(Err(format!(
+                    "unsupported join key type {l_type} in native morsel hash join"
+                )));
+            }
+            left_key_names.push(physical_name(l_expr)?);
+            right_key_names.push(physical_name(r_expr)?);
+            left_key_exprs.push(l_phys);
+            right_key_exprs.push(r_phys);
+            key_types.push(l_type);
+        }
+
+        let left_len = left_schema.fields().len();
+        let right_len = right_schema.fields().len();
+        let join_output_schema =
+            Arc::new(build_join_schema(&left_schema, &right_schema, &JoinType::Inner).0);
+
+        let mut post_ops = Vec::new();
+        if let Some(filter_expr) = &join.filter {
+            let predicate =
+                create_physical_expr(filter_expr, &join.schema, props, &planning_ctx)?;
+            if predicate.data_type(&join_output_schema)? != DataType::Boolean {
+                return plan_err!(
+                    "Morsel join filter predicate must return Boolean: {predicate}"
+                );
+            }
+            post_ops.push(Operator::Filter {
+                predicate,
+                projection: None,
+            });
+        }
+        let (extra_post_ops, mut final_schema) =
+            Self::lower_operators(post_nodes, Arc::clone(&join_output_schema), session)?;
+        post_ops.extend(extra_post_ops);
+
+        let build_side = choose_build_side(
+            estimate_side_size(&left_source, &left_ops),
+            estimate_side_size(&right_source, &right_ops),
+        );
+        let (
+            build_source,
+            mut build_ops,
+            build_schema,
+            build_key_exprs,
+            build_key_names,
+            probe_source,
+            mut probe_ops,
+            probe_key_exprs,
+            probe_key_names,
+        ) = match build_side {
+            BuildSide::Left => (
+                left_source,
+                left_ops,
+                left_schema,
+                left_key_exprs,
+                left_key_names,
+                right_source,
+                right_ops,
+                right_key_exprs,
+                right_key_names,
+            ),
+            BuildSide::Right => (
+                right_source,
+                right_ops,
+                right_schema,
+                right_key_exprs,
+                right_key_names,
+                left_source,
+                left_ops,
+                left_key_exprs,
+                left_key_names,
+            ),
+        };
+
+        // Fuse a pure-column post-join Projection (or count-only zero-column output)
+        // directly into HashJoinProbe so we avoid taking unused columns and storing
+        // unneeded build payload columns in the hash table.
+        let (build_payload_columns, output_projection, probe_output_schema) =
+            if count_only && post_ops.is_empty() {
+                let empty = Arc::new(Schema::new_with_metadata(
+                    Vec::<Field>::new(),
+                    join_output_schema.metadata().clone(),
+                ));
+                final_schema = Arc::clone(&empty);
+                (Vec::new(), Vec::new(), empty)
+            } else if let Some(Operator::Projection(projector)) = post_ops.first()
+                && projector
+                    .projection()
+                    .as_ref()
+                    .iter()
+                    .all(|p| p.expr.is::<Column>())
+            {
+                let mut payload_cols: Vec<usize> = Vec::new();
+                let mut output_proj =
+                    Vec::with_capacity(projector.projection().as_ref().len());
+                for p in projector.projection().as_ref() {
+                    let join_col = p.expr.downcast_ref::<Column>().unwrap().index();
+                    let col = match (build_side, join_col < left_len) {
+                        (BuildSide::Left, true) => {
+                            let pos = payload_cols
+                                .iter()
+                                .position(|&c| c == join_col)
+                                .unwrap_or_else(|| {
+                                    payload_cols.push(join_col);
+                                    payload_cols.len() - 1
+                                });
+                            JoinOutputCol::Build(pos)
+                        }
+                        (BuildSide::Left, false) => {
+                            JoinOutputCol::Probe(join_col - left_len)
+                        }
+                        (BuildSide::Right, true) => JoinOutputCol::Probe(join_col),
+                        (BuildSide::Right, false) => {
+                            let build_col = join_col - left_len;
+                            let pos = payload_cols
+                                .iter()
+                                .position(|&c| c == build_col)
+                                .unwrap_or_else(|| {
+                                    payload_cols.push(build_col);
+                                    payload_cols.len() - 1
+                                });
+                            JoinOutputCol::Build(pos)
+                        }
+                    };
+                    output_proj.push(col);
+                }
+                let out_schema = Arc::clone(projector.output_schema());
+                post_ops.remove(0);
+                (payload_cols, output_proj, out_schema)
+            } else {
+                let payload_cols: Vec<usize> = (0..build_schema.fields().len()).collect();
+                let mut output_proj = Vec::with_capacity(left_len + right_len);
+                match build_side {
+                    BuildSide::Left => {
+                        for i in 0..left_len {
+                            output_proj.push(JoinOutputCol::Build(i));
+                        }
+                        for i in 0..right_len {
+                            output_proj.push(JoinOutputCol::Probe(i));
+                        }
+                    }
+                    BuildSide::Right => {
+                        for i in 0..left_len {
+                            output_proj.push(JoinOutputCol::Probe(i));
+                        }
+                        for i in 0..right_len {
+                            output_proj.push(JoinOutputCol::Build(i));
+                        }
+                    }
+                }
+                (payload_cols, output_proj, Arc::clone(&join_output_schema))
+            };
+
+        prune_filter_input(&mut post_ops, &probe_output_schema);
+
+        let payload_schema = Arc::new(build_schema.project(&build_payload_columns)?);
+        let build_sink = match HashJoinBuildSink::try_new(
+            build_key_exprs,
+            build_key_names,
+            key_types.clone(),
+            build_payload_columns,
+            payload_schema,
+        )? {
+            Ok(sink) => Arc::new(sink),
+            Err(reason) => return Ok(Err(reason)),
+        };
+
+        assign_join_build_ids(&mut build_ops);
+        let build_pipeline = Arc::new(Pipeline {
+            source: build_source,
+            operators: build_ops,
+            workers: self.workers,
+            sink: Sink::HashJoinBuild(build_sink),
+            sink_capacity: 1,
+        });
+
+        let probe = Arc::new(HashJoinProbe::new(HashJoinProbeConfig {
+            build_pipeline,
+            build_side,
+            probe_key_exprs,
+            probe_key_names,
+            key_types,
+            output_projection,
+            output_schema: probe_output_schema,
+            build_id: 0,
+        }));
+        probe_ops.push(Operator::HashProbe(probe));
+        probe_ops.extend(post_ops);
+        Ok(Ok((probe_source, probe_ops, final_schema)))
     }
 
     fn lower_operators(
@@ -513,8 +921,87 @@ impl MorselQueryPlanner {
     }
 }
 
-fn unsupported_provider(table: &datafusion_common::TableReference) -> Lowering {
-    Lowering::Unsupported(format!("unsupported table provider for {table}"))
+fn unsupported_provider_reason(table: &datafusion_common::TableReference) -> String {
+    format!("unsupported table provider for {table}")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SideEstimate {
+    is_empty: bool,
+    has_join: bool,
+    mem_rows: Option<usize>,
+    approx_bytes: u64,
+}
+
+fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
+    let has_join = operators
+        .iter()
+        .any(|op| matches!(op, Operator::HashProbe(_)));
+    match source {
+        Source::Memory(mem) => {
+            let rows = mem.batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            let bytes = mem
+                .batches
+                .iter()
+                .map(get_record_batch_memory_size)
+                .fold(0usize, usize::saturating_add) as u64;
+            SideEstimate {
+                is_empty: rows == 0,
+                has_join,
+                mem_rows: Some(rows),
+                approx_bytes: bytes,
+            }
+        }
+        #[cfg(feature = "parquet")]
+        Source::Parquet(pq) => {
+            let file_bytes = pq.total_file_bytes();
+            SideEstimate {
+                is_empty: pq.is_empty(),
+                has_join,
+                mem_rows: None,
+                approx_bytes: file_bytes.saturating_mul(4),
+            }
+        }
+    }
+}
+
+fn choose_build_side(left: SideEstimate, right: SideEstimate) -> BuildSide {
+    if left.is_empty && !right.is_empty {
+        return BuildSide::Left;
+    }
+    if right.is_empty && !left.is_empty {
+        return BuildSide::Right;
+    }
+    if left.has_join && !right.has_join {
+        return BuildSide::Right;
+    }
+    if right.has_join && !left.has_join {
+        return BuildSide::Left;
+    }
+    if let (Some(l_rows), Some(r_rows)) = (left.mem_rows, right.mem_rows) {
+        return if l_rows < r_rows {
+            BuildSide::Left
+        } else {
+            BuildSide::Right
+        };
+    }
+    if left.approx_bytes < right.approx_bytes {
+        BuildSide::Left
+    } else {
+        BuildSide::Right
+    }
+}
+
+fn assign_join_build_ids(operators: &mut [Operator]) {
+    let mut next_id = 0usize;
+    for op in operators {
+        if let Operator::HashProbe(probe) = op {
+            if let Some(p) = Arc::get_mut(probe) {
+                p.build_id = next_id;
+            }
+            next_id += 1;
+        }
+    }
 }
 
 fn supported_expr(expr: &Expr) -> Result<bool> {
@@ -600,6 +1087,7 @@ enum Operator {
         projection: Option<Vec<usize>>,
     },
     Projection(Projector),
+    HashProbe(Arc<HashJoinProbe>),
 }
 
 #[derive(Debug)]
@@ -741,6 +1229,11 @@ fn apply_operators(
                 filter_batch(&batch, mask, projection.as_deref())
             })?,
             Operator::Projection(projector) => projector.project_batch(&batch)?,
+            Operator::HashProbe(_) => {
+                return internal_err!(
+                    "HashProbe must execute through join continuation driver"
+                );
+            }
         };
         if batch.num_rows() == 0 {
             break;
@@ -831,6 +1324,11 @@ impl ResultBuffer {
                 Operator::Projection(projector) => {
                     batch = projector.project_batch(&batch)?
                 }
+                Operator::HashProbe(_) => {
+                    return internal_err!(
+                        "HashProbe must execute through join continuation driver"
+                    );
+                }
             }
             if batch.num_rows() == 0 {
                 return Ok(());
@@ -898,6 +1396,7 @@ enum Sink {
         sink: AggregateSink,
         result_operators: Vec<Operator>,
     },
+    HashJoinBuild(Arc<HashJoinBuildSink>),
 }
 
 enum WorkerSink {
@@ -905,6 +1404,7 @@ enum WorkerSink {
     Count(CountState),
     GroupCount(GroupCountState),
     Aggregate(AggregateState),
+    HashJoinBuild(HashJoinBuildState),
 }
 
 enum WorkerState {
@@ -912,6 +1412,18 @@ enum WorkerState {
     Count(CountState),
     GroupCount(GroupCountState),
     Aggregate(AggregateState),
+    HashJoinBuild(HashJoinBuildState),
+}
+
+struct JoinWorkerState {
+    tables: Arc<Vec<Arc<FinalizedHashTable>>>,
+    scratch: ProbeScratch,
+}
+
+enum BuildRunOutcome {
+    Ready(Arc<Vec<Arc<FinalizedHashTable>>>),
+    EmptyShortCircuit,
+    Cancelled,
 }
 
 type WorkerTail = (Vec<RecordBatch>, WorkerMetrics);
@@ -968,10 +1480,85 @@ struct Pipeline {
 }
 
 impl Pipeline {
+    fn has_join(&self) -> bool {
+        self.operators
+            .iter()
+            .any(|op| matches!(op, Operator::HashProbe(_)))
+    }
+
     fn is_inline_memory_stream(&self) -> bool {
         self.workers == NonZeroUsize::MIN
             && matches!(self.source, Source::Memory(_))
             && matches!(self.sink, Sink::Result)
+            && !self.has_join()
+    }
+
+    #[cfg(feature = "parquet")]
+    fn collect_build_parquet_metrics<'a>(
+        &'a self,
+        out: &mut Vec<&'a ExecutionPlanMetricsSet>,
+    ) {
+        for op in &self.operators {
+            if let Operator::HashProbe(probe) = op {
+                if let Source::Parquet(source) = &probe.build_pipeline.source {
+                    out.push(&source.metrics);
+                }
+                probe.build_pipeline.collect_build_parquet_metrics(out);
+            }
+        }
+    }
+
+    pub(super) fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        #[cfg(feature = "parquet")]
+        if let Source::Parquet(source) = &self.source
+            && source.apply_expressions(f)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        match &self.sink {
+            Sink::Aggregate { sink, .. } => {
+                if sink.apply_expressions(f)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Sink::HashJoinBuild(sink) => {
+                if sink.apply_expressions(f)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Sink::Result | Sink::Count { .. } | Sink::GroupCount { .. } => {}
+        }
+        let result_operators = match &self.sink {
+            Sink::Result | Sink::HashJoinBuild(_) => &[][..],
+            Sink::Count {
+                result_operators, ..
+            }
+            | Sink::GroupCount {
+                result_operators, ..
+            }
+            | Sink::Aggregate {
+                result_operators, ..
+            } => result_operators.as_slice(),
+        };
+        for operator in self.operators.iter().chain(result_operators) {
+            let status = match operator {
+                Operator::Filter { predicate, .. } => {
+                    apply_expression_roots(std::iter::once(predicate), f)?
+                }
+                Operator::Projection(projector) => apply_expression_roots(
+                    projector.projection().iter().map(|e| &e.expr),
+                    f,
+                )?,
+                Operator::HashProbe(probe) => probe.apply_expressions(f)?,
+            };
+            if status == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn inline_memory_stream(
@@ -1095,17 +1682,26 @@ impl Pipeline {
         reservation: Option<MemoryReservation>,
     ) -> Result<WorkerSink> {
         Ok(match &self.sink {
-            Sink::Result => WorkerSink::Result(Box::new(ResultBuffer::new(
-                &self.operators,
-                batch_size,
-                self.source.has_pushed_filter(),
-            ))),
+            Sink::Result => {
+                if self.has_join() {
+                    WorkerSink::Result(Box::new(ResultBuffer::new(&[], batch_size, true)))
+                } else {
+                    WorkerSink::Result(Box::new(ResultBuffer::new(
+                        &self.operators,
+                        batch_size,
+                        self.source.has_pushed_filter(),
+                    )))
+                }
+            }
             Sink::Count { .. } => WorkerSink::Count(CountState::default()),
             Sink::GroupCount { sink, .. } => WorkerSink::GroupCount(
                 sink.new_state(reservation.expect("group count reservation")),
             ),
             Sink::Aggregate { sink, .. } => WorkerSink::Aggregate(
                 sink.new_state(reservation.expect("aggregate reservation"))?,
+            ),
+            Sink::HashJoinBuild(sink) => WorkerSink::HashJoinBuild(
+                sink.new_state(reservation.expect("hash join build reservation")),
             ),
         })
     }
@@ -1116,9 +1712,14 @@ impl Pipeline {
         next: &AtomicUsize,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
+        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
+            tables,
+            scratch: ProbeScratch::default(),
+        });
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -1132,7 +1733,20 @@ impl Pipeline {
                     return Ok(WorkerState::None);
                 }
                 let batch = worker.process(|| source.read(input))?;
-                if !self.consume(batch, tx, &mut sink, &mut worker).await? {
+                let cont = if let Some(js) = join_state.as_mut() {
+                    self.consume_with_joins(
+                        batch,
+                        tx,
+                        output.batch_size,
+                        &mut sink,
+                        js,
+                        &mut worker,
+                    )
+                    .await?
+                } else {
+                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                };
+                if !cont {
                     return Ok(WorkerState::None);
                 }
                 if index + 1 == end {
@@ -1150,9 +1764,14 @@ impl Pipeline {
         ready: ReadyReaders,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
+        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
+            tables,
+            scratch: ProbeScratch::default(),
+        });
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
             if tx.is_closed() {
@@ -1202,9 +1821,24 @@ impl Pipeline {
             };
             let mut reader = worker.decode(|| morsel.into_stream());
             while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
-                if tx.is_closed()
-                    || !self.consume(batch?, tx, &mut sink, &mut worker).await?
-                {
+                if tx.is_closed() {
+                    return Ok(WorkerState::None);
+                }
+                let batch = batch?;
+                let cont = if let Some(js) = join_state.as_mut() {
+                    self.consume_with_joins(
+                        batch,
+                        tx,
+                        output.batch_size,
+                        &mut sink,
+                        js,
+                        &mut worker,
+                    )
+                    .await?
+                } else {
+                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                };
+                if !cont {
                     return Ok(WorkerState::None);
                 }
                 tokio::task::yield_now().await;
@@ -1213,6 +1847,168 @@ impl Pipeline {
             tokio::task::yield_now().await;
         }
         self.finish_worker(sink, &output, worker)
+    }
+
+    fn advance_join_chain(
+        &self,
+        start_op: usize,
+        mut batch: RecordBatch,
+        join_state: &mut JoinWorkerState,
+        frames: &mut Vec<(usize, ProbeCursor)>,
+        batch_size: usize,
+    ) -> Result<Option<RecordBatch>> {
+        for (idx, operator) in self.operators.iter().enumerate().skip(start_op) {
+            match operator {
+                Operator::Filter {
+                    predicate,
+                    projection,
+                } => {
+                    batch = with_filter_mask(batch, predicate, |batch, mask| {
+                        filter_batch(&batch, mask, projection.as_deref())
+                    })?;
+                    if batch.num_rows() == 0 {
+                        return Ok(None);
+                    }
+                }
+                Operator::Projection(projector) => {
+                    batch = projector.project_batch(&batch)?;
+                    if batch.num_rows() == 0 {
+                        return Ok(None);
+                    }
+                }
+                Operator::HashProbe(probe) => {
+                    let table = &join_state.tables[probe.build_id];
+                    let Some(mut cursor) = probe.start_probe(batch, table)? else {
+                        return Ok(None);
+                    };
+                    match probe.next_chunk(
+                        &mut cursor,
+                        table,
+                        batch_size,
+                        &mut join_state.scratch,
+                    )? {
+                        OperatorStep::NeedMoreInput(None) => return Ok(None),
+                        OperatorStep::NeedMoreInput(Some(out)) => {
+                            batch = out;
+                        }
+                        OperatorStep::HaveMoreOutput(out) => {
+                            frames.push((idx, cursor));
+                            batch = out;
+                        }
+                    }
+                }
+            }
+        }
+        if batch.num_rows() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+
+    async fn deliver_join_output(
+        &self,
+        batch: RecordBatch,
+        tx: &mpsc::Sender<RecordBatch>,
+        sink: &mut WorkerSink,
+        worker: &mut WorkerMetrics,
+    ) -> Result<bool> {
+        match sink {
+            WorkerSink::Count(local) => worker.process(|| {
+                local.add_rows(batch.num_rows())?;
+                Ok(true)
+            }),
+            WorkerSink::GroupCount(local) => {
+                let Sink::GroupCount { sink, .. } = &self.sink else {
+                    unreachable!()
+                };
+                worker.process(|| {
+                    local.add_column(batch.column(sink.key_index))?;
+                    Ok(true)
+                })
+            }
+            WorkerSink::Aggregate(local) => worker.process(|| {
+                local.add_batch(&batch)?;
+                Ok(true)
+            }),
+            WorkerSink::HashJoinBuild(local) => worker.process(|| {
+                local.add_batch(&batch)?;
+                Ok(true)
+            }),
+            WorkerSink::Result(buffer) => {
+                let mut output = worker.process(|| {
+                    buffer.push_input(&[], batch)?;
+                    buffer.next(&[], false)
+                })?;
+                while let Some(out) = output {
+                    if !worker.send(tx, out).await {
+                        return Ok(false);
+                    }
+                    output = worker.process(|| buffer.next(&[], false))?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    async fn consume_with_joins(
+        &self,
+        batch: RecordBatch,
+        tx: &mpsc::Sender<RecordBatch>,
+        batch_size: usize,
+        sink: &mut WorkerSink,
+        join_state: &mut JoinWorkerState,
+        worker: &mut WorkerMetrics,
+    ) -> Result<bool> {
+        let mut frames: Vec<(usize, ProbeCursor)> = Vec::new();
+        let mut produced = worker.process(|| {
+            self.advance_join_chain(0, batch, join_state, &mut frames, batch_size)
+        })?;
+        loop {
+            if let Some(out) = produced
+                && !self.deliver_join_output(out, tx, sink, worker).await?
+            {
+                return Ok(false);
+            }
+            let Some((op_idx, mut cursor)) = frames.pop() else {
+                return Ok(true);
+            };
+            if tx.is_closed() {
+                return Ok(false);
+            }
+            tokio::task::yield_now().await;
+            produced = worker.process(|| {
+                let Operator::HashProbe(probe) = &self.operators[op_idx] else {
+                    unreachable!()
+                };
+                let table = &join_state.tables[probe.build_id];
+                match probe.next_chunk(
+                    &mut cursor,
+                    table,
+                    batch_size,
+                    &mut join_state.scratch,
+                )? {
+                    OperatorStep::NeedMoreInput(None) => Ok(None),
+                    OperatorStep::NeedMoreInput(Some(chunk)) => self.advance_join_chain(
+                        op_idx + 1,
+                        chunk,
+                        join_state,
+                        &mut frames,
+                        batch_size,
+                    ),
+                    OperatorStep::HaveMoreOutput(chunk) => {
+                        frames.push((op_idx, cursor));
+                        self.advance_join_chain(
+                            op_idx + 1,
+                            chunk,
+                            join_state,
+                            &mut frames,
+                            batch_size,
+                        )
+                    }
+                }
+            })?;
+        }
     }
 
     async fn consume(
@@ -1268,6 +2064,13 @@ impl Pipeline {
                 }
                 Ok(true)
             }),
+            WorkerSink::HashJoinBuild(local) => worker.process(|| {
+                let batch = apply_operators(&self.operators, batch)?;
+                if batch.num_rows() > 0 {
+                    local.add_batch(&batch)?;
+                }
+                Ok(true)
+            }),
             WorkerSink::Result(buffer) => {
                 let mut output = worker.process(|| {
                     buffer.push_input(&self.operators, batch)?;
@@ -1294,12 +2097,19 @@ impl Pipeline {
             WorkerSink::Count(local) => return Ok(WorkerState::Count(local)),
             WorkerSink::GroupCount(local) => return Ok(WorkerState::GroupCount(local)),
             WorkerSink::Aggregate(local) => return Ok(WorkerState::Aggregate(local)),
+            WorkerSink::HashJoinBuild(local) => {
+                return Ok(WorkerState::HashJoinBuild(local));
+            }
             WorkerSink::Result(buffer) => buffer,
+        };
+        let tail_ops = if self.has_join() {
+            &[][..]
+        } else {
+            self.operators.as_slice()
         };
         let mut tail = Vec::new();
         while !output.tx.is_closed() {
-            let Some(batch) = worker.process(|| buffer.next(&self.operators, true))?
-            else {
+            let Some(batch) = worker.process(|| buffer.next(tail_ops, true))? else {
                 if !tail.is_empty() {
                     output.tails.lock().push((tail, worker));
                 }
@@ -1308,6 +2118,264 @@ impl Pipeline {
             tail.push(batch);
         }
         Ok(WorkerState::None)
+    }
+
+    fn run_build_pipelines<'a>(
+        &'a self,
+        label_prefix: Option<&'a str>,
+        context: &'a Arc<TaskContext>,
+        plan_metrics: &'a ExecutionPlanMetricsSet,
+        measurement: Option<&'a Arc<RunMetrics>>,
+        tx: &'a mpsc::Sender<RecordBatch>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<BuildRunOutcome>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let probes: Vec<&Arc<HashJoinProbe>> = self
+                .operators
+                .iter()
+                .filter_map(|op| match op {
+                    Operator::HashProbe(probe) => Some(probe),
+                    _ => None,
+                })
+                .collect();
+            if probes.is_empty() {
+                return Ok(BuildRunOutcome::Ready(Arc::new(Vec::new())));
+            }
+            let multi = probes.len() > 1;
+            let mut tables = Vec::with_capacity(probes.len());
+            for (idx, probe) in probes.iter().enumerate() {
+                if tx.is_closed() {
+                    return Ok(BuildRunOutcome::Cancelled);
+                }
+                let build_label = match (label_prefix, multi) {
+                    (None, false) => "build".to_owned(),
+                    (None, true) => format!("build_{idx}"),
+                    (Some(prefix), false) => format!("{prefix}_build"),
+                    (Some(prefix), true) => format!("{prefix}_build_{idx}"),
+                };
+                let Some(table) = Self::run_single_build_pipeline(
+                    &probe.build_pipeline,
+                    &build_label,
+                    context,
+                    plan_metrics,
+                    measurement,
+                    tx,
+                )
+                .await?
+                else {
+                    return Ok(BuildRunOutcome::Cancelled);
+                };
+                if table.is_empty() {
+                    MetricBuilder::new(plan_metrics)
+                        .counter("join_empty_build_short_circuits", 0)
+                        .add(1);
+                    drop(table);
+                    drop(tables);
+                    return Ok(BuildRunOutcome::EmptyShortCircuit);
+                }
+                tables.push(table);
+            }
+            Ok(BuildRunOutcome::Ready(Arc::new(tables)))
+        })
+    }
+
+    async fn run_single_build_pipeline(
+        build_pipeline: &Arc<Pipeline>,
+        build_label: &str,
+        context: &Arc<TaskContext>,
+        plan_metrics: &ExecutionPlanMetricsSet,
+        measurement: Option<&Arc<RunMetrics>>,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<Option<Arc<FinalizedHashTable>>> {
+        let Sink::HashJoinBuild(build_sink) = &build_pipeline.sink else {
+            return internal_err!("Expected HashJoinBuild sink on join build pipeline");
+        };
+
+        let nested_tables = if build_pipeline.has_join() {
+            match build_pipeline
+                .run_build_pipelines(
+                    Some(build_label),
+                    context,
+                    plan_metrics,
+                    measurement,
+                    tx,
+                )
+                .await?
+            {
+                BuildRunOutcome::Ready(tables) => Some(tables),
+                BuildRunOutcome::Cancelled => return Ok(None),
+                BuildRunOutcome::EmptyShortCircuit => {
+                    let empty_res = MemoryConsumer::new("MorselHashJoinBuild")
+                        .register(context.memory_pool());
+                    let empty_state = build_sink.new_state(empty_res);
+                    let finalized = build_sink.finalize(empty_state, tx).await?;
+                    if finalized.is_some() {
+                        MetricBuilder::new(plan_metrics)
+                            .counter("join_build_finalizations", 0)
+                            .add(1);
+                    }
+                    return Ok(finalized);
+                }
+            }
+        } else {
+            None
+        };
+
+        let build_reservation =
+            MemoryConsumer::new("MorselHashJoinBuild").register(context.memory_pool());
+        let mut combined_build = build_sink.new_state(build_reservation.new_empty());
+        let build_output = WorkerOutput {
+            tx: tx.clone(),
+            batch_size: context.session_config().batch_size(),
+            tails: Arc::default(),
+        };
+
+        let mut tasks = JoinSet::new();
+        match &build_pipeline.source {
+            Source::Memory(source) => {
+                let next = Arc::new(AtomicUsize::new(0));
+                let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                for id in 0..build_pipeline.workers.get().min(morsels) {
+                    let (pipeline, next, output) = (
+                        Arc::clone(build_pipeline),
+                        Arc::clone(&next),
+                        build_output.clone(),
+                    );
+                    let reservation = Some(build_reservation.new_empty());
+                    let tables = nested_tables.clone();
+                    let worker = WorkerMetrics::for_pipeline(
+                        measurement.cloned(),
+                        id,
+                        build_label,
+                    );
+                    tasks.spawn(async move {
+                        let source = match &pipeline.source {
+                            Source::Memory(source) => source,
+                            #[cfg(feature = "parquet")]
+                            Source::Parquet(_) => unreachable!(),
+                        };
+                        pipeline
+                            .run_memory_worker(
+                                source,
+                                &next,
+                                output,
+                                reservation,
+                                tables,
+                                worker,
+                            )
+                            .await
+                    });
+                }
+            }
+            #[cfg(feature = "parquet")]
+            Source::Parquet(source) => {
+                let ready = source.start(
+                    context,
+                    &mut tasks,
+                    build_pipeline.workers,
+                    measurement,
+                )?;
+                for id in 0..build_pipeline.workers.get() {
+                    let (pipeline, ready, output) = (
+                        Arc::clone(build_pipeline),
+                        ready.clone(),
+                        build_output.clone(),
+                    );
+                    let reservation = Some(build_reservation.new_empty());
+                    let tables = nested_tables.clone();
+                    let worker = WorkerMetrics::for_pipeline(
+                        measurement.cloned(),
+                        id,
+                        build_label,
+                    );
+                    tasks.spawn(async move {
+                        pipeline
+                            .run_parquet_worker(
+                                ready,
+                                output,
+                                reservation,
+                                tables,
+                                worker,
+                            )
+                            .await
+                    });
+                }
+            }
+        }
+        drop(build_reservation);
+
+        let mut combine_duration = std::time::Duration::ZERO;
+        while let Some(result) = tasks.join_next().await {
+            let local = match result {
+                Ok(Ok(local)) => local,
+                Ok(Err(err)) => {
+                    drop(combined_build);
+                    abort_and_drain(&mut tasks).await;
+                    drop(nested_tables);
+                    return Err(err);
+                }
+                Err(err) if err.is_panic() => {
+                    drop(combined_build);
+                    abort_and_drain(&mut tasks).await;
+                    drop(nested_tables);
+                    std::panic::resume_unwind(err.into_panic())
+                }
+                Err(err) => {
+                    drop(combined_build);
+                    abort_and_drain(&mut tasks).await;
+                    drop(nested_tables);
+                    return Err(exec_datafusion_err!("Morsel build task failed: {err}"));
+                }
+            };
+            if let WorkerState::HashJoinBuild(local) = local {
+                let start = measurement.map(|_| Instant::now());
+                combined_build.combine(local);
+                if let Some(start) = start {
+                    combine_duration += start.elapsed();
+                }
+            }
+            if tx.is_closed() {
+                drop(combined_build);
+                abort_and_drain(&mut tasks).await;
+                drop(nested_tables);
+                return Ok(None);
+            }
+        }
+        drop(nested_tables);
+
+        if tx.is_closed() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if let Some(gate) = &build_sink.finalize_gate {
+            gate.wait().await;
+        }
+        if tx.is_closed() {
+            return Ok(None);
+        }
+
+        let finalize_start = measurement.map(|_| Instant::now());
+        let finalized = build_sink.finalize(combined_build, tx).await?;
+        if let Some(run) = measurement {
+            run.record_pipeline_time(
+                build_label,
+                "morsel_join_combine_work",
+                combine_duration,
+            );
+            if let Some(start) = finalize_start {
+                run.record_pipeline_time(
+                    build_label,
+                    "morsel_join_finalize_work",
+                    start.elapsed(),
+                );
+            }
+        }
+        if finalized.is_some() {
+            MetricBuilder::new(plan_metrics)
+                .counter("join_build_finalizations", 0)
+                .add(1);
+        }
+        Ok(finalized)
     }
 
     async fn run_count_result(
@@ -1344,6 +2412,29 @@ impl Pipeline {
         let worker_measurement = measurement.clone();
         let supervisor = SpawnedTask::spawn(async move {
             let measurement = worker_measurement;
+            let has_join = self.has_join();
+
+            // Phase 1: execute all join build pipelines and finalize hash tables
+            // strictly before any probe work begins.
+            let (finalized_tables, skip_probe) = if has_join {
+                match self
+                    .run_build_pipelines(
+                        None,
+                        &context,
+                        &metrics,
+                        measurement.as_ref(),
+                        &output.tx,
+                    )
+                    .await?
+                {
+                    BuildRunOutcome::Ready(tables) => (Some(tables), false),
+                    BuildRunOutcome::EmptyShortCircuit => (None, true),
+                    BuildRunOutcome::Cancelled => return Ok(()),
+                }
+            } else {
+                (None, false)
+            };
+
             let sink_reservation = match &self.sink {
                 Sink::GroupCount { .. } => Some(
                     MemoryConsumer::new("MorselGroupCount")
@@ -1353,7 +2444,7 @@ impl Pipeline {
                     MemoryConsumer::new("MorselAggregate")
                         .register(context.memory_pool()),
                 ),
-                Sink::Result | Sink::Count { .. } => None,
+                Sink::Result | Sink::Count { .. } | Sink::HashJoinBuild(_) => None,
             };
             let mut combined_group = match (&self.sink, &sink_reservation) {
                 (Sink::GroupCount { sink, .. }, Some(reservation)) => {
@@ -1367,131 +2458,179 @@ impl Pipeline {
                 }
                 _ => None,
             };
-            let mut tasks = JoinSet::new();
-            match &self.source {
-                Source::Memory(source) => {
-                    let next = Arc::new(AtomicUsize::new(0));
-                    let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
-                    for id in 0..self.workers.get().min(morsels) {
-                        let (pipeline, next, output) =
-                            (Arc::clone(&self), Arc::clone(&next), output.clone());
-                        let reservation =
-                            sink_reservation.as_ref().map(MemoryReservation::new_empty);
-                        let worker = WorkerMetrics::new(measurement.clone(), id);
-                        tasks.spawn(async move {
-                            let source = match &pipeline.source {
-                                Source::Memory(source) => source,
-                                #[cfg(feature = "parquet")]
-                                Source::Parquet(_) => unreachable!(),
-                            };
-                            pipeline
-                                .run_memory_worker(
-                                    source,
-                                    &next,
-                                    output,
-                                    reservation,
-                                    worker,
-                                )
-                                .await
-                        });
-                    }
-                }
-                #[cfg(feature = "parquet")]
-                Source::Parquet(source) => {
-                    let ready = source.start(
-                        &context,
-                        &mut tasks,
-                        self.workers,
-                        measurement.as_ref(),
-                    )?;
-                    for id in 0..self.workers.get() {
-                        let (pipeline, ready, output) =
-                            (Arc::clone(&self), ready.clone(), output.clone());
-                        let reservation =
-                            sink_reservation.as_ref().map(MemoryReservation::new_empty);
-                        let worker = WorkerMetrics::new(measurement.clone(), id);
-                        tasks.spawn(async move {
-                            pipeline
-                                .run_parquet_worker(ready, output, reservation, worker)
-                                .await
-                        });
-                    }
-                }
-            }
-            drop(sink_reservation);
             let mut combined_count = CountState::default();
-            while let Some(result) = tasks.join_next().await {
-                let local = match result {
-                    Ok(Ok(local)) => local,
-                    Ok(Err(err)) => {
-                        drop(combined_group);
-                        drop(combined_agg);
-                        abort_and_drain(&mut tasks).await;
-                        return Err(err);
+
+            // Phase 2: execute probe/scan pipeline unless short-circuited by an
+            // empty INNER JOIN build table (DuckDB's EmptyResultIfRHSIsEmpty).
+            if !skip_probe {
+                let mut tasks = JoinSet::new();
+                match &self.source {
+                    Source::Memory(source) => {
+                        let next = Arc::new(AtomicUsize::new(0));
+                        let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                        for id in 0..self.workers.get().min(morsels) {
+                            let (pipeline, next, output) =
+                                (Arc::clone(&self), Arc::clone(&next), output.clone());
+                            let reservation = sink_reservation
+                                .as_ref()
+                                .map(MemoryReservation::new_empty);
+                            let tables = finalized_tables.clone();
+                            let worker = if has_join {
+                                WorkerMetrics::for_pipeline(
+                                    measurement.clone(),
+                                    id,
+                                    "probe",
+                                )
+                            } else {
+                                WorkerMetrics::new(measurement.clone(), id)
+                            };
+                            tasks.spawn(async move {
+                                let source = match &pipeline.source {
+                                    Source::Memory(source) => source,
+                                    #[cfg(feature = "parquet")]
+                                    Source::Parquet(_) => unreachable!(),
+                                };
+                                pipeline
+                                    .run_memory_worker(
+                                        source,
+                                        &next,
+                                        output,
+                                        reservation,
+                                        tables,
+                                        worker,
+                                    )
+                                    .await
+                            });
+                        }
                     }
-                    Err(err) if err.is_panic() => {
-                        drop(combined_group);
-                        drop(combined_agg);
-                        abort_and_drain(&mut tasks).await;
-                        std::panic::resume_unwind(err.into_panic())
+                    #[cfg(feature = "parquet")]
+                    Source::Parquet(source) => {
+                        let ready = source.start(
+                            &context,
+                            &mut tasks,
+                            self.workers,
+                            measurement.as_ref(),
+                        )?;
+                        for id in 0..self.workers.get() {
+                            let (pipeline, ready, output) =
+                                (Arc::clone(&self), ready.clone(), output.clone());
+                            let reservation = sink_reservation
+                                .as_ref()
+                                .map(MemoryReservation::new_empty);
+                            let tables = finalized_tables.clone();
+                            let worker = if has_join {
+                                WorkerMetrics::for_pipeline(
+                                    measurement.clone(),
+                                    id,
+                                    "probe",
+                                )
+                            } else {
+                                WorkerMetrics::new(measurement.clone(), id)
+                            };
+                            tasks.spawn(async move {
+                                pipeline
+                                    .run_parquet_worker(
+                                        ready,
+                                        output,
+                                        reservation,
+                                        tables,
+                                        worker,
+                                    )
+                                    .await
+                            });
+                        }
                     }
-                    Err(err) => {
-                        drop(combined_group);
-                        drop(combined_agg);
-                        abort_and_drain(&mut tasks).await;
-                        return Err(exec_datafusion_err!("Morsel task failed: {err}"));
-                    }
-                };
-                match local {
-                    WorkerState::None => {}
-                    WorkerState::Count(local) => {
-                        if let Err(err) = combined_count.combine(local) {
+                }
+                drop(sink_reservation);
+                while let Some(result) = tasks.join_next().await {
+                    let local = match result {
+                        Ok(Ok(local)) => local,
+                        Ok(Err(err)) => {
                             drop(combined_group);
                             drop(combined_agg);
                             abort_and_drain(&mut tasks).await;
+                            drop(finalized_tables);
                             return Err(err);
                         }
-                    }
-                    WorkerState::GroupCount(local) => {
-                        if let Some(combined) = combined_group.as_mut() {
-                            match combined.merge_from(local, &output.tx).await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    drop(combined_group);
-                                    drop(combined_agg);
-                                    abort_and_drain(&mut tasks).await;
-                                    return Ok(());
-                                }
-                                Err(err) => {
-                                    drop(combined_group);
-                                    drop(combined_agg);
-                                    abort_and_drain(&mut tasks).await;
-                                    return Err(err);
+                        Err(err) if err.is_panic() => {
+                            drop(combined_group);
+                            drop(combined_agg);
+                            abort_and_drain(&mut tasks).await;
+                            drop(finalized_tables);
+                            std::panic::resume_unwind(err.into_panic())
+                        }
+                        Err(err) => {
+                            drop(combined_group);
+                            drop(combined_agg);
+                            abort_and_drain(&mut tasks).await;
+                            drop(finalized_tables);
+                            return Err(exec_datafusion_err!(
+                                "Morsel task failed: {err}"
+                            ));
+                        }
+                    };
+                    match local {
+                        WorkerState::None | WorkerState::HashJoinBuild(_) => {}
+                        WorkerState::Count(local) => {
+                            if let Err(err) = combined_count.combine(local) {
+                                drop(combined_group);
+                                drop(combined_agg);
+                                abort_and_drain(&mut tasks).await;
+                                drop(finalized_tables);
+                                return Err(err);
+                            }
+                        }
+                        WorkerState::GroupCount(local) => {
+                            if let Some(combined) = combined_group.as_mut() {
+                                match combined.merge_from(local, &output.tx).await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        drop(combined_group);
+                                        drop(combined_agg);
+                                        abort_and_drain(&mut tasks).await;
+                                        drop(finalized_tables);
+                                        return Ok(());
+                                    }
+                                    Err(err) => {
+                                        drop(combined_group);
+                                        drop(combined_agg);
+                                        abort_and_drain(&mut tasks).await;
+                                        drop(finalized_tables);
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }
-                    }
-                    WorkerState::Aggregate(local) => {
-                        if let Some(combined) = combined_agg.as_mut() {
-                            match combined.merge_from(local, &output.tx).await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    drop(combined_group);
-                                    drop(combined_agg);
-                                    abort_and_drain(&mut tasks).await;
-                                    return Ok(());
-                                }
-                                Err(err) => {
-                                    drop(combined_group);
-                                    drop(combined_agg);
-                                    abort_and_drain(&mut tasks).await;
-                                    return Err(err);
+                        WorkerState::Aggregate(local) => {
+                            if let Some(combined) = combined_agg.as_mut() {
+                                match combined.merge_from(local, &output.tx).await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        drop(combined_group);
+                                        drop(combined_agg);
+                                        abort_and_drain(&mut tasks).await;
+                                        drop(finalized_tables);
+                                        return Ok(());
+                                    }
+                                    Err(err) => {
+                                        drop(combined_group);
+                                        drop(combined_agg);
+                                        abort_and_drain(&mut tasks).await;
+                                        drop(finalized_tables);
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            } else {
+                drop(sink_reservation);
             }
+            // Release finalized join build tables as soon as probe workers finish,
+            // before publishing tails or finalizing downstream aggregate sinks.
+            drop(finalized_tables);
+
             // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
             // buffered tail only after all workers and any scan producers succeed.
             let tails = std::mem::take(&mut *output.tails.lock());
@@ -1504,7 +2643,7 @@ impl Pipeline {
                 }
             }
             match &self.sink {
-                Sink::Result => {}
+                Sink::Result | Sink::HashJoinBuild(_) => {}
                 Sink::Count {
                     sink,
                     result_operators,
@@ -1630,9 +2769,10 @@ impl MorselExec {
     fn new(pipeline: Pipeline, schema: SchemaRef) -> Self {
         let emission = match pipeline.sink {
             Sink::Result => EmissionType::Incremental,
-            Sink::Count { .. } | Sink::GroupCount { .. } | Sink::Aggregate { .. } => {
-                EmissionType::Final
-            }
+            Sink::Count { .. }
+            | Sink::GroupCount { .. }
+            | Sink::Aggregate { .. }
+            | Sink::HashJoinBuild(_) => EmissionType::Final,
         };
         let metrics = match &pipeline.source {
             Source::Memory(_) => ExecutionPlanMetricsSet::new(),
@@ -1655,24 +2795,50 @@ impl MorselExec {
     }
 }
 
+fn display_source(source: &Source, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match source {
+        Source::Memory(source) => write!(
+            f,
+            "MemTable[{}, projection={:?}]",
+            source.table, source.projection
+        ),
+        #[cfg(feature = "parquet")]
+        Source::Parquet(source) => match source.pushed_predicate() {
+            Some(predicate) => {
+                write!(f, "NativeParquet[{}, predicate={predicate}]", source.table)
+            }
+            None => write!(f, "NativeParquet[{}]", source.table),
+        },
+    }
+}
+
+fn display_build_pipelines(
+    operators: &[Operator],
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    for operator in operators {
+        if let Operator::HashProbe(probe) = operator {
+            let bp = &probe.build_pipeline;
+            display_build_pipelines(&bp.operators, f)?;
+            write!(f, "[Build: ")?;
+            display_source(&bp.source, f)?;
+            display_operators(&bp.operators, f)?;
+            if let Sink::HashJoinBuild(sink) = &bp.sink {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+            }
+            write!(f, "]; ")?;
+        }
+    }
+    Ok(())
+}
+
 impl DisplayAs for MorselExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pipeline = &self.pipeline;
         write!(f, "MorselExec: workers={}, ", pipeline.workers)?;
-        match &pipeline.source {
-            Source::Memory(source) => write!(
-                f,
-                "MemTable[{}, projection={:?}]",
-                source.table, source.projection
-            )?,
-            #[cfg(feature = "parquet")]
-            Source::Parquet(source) => match source.pushed_predicate() {
-                Some(predicate) => {
-                    write!(f, "NativeParquet[{}, predicate={predicate}]", source.table)?
-                }
-                None => write!(f, "NativeParquet[{}]", source.table)?,
-            },
-        }
+        display_build_pipelines(&pipeline.operators, f)?;
+        display_source(&pipeline.source, f)?;
         display_operators(&pipeline.operators, f)?;
         match &pipeline.sink {
             Sink::Result => {}
@@ -1702,6 +2868,10 @@ impl DisplayAs for MorselExec {
                 write!(f, "; FinalizedAggregateSource")?;
                 display_operators(result_operators, f)?;
             }
+            Sink::HashJoinBuild(sink) => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+            }
         }
         if pipeline.is_inline_memory_stream() {
             write!(f, " -> ResultSink[inline]")
@@ -1727,6 +2897,10 @@ fn display_operators(operators: &[Operator], f: &mut fmt::Formatter<'_>) -> fmt:
             Operator::Projection(projector) => {
                 write!(f, " -> {}", projector.projection())?
             }
+            Operator::HashProbe(probe) => {
+                write!(f, " -> ")?;
+                probe.display_summary(f)?;
+            }
         }
     }
     Ok(())
@@ -1742,7 +2916,22 @@ impl ExecutionPlan for MorselExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
+        #[cfg(feature = "parquet")]
+        {
+            let mut combined = self.metrics.clone_inner();
+            let mut build_sets = Vec::new();
+            self.pipeline.collect_build_parquet_metrics(&mut build_sets);
+            for set in build_sets {
+                for metric in set.clone_inner().iter() {
+                    combined.push(Arc::clone(metric));
+                }
+            }
+            Some(combined)
+        }
+        #[cfg(not(feature = "parquet"))]
+        {
+            Some(self.metrics.clone_inner())
+        }
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1753,44 +2942,7 @@ impl ExecutionPlan for MorselExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        #[cfg(feature = "parquet")]
-        if let Source::Parquet(source) = &self.pipeline.source
-            && source.apply_expressions(f)? == TreeNodeRecursion::Stop
-        {
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        if let Sink::Aggregate { sink, .. } = &self.pipeline.sink
-            && sink.apply_expressions(f)? == TreeNodeRecursion::Stop
-        {
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        let result_operators = match &self.pipeline.sink {
-            Sink::Result => &[][..],
-            Sink::Count {
-                result_operators, ..
-            }
-            | Sink::GroupCount {
-                result_operators, ..
-            }
-            | Sink::Aggregate {
-                result_operators, ..
-            } => result_operators.as_slice(),
-        };
-        apply_expression_roots(
-            self.pipeline
-                .operators
-                .iter()
-                .chain(result_operators)
-                .flat_map(|operator| match operator {
-                    Operator::Filter { predicate, .. } => {
-                        itertools::Either::Left(std::iter::once(predicate))
-                    }
-                    Operator::Projection(projector) => itertools::Either::Right(
-                        projector.projection().iter().map(|e| &e.expr),
-                    ),
-                }),
-            f,
-        )
+        self.pipeline.apply_expressions(f)
     }
 
     fn with_new_children(
