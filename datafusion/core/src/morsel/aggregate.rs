@@ -1698,7 +1698,11 @@ where
         let null_count = key_arr.null_count();
         self.group_indices.clear();
         let selected = view.num_rows();
-        self.group_indices.reserve(selected);
+        self.group_indices.try_reserve(selected).map_err(|e| {
+            datafusion_common::exec_datafusion_err!(
+                "Morsel DirectGrouped index buffer allocation failed: {e}"
+            )
+        })?;
 
         match view.selection() {
             Selection::All => {

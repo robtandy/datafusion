@@ -1153,12 +1153,10 @@ impl HashJoinProbe {
         // General selection-aware probe path (strings, composite keys, or expression keys):
         // evaluate key expressions and hash ONLY selected rows, while keeping the
         // backing batch uncopied so payload columns are gathered only for matches.
-        let backing_rows = match view.selection().to_indices(view.batch().num_rows()) {
-            Some(indices) => indices,
-            None => {
-                // Fallback for batches exceeding u32::MAX rows.
-                return self.start_probe_all(view.materialize()?, table);
-            }
+        let Some(backing_rows) = view.selection().to_indices(view.batch().num_rows())
+        else {
+            // Fallback for batches exceeding u32::MAX rows.
+            return self.start_probe_all(view.materialize()?, table);
         };
         let selected = backing_rows.len();
         let key_needed_cols = collect_expr_column_indices(&self.probe_key_exprs);
@@ -2207,7 +2205,7 @@ mod tests {
                     }
                 }
             }
-            pairs.sort();
+            pairs.sort_unstable();
             Ok(pairs)
         };
 

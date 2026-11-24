@@ -274,7 +274,7 @@ impl Selection {
             }
             Self::Mask { bits, .. } => {
                 let limit = compact_bits.len();
-                let use_indices = physical_rows <= u32::MAX as usize
+                let use_indices = u32::try_from(physical_rows).is_ok()
                     && new_selected.saturating_mul(SPARSE_INDICES_DENOMINATOR)
                         <= physical_rows;
                 if use_indices {
@@ -829,7 +829,7 @@ fn materialize_batch_with_selection(
                 return Ok(batch.clone());
             }
             if batch.num_columns() >= 2
-                && physical_rows <= u32::MAX as usize
+                && u32::try_from(physical_rows).is_ok()
                 && selected.saturating_mul(SPARSE_INDICES_DENOMINATOR) <= physical_rows
                 && let Some(indices) = selection.to_indices(physical_rows)
             {
@@ -1413,7 +1413,7 @@ mod tests {
         assert!(mod_est < full_bytes);
         let mid_pool: Arc<dyn MemoryPool> =
             Arc::new(GreedyMemoryPool::new(mod_est + 128 * 1024));
-        assert!(mid_pool.reserved() == 0);
+        assert_eq!(mid_pool.reserved(), 0);
         let mut mid_res = MemoryConsumer::new("test_mid_pool").register(&mid_pool);
         let compacted = mod_view.into_reserved_for_retention(&mut mid_res)?;
         assert!(compacted.is_all());
