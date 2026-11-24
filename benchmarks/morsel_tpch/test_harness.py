@@ -79,11 +79,19 @@ class TpchHarnessTest(unittest.TestCase):
             "plan": "MorselExec: workers=4, NativeParquet[lineitem] -> Filter[...] -> CountSink; FinalizedCountSource",
             "parquet_morsels_claimed": 16,
             "count_finalizations": 1,
+            "aggregate_finalizations": 0,
         }
         morsel_scan_ev = {
             "plan": "MorselExec: workers=4, NativeParquet[lineitem] -> Filter[...] -> Projection[...] -> ResultSink[capacity=2]",
             "parquet_morsels_claimed": 16,
             "count_finalizations": 0,
+            "aggregate_finalizations": 0,
+        }
+        morsel_agg_ev = {
+            "plan": "MorselExec: workers=4, NativeParquet[lineitem] -> Filter[...] -> AggregateSink[aggr=[sum(...)]]; FinalizedAggregateSource",
+            "parquet_morsels_claimed": 16,
+            "count_finalizations": 0,
+            "aggregate_finalizations": 1,
         }
         rgs = {"lineitem": 16}
 
@@ -93,6 +101,10 @@ class TpchHarnessTest(unittest.TestCase):
         )
         validate_plan(
             morsel_scan_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q6_scan"], rgs
+        )
+        validate_plan(morsel_agg_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q6"], rgs)
+        validate_plan(
+            morsel_agg_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q1_unordered"], rgs
         )
 
         # Stock arm must reject MorselExec plan.
@@ -211,6 +223,7 @@ class TpchHarnessTest(unittest.TestCase):
                 {k: v["rows"] for k, v in report["verified"].items()},
                 {
                     "q6": 1,
+                    "q1_unordered": 4,
                     "q1": 4,
                     "q3": 10,
                     "q12": 2,
@@ -219,7 +232,7 @@ class TpchHarnessTest(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                set(report["morsel_rejections"].keys()), {"q6", "q1", "q3", "q12"}
+                set(report["morsel_rejections"].keys()), {"q1", "q3", "q12"}
             )
             for qname, err in report["morsel_rejections"].items():
                 self.assertIn("morsel_mode=required", err, msg=qname)
@@ -282,7 +295,9 @@ class TpchHarnessTest(unittest.TestCase):
                     "--repeats",
                     "2",
                     "--queries",
+                    "q1",
                     "q6",
+                    "q1_unordered",
                     "q6_count",
                     "q6_scan",
                     "--roadmap-arms",
@@ -302,9 +317,9 @@ class TpchHarnessTest(unittest.TestCase):
             header, trials = records[0], records[1:]
             self.assertEqual(header["record_type"], "header")
             self.assertEqual(header["cache_regime"], "warm")
-            self.assertIn("q6", header["morsel_rejections"])
-            # 2 arms * 2 reps for q6 + 3 arms * 2 reps for q6_count + 3 arms * 2 reps for q6_scan = 16
-            self.assertEqual(len(trials), 16)
+            self.assertIn("q1", header["morsel_rejections"])
+            # 2 arms * 2 reps for q1 + 3 arms * 2 reps for (q6, q1_unordered, q6_count, q6_scan) = 28
+            self.assertEqual(len(trials), 28)
             for trial in trials:
                 self.assertGreater(trial["seconds"], 0)
                 before = trial["cache_pages_before"]
