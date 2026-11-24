@@ -22,7 +22,6 @@ use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{Result, ScalarValue, internal_err};
-#[cfg(test)]
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
@@ -30,11 +29,9 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::Projector;
 
 /// Default minimum wasted backing bytes before compacting a `BatchView` for retention.
-#[cfg(test)]
-pub(super) const DEFAULT_COMPACT_MIN_WASTED_BYTES: usize = 64 * 1024;
+pub(super) const DEFAULT_COMPACT_MIN_WASTED_BYTES: usize = 512 * 1024;
 /// Default minimum `retained / estimated_compacted` ratio before compacting for retention.
-#[cfg(test)]
-pub(super) const DEFAULT_COMPACT_MAX_RETENTION_RATIO: usize = 4;
+pub(super) const DEFAULT_COMPACT_MAX_RETENTION_RATIO: usize = 16;
 /// Convert sparse `Mask` selections (`selected * 8 <= physical_rows`) to `Indices`
 /// when gathering multiple columns or composing stacked filters.
 pub(super) const SPARSE_INDICES_DENOMINATOR: usize = 8;
@@ -790,7 +787,6 @@ impl BatchView {
     /// Reserve memory for retaining this view, proactively compacting oversized
     /// backing buffers and falling back to compaction if the reservation limit
     /// cannot accommodate the uncompacted backing buffers.
-    #[cfg(test)]
     pub(super) fn into_reserved_for_retention(
         self,
         reservation: &mut MemoryReservation,

@@ -1000,6 +1000,7 @@ pub(super) struct ProbeCursor {
     rows: ProbeRows,
     pos: usize,
     next_entry: u32,
+    _reservation: MemoryReservation,
 }
 
 impl ProbeCursor {
@@ -1087,15 +1088,26 @@ impl HashJoinProbe {
         &self,
         view: BatchView,
         table: &FinalizedHashTable,
+        probe_reservation: &MemoryReservation,
     ) -> Result<Option<ProbeCursor>> {
         if view.is_empty() || table.is_empty() {
             return Ok(None);
         }
-        // Compact only when a tiny selection pins a disproportionately large backing
-        // buffer across a probe continuation cursor.
-        let view = view.into_compacted_for_retention(512 * 1024, 16)?;
         if view.is_all() {
-            return self.start_probe_all(view.into_parts().0, table);
+            return self.start_probe_all(
+                view.into_parts().0,
+                table,
+                probe_reservation.new_empty(),
+            );
+        }
+
+        // Account for retained backing buffers while held by ProbeCursor across
+        // continuation yields, compacting proactively for tiny selections or when
+        // the memory pool cannot accommodate the uncompacted backing buffers.
+        let mut cursor_reservation = probe_reservation.new_empty();
+        let view = view.into_reserved_for_retention(&mut cursor_reservation)?;
+        if view.is_all() {
+            return self.start_probe_all(view.into_parts().0, table, cursor_reservation);
         }
 
         // Zero-copy fast path for single plain integer column keys:
@@ -1147,6 +1159,7 @@ impl HashJoinProbe {
                 rows,
                 pos: 0,
                 next_entry: 0,
+                _reservation: cursor_reservation,
             }));
         }
 
@@ -1156,7 +1169,7 @@ impl HashJoinProbe {
         let Some(backing_rows) = view.selection().to_indices(view.batch().num_rows())
         else {
             // Fallback for batches exceeding u32::MAX rows.
-            return self.start_probe_all(view.materialize()?, table);
+            return self.start_probe_all(view.materialize()?, table, cursor_reservation);
         };
         let selected = backing_rows.len();
         let key_needed_cols = collect_expr_column_indices(&self.probe_key_exprs);
@@ -1181,6 +1194,7 @@ impl HashJoinProbe {
             rows: ProbeRows::CompactedKeys { backing_rows },
             pos: 0,
             next_entry: 0,
+            _reservation: cursor_reservation,
         }))
     }
 
@@ -1188,6 +1202,7 @@ impl HashJoinProbe {
         &self,
         batch: RecordBatch,
         table: &FinalizedHashTable,
+        reservation: MemoryReservation,
     ) -> Result<Option<ProbeCursor>> {
         let num_rows = batch.num_rows();
         if num_rows == 0 || table.is_empty() {
@@ -1212,6 +1227,7 @@ impl HashJoinProbe {
             rows: ProbeRows::All { num_rows },
             pos: 0,
             next_entry: 0,
+            _reservation: reservation,
         }))
     }
 
@@ -2159,10 +2175,12 @@ mod tests {
             build_id: 0,
         });
 
+        let probe_res = MemoryConsumer::new("test_hj_probe").register(&pool);
         let drain = |view: BatchView| -> Result<Vec<(i32, i32)>> {
             let mut scratch = ProbeScratch::default();
             let mut pairs = Vec::new();
-            let Some(mut cursor) = probe.start_probe_view(view, &table)? else {
+            let Some(mut cursor) = probe.start_probe_view(view, &table, &probe_res)?
+            else {
                 return Ok(pairs);
             };
             loop {
@@ -2230,7 +2248,9 @@ mod tests {
         });
         for view in [view_mask, view_indices] {
             let mut scratch = ProbeScratch::default();
-            let mut cursor = count_probe.start_probe_view(view, &table)?.unwrap();
+            let mut cursor = count_probe
+                .start_probe_view(view, &table, &probe_res)?
+                .unwrap();
             let mut total = 0usize;
             loop {
                 match count_probe.next_chunk(&mut cursor, &table, 2, &mut scratch)? {

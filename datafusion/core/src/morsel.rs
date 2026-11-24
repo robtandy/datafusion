@@ -1695,6 +1695,7 @@ enum WorkerState {
 struct JoinWorkerState {
     tables: Arc<Vec<Arc<FinalizedHashTable>>>,
     scratch: ProbeScratch,
+    probe_reservation: MemoryReservation,
 }
 
 enum BuildRunOutcome {
@@ -1989,14 +1990,16 @@ impl Pipeline {
         next: &AtomicUsize,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
-        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
-        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
-            tables,
-            scratch: ProbeScratch::default(),
-        });
+        let mut join_state =
+            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
+                tables,
+                scratch: ProbeScratch::default(),
+                probe_reservation,
+            });
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -2041,14 +2044,16 @@ impl Pipeline {
         ready: ReadyReaders,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
-        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
-        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
-            tables,
-            scratch: ProbeScratch::default(),
-        });
+        let mut join_state =
+            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
+                tables,
+                scratch: ProbeScratch::default(),
+                probe_reservation,
+            });
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
             if tx.is_closed() {
@@ -2156,7 +2161,12 @@ impl Pipeline {
                 }
                 Operator::HashProbe(probe) => {
                     let table = &join_state.tables[probe.build_id];
-                    let Some(mut cursor) = probe.start_probe_view(view, table)? else {
+                    let Some(mut cursor) = probe.start_probe_view(
+                        view,
+                        table,
+                        &join_state.probe_reservation,
+                    )?
+                    else {
                         return Ok(None);
                     };
                     match probe.next_chunk(
@@ -2516,6 +2526,9 @@ impl Pipeline {
 
         let build_reservation =
             MemoryConsumer::new("MorselHashJoinBuild").register(context.memory_pool());
+        let nested_probe_reservation = nested_tables.as_ref().map(|_| {
+            MemoryConsumer::new("MorselHashJoinProbe").register(context.memory_pool())
+        });
         let mut combined_build = build_sink.new_state(build_reservation.new_empty());
         let build_output = WorkerOutput {
             tx: tx.clone(),
@@ -2535,7 +2548,15 @@ impl Pipeline {
                         build_output.clone(),
                     );
                     let reservation = Some(build_reservation.new_empty());
-                    let tables = nested_tables.clone();
+                    let join_ctx = nested_tables.as_ref().map(|t| {
+                        (
+                            Arc::clone(t),
+                            nested_probe_reservation
+                                .as_ref()
+                                .expect("nested probe reservation")
+                                .new_empty(),
+                        )
+                    });
                     let worker = WorkerMetrics::for_pipeline(
                         measurement.cloned(),
                         id,
@@ -2553,7 +2574,7 @@ impl Pipeline {
                                 &next,
                                 output,
                                 reservation,
-                                tables,
+                                join_ctx,
                                 worker,
                             )
                             .await
@@ -2575,7 +2596,15 @@ impl Pipeline {
                         build_output.clone(),
                     );
                     let reservation = Some(build_reservation.new_empty());
-                    let tables = nested_tables.clone();
+                    let join_ctx = nested_tables.as_ref().map(|t| {
+                        (
+                            Arc::clone(t),
+                            nested_probe_reservation
+                                .as_ref()
+                                .expect("nested probe reservation")
+                                .new_empty(),
+                        )
+                    });
                     let worker = WorkerMetrics::for_pipeline(
                         measurement.cloned(),
                         id,
@@ -2587,7 +2616,7 @@ impl Pipeline {
                                 ready,
                                 output,
                                 reservation,
-                                tables,
+                                join_ctx,
                                 worker,
                             )
                             .await
@@ -2596,6 +2625,7 @@ impl Pipeline {
             }
         }
         drop(build_reservation);
+        drop(nested_probe_reservation);
 
         let mut combine_duration = std::time::Duration::ZERO;
         while let Some(result) = tasks.join_next().await {
@@ -2756,6 +2786,10 @@ impl Pipeline {
             // Phase 2: execute probe/scan pipeline unless short-circuited by an
             // empty INNER JOIN build table (DuckDB's EmptyResultIfRHSIsEmpty).
             if !skip_probe {
+                let probe_reservation = finalized_tables.as_ref().map(|_| {
+                    MemoryConsumer::new("MorselHashJoinProbe")
+                        .register(context.memory_pool())
+                });
                 let mut tasks = JoinSet::new();
                 match &self.source {
                     Source::Memory(source) => {
@@ -2767,7 +2801,15 @@ impl Pipeline {
                             let reservation = sink_reservation
                                 .as_ref()
                                 .map(MemoryReservation::new_empty);
-                            let tables = finalized_tables.clone();
+                            let join_ctx = finalized_tables.as_ref().map(|t| {
+                                (
+                                    Arc::clone(t),
+                                    probe_reservation
+                                        .as_ref()
+                                        .expect("probe reservation")
+                                        .new_empty(),
+                                )
+                            });
                             let worker = if has_join {
                                 WorkerMetrics::for_pipeline(
                                     measurement.clone(),
@@ -2789,7 +2831,7 @@ impl Pipeline {
                                         &next,
                                         output,
                                         reservation,
-                                        tables,
+                                        join_ctx,
                                         worker,
                                     )
                                     .await
@@ -2810,7 +2852,15 @@ impl Pipeline {
                             let reservation = sink_reservation
                                 .as_ref()
                                 .map(MemoryReservation::new_empty);
-                            let tables = finalized_tables.clone();
+                            let join_ctx = finalized_tables.as_ref().map(|t| {
+                                (
+                                    Arc::clone(t),
+                                    probe_reservation
+                                        .as_ref()
+                                        .expect("probe reservation")
+                                        .new_empty(),
+                                )
+                            });
                             let worker = if has_join {
                                 WorkerMetrics::for_pipeline(
                                     measurement.clone(),
@@ -2826,7 +2876,7 @@ impl Pipeline {
                                         ready,
                                         output,
                                         reservation,
-                                        tables,
+                                        join_ctx,
                                         worker,
                                     )
                                     .await
@@ -2835,6 +2885,7 @@ impl Pipeline {
                     }
                 }
                 drop(sink_reservation);
+                drop(probe_reservation);
                 while let Some(result) = tasks.join_next().await {
                     let local = match result {
                         Ok(Ok(local)) => local,
