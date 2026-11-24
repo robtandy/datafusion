@@ -143,6 +143,9 @@ fn build_config(mode: MorselMode, profile: ScanProfile, workers: usize) -> Sessi
             execution.parquet.pushdown_filters = false;
         }
         ScanProfile::Pushdown => {
+            if mode == MorselMode::Required {
+                config = config.with_repartition_file_scans(false);
+            }
             let execution = &mut config.options_mut().execution;
             execution.morsel_mode = mode;
             execution.parquet.pushdown_filters = true;
@@ -288,6 +291,7 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "plan": displayable(plan.as_ref()).indent(false).to_string(),
             "parquet_morsels_claimed": metric(plan.as_ref(), "parquet_morsels_claimed"),
             "count_finalizations": metric(plan.as_ref(), "count_finalizations"),
+            "aggregate_finalizations": metric(plan.as_ref(), "aggregate_finalizations"),
             "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
         })
     );

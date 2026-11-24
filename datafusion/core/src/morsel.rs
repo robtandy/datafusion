@@ -52,6 +52,7 @@ use tokio::sync::mpsc;
 use crate::datasource::{MemTable, source_as_provider};
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
+mod aggregate;
 mod count;
 mod fallback;
 mod group_count;
@@ -59,6 +60,7 @@ mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
 
+use aggregate::{AggregateSink, AggregateState};
 use count::{CountSink, CountState, FinalizedCount};
 use group_count::{GroupCountSink, GroupCountState, IntKeyType};
 pub use metrics::MorselMetrics;
@@ -71,6 +73,7 @@ mod tests;
 const BATCHES_PER_MORSEL: usize = 4;
 const COUNT_RESULT_CAPACITY: usize = 2;
 const GROUP_COUNT_RESULT_CAPACITY: usize = 2;
+const AGGREGATE_RESULT_CAPACITY: usize = 2;
 const MAX_RESULT_CAPACITY: usize = 32;
 
 fn result_capacity(workers: NonZeroUsize) -> usize {
@@ -80,7 +83,7 @@ fn result_capacity(workers: NonZeroUsize) -> usize {
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`]
 /// and supported Parquet listing scans (with the `parquet` feature).
 /// Lowers scans, filters, and projections with synchronous scalar expressions,
-/// ungrouped `COUNT(*)` over filtered input, and `GROUP BY <integer column>, COUNT(*)`.
+/// and ungrouped or grouped aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`).
 /// Installing this planner explicitly opts in even when the session mode is off.
 /// Unsupported queries use [`DefaultPhysicalPlanner`] unless the mode is
 /// [`MorselMode::Required`], which produces a planning error instead.
@@ -119,6 +122,10 @@ enum LoweredAggregate<'a> {
         key_index: usize,
         key_type: IntKeyType,
         count_expr: &'a Expr,
+        result_nodes: Vec<&'a LogicalPlan>,
+    },
+    General {
+        aggregate: &'a datafusion_expr::logical_plan::Aggregate,
         result_nodes: Vec<&'a LogicalPlan>,
     },
 }
@@ -161,35 +168,48 @@ impl MorselQueryPlanner {
                     node = &projection.input;
                 }
                 LogicalPlan::Aggregate(aggregate) if lowered_aggregate.is_none() => {
-                    let Some(count_expr) = count::count_star_aggr_expr(aggregate) else {
-                        return Ok(Lowering::Unsupported(
-                            "only COUNT(*) is supported in native morsel aggregates"
-                                .into(),
-                        ));
-                    };
                     if !nodes
                         .iter()
                         .all(|node| matches!(node, LogicalPlan::Projection(_)))
                     {
                         return Ok(Lowering::Unsupported(
-                            "only projection is supported above COUNT(*)".into(),
+                            "only projection is supported above aggregate".into(),
                         ));
                     }
-                    if aggregate.group_expr.is_empty() {
-                        lowered_aggregate = Some(LoweredAggregate::Count {
-                            aggregate,
-                            count_expr,
-                            result_nodes: std::mem::take(&mut nodes),
-                        });
+                    if let Some(count_expr) = count::count_star_aggr_expr(aggregate) {
+                        if aggregate.group_expr.is_empty() {
+                            lowered_aggregate = Some(LoweredAggregate::Count {
+                                aggregate,
+                                count_expr,
+                                result_nodes: std::mem::take(&mut nodes),
+                            });
+                        } else if let Ok(key) =
+                            group_count::group_by_integer_column(aggregate)?
+                        {
+                            lowered_aggregate = Some(LoweredAggregate::GroupCount {
+                                aggregate,
+                                key_expr: key.expr,
+                                key_index: key.column_index,
+                                key_type: key.key_type,
+                                count_expr,
+                                result_nodes: std::mem::take(&mut nodes),
+                            });
+                        } else {
+                            match aggregate::validate_aggregate(aggregate)? {
+                                Ok(()) => {
+                                    lowered_aggregate = Some(LoweredAggregate::General {
+                                        aggregate,
+                                        result_nodes: std::mem::take(&mut nodes),
+                                    });
+                                }
+                                Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                            }
+                        }
                     } else {
-                        match group_count::group_by_integer_column(aggregate)? {
-                            Ok(key) => {
-                                lowered_aggregate = Some(LoweredAggregate::GroupCount {
+                        match aggregate::validate_aggregate(aggregate)? {
+                            Ok(()) => {
+                                lowered_aggregate = Some(LoweredAggregate::General {
                                     aggregate,
-                                    key_expr: key.expr,
-                                    key_index: key.column_index,
-                                    key_type: key.key_type,
-                                    count_expr,
                                     result_nodes: std::mem::take(&mut nodes),
                                 });
                             }
@@ -197,6 +217,12 @@ impl MorselQueryPlanner {
                         }
                     }
                     node = &aggregate.input;
+                }
+                LogicalPlan::Aggregate(_) => {
+                    return Ok(Lowering::Unsupported(
+                        "nested aggregates (such as DISTINCT rewrites) are not supported in native morsel aggregates"
+                            .into(),
+                    ));
                 }
                 LogicalPlan::TableScan(scan) => break scan,
                 LogicalPlan::Limit(_) => {
@@ -213,15 +239,6 @@ impl MorselQueryPlanner {
                 }
             }
         };
-        if matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. }))
-            && !nodes
-                .iter()
-                .any(|node| matches!(node, LogicalPlan::Filter(_)))
-        {
-            return Ok(Lowering::Unsupported(
-                "COUNT(*) requires a filter on its input".into(),
-            ));
-        }
         for (present, feature) in [
             (scan.fetch.is_some(), "LIMIT"),
             (scan.skip.is_some(), "OFFSET"),
@@ -286,11 +303,18 @@ impl MorselQueryPlanner {
             )?;
         }
         let prune_filter = match source {
-            Source::Memory(_) => self.workers == NonZeroUsize::MIN,
+            Source::Memory(_) => {
+                self.workers == NonZeroUsize::MIN
+                    || matches!(lowered_aggregate, Some(LoweredAggregate::General { .. }))
+            }
             #[cfg(feature = "parquet")]
             Source::Parquet(_) => true,
         };
-        if lowered_aggregate.is_none() && prune_filter {
+        if !matches!(
+            lowered_aggregate,
+            Some(LoweredAggregate::Count { .. } | LoweredAggregate::GroupCount { .. })
+        ) && prune_filter
+        {
             prune_filter_input(&mut operators, source.schema());
         }
         let sink = match lowered_aggregate {
@@ -385,12 +409,32 @@ impl MorselQueryPlanner {
                     result_operators,
                 }
             }
+            Some(LoweredAggregate::General {
+                aggregate,
+                result_nodes,
+            }) => {
+                let sink = match AggregateSink::try_new(aggregate, &schema, session)? {
+                    Ok(sink) => sink,
+                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                };
+                let (result_operators, result_schema) = Self::lower_operators(
+                    result_nodes,
+                    Arc::clone(sink.schema()),
+                    session,
+                )?;
+                schema = result_schema;
+                Sink::Aggregate {
+                    sink,
+                    result_operators,
+                }
+            }
             None => Sink::Result,
         };
         let sink_capacity = match sink {
             Sink::Result => result_capacity(self.workers),
             Sink::Count { .. } => COUNT_RESULT_CAPACITY,
             Sink::GroupCount { .. } => GROUP_COUNT_RESULT_CAPACITY,
+            Sink::Aggregate { .. } => AGGREGATE_RESULT_CAPACITY,
         };
         Ok(Lowering::Native(MorselExec::new(
             Pipeline {
@@ -658,6 +702,22 @@ fn filter_batch(
     if batch.num_columns() == 0 {
         count::validate_mask_length(batch, mask)?;
     }
+    if mask.len() == batch.num_rows() {
+        let selected = mask.true_count();
+        if selected == batch.num_rows() {
+            return match projection {
+                Some(columns) => Ok(batch.project(columns)?),
+                None => Ok(batch.clone()),
+            };
+        }
+        if selected == 0 {
+            let schema = match projection {
+                Some(columns) => Arc::new(batch.schema().project(columns)?),
+                None => batch.schema(),
+            };
+            return Ok(RecordBatch::new_empty(schema));
+        }
+    }
     match projection {
         Some(columns) if mask.len() == batch.num_rows() => {
             Ok(filter_record_batch(&batch.project(columns)?, mask)?)
@@ -834,18 +894,24 @@ enum Sink {
         sink: GroupCountSink,
         result_operators: Vec<Operator>,
     },
+    Aggregate {
+        sink: AggregateSink,
+        result_operators: Vec<Operator>,
+    },
 }
 
 enum WorkerSink {
     Result(Box<ResultBuffer>),
     Count(CountState),
     GroupCount(GroupCountState),
+    Aggregate(AggregateState),
 }
 
 enum WorkerState {
     None,
     Count(CountState),
     GroupCount(GroupCountState),
+    Aggregate(AggregateState),
 }
 
 type WorkerTail = (Vec<RecordBatch>, WorkerMetrics);
@@ -1027,8 +1093,8 @@ impl Pipeline {
         &self,
         batch_size: usize,
         reservation: Option<MemoryReservation>,
-    ) -> WorkerSink {
-        match &self.sink {
+    ) -> Result<WorkerSink> {
+        Ok(match &self.sink {
             Sink::Result => WorkerSink::Result(Box::new(ResultBuffer::new(
                 &self.operators,
                 batch_size,
@@ -1038,7 +1104,10 @@ impl Pipeline {
             Sink::GroupCount { sink, .. } => WorkerSink::GroupCount(
                 sink.new_state(reservation.expect("group count reservation")),
             ),
-        }
+            Sink::Aggregate { sink, .. } => WorkerSink::Aggregate(
+                sink.new_state(reservation.expect("aggregate reservation"))?,
+            ),
+        })
     }
 
     async fn run_memory_worker(
@@ -1049,7 +1118,7 @@ impl Pipeline {
         reservation: Option<MemoryReservation>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation);
+        let mut sink = self.worker_sink(output.batch_size, reservation)?;
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -1083,7 +1152,7 @@ impl Pipeline {
         reservation: Option<MemoryReservation>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation);
+        let mut sink = self.worker_sink(output.batch_size, reservation)?;
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
             if tx.is_closed() {
@@ -1192,6 +1261,13 @@ impl Pipeline {
                     Ok(true)
                 })
             }
+            WorkerSink::Aggregate(local) => worker.process(|| {
+                let batch = apply_operators(&self.operators, batch)?;
+                if batch.num_rows() > 0 {
+                    local.add_batch(&batch)?;
+                }
+                Ok(true)
+            }),
             WorkerSink::Result(buffer) => {
                 let mut output = worker.process(|| {
                     buffer.push_input(&self.operators, batch)?;
@@ -1217,6 +1293,7 @@ impl Pipeline {
         let mut buffer = match sink {
             WorkerSink::Count(local) => return Ok(WorkerState::Count(local)),
             WorkerSink::GroupCount(local) => return Ok(WorkerState::GroupCount(local)),
+            WorkerSink::Aggregate(local) => return Ok(WorkerState::Aggregate(local)),
             WorkerSink::Result(buffer) => buffer,
         };
         let mut tail = Vec::new();
@@ -1267,16 +1344,26 @@ impl Pipeline {
         let worker_measurement = measurement.clone();
         let supervisor = SpawnedTask::spawn(async move {
             let measurement = worker_measurement;
-            let group_reservation = match &self.sink {
+            let sink_reservation = match &self.sink {
                 Sink::GroupCount { .. } => Some(
                     MemoryConsumer::new("MorselGroupCount")
                         .register(context.memory_pool()),
                 ),
+                Sink::Aggregate { .. } => Some(
+                    MemoryConsumer::new("MorselAggregate")
+                        .register(context.memory_pool()),
+                ),
                 Sink::Result | Sink::Count { .. } => None,
             };
-            let mut combined_group = match (&self.sink, &group_reservation) {
+            let mut combined_group = match (&self.sink, &sink_reservation) {
                 (Sink::GroupCount { sink, .. }, Some(reservation)) => {
                     Some(sink.new_state(reservation.new_empty()))
+                }
+                _ => None,
+            };
+            let mut combined_agg = match (&self.sink, &sink_reservation) {
+                (Sink::Aggregate { sink, .. }, Some(reservation)) => {
+                    Some(sink.new_state(reservation.new_empty())?)
                 }
                 _ => None,
             };
@@ -1289,7 +1376,7 @@ impl Pipeline {
                         let (pipeline, next, output) =
                             (Arc::clone(&self), Arc::clone(&next), output.clone());
                         let reservation =
-                            group_reservation.as_ref().map(MemoryReservation::new_empty);
+                            sink_reservation.as_ref().map(MemoryReservation::new_empty);
                         let worker = WorkerMetrics::new(measurement.clone(), id);
                         tasks.spawn(async move {
                             let source = match &pipeline.source {
@@ -1321,7 +1408,7 @@ impl Pipeline {
                         let (pipeline, ready, output) =
                             (Arc::clone(&self), ready.clone(), output.clone());
                         let reservation =
-                            group_reservation.as_ref().map(MemoryReservation::new_empty);
+                            sink_reservation.as_ref().map(MemoryReservation::new_empty);
                         let worker = WorkerMetrics::new(measurement.clone(), id);
                         tasks.spawn(async move {
                             pipeline
@@ -1331,23 +1418,26 @@ impl Pipeline {
                     }
                 }
             }
-            drop(group_reservation);
+            drop(sink_reservation);
             let mut combined_count = CountState::default();
             while let Some(result) = tasks.join_next().await {
                 let local = match result {
                     Ok(Ok(local)) => local,
                     Ok(Err(err)) => {
                         drop(combined_group);
+                        drop(combined_agg);
                         abort_and_drain(&mut tasks).await;
                         return Err(err);
                     }
                     Err(err) if err.is_panic() => {
                         drop(combined_group);
+                        drop(combined_agg);
                         abort_and_drain(&mut tasks).await;
                         std::panic::resume_unwind(err.into_panic())
                     }
                     Err(err) => {
                         drop(combined_group);
+                        drop(combined_agg);
                         abort_and_drain(&mut tasks).await;
                         return Err(exec_datafusion_err!("Morsel task failed: {err}"));
                     }
@@ -1357,6 +1447,7 @@ impl Pipeline {
                     WorkerState::Count(local) => {
                         if let Err(err) = combined_count.combine(local) {
                             drop(combined_group);
+                            drop(combined_agg);
                             abort_and_drain(&mut tasks).await;
                             return Err(err);
                         }
@@ -1367,11 +1458,32 @@ impl Pipeline {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     drop(combined_group);
+                                    drop(combined_agg);
                                     abort_and_drain(&mut tasks).await;
                                     return Ok(());
                                 }
                                 Err(err) => {
                                     drop(combined_group);
+                                    drop(combined_agg);
+                                    abort_and_drain(&mut tasks).await;
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                    WorkerState::Aggregate(local) => {
+                        if let Some(combined) = combined_agg.as_mut() {
+                            match combined.merge_from(local, &output.tx).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
+                                    abort_and_drain(&mut tasks).await;
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
                                     abort_and_drain(&mut tasks).await;
                                     return Err(err);
                                 }
@@ -1446,6 +1558,33 @@ impl Pipeline {
                         }
                     }
                 }
+                Sink::Aggregate {
+                    sink,
+                    result_operators,
+                } => {
+                    if !tx.is_closed() {
+                        #[cfg(test)]
+                        if let Some(gate) = &sink.finalize_gate {
+                            gate.wait().await;
+                        }
+                        if !tx.is_closed()
+                            && let Some(combined) = combined_agg.take()
+                        {
+                            let finalized = sink.finalize(combined);
+                            MetricBuilder::new(&metrics)
+                                .counter("aggregate_finalizations", 0)
+                                .add(1);
+                            finalized
+                                .emit(
+                                    result_operators,
+                                    output.batch_size,
+                                    tx,
+                                    measurement.as_deref(),
+                                )
+                                .await?;
+                        }
+                    }
+                }
             }
             Ok(())
         });
@@ -1491,7 +1630,9 @@ impl MorselExec {
     fn new(pipeline: Pipeline, schema: SchemaRef) -> Self {
         let emission = match pipeline.sink {
             Sink::Result => EmissionType::Incremental,
-            Sink::Count { .. } | Sink::GroupCount { .. } => EmissionType::Final,
+            Sink::Count { .. } | Sink::GroupCount { .. } | Sink::Aggregate { .. } => {
+                EmissionType::Final
+            }
         };
         let metrics = match &pipeline.source {
             Source::Memory(_) => ExecutionPlanMetricsSet::new(),
@@ -1552,6 +1693,15 @@ impl DisplayAs for MorselExec {
                 )?;
                 display_operators(result_operators, f)?;
             }
+            Sink::Aggregate {
+                sink,
+                result_operators,
+            } => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+                write!(f, "; FinalizedAggregateSource")?;
+                display_operators(result_operators, f)?;
+            }
         }
         if pipeline.is_inline_memory_stream() {
             write!(f, " -> ResultSink[inline]")
@@ -1609,12 +1759,20 @@ impl ExecutionPlan for MorselExec {
         {
             return Ok(TreeNodeRecursion::Stop);
         }
+        if let Sink::Aggregate { sink, .. } = &self.pipeline.sink
+            && sink.apply_expressions(f)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
+        }
         let result_operators = match &self.pipeline.sink {
             Sink::Result => &[][..],
             Sink::Count {
                 result_operators, ..
             }
             | Sink::GroupCount {
+                result_operators, ..
+            }
+            | Sink::Aggregate {
                 result_operators, ..
             } => result_operators.as_slice(),
         };

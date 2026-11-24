@@ -48,6 +48,7 @@ class Workload:
     morsel_admitted: bool
     is_count: bool
     description: str
+    is_aggregate: bool = False
 
 
 WORKLOADS: dict[str, Workload] = {
@@ -66,9 +67,39 @@ WORKLOADS: dict[str, Workload] = {
             "    AND l_quantity < 24"
         ),
         ordered=True,
-        morsel_admitted=False,
+        morsel_admitted=True,
         is_count=False,
+        is_aggregate=True,
         description="Standard TPC-H Q6 (filtered SUM over lineitem)",
+    ),
+    "q1_unordered": Workload(
+        name="q1_unordered",
+        tables=("lineitem",),
+        sql=(
+            "SELECT\n"
+            "    l_returnflag,\n"
+            "    l_linestatus,\n"
+            "    SUM(l_quantity) AS sum_qty,\n"
+            "    SUM(l_extendedprice) AS sum_base_price,\n"
+            "    SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n"
+            "    SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n"
+            "    AVG(l_quantity) AS avg_qty,\n"
+            "    AVG(l_extendedprice) AS avg_price,\n"
+            "    AVG(l_discount) AS avg_disc,\n"
+            "    COUNT(*) AS count_order\n"
+            "FROM\n"
+            "    lineitem\n"
+            "WHERE\n"
+            "    l_shipdate <= DATE '1998-09-02'\n"
+            "GROUP BY\n"
+            "    l_returnflag,\n"
+            "    l_linestatus"
+        ),
+        ordered=False,
+        morsel_admitted=True,
+        is_count=False,
+        is_aggregate=True,
+        description="Unordered TPC-H Q1 (grouped multi-aggregate without ORDER BY over lineitem)",
     ),
     "q1": Workload(
         name="q1",
@@ -243,6 +274,13 @@ ARMS: dict[str, Arm] = {
         mode="required",
         profile="pruning",
         label="Morsel DataFusion (required, pushdown_filters=false, pruning=true)",
+    ),
+    "morsel_pushdown": Arm(
+        name="morsel_pushdown",
+        engine="datafusion",
+        mode="required",
+        profile="pushdown",
+        label="Morsel DataFusion (required, pushdown_filters=true, reorder_filters=true)",
     ),
     "stock_default": Arm(
         name="stock_default",
@@ -556,6 +594,7 @@ def _duckdb_exec(
                     "plan": plan,
                     "parquet_morsels_claimed": None,
                     "count_finalizations": None,
+                    "aggregate_finalizations": None,
                     "bytes_scanned": None,
                 }
             )
@@ -657,9 +696,9 @@ def validate_plan(
 
     # mode == "required"
     table = workload.tables[0]
-    if not plan.startswith("MorselExec:") or f"NativeParquet[{table}]" not in plan:
+    if not plan.startswith("MorselExec:") or f"NativeParquet[{table}" not in plan:
         raise ValueError(
-            f"{arm.name}/{workload.name}: expected MorselExec with NativeParquet[{table}], got:\n{plan}"
+            f"{arm.name}/{workload.name}: expected MorselExec with NativeParquet[{table}...], got:\n{plan}"
         )
     expected_rgs = table_row_groups[table]
     claimed = evidence["parquet_morsels_claimed"]
@@ -681,6 +720,14 @@ def validate_plan(
         raise ValueError(
             f"{arm.name}/{workload.name}: unexpected CountSink or count_finalizations "
             f"(is_count={workload.is_count}, count_finalizations={evidence['count_finalizations']})"
+        )
+    agg_finalizations = evidence.get("aggregate_finalizations", 0)
+    if ("AggregateSink" in plan) != workload.is_aggregate or agg_finalizations != int(
+        workload.is_aggregate
+    ):
+        raise ValueError(
+            f"{arm.name}/{workload.name}: unexpected AggregateSink or aggregate_finalizations "
+            f"(is_aggregate={workload.is_aggregate}, aggregate_finalizations={agg_finalizations})"
         )
 
 
@@ -742,6 +789,7 @@ def verify_suite(
                     "output_rows": sample["output_rows"],
                     "parquet_morsels_claimed": sample["parquet_morsels_claimed"],
                     "count_finalizations": sample["count_finalizations"],
+                    "aggregate_finalizations": sample["aggregate_finalizations"],
                     "bytes_scanned": sample["bytes_scanned"],
                     "plan": sample["plan"],
                 }
