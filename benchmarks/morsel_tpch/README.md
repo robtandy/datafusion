@@ -76,8 +76,9 @@ as `--queries q1,q3,q6,q12` or `--queries q6_count q6_scan q1_unordered`.
 
 ### Roadmap TPC-H Queries (Stock DataFusion vs DuckDB; Morsel Not Yet Admitted)
 
-21 of the 22 standard TPC-H queries (`q1`–`q5`, `q7`–`q22`) are currently
-rejected at planning time under `morsel_mode=required` (see
+19 of the 22 standard TPC-H queries (`q1`–`q5`, `q7`–`q13`, `q15`–`q18`,
+`q20`–`q22`) are currently rejected at planning time under `morsel_mode=required`
+(see
 [sf5_baseline_22q.md](sf5_baseline_22q.md#3-live-22-query-morsel-admission--operator-capability-checklist)
 for the complete 22-query rejection and operator-capability checklist). The
 original SF1 roadmap subset (`q1`, `q3`, `q12`) remains directly runnable via
@@ -100,18 +101,25 @@ morsel planner):
 
 ### Currently-Admitted Morsel-Native Queries (Live 3-Way Comparison)
 
-All four queries run directly over the real TPC-H `lineitem` Parquet schema
-(`l_quantity`, `l_extendedprice`, `l_discount`, `l_tax` as `DECIMAL(15,2)`,
-`l_shipdate` as `DATE32`, `l_orderkey` as `INT64`, `l_returnflag` /
-`l_linestatus` as `Utf8View`) — no casts or schema workarounds are needed;
-`morsel_mode=required` admits all four natively under `MorselExec` +
-`NativeParquet[lineitem]` (see [checkpoint_a_results.md](checkpoint_a_results.md)
-for the idle-`dduck2` Checkpoint A 3-way scorecard across all four queries, and
-[morsel_aggregate.md](morsel_aggregate.md) for the `#168` `dduck1` aggregate
-note):
+Six workloads (`q6`, `q14`, `q19`, `q1_unordered`, `q6_count`, `q6_scan`) run
+directly over the real TPC-H Parquet schemas (`l_quantity`, `l_extendedprice`,
+`l_discount`, `l_tax` as `DECIMAL(15,2)`, `l_shipdate` as `DATE32`,
+`l_orderkey` / `p_partkey` as `INT64`, string columns as `Utf8View`) — no casts
+or schema workarounds are needed; `morsel_mode=required` admits all six natively
+under `MorselExec` (see [sf5_baseline_22q.md](sf5_baseline_22q.md) for the
+post-`#188` SF5 5-arm comparison including `q14` and `q19`,
+[checkpoint_a_results.md](checkpoint_a_results.md) for the idle-`dduck2`
+Checkpoint A SF1 3-way scorecard, and [morsel_aggregate.md](morsel_aggregate.md)
+for the `#168` `dduck1` aggregate note):
 
 - **`q6`**: Standard TPC-H Q6 (matching `benchmarks/queries/q6.sql`) — filtered
   ungrouped `SUM(l_extendedprice * l_discount)` over `lineitem`.
+- **`q14`**: Standard TPC-H Q14 (matching `benchmarks/queries/q14.sql`) —
+  two-pipeline native Inner `HashJoin` (`part` build, filtered `lineitem` probe)
+  - conditional `SUM` ratio (`#188`).
+- **`q19`**: Standard TPC-H Q19 (matching `benchmarks/queries/q19.sql`) —
+  two-pipeline native Inner `HashJoin` (`part` build, `lineitem` probe) with
+  disjunctive 3-branch `OR` join filter + ungrouped `SUM` (`#188`).
 - **`q1_unordered`**: TPC-H Q1 without `ORDER BY` — filtered grouped
   multi-aggregate (`4× SUM`, `3× AVG`, `COUNT(*)`) over
   `(l_returnflag, l_linestatus)` on `lineitem`.

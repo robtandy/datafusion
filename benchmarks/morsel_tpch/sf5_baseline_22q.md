@@ -7,14 +7,15 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 # TPC-H SF5 All-22-Query Baseline: Stock DataFusion vs. DuckDB 2.0.1 + Morsel Admission Matrix (#189)
 
 This baseline expands `benchmarks/morsel_tpch/` to **all 22 standard TPC-H
-queries (`q1`–`q22`) at Scale Factor 5 (`--sf 5`)** on idle `rob-tandy-dduck2`.
-It records:
+queries (`q1`–`q22`) at Scale Factor 5 (`--sf 5`)** on idle `rob-tandy-dduck2`
+after `#188` (native two-pipeline Inner `HashJoin`). It records:
 
 1. A quiet-host **Stock DataFusion (`stock_default`) vs. DuckDB 2.0.1
    (`duckdb_default`)** warm-cache baseline across all 22 standard TPC-H
    queries (plus geometric mean and sum-of-medians totals).
 2. A live **Morsel (`morsel_mode=required`)** 5-arm comparison at SF5 on all
-   currently-admitted workloads (`q6`, `q1_unordered`, `q6_count`, `q6_scan`).
+   six currently-admitted workloads (`q6`, `q14`, `q19`, `q1_unordered`,
+   `q6_count`, `q6_scan`).
 3. A **live 22-query Morsel admission & rejection matrix** showing both the
    verbatim planning rejection emitted by `morsel_mode=required` at HEAD and
    the underlying physical operator requirements per query (`Sort`/`TopN`,
@@ -29,30 +30,42 @@ All 25 workloads (all 22 standard TPC-H queries `q1`–`q22` plus `q1_unordered`
 
 - **22-query standard TPC-H (`q1`–`q22`) geometric mean at SF5 (8 pinned cores,
   warm page cache):**
-  - Stock DataFusion (`stock_default`): **459.2 ms**
-  - DuckDB 2.0.1 (`duckdb_default`): **303.6 ms**
-  - **Geometric mean ratio (`stock_default / duckdb_default`): `1.51×`**
-    (sum of medians: `12,944.6 ms` vs. `7,676.9 ms`, **`1.69×`**).
+  - Stock DataFusion (`stock_default`): **458.9 ms**
+  - DuckDB 2.0.1 (`duckdb_default`): **302.4 ms**
+  - **Geometric mean ratio (`stock_default / duckdb_default`): `1.52×`**
+    (sum of medians: `12,921.6 ms` vs. `7,654.2 ms`, **`1.69×`**).
 - **Where Stock DataFusion already leads or matches DuckDB 2.0.1 at SF5:**
-  `q22` (**0.86×**, `120.2` vs. `140.6 ms`), `q13` (**0.88×**, `465.7` vs.
-  `527.2 ms`), `q16` (**0.97×**, `131.8` vs. `135.6 ms`), and `q12` (**1.00×**,
-  `216.2` vs. `217.1 ms`).
-- **Largest Stock vs. DuckDB gaps (`> 2.0×`):** `q18` (**3.00×**, `1,379.0` vs.
-  `460.2 ms`), `q17` (**2.95×**, `1,178.6` vs. `400.0 ms`), `q15` (**2.68×**,
-  `715.0` vs. `267.1 ms` — Stock scans `lineitem` twice for `revenue0`,
+  `q22` (**0.86×**, `121.7` vs. `142.2 ms`), `q13` (**0.91×**, `467.9` vs.
+  `513.2 ms`), `q16` (**0.95×**, `129.2` vs. `135.8 ms`), and `q12` (**1.00×**,
+  `214.6` vs. `215.3 ms`).
+- **Largest Stock vs. DuckDB gaps (`> 2.0×`):** `q18` (**3.00×**, `1,365.5` vs.
+  `455.6 ms`), `q17` (**2.94×**, `1,168.6` vs. `398.0 ms`), `q15` (**2.67×**,
+  `707.9` vs. `265.4 ms` — Stock scans `lineitem` twice for `revenue0`,
   `605.1 MB` `bytes_scanned`, while DuckDB materializes the CTE once), and `q7`
-  (**2.14×**, `871.2` vs. `406.2 ms`).
-- **Currently-admitted Morsel workloads at SF5 (`q6`, `q1_unordered`,
-  `q6_count`, `q6_scan`):** `morsel_no_pushdown` outperforms unmodified
-  `stock_default` by **`1.07–1.09×`** (`−16.6` to `−50.2 ms`) across all four
-  queries and matches or edges out tuned `stock_no_pushdown` (`1.00–1.03×`),
-  claiming all `240 / 240` `lineitem` row groups cleanly across 8 workers
-  (`28–33` row groups per worker) with `0.0 ms` `morsel_output_wait`.
-- **Live Morsel admission status across `q1`–`q22`:** **`1 / 22` standard
-  queries admitted** (`q6`), plus 3 single-table Morsel slices (`q1_unordered`,
-  `q6_count`, `q6_scan`). The remaining **`21 / 22`** standard queries are
-  explicitly rejected under `morsel_mode=required`: 18 at top-level `Sort` /
-  `TopN`, 2 at `Inner Join` (`q14`, `q19`), and 1 at `LeftSemi Join` (`q17`).
+  (**2.10×**, `847.8` vs. `403.1 ms`).
+- **Currently-admitted Morsel workloads at SF5 (`q6`, `q14`, `q19`,
+  `q1_unordered`, `q6_count`, `q6_scan`):** The best Morsel arm outperforms
+  unmodified `stock_default` by **`1.05–1.13×`** (`−13.0` to `−59.9 ms`) across
+  all six workloads:
+  - Newly admitted native `HashJoin` query **`q14`** (`morsel_pushdown`,
+    **`354.7 ms`**) beats `stock_default` (`402.3 ms`) by **`1.13×`
+    (`−47.6 ms`)** and `stock_no_pushdown` (`393.4 ms`) by **`1.11×`**, coming
+    within **`1.09×`** of DuckDB 2.0.1 (`326.7 ms`) over the 30M × 1M
+    `lineitem ⋈ part` join.
+  - Newly admitted native `HashJoin` query **`q19`** (`morsel_no_pushdown`,
+    **`521.8 ms`**) beats `stock_default` (`554.3 ms`) by **`1.06×`
+    (`−32.5 ms`)** and `stock_no_pushdown` (`545.9 ms`) by **`1.05×`**.
+  - Single-table `q6` (`339.3` vs. `364.2 ms`), `q1_unordered` (`720.1` vs.
+    `780.0 ms`), `q6_count` (`187.1` vs. `200.1 ms`), and `q6_scan` (`381.2`
+    vs. `400.7 ms`) beat `stock_default` by **`1.05–1.08×`**, claiming all
+    `240 / 240` `lineitem` row groups (`248 / 248` with `part` on `q14`/`q19`)
+    with `0.0 ms` `morsel_output_wait`.
+- **Live Morsel admission status across `q1`–`q22`:** **`3 / 22` standard
+  queries admitted** (`q6`, `q14`, `q19`), plus 3 single-table Morsel slices
+  (`q1_unordered`, `q6_count`, `q6_scan`). The remaining **`19 / 22`** standard
+  queries are explicitly rejected under `morsel_mode=required`: 18 at top-level
+  `Sort` / `TopN`, and 1 (`q17`) at `unsupported join type LeftSemi in native
+morsel hash join (only INNER JOIN is supported)`.
 
 ## Environment, Controls, and Reproduction Commands
 
@@ -64,13 +77,14 @@ All 25 workloads (all 22 standard TPC-H queries `q1`–`q22` plus `q1_unordered`
 - **CPU pinning and threads:** `taskset -c 0-7` (8 pinned CPUs), `--threads 8`
   (Tokio `worker_threads=8`, `max_blocking_threads=8`, `target_partitions=8`;
   DuckDB `SET threads = 8`), batch size `8,192`.
-- **Host idle verification:** `vmstat -y 1 3` immediately before the 310-trial
-  benchmark reported **87–93% host CPU idle** (`us 6–12%, sy 0–2%`);
-  immediately after reported **99% host CPU idle** (`us 0–1%, sy 0%`).
+- **Host idle verification:** `vmstat -y 1 3` immediately after the 340-trial
+  benchmark reported **96–99% host CPU idle** (`us 0–3%, sy 0–1%`; the
+  pre-command `vmstat` caught the tail of the prior `cargo clippy` settling
+  `13 → 39 → 79%` idle before the ~1m50s unmeasured verification phase began).
 - **Build & versions:**
-  - DataFusion revision: `9d512c59c38ea5b9f21c083f0da8033dc7114c38`
-    (`agent/morsel-issue-189`, on top of `morsel-execution` HEAD `c21d06f93`),
-    built with `--locked --profile release-nonlto -p datafusion
+  - DataFusion revision: `0ff9edecf4c604e463bfd99a7f5f065afad4ab9c`
+    (`agent/morsel-issue-189`, merged with `morsel-execution` HEAD `f044eda78`
+    after `#188`), built with `--locked --profile release-nonlto -p datafusion
 --no-default-features --features
 parquet,sql,datetime_expressions,unicode_expressions --example
 morsel_tpch_runner` (`datetime_expressions` is required for `EXTRACT(YEAR ...)`
@@ -80,7 +94,7 @@ morsel_tpch_runner` (`datetime_expressions` is required for `EXTRACT(YEAR ...)`
     Python `3.12.10`, DuckDB `2.0.1`, PyArrow `26.0.1`, NumPy `2.5.5`.
 - **Protocol:** Fresh process per trial, 1 unmeasured warmup round + 5 measured
   counterbalanced rounds (alternating arm order between odd and even rounds).
-  All `310 / 310` measured trials started and ended with **100% of 4 KiB
+  All `340 / 340` measured trials started and ended with **100% of 4 KiB
   Parquet file pages resident** via Linux `mincore`. Timings below are medians
   in milliseconds with observed `min–max` in parentheses.
 
@@ -106,8 +120,9 @@ min/max statistics:
 
 For `lineitem`, 16 files × 15 row groups (`14 × 131,072` + 1 tail group of
 `~39,979` rows per file) produce `240` row groups (`30` per worker on 8
-workers), `orders` produces `64` row groups (`8` per worker), and `partsupp`
-produces `32` row groups (`4` per worker).
+workers), `orders` produces `64` row groups (`8` per worker), `partsupp`
+produces `32` row groups (`4` per worker), and `part` produces `8` row groups
+(`1` per worker).
 
 ### Exact Reproduction Commands
 
@@ -169,136 +184,166 @@ total wall times (`< 1.00×` means Stock DataFusion is faster).
 
 | Query             |   Rows | `mincore` pages (100%) | `bytes_scanned` | Stock `stock_default` total ms (min–max) | Stock exec ms | DuckDB `duckdb_default` total ms (min–max) | Stock / DuckDB | Morsel (`required`)   |
 | ----------------- | -----: | ---------------------: | --------------: | ---------------------------------------: | ------------: | -----------------------------------------: | -------------: | --------------------- |
-| `q1`              |      4 |                229,147 |     259,744,879 |                      767.2 (757.0–776.9) |         752.3 |                        463.8 (459.4–472.6) |          1.65× | Rejected (`Sort`)     |
-| `q2`              |    100 |                 44,595 |      69,066,048 |                      178.1 (174.0–193.6) |         161.3 |                        119.9 (119.2–130.8) |          1.49× | Rejected (`Sort`)     |
-| `q3`              |     10 |                297,360 |     334,406,980 |                      527.7 (510.6–547.4) |         510.2 |                        344.7 (340.2–371.0) |          1.53× | Rejected (`Sort`)     |
-| `q4`              |      5 |                286,442 |     175,082,186 |                      201.3 (196.0–202.5) |         185.6 |                        187.6 (187.2–188.4) |          1.07× | Rejected (`Sort`)     |
-| `q5`              |      5 |                298,107 |     374,043,457 |                      691.9 (678.3–704.0) |         672.9 |                        373.3 (370.4–383.4) |          1.85× | Rejected (`Sort`)     |
-| `q6`              |      1 |                229,147 |     238,671,437 |                      363.0 (355.6–367.2) |         350.0 |                        201.1 (198.0–206.8) |          1.80× | **Admitted**          |
-| `q7`              |      4 |                298,106 |     408,905,403 |                      871.2 (845.3–902.5) |         850.9 |                        406.2 (400.2–411.8) |          2.14× | Rejected (`Sort`)     |
-| `q8`              |      2 |                303,951 |     531,613,209 |                      650.3 (650.3–663.0) |         627.1 |                        451.4 (449.0–453.6) |          1.44× | Rejected (`Sort`)     |
-| `q9`              |    175 |                331,036 |     554,729,920 |                1,012.6 (1,001.2–1,059.2) |         992.4 |                        768.5 (764.4–783.3) |          1.32× | Rejected (`Sort`)     |
-| `q10`             |     20 |                297,361 |     335,186,811 |                      637.3 (621.6–649.1) |         617.7 |                        443.8 (440.5–450.6) |          1.44× | Rejected (`Sort`)     |
-| `q11`             |  4,606 |                 38,750 |      70,213,866 |                      108.9 (107.9–111.0) |          96.6 |                          98.0 (90.1–100.3) |          1.11× | Rejected (`Sort`)     |
-| `q12`             |      2 |                286,442 |     221,292,133 |                      216.2 (212.8–220.4) |         199.5 |                        217.1 (215.9–222.6) |      **1.00×** | Rejected (`Sort`)     |
-| `q13`             |     42 |                 68,213 |     163,187,253 |                      465.7 (462.4–508.7) |         456.8 |                        527.2 (516.7–535.3) |      **0.88×** | Rejected (`Sort`)     |
-| `q14`             |      1 |                234,991 |     373,492,768 |                      404.5 (399.8–406.3) |         388.6 |                        325.9 (321.9–328.7) |          1.24× | Rejected (`Inner`)    |
-| `q15`             |      1 |                229,892 |     605,140,002 |                      715.0 (708.6–722.3) |         697.0 |                        267.1 (259.1–297.4) |          2.68× | Rejected (`Sort`)     |
-| `q16`             | 27,724 |                 44,593 |      22,553,011 |                      131.8 (131.1–138.5) |         120.8 |                        135.6 (134.4–137.3) |      **0.97×** | Rejected (`Sort`)     |
-| `q17`             |      1 |                234,991 |     513,275,514 |                1,178.6 (1,161.8–1,184.5) |       1,162.1 |                        400.0 (398.4–404.5) |          2.95× | Rejected (`LeftSemi`) |
-| `q18`             |    100 |                297,360 |     237,511,219 |                1,379.0 (1,351.0–1,385.3) |       1,362.1 |                        460.2 (450.6–465.7) |          3.00× | Rejected (`Sort`)     |
-| `q19`             |      1 |                234,991 |     369,999,158 |                      553.0 (541.8–557.0) |         536.4 |                        330.2 (326.3–372.7) |          1.67× | Rejected (`Inner`)    |
-| `q20`             |    901 |                273,741 |     347,065,289 |                      466.8 (450.7–494.4) |         448.4 |                        296.6 (295.8–300.6) |          1.57× | Rejected (`Sort`)     |
-| `q21`             |    100 |                287,188 |     606,479,991 |                1,304.2 (1,297.4–1,315.5) |       1,283.6 |                        718.2 (713.3–721.5) |          1.82× | Rejected (`Sort`)     |
-| `q22`             |      7 |                 68,213 |      59,097,054 |                      120.2 (115.4–121.2) |         109.4 |                        140.6 (137.5–142.5) |      **0.86×** | Rejected (`Sort`)     |
-| **GeoMean (22q)** |      — |                      — |               — |                             **459.2 ms** |             — |                               **303.6 ms** |      **1.51×** | `1 / 22` admitted     |
-| **Sum (22q)**     |      — |                      — |               — |                          **12,944.6 ms** |             — |                             **7,676.9 ms** |      **1.69×** | `1 / 22` admitted     |
+| `q1`              |      4 |                229,147 |     259,744,879 |                      767.9 (763.6–787.8) |         753.3 |                        464.5 (459.6–538.6) |          1.65× | Rejected (`Sort`)     |
+| `q2`              |    100 |                 44,595 |      69,066,048 |                      181.7 (179.1–184.6) |         164.6 |                        123.0 (120.4–125.9) |          1.48× | Rejected (`Sort`)     |
+| `q3`              |     10 |                297,360 |     334,406,980 |                      513.8 (499.0–521.1) |         496.5 |                        344.6 (340.7–348.6) |          1.49× | Rejected (`Sort`)     |
+| `q4`              |      5 |                286,442 |     175,082,186 |                      203.2 (193.8–205.4) |         187.6 |                        185.3 (183.7–186.4) |          1.10× | Rejected (`Sort`)     |
+| `q5`              |      5 |                298,107 |     374,043,457 |                      695.4 (688.9–770.8) |         676.2 |                        374.8 (370.4–379.4) |          1.86× | Rejected (`Sort`)     |
+| `q6`              |      1 |                229,147 |     238,671,437 |                      364.2 (358.2–373.5) |         350.8 |                        203.0 (201.9–208.5) |          1.79× | **Admitted**          |
+| `q7`              |      4 |                298,106 |     408,905,403 |                      847.8 (845.6–853.4) |         826.9 |                        403.1 (401.7–414.1) |          2.10× | Rejected (`Sort`)     |
+| `q8`              |      2 |                303,951 |     531,613,209 |                      654.0 (647.4–666.8) |         630.7 |                        449.3 (445.7–455.2) |          1.46× | Rejected (`Sort`)     |
+| `q9`              |    175 |                331,036 |     554,729,920 |                  1,005.0 (988.2–1,048.3) |         983.8 |                        775.6 (770.2–787.9) |          1.30× | Rejected (`Sort`)     |
+| `q10`             |     20 |                297,361 |     335,186,811 |                      647.9 (647.0–675.0) |         628.6 |                        447.9 (444.7–448.4) |          1.45× | Rejected (`Sort`)     |
+| `q11`             |  4,606 |                 38,750 |      70,213,866 |                      110.0 (106.4–113.5) |          97.6 |                           92.4 (88.3–96.0) |          1.19× | Rejected (`Sort`)     |
+| `q12`             |      2 |                286,442 |     221,292,133 |                      214.6 (207.1–218.8) |         198.6 |                        215.3 (213.9–225.1) |      **1.00×** | Rejected (`Sort`)     |
+| `q13`             |     42 |                 68,213 |     163,187,253 |                      467.9 (461.4–471.2) |         458.9 |                        513.2 (507.1–515.0) |      **0.91×** | Rejected (`Sort`)     |
+| `q14`             |      1 |                234,991 |     373,492,768 |                      402.3 (399.2–405.6) |         386.4 |                        326.7 (320.5–330.1) |          1.23× | **Admitted** (`Join`) |
+| `q15`             |      1 |                229,892 |     605,140,002 |                      707.9 (697.1–749.0) |         689.6 |                        265.4 (259.9–277.7) |          2.67× | Rejected (`Sort`)     |
+| `q16`             | 27,724 |                 44,593 |      22,553,011 |                      129.2 (127.8–161.7) |         118.5 |                        135.8 (135.1–136.8) |      **0.95×** | Rejected (`Sort`)     |
+| `q17`             |      1 |                234,991 |     513,275,514 |                1,168.6 (1,156.8–1,178.4) |       1,152.4 |                        398.0 (394.5–403.2) |          2.94× | Rejected (`LeftSemi`) |
+| `q18`             |    100 |                297,360 |     237,511,219 |                1,365.5 (1,350.8–1,375.9) |       1,348.1 |                        455.6 (450.3–469.1) |          3.00× | Rejected (`Sort`)     |
+| `q19`             |      1 |                234,991 |     369,999,158 |                      554.3 (545.1–587.1) |         536.6 |                        327.4 (325.6–332.9) |          1.69× | **Admitted** (`Join`) |
+| `q20`             |    901 |                273,741 |     347,065,289 |                      466.1 (450.9–496.6) |         447.0 |                        294.1 (290.5–298.4) |          1.59× | Rejected (`Sort`)     |
+| `q21`             |    100 |                287,188 |     606,479,991 |                1,332.3 (1,313.5–1,356.2) |       1,311.8 |                        717.2 (713.1–724.0) |          1.86× | Rejected (`Sort`)     |
+| `q22`             |      7 |                 68,213 |      59,097,054 |                      121.7 (119.3–123.9) |         110.4 |                        142.2 (137.7–159.1) |      **0.86×** | Rejected (`Sort`)     |
+| **GeoMean (22q)** |      — |                      — |               — |                             **458.9 ms** |             — |                               **302.4 ms** |      **1.52×** | `3 / 22` admitted     |
+| **Sum (22q)**     |      — |                      — |               — |                          **12,921.6 ms** |             — |                             **7,654.2 ms** |      **1.69×** | `3 / 22` admitted     |
 
-## 2. Currently-Admitted Morsel Queries at SF5 (`q6`, `q1_unordered`, `q6_count`, `q6_scan`)
+## 2. Currently-Admitted Morsel Queries at SF5 (`q6`, `q14`, `q19`, `q1_unordered`, `q6_count`, `q6_scan`)
 
-All four admitted queries run over SF5 `lineitem` (`29,999,795` rows, 16 files,
-`240` row groups, `229,147 / 229,147` 4 KiB pages resident via `mincore`). Both
-Morsel arms executed natively under `MorselExec: workers=8,
-NativeParquet[lineitem...]`, claimed all `240 / 240` row groups, and scanned
-the exact same `bytes_scanned` as Stock DataFusion (`238,671,437` on `q6`,
-`259,744,879` on `q1_unordered`, `82,528,403` on `q6_count`, `285,708,571` on
-`q6_scan`).
+All six admitted workloads executed natively under `MorselExec: workers=8`,
+claimed 100% of scanned row groups (`240 / 240` for `lineitem`-only queries;
+`248 / 248` = `240 lineitem + 8 part` for two-pipeline `HashJoin` queries `q14`
+and `q19`), passed exact `mincore` warm-cache verification (`229,147 / 229,147`
+pages on `lineitem`-only; `234,991 / 234,991` pages on `lineitem + part`), and
+scanned the exact same `bytes_scanned` as Stock DataFusion (`238,671,437` on
+`q6`, `373,492,768` on `q14`, `369,999,158` on `q19`, `259,744,879` on
+`q1_unordered`, `82,528,403` on `q6_count`, `285,708,571` on `q6_scan`).
 
 ### 5-Arm Wall-Clock Comparison
 
 | Query          |    Rows | Arm                  | Batches | Morsels claimed | Median total ms (min–max) | Median exec ms (min–max) | vs. `stock_default` | vs. `duckdb_default` |
 | -------------- | ------: | -------------------- | ------: | --------------: | ------------------------: | -----------------------: | ------------------: | -------------------: |
-| `q6`           |       1 | `stock_default`      |       1 |               0 |       363.0 (355.6–367.2) |      350.0 (343.2–354.6) |               1.00× |                1.80× |
-| `q6`           |       1 | `stock_no_pushdown`  |       1 |               0 |       340.5 (337.2–349.4) |      329.2 (326.3–338.5) |               1.07× |                1.69× |
-| `q6`           |       1 | `morsel_no_pushdown` |       1 |             240 |   **338.4** (335.2–347.3) |      328.1 (325.0–337.0) |           **1.07×** |                1.68× |
-| `q6`           |       1 | `morsel_pushdown`    |       1 |             240 |       491.5 (487.4–522.6) |      478.8 (474.9–510.4) |               0.74× |                2.44× |
-| `q6`           |       1 | `duckdb_default`     |       1 |               — |       201.1 (198.0–206.8) |                        — |               1.80× |                1.00× |
-| `q1_unordered` |       4 | `stock_default`      |       3 |               0 |       761.9 (755.0–784.9) |      748.0 (740.9–770.7) |               1.00× |                1.63× |
-| `q1_unordered` |       4 | `stock_no_pushdown`  |       3 |               0 |       733.1 (726.6–751.9) |      719.7 (714.1–739.3) |               1.04× |                1.57× |
-| `q1_unordered` |       4 | `morsel_no_pushdown` |       1 |             240 |   **711.7** (706.0–715.6) |      699.8 (694.4–704.3) |           **1.07×** |                1.53× |
-| `q1_unordered` |       4 | `morsel_pushdown`    |       1 |             240 |       719.6 (706.2–723.2) |      706.0 (693.7–710.2) |               1.06× |                1.54× |
-| `q1_unordered` |       4 | `duckdb_default`     |       4 |               — |       466.3 (461.3–498.6) |                        — |               1.63× |                1.00× |
-| `q6_count`     |       1 | `stock_default`      |       1 |               0 |       203.7 (198.9–205.4) |      191.5 (186.2–192.7) |               1.00× |                2.54× |
-| `q6_count`     |       1 | `stock_no_pushdown`  |       1 |               0 |       188.2 (181.6–194.0) |      177.3 (171.5–183.1) |               1.08× |                2.34× |
-| `q6_count`     |       1 | `morsel_no_pushdown` |       1 |             240 |   **187.1** (185.0–189.2) |      176.8 (174.4–178.9) |           **1.09×** |                2.33× |
-| `q6_count`     |       1 | `morsel_pushdown`    |       1 |             240 |       250.8 (247.1–257.2) |      238.9 (235.4–245.8) |               0.81× |                3.12× |
-| `q6_count`     |       1 | `duckdb_default`     |       1 |               — |          80.3 (79.0–89.7) |                        — |               2.54× |                1.00× |
-| `q6_scan`      | 569,999 | `stock_default`      |      74 |               0 |       402.0 (397.4–424.4) |      389.5 (385.4–412.2) |               1.00× |                1.65× |
-| `q6_scan`      | 569,999 | `stock_no_pushdown`  |      72 |               0 |       375.4 (368.5–378.5) |      364.6 (358.4–368.3) |               1.07× |                1.54× |
-| `q6_scan`      | 569,999 | `morsel_no_pushdown` |   72–73 |             240 |   **376.6** (375.9–382.1) |      366.9 (366.2–372.3) |           **1.07×** |                1.55× |
-| `q6_scan`      | 569,999 | `morsel_pushdown`    |   73–74 |             240 |       549.4 (535.0–554.2) |      538.0 (524.2–542.7) |               0.73× |                2.26× |
-| `q6_scan`      | 569,999 | `duckdb_default`     |     240 |               — |       243.0 (242.4–245.0) |                        — |               1.65× |                1.00× |
+| `q6`           |       1 | `stock_default`      |       1 |               0 |       364.2 (358.2–373.5) |      350.8 (345.3–360.9) |               1.00× |                1.79× |
+| `q6`           |       1 | `stock_no_pushdown`  |       1 |               0 |       339.5 (336.8–352.7) |      328.2 (326.4–341.2) |               1.07× |                1.67× |
+| `q6`           |       1 | `morsel_no_pushdown` |       1 |             240 |   **339.3** (337.0–343.5) |      328.8 (326.7–333.3) |           **1.07×** |                1.67× |
+| `q6`           |       1 | `morsel_pushdown`    |       1 |             240 |       495.6 (483.7–519.9) |      483.6 (472.1–507.8) |               0.73× |                2.44× |
+| `q6`           |       1 | `duckdb_default`     |       1 |               — |       203.0 (201.9–208.5) |                        — |               1.79× |                1.00× |
+| `q14`          |       1 | `stock_default`      |       1 |               0 |       402.3 (399.2–405.6) |      386.4 (383.5–390.4) |               1.00× |                1.23× |
+| `q14`          |       1 | `stock_no_pushdown`  |       1 |               0 |       393.4 (387.1–401.1) |      379.2 (372.9–387.4) |               1.02× |                1.20× |
+| `q14`          |       1 | `morsel_no_pushdown` |       1 |             248 |       455.7 (453.1–457.9) |      443.5 (441.2–445.0) |               0.88× |                1.39× |
+| `q14`          |       1 | `morsel_pushdown`    |       1 |             248 |   **354.7** (348.7–356.6) |      340.8 (334.6–342.8) |           **1.13×** |            **1.09×** |
+| `q14`          |       1 | `duckdb_default`     |       1 |               — |       326.7 (320.5–330.1) |                        — |               1.23× |                1.00× |
+| `q19`          |       1 | `stock_default`      |       1 |               0 |       554.3 (545.1–587.1) |      536.6 (528.3–570.1) |               1.00× |                1.69× |
+| `q19`          |       1 | `stock_no_pushdown`  |       1 |               0 |       545.9 (533.3–595.6) |      531.4 (519.2–580.5) |               1.02× |                1.67× |
+| `q19`          |       1 | `morsel_no_pushdown` |       1 |             248 |   **521.8** (515.7–564.5) |      508.6 (502.2–551.0) |           **1.06×** |                1.59× |
+| `q19`          |       1 | `morsel_pushdown`    |       1 |             248 |       686.3 (668.0–689.7) |      670.6 (653.0–674.4) |               0.81× |                2.10× |
+| `q19`          |       1 | `duckdb_default`     |       1 |               — |       327.4 (325.6–332.9) |                        — |               1.69× |                1.00× |
+| `q1_unordered` |       4 | `stock_default`      |       3 |               0 |       780.0 (775.4–801.6) |      765.0 (761.3–787.5) |               1.00× |                1.66× |
+| `q1_unordered` |       4 | `stock_no_pushdown`  |       3 |               0 |       751.0 (738.4–764.9) |      738.1 (725.5–751.7) |               1.04× |                1.60× |
+| `q1_unordered` |       4 | `morsel_no_pushdown` |       1 |             240 |       720.7 (706.8–731.7) |      709.1 (695.1–719.9) |               1.08× |                1.54× |
+| `q1_unordered` |       4 | `morsel_pushdown`    |       1 |             240 |   **720.1** (713.8–749.8) |      707.2 (701.0–736.5) |           **1.08×** |                1.54× |
+| `q1_unordered` |       4 | `duckdb_default`     |       4 |               — |       468.7 (463.9–471.3) |                        — |               1.66× |                1.00× |
+| `q6_count`     |       1 | `stock_default`      |       1 |               0 |       200.1 (195.4–215.0) |      188.0 (182.9–202.4) |               1.00× |                2.48× |
+| `q6_count`     |       1 | `stock_no_pushdown`  |       1 |               0 |       187.8 (186.1–196.0) |      177.1 (175.6–184.6) |               1.07× |                2.33× |
+| `q6_count`     |       1 | `morsel_no_pushdown` |       1 |             240 |   **187.1** (183.8–189.0) |      176.8 (173.7–179.4) |           **1.07×** |                2.32× |
+| `q6_count`     |       1 | `morsel_pushdown`    |       1 |             240 |       247.8 (245.3–274.3) |      236.3 (233.7–262.5) |               0.81× |                3.07× |
+| `q6_count`     |       1 | `duckdb_default`     |       1 |               — |          80.7 (78.3–84.9) |                        — |               2.48× |                1.00× |
+| `q6_scan`      | 569,999 | `stock_default`      |   73–74 |               0 |       400.7 (394.7–405.1) |      388.7 (382.6–392.6) |               1.00× |                1.62× |
+| `q6_scan`      | 569,999 | `stock_no_pushdown`  |      72 |               0 |       377.2 (371.5–392.3) |      367.0 (360.7–382.0) |               1.06× |                1.53× |
+| `q6_scan`      | 569,999 | `morsel_no_pushdown` |   72–74 |             240 |   **381.2** (375.3–383.0) |      371.7 (365.7–373.1) |           **1.05×** |                1.54× |
+| `q6_scan`      | 569,999 | `morsel_pushdown`    |   72–75 |             240 |       546.4 (543.0–565.5) |      534.6 (531.6–553.4) |               0.73× |                2.21× |
+| `q6_scan`      | 569,999 | `duckdb_default`     |     240 |               — |       247.2 (241.9–265.6) |                        — |               1.62× |                1.00× |
 
-### Morsel Wait/Work Breakdown at SF5 (`MORSEL_METRICS=1`, Summed Across 8 Workers)
+### Morsel Wait/Work Breakdown at SF5 (`MORSEL_METRICS=1`, Summed Across 8 Workers & Pipelines)
 
-| Query          | Arm                  | Decode work ms | Process work ms | Ready wait ms | Output wait ms | Pending IO ms | Peak ready/out | Example worker claims (`240` total) |
-| -------------- | -------------------- | -------------: | --------------: | ------------: | -------------: | ------------: | -------------: | ----------------------------------- |
-| `q6`           | `morsel_no_pushdown` |        2,260.9 |           211.0 |          14.8 |            0.0 |         240.9 |          `8/1` | `[29, 30, 31, 31, 31, 29, 29, 30]`  |
-| `q6`           | `morsel_pushdown`    |        3,208.8 |             4.4 |         120.4 |            0.0 |         347.9 |          `5/1` | `[32, 32, 36, 27, 26, 25, 33, 29]`  |
-| `q1_unordered` | `morsel_no_pushdown` |        3,175.4 |         2,236.0 |          16.6 |            0.0 |         266.4 |          `8/1` | `[30, 30, 30, 30, 31, 30, 30, 29]`  |
-| `q1_unordered` | `morsel_pushdown`    |        3,353.8 |         1,915.3 |          39.2 |            0.0 |         302.6 |          `8/1` | `[32, 15, 47, 34, 25, 18, 32, 37]`  |
-| `q6_count`     | `morsel_no_pushdown` |        1,145.2 |           168.6 |          10.8 |            0.0 |         126.4 |          `8/1` | `[29, 30, 30, 30, 30, 29, 33, 29]`  |
-| `q6_count`     | `morsel_pushdown`    |        1,559.7 |             0.1 |          80.5 |            0.0 |         213.0 |          `6/1` | `[26, 34, 25, 29, 28, 31, 32, 35]`  |
-| `q6_scan`      | `morsel_no_pushdown` |        2,517.2 |           229.9 |          16.8 |            0.0 |         290.8 |          `8/6` | `[29, 33, 29, 29, 31, 31, 28, 30]`  |
-| `q6_scan`      | `morsel_pushdown`    |        3,566.6 |             7.4 |         134.0 |            0.0 |         366.3 |          `5/4` | `[33, 30, 29, 30, 21, 40, 30, 27]`  |
+| Query          | Arm                  | Decode work ms | Process work ms | Ready wait ms | Output wait ms | Pending IO ms | Peak ready/out | Example worker claims (`240` or `248` total) |
+| -------------- | -------------------- | -------------: | --------------: | ------------: | -------------: | ------------: | -------------: | -------------------------------------------- |
+| `q6`           | `morsel_no_pushdown` |        2,246.9 |           211.1 |          14.0 |            0.0 |         245.5 |          `8/1` | `[28, 32, 31, 30, 30, 30, 29, 30]`           |
+| `q6`           | `morsel_pushdown`    |        3,240.6 |             4.7 |          99.2 |            0.0 |         315.9 |          `5/1` | `[31, 32, 41, 26, 30, 32, 23, 25]`           |
+| `q14`          | `morsel_no_pushdown` |        2,460.9 |           253.3 |          32.0 |            0.0 |         283.7 |          `8/1` | `[31, 31, 32, 30, 31, 31, 31, 31]`           |
+| `q14`          | `morsel_pushdown`    |        1,492.5 |            78.3 |         102.6 |            0.0 |         316.2 |          `6/1` | `[32, 31, 35, 36, 30, 29, 28, 27]`           |
+| `q19`          | `morsel_no_pushdown` |        3,074.2 |           772.1 |          38.3 |            0.0 |         279.7 |          `8/1` | `[30, 30, 30, 30, 32, 31, 31, 34]`           |
+| `q19`          | `morsel_pushdown`    |        4,409.2 |            38.7 |         153.4 |            0.0 |         360.8 |          `5/1` | `[35, 28, 30, 29, 25, 32, 36, 33]`           |
+| `q1_unordered` | `morsel_no_pushdown` |        3,207.7 |         2,246.4 |          16.2 |            0.0 |         273.6 |          `8/1` | `[29, 31, 31, 31, 30, 29, 28, 31]`           |
+| `q1_unordered` | `morsel_pushdown`    |        3,374.0 |         1,922.2 |          38.9 |            0.0 |         333.5 |          `8/1` | `[25, 28, 30, 34, 31, 44, 26, 22]`           |
+| `q6_count`     | `morsel_no_pushdown` |        1,146.7 |           168.5 |           8.4 |            0.0 |         124.1 |          `8/1` | `[30, 29, 30, 29, 30, 30, 32, 30]`           |
+| `q6_count`     | `morsel_pushdown`    |        1,557.5 |             0.1 |          74.8 |            0.0 |         214.6 |          `6/1` | `[29, 30, 32, 33, 32, 24, 27, 33]`           |
+| `q6_scan`      | `morsel_no_pushdown` |        2,557.4 |           226.8 |          17.3 |            0.0 |         260.3 |          `8/4` | `[32, 30, 28, 28, 30, 31, 31, 30]`           |
+| `q6_scan`      | `morsel_pushdown`    |        3,618.6 |             8.1 |         116.3 |            0.0 |         361.5 |          `5/3` | `[24, 31, 29, 30, 35, 27, 36, 28]`           |
 
-Notice how cleanly SF5 scales compared to SF1 (`checkpoint_a_results.md`):
-under `morsel_no_pushdown`, aggregate `morsel_ready_wait` across all 8 workers
-stays at `10.8–16.8 ms` (`1.4–2.1 ms` per worker) over 240 row groups, and
-`morsel_output_wait` remains `0.0 ms`. On `q6`/`q6_count`/`q6_scan`, Parquet
-`RowFilter` pushdown (`morsel_pushdown`) still adds `~40%` extra decode work
-for the low-selectivity `Decimal128` predicates (as noted in `#173`), while on
-`q1_unordered` (98.6% selectivity) `morsel_no_pushdown` (`711.7 ms`) edges out
-`morsel_pushdown` (`719.6 ms`).
+Key SF5 Morsel observations:
+
+- **`q14` shows why `RowFilter` pushdown shines on selective `Date32`
+  predicates:** `l_shipdate` selects 1 month (~1.2% of `lineitem`), so
+  `morsel_pushdown` skips decoding `l_partkey`/`l_extendedprice`/`l_discount`
+  for ~98.8% of rows, slashing `decode_work` from `2,460.9` → `1,492.5 ms`
+  (`−39%`) and `process_work` from `253.3` → `78.3 ms`, turning a `455.7 ms`
+  `morsel_no_pushdown` run into a `354.7 ms` win over both `stock_default`
+  (`402.3 ms`, `1.13×`) and `stock_no_pushdown` (`393.4 ms`, `1.11×`) and
+  landing within `1.09×` of DuckDB 2.0.1 (`326.7 ms`).
+- **`q19` shows the opposite pushdown trade-off:** its probe-side `lineitem`
+  filter mixes `Utf8View` (`l_shipmode`, `l_shipinstruct`) and `Decimal128`
+  (`l_quantity`), where Parquet `RowFilter` adds `+1,335 ms` of decode work
+  (`3,074.2` → `4,409.2 ms`); without pushdown, `morsel_no_pushdown`
+  (`521.8 ms`) beats both `stock_default` (`554.3 ms`, `1.06×`) and
+  `stock_no_pushdown` (`545.9 ms`, `1.05×`).
+- **Low scheduling overhead at SF5:** under `morsel_no_pushdown`, aggregate
+  `morsel_ready_wait` across all 8 workers is `8.4–17.3 ms` on single-table
+  queries (`32.0–38.3 ms` across two pipelines on `q14`/`q19`), and
+  `morsel_output_wait` is `0.0 ms` on every query and arm.
 
 ## 3. Live 22-Query Morsel Admission & Operator-Capability Checklist
 
 Every standard TPC-H query (`q1`–`q22`) was probed with
-`tpch_runner plan required no_pushdown` at revision `9d512c59c`. Because
-`MorselQueryPlanner` walks logical plans top-down and stops at the first
-unsupported operator, the table below lists **both**:
+`tpch_runner plan required no_pushdown` at revision `0ff9edecf` (after `#188`
+native Inner `HashJoin`). Because `MorselQueryPlanner` walks logical plans
+top-down and stops at the first unsupported operator, the table below lists
+**both**:
 
 1. The **verbatim planning rejection** emitted under `morsel_mode=required`, and
 2. The **full set of physical plan operators** observed in Stock DataFusion's
    SF5 plan (`Sort`/`TopN`, `HashJoin` join types, `ScalarSubquery`,
    multi-stage `AggregateExec`, `COUNT(DISTINCT)`), providing a live checklist
-   for the upcoming `Sort`/`TopN`, `Inner Join`, `Semi`/`Anti`/`Outer Join`,
-   and Multi-Stage Composition issues.
+   for the upcoming `Sort`/`TopN`, multi-way `Inner Join`,
+   `Semi`/`Anti`/`Outer Join`, and Multi-Stage Composition issues.
 
-| Query | Status at HEAD | Underlying Stock Physical Plan Capabilities Needed                           | Verbatim `morsel_mode=required` Planning Rejection                                                                                                                                                                                                   |
-| ----- | -------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `q1`  | Rejected       | `Sort`, `Agg` (1 stage)                                                      | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: lineitem.l_returnflag ASC NULLS LAST, lineitem.l_linestatus ASC NULLS LAST`                                                                                        |
-| `q2`  | Rejected       | `TopN(100)`, `HashJoin(Inner×6, LeftSemi, RightSemi)`, `Agg`                 | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_acctbal DESC NULLS FIRST, nation.n_name ASC NULLS LAST, supplier.s_name ASC NULLS LAST, part.p_partkey ASC NULLS LAST, fetch=100`                       |
-| `q3`  | Rejected       | `TopN(10)`, `HashJoin(Inner×2)`, `Agg`                                       | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=10`                                                                                             |
-| `q4`  | Rejected       | `Sort`, `HashJoin(LeftSemi)`, `Agg`                                          | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: orders.o_orderpriority ASC NULLS LAST`                                                                                                                             |
-| `q5`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                           | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST`                                                                                                                                          |
-| `q6`  | **Admitted**   | `Agg` (ungrouped `SUM`) — **natively admitted**                              | _(admitted: `MorselExec: workers=8, NativeParquet[lineitem...] -> Filter -> AggregateSink`)_                                                                                                                                                         |
-| `q7`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                           | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: shipping.supp_nation ASC NULLS LAST, shipping.cust_nation ASC NULLS LAST, shipping.l_year ASC NULLS LAST`                                                          |
-| `q8`  | Rejected       | `Sort`, `HashJoin(Inner×7)`, `Agg`                                           | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: all_nations.o_year ASC NULLS LAST`                                                                                                                                 |
-| `q9`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                           | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: profit.nation ASC NULLS LAST, profit.o_year DESC NULLS FIRST`                                                                                                      |
-| `q10` | Rejected       | `TopN(20)`, `HashJoin(Inner×3)`, `Agg`                                       | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST, fetch=20`                                                                                                                                |
-| `q11` | Rejected       | `Sort`, `HashJoin(Inner×4)`, `MultiStageAgg(×2)`, `ScalarSubquery`           | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: value DESC NULLS FIRST`                                                                                                                                            |
-| `q12` | Rejected       | `Sort`, `HashJoin(Inner)`, `Agg`                                             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: lineitem.l_shipmode ASC NULLS LAST`                                                                                                                                |
-| `q13` | Rejected       | `Sort`, `HashJoin(Left)`, `MultiStageAgg(×2)`                                | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST`                                                                                                      |
-| `q14` | Rejected       | `HashJoin(Inner)`, `Agg`                                                     | `Error during planning: morsel_mode=required: unsupported logical operator: Inner Join: lineitem.l_partkey = part.p_partkey`                                                                                                                         |
-| `q15` | Rejected       | `Sort`, `HashJoin(Inner)`, `MultiStageAgg(×3)`, `ScalarSubquery`             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_suppkey ASC NULLS LAST`                                                                                                                                 |
-| `q16` | Rejected       | `Sort`, `HashJoin(Inner, RightAnti)`, `MultiStageAgg(×2)`, `COUNT(DISTINCT)` | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier_cnt DESC NULLS FIRST, part.p_brand ASC NULLS LAST, part.p_type ASC NULLS LAST, part.p_size ASC NULLS LAST`                                                |
-| `q17` | Rejected       | `HashJoin(Inner, LeftSemi + filter)`, `MultiStageAgg(×2)`                    | `Error during planning: morsel_mode=required: unsupported logical operator: LeftSemi Join: part.p_partkey = __scalar_sq_1.l_partkey Filter: CAST(lineitem.l_quantity AS Decimal128(30, 15)) < __scalar_sq_1.Float64(0.2) * avg(lineitem.l_quantity)` |
-| `q18` | Rejected       | `TopN(100)`, `HashJoin(Inner×2, RightSemi)`, `MultiStageAgg(×2)`             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: orders.o_totalprice DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=100`                                                                                |
-| `q19` | Rejected       | `HashJoin(Inner + disjunctive filter)`, `Agg`                                | `Error during planning: morsel_mode=required: unsupported logical operator: Inner Join: lineitem.l_partkey = part.p_partkey Filter: ...` _(3-branch disjunctive `OR` filter on `part`/`lineitem`)_                                                   |
-| `q20` | Rejected       | `Sort`, `HashJoin(Inner, LeftSemi×2, RightSemi)`, `Agg`                      | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_name ASC NULLS LAST`                                                                                                                                    |
-| `q21` | Rejected       | `TopN(100)`, `HashJoin(Inner×3, LeftSemi, RightAnti)`, `Agg`                 | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: numwait DESC NULLS FIRST, supplier.s_name ASC NULLS LAST, fetch=100`                                                                                               |
-| `q22` | Rejected       | `Sort`, `HashJoin(LeftAnti)`, `MultiStageAgg(×2)`, `ScalarSubquery`          | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: custsale.cntrycode ASC NULLS LAST`                                                                                                                                 |
+| Query | Status at HEAD | Underlying Stock Physical Plan Capabilities Needed                             | Verbatim `morsel_mode=required` Planning Rejection                                                                                                                                                                             |
+| ----- | -------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `q1`  | Rejected       | `Sort`, `Agg` (1 stage)                                                        | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: lineitem.l_returnflag ASC NULLS LAST, lineitem.l_linestatus ASC NULLS LAST`                                                                  |
+| `q2`  | Rejected       | `TopN(100)`, `HashJoin(Inner×6, LeftSemi, RightSemi)`, `Agg`                   | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_acctbal DESC NULLS FIRST, nation.n_name ASC NULLS LAST, supplier.s_name ASC NULLS LAST, part.p_partkey ASC NULLS LAST, fetch=100` |
+| `q3`  | Rejected       | `TopN(10)`, `HashJoin(Inner×2)`, `Agg`                                         | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=10`                                                                       |
+| `q4`  | Rejected       | `Sort`, `HashJoin(LeftSemi)`, `Agg`                                            | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: orders.o_orderpriority ASC NULLS LAST`                                                                                                       |
+| `q5`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST`                                                                                                                    |
+| `q6`  | **Admitted**   | `Agg` (ungrouped `SUM`) — **natively admitted**                                | _(admitted: `MorselExec: workers=8, NativeParquet[lineitem] -> Filter -> AggregateSink`)_                                                                                                                                      |
+| `q7`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: shipping.supp_nation ASC NULLS LAST, shipping.cust_nation ASC NULLS LAST, shipping.l_year ASC NULLS LAST`                                    |
+| `q8`  | Rejected       | `Sort`, `HashJoin(Inner×7)`, `Agg`                                             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: all_nations.o_year ASC NULLS LAST`                                                                                                           |
+| `q9`  | Rejected       | `Sort`, `HashJoin(Inner×5)`, `Agg`                                             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: profit.nation ASC NULLS LAST, profit.o_year DESC NULLS FIRST`                                                                                |
+| `q10` | Rejected       | `TopN(20)`, `HashJoin(Inner×3)`, `Agg`                                         | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: revenue DESC NULLS FIRST, fetch=20`                                                                                                          |
+| `q11` | Rejected       | `Sort`, `HashJoin(Inner×4)`, `MultiStageAgg(×2)`, `ScalarSubquery`             | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: value DESC NULLS FIRST`                                                                                                                      |
+| `q12` | Rejected       | `Sort`, `HashJoin(Inner)`, `Agg`                                               | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: lineitem.l_shipmode ASC NULLS LAST`                                                                                                          |
+| `q13` | Rejected       | `Sort`, `HashJoin(Left)`, `MultiStageAgg(×2)`                                  | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST`                                                                                |
+| `q14` | **Admitted**   | `HashJoin(Inner)`, `Agg` — **natively admitted (`#188`)**                      | _(admitted: `MorselExec: workers=8, [Build: NativeParquet[part] -> HashJoinBuildSink]; NativeParquet[lineitem] -> Filter -> HashJoinProbe -> AggregateSink`)_                                                                  |
+| `q15` | Rejected       | `Sort`, `HashJoin(Inner)`, `MultiStageAgg(×3)`, `ScalarSubquery`               | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_suppkey ASC NULLS LAST`                                                                                                           |
+| `q16` | Rejected       | `Sort`, `HashJoin(Inner, RightAnti)`, `MultiStageAgg(×2)`, `COUNT(DISTINCT)`   | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier_cnt DESC NULLS FIRST, part.p_brand ASC NULLS LAST, part.p_type ASC NULLS LAST, part.p_size ASC NULLS LAST`                          |
+| `q17` | Rejected       | `HashJoin(Inner, LeftSemi + filter)`, `MultiStageAgg(×2)`                      | `Error during planning: morsel_mode=required: unsupported join type LeftSemi in native morsel hash join (only INNER JOIN is supported)`                                                                                        |
+| `q18` | Rejected       | `TopN(100)`, `HashJoin(Inner×2, RightSemi)`, `MultiStageAgg(×2)`               | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: orders.o_totalprice DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=100`                                                          |
+| `q19` | **Admitted**   | `HashJoin(Inner + disjunctive filter)`, `Agg` — **natively admitted (`#188`)** | _(admitted: `MorselExec: workers=8, [Build: NativeParquet[part] -> Filter -> HashJoinBuildSink]; NativeParquet[lineitem] -> Filter -> HashJoinProbe[filter=...] -> AggregateSink`)_                                            |
+| `q20` | Rejected       | `Sort`, `HashJoin(Inner, LeftSemi×2, RightSemi)`, `Agg`                        | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: supplier.s_name ASC NULLS LAST`                                                                                                              |
+| `q21` | Rejected       | `TopN(100)`, `HashJoin(Inner×3, LeftSemi, RightAnti)`, `Agg`                   | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: numwait DESC NULLS FIRST, supplier.s_name ASC NULLS LAST, fetch=100`                                                                         |
+| `q22` | Rejected       | `Sort`, `HashJoin(LeftAnti)`, `MultiStageAgg(×2)`, `ScalarSubquery`            | `Error during planning: morsel_mode=required: unsupported logical operator: Sort: custsale.cntrycode ASC NULLS LAST`                                                                                                           |
 
 ### Capability Unlock Roadmap Summary
 
-- **Already admitted (`1 / 22`):** `q6` (plus slices `q1_unordered`,
-  `q6_count`, `q6_scan`).
-- **`Sort` alone unlocks (`+1` → `2 / 22`):** `q1`.
-- **`Inner Join` + `Sort`/`TopN` + multi-join pipelines unlock (`+9` →
-  `11 / 22`):** `q14`, `q19` (with join filter), `q12`, `q3`, `q10`, `q5`,
-  `q7`, `q8`, `q9` (note `q14`/`q19` need no `Sort` at all — `Inner Join` alone
-  unlocks `q14`, and `Inner Join` with residual filter unlocks `q19`).
+- **Already admitted (`3 / 22`):** `q6`, `q14`, `q19` (plus slices
+  `q1_unordered`, `q6_count`, `q6_scan`).
+- **`Sort` alone unlocks (`+1` → `4 / 22`):** `q1` (and with `#188`'s single
+  `Inner Join`, **`q12`** as well once `Sort` lands, bringing single-join +
+  `Sort` to `5 / 22`).
+- **`Sort` / `TopN` + multi-way `Inner Join` pipelines unlock (`+7` →
+  `11 / 22`):** `q12` (1 inner join + `Sort`), `q3` (2 inner joins + `TopN`),
+  `q10` (3 inner joins + `TopN`), `q5`, `q7`, `q8`, `q9` (5–7 inner joins +
+  `Sort`).
 - **Semi / Anti / Left Outer Joins (+ multi-stage agg / `COUNT(DISTINCT)`)
   unlock (`+8` → `19 / 22`):** `q4` (`LeftSemi`), `q13` (`Left` + 2-stage agg),
   `q16` (`RightAnti` + `COUNT(DISTINCT)`), `q17` (`LeftSemi` with filter +
