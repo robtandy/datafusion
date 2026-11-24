@@ -21,10 +21,14 @@ use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{Result, exec_err, internal_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::execution_plan::apply_expression_roots;
 use tokio::sync::mpsc;
 
 use super::Pipeline;
+use super::batch::{
+    BatchView, Selection, collect_expr_column_indices, remap_expr_columns,
+};
 
 const FINALIZE_YIELD_CHUNK: usize = 4096;
 
@@ -680,6 +684,79 @@ pub(super) struct HashJoinBuildState {
 }
 
 impl HashJoinBuildState {
+    pub(super) fn add_view(&mut self, view: &BatchView) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        if view.is_all() {
+            return self.add_batch(view.batch());
+        }
+        let batch = view.batch();
+        let selected = view.num_rows();
+        let key_needed_cols = collect_expr_column_indices(&self.key_exprs);
+        let compact_key_input = view.materialize_columns(&key_needed_cols)?;
+        let mut keys = Vec::with_capacity(self.key_exprs.len());
+        for expr in &self.key_exprs {
+            let rebound = remap_expr_columns(Arc::clone(expr), &key_needed_cols)?;
+            keys.push(rebound.evaluate(&compact_key_input)?.into_array(selected)?);
+        }
+
+        let valid_mask = valid_key_mask(&keys);
+        let (filtered_keys, payload_selection, valid_rows) = match valid_mask {
+            Some(bits) => {
+                let valid_rows = bits.count_set_bits();
+                if valid_rows == 0 {
+                    return Ok(());
+                }
+                let predicate = BooleanArray::new(bits, None);
+                let filtered_keys = keys
+                    .iter()
+                    .map(|k| Ok(filter(k.as_ref(), &predicate)?))
+                    .collect::<Result<Vec<ArrayRef>>>()?;
+                let combined_sel = view
+                    .selection()
+                    .compose_compact_mask(batch.num_rows(), &predicate)?;
+                (filtered_keys, Some(combined_sel), valid_rows)
+            }
+            None => (keys, None, selected),
+        };
+
+        let payload_batch = if self.payload_columns.is_empty() {
+            None
+        } else {
+            match payload_selection {
+                Some(sel) => {
+                    let narrowed_view =
+                        BatchView::try_new(batch.project(&self.payload_columns)?, sel)?;
+                    Some(narrowed_view.materialize()?)
+                }
+                None => Some(view.materialize_columns(&self.payload_columns)?),
+            }
+        };
+
+        let normalized_keys = normalize_key_arrays(filtered_keys, self.has_floats);
+        let hashes = compute_build_hashes(self.key_kind, &normalized_keys, valid_rows)?;
+
+        let delta = chunk_memory_bytes(
+            payload_batch.as_ref(),
+            &normalized_keys,
+            hashes.capacity(),
+        );
+        self.reservation.try_grow(delta)?;
+
+        if let Some(payload) = payload_batch {
+            self.batches.push(payload);
+        }
+        self.key_batches.push(normalized_keys);
+        self.hash_chunks.push(hashes);
+        self.num_rows = self.num_rows.checked_add(valid_rows).ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!(
+                "Morsel HashJoin build row count overflow"
+            )
+        })?;
+        Ok(())
+    }
+
     pub(super) fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -902,17 +979,38 @@ enum ProbeKeys {
     },
 }
 
+enum ProbeRows {
+    /// All rows `0..num_rows` in `cursor.batch` (key index == backing row).
+    All { num_rows: usize },
+    /// Backing-coordinate bitmask (key array is uncompacted; key index == backing row).
+    Mask {
+        bits: BooleanBuffer,
+        num_rows: usize,
+    },
+    /// Backing-coordinate indices (key array is uncompacted; backing row = `indices[pos]`).
+    BackingIndices(UInt32Array),
+    /// Compacted key arrays of length `backing_rows.len()`; payload is gathered from `backing_rows[pos]`.
+    CompactedKeys { backing_rows: UInt32Array },
+}
+
 pub(super) struct ProbeCursor {
     batch: RecordBatch,
     keys: ProbeKeys,
     valid_mask: Option<BooleanBuffer>,
-    probe_row: usize,
+    rows: ProbeRows,
+    pos: usize,
     next_entry: u32,
 }
 
 impl ProbeCursor {
     fn is_exhausted(&self) -> bool {
-        self.probe_row >= self.batch.num_rows()
+        match &self.rows {
+            ProbeRows::All { num_rows } | ProbeRows::Mask { num_rows, .. } => {
+                self.pos >= *num_rows
+            }
+            ProbeRows::BackingIndices(indices) => self.pos >= indices.len(),
+            ProbeRows::CompactedKeys { backing_rows } => self.pos >= backing_rows.len(),
+        }
     }
 }
 
@@ -922,6 +1020,7 @@ pub(super) struct HashJoinProbe {
     pub(super) build_side: BuildSide,
     probe_key_exprs: Vec<Arc<dyn PhysicalExpr>>,
     probe_key_names: Vec<String>,
+    plain_single_key_col: Option<usize>,
     key_kind: KeyKind,
     has_floats: bool,
     pub(super) output_projection: Vec<JoinOutputCol>,
@@ -945,11 +1044,16 @@ impl HashJoinProbe {
     pub(super) fn new(config: HashJoinProbeConfig) -> Self {
         let key_kind = KeyKind::from_types(&config.key_types);
         let has_floats = has_float_type(&config.key_types);
+        let plain_single_key_col = match config.probe_key_exprs.as_slice() {
+            [expr] => expr.downcast_ref::<Column>().map(Column::index),
+            _ => None,
+        };
         Self {
             build_pipeline: config.build_pipeline,
             build_side: config.build_side,
             probe_key_exprs: config.probe_key_exprs,
             probe_key_names: config.probe_key_names,
+            plain_single_key_col,
             key_kind,
             has_floats,
             output_projection: config.output_projection,
@@ -979,7 +1083,110 @@ impl HashJoinProbe {
         )
     }
 
-    pub(super) fn start_probe(
+    pub(super) fn start_probe_view(
+        &self,
+        view: BatchView,
+        table: &FinalizedHashTable,
+    ) -> Result<Option<ProbeCursor>> {
+        if view.is_empty() || table.is_empty() {
+            return Ok(None);
+        }
+        // Compact only when a tiny selection pins a disproportionately large backing
+        // buffer across a probe continuation cursor.
+        let view = view.into_compacted_for_retention(512 * 1024, 16)?;
+        if view.is_all() {
+            return self.start_probe_all(view.into_parts().0, table);
+        }
+
+        // Zero-copy fast path for single plain integer column keys:
+        // read directly from backing array at selected row positions without copying keys.
+        let is_flat_int = matches!(
+            self.key_kind,
+            KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+        );
+        if is_flat_int && let Some(key_col) = self.plain_single_key_col {
+            let (batch, selection) = view.into_parts();
+            let num_rows = batch.num_rows();
+            let key_arr = batch.column(key_col);
+            let (rows, valid_mask) = match selection {
+                Selection::All => unreachable!(),
+                Selection::Mask { bits, .. } => {
+                    let effective_bits = if key_arr.null_count() > 0 {
+                        let nulls = key_arr.nulls().unwrap().inner();
+                        let combined = &bits & nulls;
+                        if combined.count_set_bits() == 0 {
+                            return Ok(None);
+                        }
+                        combined
+                    } else {
+                        bits
+                    };
+                    (
+                        ProbeRows::Mask {
+                            bits: effective_bits,
+                            num_rows,
+                        },
+                        None,
+                    )
+                }
+                Selection::Indices(indices) => {
+                    let valid_mask = if key_arr.null_count() > 0 {
+                        Some(key_arr.nulls().unwrap().inner().clone())
+                    } else {
+                        None
+                    };
+                    (ProbeRows::BackingIndices(indices), valid_mask)
+                }
+            };
+            let keys =
+                self.build_probe_keys(std::slice::from_ref(key_arr), num_rows, table)?;
+            return Ok(Some(ProbeCursor {
+                batch,
+                keys,
+                valid_mask,
+                rows,
+                pos: 0,
+                next_entry: 0,
+            }));
+        }
+
+        // General selection-aware probe path (strings, composite keys, or expression keys):
+        // evaluate key expressions and hash ONLY selected rows, while keeping the
+        // backing batch uncopied so payload columns are gathered only for matches.
+        let backing_rows = match view.selection().to_indices(view.batch().num_rows()) {
+            Some(indices) => indices,
+            None => {
+                // Fallback for batches exceeding u32::MAX rows.
+                return self.start_probe_all(view.materialize()?, table);
+            }
+        };
+        let selected = backing_rows.len();
+        let key_needed_cols = collect_expr_column_indices(&self.probe_key_exprs);
+        let compact_key_input = view.materialize_columns(&key_needed_cols)?;
+        let mut key_arrays = Vec::with_capacity(self.probe_key_exprs.len());
+        for expr in &self.probe_key_exprs {
+            let rebound = remap_expr_columns(Arc::clone(expr), &key_needed_cols)?;
+            key_arrays.push(rebound.evaluate(&compact_key_input)?.into_array(selected)?);
+        }
+        let valid_mask = valid_key_mask(&key_arrays);
+        if let Some(bits) = &valid_mask
+            && bits.count_set_bits() == 0
+        {
+            return Ok(None);
+        }
+        let keys = self.build_probe_keys(&key_arrays, selected, table)?;
+        let (batch, _) = view.into_parts();
+        Ok(Some(ProbeCursor {
+            batch,
+            keys,
+            valid_mask,
+            rows: ProbeRows::CompactedKeys { backing_rows },
+            pos: 0,
+            next_entry: 0,
+        }))
+    }
+
+    fn start_probe_all(
         &self,
         batch: RecordBatch,
         table: &FinalizedHashTable,
@@ -998,7 +1205,25 @@ impl HashJoinProbe {
         {
             return Ok(None);
         }
-        let keys = match (&self.key_kind, &table.keys) {
+        let keys = self.build_probe_keys(&key_arrays, num_rows, table)?;
+
+        Ok(Some(ProbeCursor {
+            batch,
+            keys,
+            valid_mask,
+            rows: ProbeRows::All { num_rows },
+            pos: 0,
+            next_entry: 0,
+        }))
+    }
+
+    fn build_probe_keys(
+        &self,
+        key_arrays: &[ArrayRef],
+        num_rows: usize,
+        table: &FinalizedHashTable,
+    ) -> Result<ProbeKeys> {
+        match (&self.key_kind, &table.keys) {
             (KeyKind::Int32, BuildKeys::Int32(_)) => {
                 let arr = key_arrays[0]
                     .as_any()
@@ -1009,7 +1234,7 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::Int32(arr)
+                Ok(ProbeKeys::Int32(arr))
             }
             (KeyKind::Int64, BuildKeys::Int64(_)) => {
                 let arr = key_arrays[0]
@@ -1021,7 +1246,7 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::Int64(arr)
+                Ok(ProbeKeys::Int64(arr))
             }
             (KeyKind::UInt32, BuildKeys::UInt32(_)) => {
                 let arr = key_arrays[0]
@@ -1033,7 +1258,7 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::UInt32(arr)
+                Ok(ProbeKeys::UInt32(arr))
             }
             (KeyKind::UInt64, BuildKeys::UInt64(_)) => {
                 let arr = key_arrays[0]
@@ -1045,11 +1270,11 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::UInt64(arr)
+                Ok(ProbeKeys::UInt64(arr))
             }
             (KeyKind::Utf8, BuildKeys::Utf8 { .. }) => {
                 let mut hashes = vec![0u64; num_rows];
-                create_hashes(&key_arrays, &join_random_state(), &mut hashes)?;
+                create_hashes(key_arrays, &join_random_state(), &mut hashes)?;
                 let array = key_arrays[0]
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -1059,11 +1284,11 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::Utf8 { array, hashes }
+                Ok(ProbeKeys::Utf8 { array, hashes })
             }
             (KeyKind::LargeUtf8, BuildKeys::LargeUtf8 { .. }) => {
                 let mut hashes = vec![0u64; num_rows];
-                create_hashes(&key_arrays, &join_random_state(), &mut hashes)?;
+                create_hashes(key_arrays, &join_random_state(), &mut hashes)?;
                 let array = key_arrays[0]
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
@@ -1073,11 +1298,11 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::LargeUtf8 { array, hashes }
+                Ok(ProbeKeys::LargeUtf8 { array, hashes })
             }
             (KeyKind::Utf8View, BuildKeys::Utf8View { .. }) => {
                 let mut hashes = vec![0u64; num_rows];
-                create_hashes(&key_arrays, &join_random_state(), &mut hashes)?;
+                create_hashes(key_arrays, &join_random_state(), &mut hashes)?;
                 let array = key_arrays[0]
                     .as_any()
                     .downcast_ref::<StringViewArray>()
@@ -1087,29 +1312,18 @@ impl HashJoinProbe {
                         )
                     })?
                     .clone();
-                ProbeKeys::Utf8View { array, hashes }
+                Ok(ProbeKeys::Utf8View { array, hashes })
             }
             (KeyKind::Rows, BuildKeys::Rows { converter, .. }) => {
-                let normalized = normalize_key_arrays(key_arrays, self.has_floats);
+                let normalized =
+                    normalize_key_arrays(key_arrays.to_vec(), self.has_floats);
                 let mut hashes = vec![0u64; num_rows];
                 create_hashes(&normalized, &join_random_state(), &mut hashes)?;
                 let rows = converter.convert_columns(&normalized)?;
-                ProbeKeys::Rows { rows, hashes }
+                Ok(ProbeKeys::Rows { rows, hashes })
             }
-            _ => {
-                return internal_err!(
-                    "Morsel HashJoin build/probe key representation mismatch"
-                );
-            }
-        };
-
-        Ok(Some(ProbeCursor {
-            batch,
-            keys,
-            valid_mask,
-            probe_row: 0,
-            next_entry: 0,
-        }))
+            _ => internal_err!("Morsel HashJoin build/probe key representation mismatch"),
+        }
     }
 
     pub(super) fn next_chunk(
@@ -1206,118 +1420,311 @@ impl HashJoinProbe {
     }
 }
 
-macro_rules! probe_flat_int_core {
-    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $num_rows:expr, $hash_key:expr, $on_match:expr) => {{
+macro_rules! probe_flat_int_step {
+    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $key_idx:expr, $backing_row:expr, $matched:expr, $hash_key:expr, $on_match:expr) => {{
         let slots = $flat.slots.as_slice();
         let dup_next = $flat.dup_next.as_slice();
         let mask = $flat.mask;
-        let mut matched = 0usize;
+        let key_idx: usize = $key_idx;
+        let backing_row: u32 = $backing_row;
 
-        while $cursor.probe_row < $num_rows && matched < $limit {
-            let probe_row = $cursor.probe_row;
-            if $cursor.next_entry == 0 {
-                if let Some(valid) = &$cursor.valid_mask
-                    && !valid.value(probe_row)
-                {
-                    $cursor.probe_row += 1;
+        if $cursor.next_entry == 0 {
+            if let Some(valid) = &$cursor.valid_mask
+                && !valid.value(key_idx)
+            {
+                $cursor.pos += 1;
+                continue;
+            }
+            let pk = $p_vals[key_idx];
+            let mut slot_pos = ($hash_key(pk) as usize) & mask;
+            let dup_head = loop {
+                let slot = &slots[slot_pos];
+                if slot.first_row == 0 {
+                    break None;
+                }
+                if slot.key == pk {
+                    $on_match(slot.first_row - 1, backing_row);
+                    $matched += 1;
+                    break Some(slot.dup_head);
+                }
+                slot_pos = (slot_pos + 1) & mask;
+            };
+            match dup_head {
+                None | Some(0) => {
+                    $cursor.pos += 1;
                     continue;
                 }
-                let pk = $p_vals[probe_row];
-                let mut pos = ($hash_key(pk) as usize) & mask;
-                let dup_head = loop {
-                    let slot = &slots[pos];
-                    if slot.first_row == 0 {
-                        break None;
+                Some(head) => {
+                    $cursor.next_entry = head;
+                    if $matched == $limit {
+                        break;
                     }
-                    if slot.key == pk {
-                        $on_match(slot.first_row - 1, probe_row as u32);
+                }
+            }
+        }
+
+        let mut entry = $cursor.next_entry;
+        while entry != 0 {
+            let build_row = (entry - 1) as usize;
+            entry = dup_next[build_row];
+            $on_match(build_row as u32, backing_row);
+            $matched += 1;
+            if $matched == $limit {
+                $cursor.next_entry = entry;
+                if entry == 0 {
+                    $cursor.pos += 1;
+                }
+                break;
+            }
+        }
+        if $matched < $limit {
+            $cursor.next_entry = 0;
+            $cursor.pos += 1;
+        }
+    }};
+}
+
+macro_rules! probe_flat_int_core {
+    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $hash_key:expr, $on_match:expr) => {{
+        let mut matched = 0usize;
+        match &$cursor.rows {
+            ProbeRows::All { num_rows } => {
+                let num_rows = *num_rows;
+                while $cursor.pos < num_rows && matched < $limit {
+                    let probe_row = $cursor.pos;
+                    probe_flat_int_step!(
+                        $cursor,
+                        $flat,
+                        $p_vals,
+                        $limit,
+                        probe_row,
+                        probe_row as u32,
+                        matched,
+                        $hash_key,
+                        $on_match
+                    );
+                }
+            }
+            ProbeRows::Mask { bits, num_rows } => {
+                let slots = $flat.slots.as_slice();
+                let dup_next = $flat.dup_next.as_slice();
+                let mask = $flat.mask;
+                let num_rows = *num_rows;
+
+                // Resume pending duplicate chain for `$cursor.pos` first.
+                if $cursor.next_entry != 0 && $cursor.pos < num_rows {
+                    let probe_row = $cursor.pos;
+                    let mut entry = $cursor.next_entry;
+                    while entry != 0 && matched < $limit {
+                        let build_row = (entry - 1) as usize;
+                        entry = dup_next[build_row];
+                        $on_match(build_row as u32, probe_row as u32);
                         matched += 1;
-                        break Some(slot.dup_head);
                     }
-                    pos = (pos + 1) & mask;
-                };
-                match dup_head {
-                    None | Some(0) => {
-                        $cursor.probe_row += 1;
-                        continue;
+                    if entry == 0 {
+                        $cursor.next_entry = 0;
+                        $cursor.pos = probe_row + 1;
+                    } else {
+                        $cursor.next_entry = entry;
                     }
-                    Some(head) => {
-                        $cursor.next_entry = head;
-                        if matched == $limit {
-                            break;
+                }
+
+                if matched < $limit && $cursor.pos < num_rows {
+                    let start = $cursor.pos;
+                    let mut hit_limit = false;
+                    for rel in bits.slice(start, num_rows - start).set_indices() {
+                        let probe_row = start + rel;
+                        let pk = $p_vals[probe_row];
+                        let mut slot_pos = ($hash_key(pk) as usize) & mask;
+                        let dup_head = loop {
+                            let slot = &slots[slot_pos];
+                            if slot.first_row == 0 {
+                                break None;
+                            }
+                            if slot.key == pk {
+                                $on_match(slot.first_row - 1, probe_row as u32);
+                                matched += 1;
+                                break Some(slot.dup_head);
+                            }
+                            slot_pos = (slot_pos + 1) & mask;
+                        };
+                        match dup_head {
+                            None | Some(0) => {
+                                if matched == $limit {
+                                    $cursor.pos = probe_row + 1;
+                                    $cursor.next_entry = 0;
+                                    hit_limit = true;
+                                    break;
+                                }
+                            }
+                            Some(head) => {
+                                if matched == $limit {
+                                    $cursor.pos = probe_row;
+                                    $cursor.next_entry = head;
+                                    hit_limit = true;
+                                    break;
+                                }
+                                let mut entry = head;
+                                while entry != 0 {
+                                    let build_row = (entry - 1) as usize;
+                                    entry = dup_next[build_row];
+                                    $on_match(build_row as u32, probe_row as u32);
+                                    matched += 1;
+                                    if matched == $limit {
+                                        $cursor.next_entry = entry;
+                                        $cursor.pos = if entry == 0 {
+                                            probe_row + 1
+                                        } else {
+                                            probe_row
+                                        };
+                                        hit_limit = true;
+                                        break;
+                                    }
+                                }
+                                if hit_limit {
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-            }
-
-            let mut entry = $cursor.next_entry;
-            while entry != 0 {
-                let build_row = (entry - 1) as usize;
-                entry = dup_next[build_row];
-                $on_match(build_row as u32, probe_row as u32);
-                matched += 1;
-                if matched == $limit {
-                    $cursor.next_entry = entry;
-                    if entry == 0 {
-                        $cursor.probe_row += 1;
+                    if !hit_limit {
+                        $cursor.pos = num_rows;
+                        $cursor.next_entry = 0;
                     }
-                    break;
                 }
             }
-            if matched < $limit {
-                $cursor.next_entry = 0;
-                $cursor.probe_row += 1;
+            ProbeRows::BackingIndices(indices) => {
+                let sel = indices.values();
+                let len = sel.len();
+                while $cursor.pos < len && matched < $limit {
+                    let backing_row = sel[$cursor.pos];
+                    probe_flat_int_step!(
+                        $cursor,
+                        $flat,
+                        $p_vals,
+                        $limit,
+                        backing_row as usize,
+                        backing_row,
+                        matched,
+                        $hash_key,
+                        $on_match
+                    );
+                }
+            }
+            ProbeRows::CompactedKeys { backing_rows } => {
+                let backing = backing_rows.values();
+                let len = backing.len();
+                while $cursor.pos < len && matched < $limit {
+                    let key_idx = $cursor.pos;
+                    let backing_row = backing[key_idx];
+                    probe_flat_int_step!(
+                        $cursor,
+                        $flat,
+                        $p_vals,
+                        $limit,
+                        key_idx,
+                        backing_row,
+                        matched,
+                        $hash_key,
+                        $on_match
+                    );
+                }
             }
         }
         matched
     }};
 }
 
-macro_rules! probe_loop_core {
-    ($cursor:expr, $table:expr, $limit:expr, $num_rows:expr, $get_hash:expr, $is_match:expr, $on_match:expr) => {{
+macro_rules! probe_loop_step {
+    ($cursor:expr, $table:expr, $limit:expr, $key_idx:expr, $backing_row:expr, $matched:expr, $get_hash:expr, $is_match:expr, $on_match:expr) => {{
         let buckets = $table.buckets.as_slice();
         let next = $table.next.as_slice();
         let mask = $table.mask;
-        let mut matched = 0usize;
+        let key_idx: usize = $key_idx;
+        let backing_row: u32 = $backing_row;
 
-        while $cursor.probe_row < $num_rows && matched < $limit {
-            let probe_row = $cursor.probe_row;
-            if $cursor.next_entry == 0 {
-                if let Some(valid) = &$cursor.valid_mask
-                    && !valid.value(probe_row)
-                {
-                    $cursor.probe_row += 1;
-                    continue;
-                }
-                let h: u64 = $get_hash(probe_row);
-                let entry = buckets[(h as usize) & mask];
-                if entry == 0 {
-                    $cursor.probe_row += 1;
-                    continue;
-                }
-                $cursor.next_entry = entry;
+        if $cursor.next_entry == 0 {
+            if let Some(valid) = &$cursor.valid_mask
+                && !valid.value(key_idx)
+            {
+                $cursor.pos += 1;
+                continue;
             }
+            let h: u64 = $get_hash(key_idx);
+            let entry = buckets[(h as usize) & mask];
+            if entry == 0 {
+                $cursor.pos += 1;
+                continue;
+            }
+            $cursor.next_entry = entry;
+        }
 
-            let h: u64 = $get_hash(probe_row);
-            let mut entry = $cursor.next_entry;
-            while entry != 0 {
-                let build_row = (entry - 1) as usize;
-                entry = next[build_row];
-                if $is_match(build_row, probe_row, h) {
-                    $on_match(build_row as u32, probe_row as u32);
-                    matched += 1;
-                    if matched == $limit {
-                        $cursor.next_entry = entry;
-                        if entry == 0 {
-                            $cursor.probe_row += 1;
-                        }
-                        break;
+        let h: u64 = $get_hash(key_idx);
+        let mut entry = $cursor.next_entry;
+        while entry != 0 {
+            let build_row = (entry - 1) as usize;
+            entry = next[build_row];
+            if $is_match(build_row, key_idx, h) {
+                $on_match(build_row as u32, backing_row);
+                $matched += 1;
+                if $matched == $limit {
+                    $cursor.next_entry = entry;
+                    if entry == 0 {
+                        $cursor.pos += 1;
                     }
+                    break;
                 }
             }
-            if matched < $limit {
-                $cursor.next_entry = 0;
-                $cursor.probe_row += 1;
+        }
+        if $matched < $limit {
+            $cursor.next_entry = 0;
+            $cursor.pos += 1;
+        }
+    }};
+}
+
+macro_rules! probe_loop_core {
+    ($cursor:expr, $table:expr, $limit:expr, $get_hash:expr, $is_match:expr, $on_match:expr) => {{
+        let mut matched = 0usize;
+        match &$cursor.rows {
+            ProbeRows::All { num_rows } => {
+                let num_rows = *num_rows;
+                while $cursor.pos < num_rows && matched < $limit {
+                    let probe_row = $cursor.pos;
+                    probe_loop_step!(
+                        $cursor,
+                        $table,
+                        $limit,
+                        probe_row,
+                        probe_row as u32,
+                        matched,
+                        $get_hash,
+                        $is_match,
+                        $on_match
+                    );
+                }
+            }
+            ProbeRows::CompactedKeys { backing_rows } => {
+                let backing = backing_rows.values();
+                let len = backing.len();
+                while $cursor.pos < len && matched < $limit {
+                    let key_idx = $cursor.pos;
+                    let backing_row = backing[key_idx];
+                    probe_loop_step!(
+                        $cursor,
+                        $table,
+                        $limit,
+                        key_idx,
+                        backing_row,
+                        matched,
+                        $get_hash,
+                        $is_match,
+                        $on_match
+                    );
+                }
+            }
+            ProbeRows::Mask { .. } | ProbeRows::BackingIndices(_) => {
+                unreachable!("non-integer probe keys always use All or CompactedKeys")
             }
         }
         matched
@@ -1330,7 +1737,6 @@ fn probe_collect_matches(
     limit: usize,
     scratch: &mut ProbeScratch,
 ) -> Result<()> {
-    let num_rows = cursor.batch.num_rows();
     let build_out = &mut scratch.build_indices;
     let probe_out = &mut scratch.probe_indices;
 
@@ -1342,7 +1748,6 @@ fn probe_collect_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: i32| mix_u64(v as u32 as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
@@ -1357,7 +1762,6 @@ fn probe_collect_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: i64| mix_u64(v as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
@@ -1372,7 +1776,6 @@ fn probe_collect_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: u32| mix_u64(v as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
@@ -1387,7 +1790,6 @@ fn probe_collect_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: u64| mix_u64(v),
                 |b: u32, p: u32| {
                     build_out.push(b);
@@ -1409,7 +1811,6 @@ fn probe_collect_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1433,7 +1834,6 @@ fn probe_collect_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1457,7 +1857,6 @@ fn probe_collect_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1482,7 +1881,6 @@ fn probe_collect_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_rows.row(b).as_ref() == p_rows.row(p).as_ref(),
@@ -1506,7 +1904,6 @@ fn probe_count_matches(
     table: &FinalizedHashTable,
     limit: usize,
 ) -> Result<usize> {
-    let num_rows = cursor.batch.num_rows();
     let matched = match (&cursor.keys, &table.keys) {
         (ProbeKeys::Int32(p_arr), BuildKeys::Int32(flat)) => {
             let p_vals = p_arr.values();
@@ -1515,7 +1912,6 @@ fn probe_count_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: i32| mix_u64(v as u32 as u64),
                 |_b: u32, _p: u32| {}
             )
@@ -1527,7 +1923,6 @@ fn probe_count_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: i64| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
             )
@@ -1539,7 +1934,6 @@ fn probe_count_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: u32| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
             )
@@ -1551,7 +1945,6 @@ fn probe_count_matches(
                 flat,
                 p_vals,
                 limit,
-                num_rows,
                 |v: u64| mix_u64(v),
                 |_b: u32, _p: u32| {}
             )
@@ -1570,7 +1963,6 @@ fn probe_count_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1591,7 +1983,6 @@ fn probe_count_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1612,7 +2003,6 @@ fn probe_count_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_arr.value(b) == p_arr.value(p),
@@ -1634,7 +2024,6 @@ fn probe_count_matches(
                 cursor,
                 table,
                 limit,
-                num_rows,
                 |p: usize| p_hashes[p],
                 |b: usize, p: usize, h: u64| b_hashes[b] == h
                     && b_rows.row(b).as_ref() == p_rows.row(p).as_ref(),
@@ -1648,4 +2037,220 @@ fn probe_count_matches(
         }
     };
     Ok(matched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_execution::memory_pool::{
+        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+    };
+
+    use super::super::{MemorySource, Sink, Source};
+
+    fn dummy_build_pipeline(
+        schema: SchemaRef,
+        sink: Arc<HashJoinBuildSink>,
+    ) -> Arc<Pipeline> {
+        Arc::new(Pipeline {
+            source: Source::Memory(MemorySource {
+                table: "build".to_owned(),
+                batches: vec![],
+                projection: None,
+                schema,
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::MIN,
+            sink: Sink::HashJoinBuild(sink),
+            sink_capacity: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn probe_view_all_mask_indices_fanout_and_sliced_batches() -> Result<()> {
+        // Build side: duplicate key 10 (3 rows), key 20 (2 rows), key NULL (ignored)
+        let build_schema = Arc::new(Schema::new(vec![
+            Field::new("bk", DataType::Int64, true),
+            Field::new("bval", DataType::Int32, false),
+        ]));
+        let build_batch = RecordBatch::try_new(
+            Arc::clone(&build_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(10),
+                    Some(20),
+                    None,
+                    Some(10),
+                    Some(20),
+                ])),
+                Arc::new(Int32Array::from(vec![100, 101, 200, 999, 102, 201])),
+            ],
+        )?;
+        let payload_schema = Arc::new(build_schema.project(&[1])?);
+        let build_sink = Arc::new(
+            HashJoinBuildSink::try_new(
+                vec![Arc::new(Column::new("bk", 0))],
+                vec!["bk".to_owned()],
+                vec![DataType::Int64],
+                vec![1],
+                Arc::clone(&payload_schema),
+            )?
+            .expect("valid build sink"),
+        );
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let res = MemoryConsumer::new("test_hj_view").register(&pool);
+        let mut build_state = build_sink.new_state(res);
+        // Feed build side through a BatchView Mask that excludes row 5 (20, 201)
+        let build_mask = BooleanArray::from(vec![true, true, true, true, true, false]);
+        let build_view = BatchView::from_boolean_array(build_batch, &build_mask)?;
+        build_state.add_view(&build_view)?;
+        let (tx, _rx) = mpsc::channel(2);
+        let table = build_sink.finalize(build_state, &tx).await?.unwrap();
+
+        // Probe side (sliced): keys [10, NULL, 20, 99, 10, 20]
+        let probe_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, true),
+            Field::new("pid", DataType::Int32, false),
+        ]));
+        let probe_base = RecordBatch::try_new(
+            Arc::clone(&probe_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(10),
+                    None,
+                    Some(20),
+                    Some(99),
+                    Some(10),
+                    Some(20),
+                    Some(10),
+                ])),
+                Arc::new(Int32Array::from(vec![-1, 0, 1, 2, 3, 4, 5, -2])),
+            ],
+        )?;
+        let probe_sliced = probe_base.slice(1, 6);
+        let probe_mask = BooleanArray::from(vec![
+            Some(true),  // pid=0, pk=10 -> 3 matches
+            Some(true),  // pid=1, pk=NULL -> 0 matches
+            Some(true),  // pid=2, pk=20 -> 1 match
+            Some(true),  // pid=3, pk=99 -> 0 matches
+            Some(false), // pid=4 rejected
+            Some(true),  // pid=5, pk=20 -> 1 match
+        ]);
+        let view_mask = BatchView::from_boolean_array(probe_sliced.clone(), &probe_mask)?;
+        let view_indices = view_mask.clone().with_indices_selection();
+        let view_all = BatchView::all(view_mask.materialize_ref()?);
+
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("bval", DataType::Int32, false),
+            Field::new("pid", DataType::Int32, false),
+        ]));
+        let probe = HashJoinProbe::new(HashJoinProbeConfig {
+            build_pipeline: dummy_build_pipeline(build_schema, Arc::clone(&build_sink)),
+            build_side: BuildSide::Left,
+            probe_key_exprs: vec![Arc::new(Column::new("pk", 0))],
+            probe_key_names: vec!["pk".to_owned()],
+            key_types: vec![DataType::Int64],
+            output_projection: vec![JoinOutputCol::Build(0), JoinOutputCol::Probe(1)],
+            output_schema: out_schema,
+            build_id: 0,
+        });
+
+        let drain = |view: BatchView| -> Result<Vec<(i32, i32)>> {
+            let mut scratch = ProbeScratch::default();
+            let mut pairs = Vec::new();
+            let Some(mut cursor) = probe.start_probe_view(view, &table)? else {
+                return Ok(pairs);
+            };
+            loop {
+                // Tiny batch_size=2 forces fanout resumption across duplicate chains!
+                match probe.next_chunk(&mut cursor, &table, 2, &mut scratch)? {
+                    OperatorStep::NeedMoreInput(opt) => {
+                        if let Some(batch) = opt {
+                            assert!(batch.num_rows() <= 2);
+                            let b = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            let p = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            for i in 0..batch.num_rows() {
+                                pairs.push((b.value(i), p.value(i)));
+                            }
+                        }
+                        break;
+                    }
+                    OperatorStep::HaveMoreOutput(batch) => {
+                        assert_eq!(batch.num_rows(), 2);
+                        let b = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        let p = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        for i in 0..batch.num_rows() {
+                            pairs.push((b.value(i), p.value(i)));
+                        }
+                    }
+                }
+            }
+            pairs.sort();
+            Ok(pairs)
+        };
+
+        let expected = vec![(100, 0), (101, 0), (102, 0), (200, 2), (200, 5)];
+        assert_eq!(drain(view_all)?, expected);
+        assert_eq!(drain(view_mask.clone())?, expected);
+        assert_eq!(drain(view_indices.clone())?, expected);
+
+        // Count-only (zero-column output) across Mask and Indices with tiny batch_size=2
+        let count_probe = HashJoinProbe::new(HashJoinProbeConfig {
+            build_pipeline: dummy_build_pipeline(
+                Arc::new(Schema::empty()),
+                Arc::clone(&build_sink),
+            ),
+            build_side: BuildSide::Left,
+            probe_key_exprs: vec![Arc::new(Column::new("pk", 0))],
+            probe_key_names: vec!["pk".to_owned()],
+            key_types: vec![DataType::Int64],
+            output_projection: vec![],
+            output_schema: Arc::new(Schema::empty()),
+            build_id: 0,
+        });
+        for view in [view_mask, view_indices] {
+            let mut scratch = ProbeScratch::default();
+            let mut cursor = count_probe.start_probe_view(view, &table)?.unwrap();
+            let mut total = 0usize;
+            loop {
+                match count_probe.next_chunk(&mut cursor, &table, 2, &mut scratch)? {
+                    OperatorStep::NeedMoreInput(opt) => {
+                        total += opt.map_or(0, |b| b.num_rows());
+                        break;
+                    }
+                    OperatorStep::HaveMoreOutput(b) => {
+                        assert_eq!(b.num_columns(), 0);
+                        total += b.num_rows();
+                    }
+                }
+            }
+            assert_eq!(total, 5);
+        }
+
+        drop(table);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
 }
