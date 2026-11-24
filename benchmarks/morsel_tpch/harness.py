@@ -1349,15 +1349,16 @@ def summarize_jsonl(path: Path):
                 f"{peak_ready}/{peak_out} |"
             )
 
-    # Pairwise geometric mean for Stock DataFusion vs DuckDB on shared queries.
-    cases_in_order = list(dict.fromkeys(case for case, _ in grouped))
+    # Pairwise geometric mean for Stock DataFusion vs DuckDB on standard TPC-H queries
+    # only (excludes non-standard slices such as q1_unordered, q6_count, q6_scan so
+    # queries are never double-counted).
     medians = {
         key: statistics.median(r["seconds"] * 1000.0 for r in rows)
         for key, rows in grouped.items()
     }
     shared_sd = [
         c
-        for c in cases_in_order
+        for c in STANDARD_TPCH_QUERIES
         if (c, "stock_default") in medians and (c, "duckdb_default") in medians
     ]
     if shared_sd:
@@ -1375,8 +1376,8 @@ def summarize_jsonl(path: Path):
         duck_sum = sum(medians[(c, "duckdb_default")] for c in shared_sd)
         print()
         print(
-            f"Geometric mean across {len(shared_sd)} shared queries "
-            f"(`stock_default` vs `duckdb_default`): "
+            f"Geometric mean across {len(shared_sd)}/{len(STANDARD_TPCH_QUERIES)} "
+            f"standard queries (`stock_default` vs `duckdb_default`): "
             f"`stock_default`={stock_gmean:.1f} ms, `duckdb_default`={duck_gmean:.1f} ms, "
             f"geomean ratio={ratio_gmean:.2f}x "
             f"(sum of medians: {stock_sum:.1f} ms vs {duck_sum:.1f} ms, {stock_sum / duck_sum:.2f}x)"

@@ -263,11 +263,13 @@ data_dir="$work/tpch_sf1"
 timeout 180s "$py" -B "$b/harness.py" generate "$data_dir" \
   --sf 1 --row-group-size 131072
 
-# 5. Run the controlled warm-cache 3-way SF1 benchmark on 8 pinned cores.
+# 5. Run the controlled warm-cache 3-way SF1 benchmark on 8 pinned cores
+#    (7-workload SF1 suite; see sf5_baseline_22q.md for the all-22-query SF5 command).
 vmstat -y 1 3
 timeout --kill-after=10s 300s taskset -c 0-7 "$py" -B "$b/harness.py" bench \
   "$data_dir" --runner "$runner" --revision "$revision" \
   --threads 8 --timeout 120 --cache warm --warmups 1 --repeats 7 \
+  --queries q6,q1_unordered,q1,q3,q12,q6_count,q6_scan \
   > "$work/sf1_warm.jsonl"
 vmstat -y 1 3
 

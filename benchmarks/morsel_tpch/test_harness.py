@@ -111,6 +111,36 @@ class TpchHarnessTest(unittest.TestCase):
             )
             self.assertEqual(lineitem_schema.field("l_shipdate").type, pa.date32())
 
+    def test_generate_sf001_small_row_group_exercises_multi_batch_sharding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "sf001_rg1000"
+            generate(out_dir, sf=0.01, row_group_size=1000)
+            summary = dataset_summary(out_dir)
+
+            self.assertEqual(summary["total_rows"], sum(EXPECTED_SF001_ROWS.values()))
+            for table, expected_rows in EXPECTED_SF001_ROWS.items():
+                self.assertEqual(summary["tables"][table]["rows"], expected_rows)
+
+            # 60,175 rows / 16 files = 3,760 or 3,761 rows/file -> 4 RGs/file = 64 RGs.
+            self.assertEqual(summary["tables"]["lineitem"]["files"], 16)
+            self.assertEqual(summary["tables"]["lineitem"]["row_groups"], 64)
+
+            # Verify strict primary-key order is preserved across streamed shards.
+            prev_key = None
+            for part in table_files(out_dir, "lineitem"):
+                tbl = pq.read_table(part, columns=["l_orderkey", "l_linenumber"])
+                keys = list(
+                    zip(
+                        tbl.column("l_orderkey").to_pylist(),
+                        tbl.column("l_linenumber").to_pylist(),
+                    )
+                )
+                self.assertTrue(keys)
+                if prev_key is not None:
+                    self.assertLess(prev_key, keys[0])
+                self.assertEqual(keys, sorted(keys))
+                prev_key = keys[-1]
+
     def test_validate_plan_enforces_stock_and_morsel_invariants(self):
         stock_ev = {"plan": "DataSourceExec: file_type=parquet\n"}
         morsel_count_ev = {
@@ -375,14 +405,39 @@ class TpchHarnessTest(unittest.TestCase):
                     "output_batches": 1,
                     "parquet_morsels_claimed": None,
                 },
+                # Non-standard slice with both arms must be excluded from standard-query
+                # geomean and sum so q1/q6 slices are never double-counted.
+                {
+                    "record_type": "trial",
+                    "case": "q6_count",
+                    "arm": "stock_default",
+                    "seconds": 9.9,
+                    "exec_seconds": 9.8,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6_count",
+                    "arm": "duckdb_default",
+                    "seconds": 0.01,
+                    "exec_seconds": None,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
             ]
             jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n")
             buf = io.StringIO()
             with redirect_stdout(buf):
                 summarize_jsonl(jsonl)
             out = buf.getvalue()
-            # Geomean ratio of (2.0, 8.0) is 4.00x.
+            # Only q1 (2.0x) and q6 (8.0x) count -> 2/22 standard queries, geomean=4.00x,
+            # sum=600.0 ms vs 150.0 ms (q6_count's 9900 ms must be excluded).
+            self.assertIn("2/22 standard queries", out)
             self.assertIn("geomean ratio=4.00x", out)
+            self.assertIn("sum of medians: 600.0 ms vs 150.0 ms", out)
             self.assertIn("unsupported logical operator: Sort", out)
 
     def test_require_warm_cache_rejects_partial_residency(self):
