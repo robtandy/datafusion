@@ -1345,6 +1345,7 @@ enum NarrowProjectorCache {
     Identity,
     Narrowed {
         columns: Vec<usize>,
+        schema: SchemaRef,
         projector: Projector,
     },
 }
@@ -1358,6 +1359,8 @@ struct ResultBuffer {
     /// `Operator::Projection` at index `i`. Slot `operators.len()` is the terminal
     /// coalescer for filtered batches reaching the `Result` sink.
     coalescers: Vec<Option<LimitedBatchCoalescer>>,
+    is_pure_projection: Vec<bool>,
+    filter_schemas: Vec<Option<SchemaRef>>,
     narrow_projectors: Vec<NarrowProjectorCache>,
     output: Option<RecordBatch>,
     next_to_finish: usize,
@@ -1369,16 +1372,29 @@ impl ResultBuffer {
             .iter()
             .any(|op| matches!(op, Operator::Filter { .. }));
         let slot_count = if has_filter { operators.len() + 1 } else { 0 };
+        let op_cache_len = if has_filter { operators.len() } else { 0 };
+        let is_pure_projection = if has_filter {
+            operators
+                .iter()
+                .map(|op| {
+                    matches!(op, Operator::Projection(p) if is_pure_column_projection(p))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             batch_size,
             coalesce_source,
             source_coalescer: None,
             source_finished: !coalesce_source,
             coalescers: std::iter::repeat_with(|| None).take(slot_count).collect(),
+            is_pure_projection,
+            filter_schemas: std::iter::repeat_with(|| None).take(op_cache_len).collect(),
             narrow_projectors: std::iter::repeat_with(|| {
                 NarrowProjectorCache::Uninitialized
             })
-            .take(if has_filter { operators.len() } else { 0 })
+            .take(op_cache_len)
             .collect(),
             output: None,
             next_to_finish: 0,
@@ -1418,8 +1434,31 @@ impl ResultBuffer {
         &mut self,
         operators: &[Operator],
         start: usize,
-        batch: RecordBatch,
+        mut batch: RecordBatch,
     ) -> Result<()> {
+        if self.coalescers.is_empty() {
+            for op in operators.iter().skip(start) {
+                match op {
+                    Operator::Projection(projector) => {
+                        batch = projector.project_batch(&batch)?;
+                    }
+                    Operator::Filter { .. } => unreachable!(),
+                    Operator::HashProbe(_) => {
+                        return internal_err!(
+                            "HashProbe must execute through join continuation driver"
+                        );
+                    }
+                }
+                if batch.num_rows() == 0 {
+                    return Ok(());
+                }
+            }
+            if batch.num_rows() != 0 {
+                debug_assert!(self.output.is_none());
+                self.output = Some(batch);
+            }
+            return Ok(());
+        }
         self.push_view_from(operators, start, BatchView::all(batch), false)
     }
 
@@ -1433,22 +1472,25 @@ impl ResultBuffer {
         }
         let needed = projector.projection().column_indices();
         if needed.len() < input_schema.fields().len() {
-            let remap = || -> Result<Projector> {
+            let remap = || -> Result<(SchemaRef, Projector)> {
                 let narrow = ProjectionExprs::from_indices(&needed, input_schema);
-                projector
+                let narrow_schema = Arc::new(input_schema.project(&needed)?);
+                let remapped = projector
                     .projection()
                     .clone()
                     .try_map_exprs(|expr| narrow.project_expr(&expr))?
                     .make_projector_with_schema_metadata(
-                        &input_schema.project(&needed)?,
+                        &narrow_schema,
                         projector.output_schema(),
-                    )
+                    )?;
+                Ok((narrow_schema, remapped))
             };
-            if let Ok(remapped) = remap()
+            if let Ok((schema, remapped)) = remap()
                 && remapped.output_schema() == projector.output_schema()
             {
                 *cache = NarrowProjectorCache::Narrowed {
                     columns: needed,
+                    schema,
                     projector: remapped,
                 };
                 return;
@@ -1472,16 +1514,23 @@ impl ResultBuffer {
                 } => {
                     view = view.filter(predicate)?;
                     if let Some(columns) = projection {
-                        view = view.project_columns(columns)?;
+                        let schema = match &self.filter_schemas[index] {
+                            Some(s) => Arc::clone(s),
+                            None => {
+                                let s = Arc::new(view.batch().schema().project(columns)?);
+                                self.filter_schemas[index] = Some(Arc::clone(&s));
+                                s
+                            }
+                        };
+                        view = view.project_columns_with_schema(columns, schema)?;
                     }
                     saw_filter = true;
                 }
                 Operator::Projection(projector) => {
-                    if is_pure_column_projection(projector) {
+                    if self.is_pure_projection.get(index).copied().unwrap_or(false) {
                         view = view.apply_projection(projector)?;
-                    } else if saw_filter
-                        || (!self.coalescers.is_empty()
-                            && self.coalescers[index].is_some())
+                    } else if !self.coalescers.is_empty()
+                        && (saw_filter || self.coalescers[index].is_some())
                     {
                         // Narrow away filter-only columns zero-copy before coalescing,
                         // then evaluate expressions on full coalesced batches.
@@ -1490,10 +1539,14 @@ impl ResultBuffer {
                             projector,
                             view.batch().schema().as_ref(),
                         );
-                        if let NarrowProjectorCache::Narrowed { columns, .. } =
-                            &self.narrow_projectors[index]
+                        if let NarrowProjectorCache::Narrowed {
+                            columns, schema, ..
+                        } = &self.narrow_projectors[index]
                         {
-                            view = view.project_columns(columns)?;
+                            view = view.project_columns_with_schema(
+                                columns,
+                                Arc::clone(schema),
+                            )?;
                         }
                         if view.is_empty() {
                             return Ok(());
@@ -1581,7 +1634,7 @@ impl ResultBuffer {
                 .as_mut()
                 .and_then(LimitedBatchCoalescer::next_completed_batch)
             {
-                self.push_view_from(operators, 0, BatchView::all(batch), false)?;
+                self.push_from(operators, 0, batch)?;
             } else if eof && !self.source_finished {
                 if let Some(coalescer) = &mut self.source_coalescer {
                     coalescer.finish()?;

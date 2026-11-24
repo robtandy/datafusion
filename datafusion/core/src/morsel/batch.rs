@@ -438,6 +438,35 @@ impl BatchView {
         }
     }
 
+    /// Zero-copy column narrowing preserving the active selection using a precomputed schema.
+    pub(super) fn project_columns_with_schema(
+        self,
+        columns: &[usize],
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        if columns.is_empty() {
+            let batch = RecordBatch::try_new_with_options(
+                schema,
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(self.num_rows())),
+            )?;
+            return Ok(Self::all(batch));
+        }
+        let mut cols = Vec::with_capacity(columns.len());
+        for &idx in columns {
+            cols.push(Arc::clone(self.batch.column(idx)));
+        }
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(self.batch.num_rows())),
+        )?;
+        Ok(Self {
+            batch,
+            selection: self.selection,
+        })
+    }
+
     /// Zero-copy column narrowing preserving the active selection.
     pub(super) fn project_columns(self, columns: &[usize]) -> Result<Self> {
         if columns.is_empty() {
@@ -712,6 +741,13 @@ impl BatchView {
             return self.backing_memory_size() > 0 || self.selection_memory_size() > 0;
         }
         if self.is_all() {
+            return false;
+        }
+        // Fast O(1) pre-check: avoid walking Arrow buffers when selectivity cannot
+        // meet `max_retention_ratio` (with 2x slack for selection buffer overhead).
+        let physical = self.batch.num_rows();
+        let selected = self.num_rows();
+        if selected.saturating_mul(max_retention_ratio) > physical.saturating_mul(2) {
             return false;
         }
         let retained = self.retained_memory_size();
