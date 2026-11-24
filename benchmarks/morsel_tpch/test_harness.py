@@ -199,6 +199,64 @@ class TpchHarnessTest(unittest.TestCase):
                 morsel_count_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q6_scan"], rgs
             )
 
+    def test_validate_plan_handles_multi_table_join_plans(self):
+        join_ev = {
+            "plan": (
+                "MorselExec: workers=4, [Build: NativeParquet[part] -> HashJoinBuildSink]; "
+                "NativeParquet[lineitem] -> Filter[...] -> HashJoinProbe[...] -> "
+                "AggregateSink[aggr=[sum(...)]]; FinalizedAggregateSource"
+            ),
+            "parquet_morsels_claimed": 18,
+            "count_finalizations": 0,
+            "aggregate_finalizations": 1,
+        }
+        rgs = {"lineitem": 16, "part": 2}
+
+        validate_plan(join_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q14"], rgs)
+        validate_plan(join_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q19"], rgs)
+        validate_plan(
+            dict(join_ev, parquet_morsels_claimed=10),
+            ARMS["morsel_pruning"],
+            WORKLOADS["q14"],
+            rgs,
+        )
+        validate_plan(
+            dict(join_ev, parquet_morsels_claimed=18),
+            ARMS["morsel_pushdown"],
+            WORKLOADS["q19"],
+            rgs,
+        )
+
+        # Missing build-side NativeParquet[part] must fail.
+        missing_part = dict(
+            join_ev,
+            plan="MorselExec: workers=4, NativeParquet[lineitem] -> AggregateSink; FinalizedAggregateSource",
+        )
+        with self.assertRaisesRegex(ValueError, "missing"):
+            validate_plan(
+                missing_part, ARMS["morsel_no_pushdown"], WORKLOADS["q14"], rgs
+            )
+
+        # Under no_pushdown, claims must equal the sum across all scanned tables (16 + 2 = 18).
+        for bad_claims in (16, 17, 19):
+            with self.subTest(bad_claims=bad_claims), self.assertRaises(ValueError):
+                validate_plan(
+                    dict(join_ev, parquet_morsels_claimed=bad_claims),
+                    ARMS["morsel_no_pushdown"],
+                    WORKLOADS["q14"],
+                    rgs,
+                )
+
+        # Under pruning/pushdown, claims must be in 1..=sum.
+        for bad_claims in (0, 19):
+            with self.subTest(pruning_bad=bad_claims), self.assertRaises(ValueError):
+                validate_plan(
+                    dict(join_ev, parquet_morsels_claimed=bad_claims),
+                    ARMS["morsel_pruning"],
+                    WORKLOADS["q14"],
+                    rgs,
+                )
+
     def test_compare_tables_handles_decimal_and_order_semantics(self):
         oracle = pa.table(
             {
@@ -556,6 +614,7 @@ class TpchHarnessTest(unittest.TestCase):
             expected_rejected = set(STANDARD_TPCH_QUERIES) - set(
                 MORSEL_ADMITTED_QUERIES
             )
+            self.assertEqual(len(expected_rejected), 19)
             self.assertEqual(set(report["morsel_rejections"].keys()), expected_rejected)
             for qname, err in report["morsel_rejections"].items():
                 self.assertIn("morsel_mode=required", err, msg=qname)
@@ -576,6 +635,22 @@ class TpchHarnessTest(unittest.TestCase):
                 morsel_ev[("q6", "morsel_no_pushdown")]["aggregate_finalizations"],
                 1,
             )
+            for join_q in ("q14", "q19"):
+                self.assertEqual(
+                    morsel_ev[(join_q, "morsel_no_pushdown")][
+                        "parquet_morsels_claimed"
+                    ],
+                    18,
+                )
+                self.assertEqual(
+                    morsel_ev[(join_q, "morsel_no_pushdown")][
+                        "aggregate_finalizations"
+                    ],
+                    1,
+                )
+                self.assertIn(
+                    "HashJoinProbe", morsel_ev[(join_q, "morsel_no_pushdown")]["plan"]
+                )
             self.assertEqual(
                 morsel_ev[("q1_unordered", "morsel_pushdown")][
                     "aggregate_finalizations"
@@ -635,6 +710,7 @@ class TpchHarnessTest(unittest.TestCase):
                     "--queries",
                     "q1",
                     "q6",
+                    "q14",
                     "q1_unordered",
                     "q6_count",
                     "q6_scan",
@@ -657,8 +733,8 @@ class TpchHarnessTest(unittest.TestCase):
             self.assertEqual(header["record_type"], "header")
             self.assertEqual(header["cache_regime"], "warm")
             self.assertIn("q1", header["morsel_rejections"])
-            # 2 arms * 2 reps for q1 + 4 arms * 2 reps for (q6, q1_unordered, q6_count, q6_scan) = 36
-            self.assertEqual(len(trials), 36)
+            # 2 arms * 2 reps for q1 + 4 arms * 2 reps for (q6, q14, q1_unordered, q6_count, q6_scan) = 44
+            self.assertEqual(len(trials), 44)
             for trial in trials:
                 self.assertGreater(trial["seconds"], 0)
                 if sys.platform == "linux" and sys.maxsize > 2**32:

@@ -208,8 +208,8 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         14,
         ("lineitem", "part"),
         True,
-        False,
-        False,
+        True,
+        True,
         "Standard TPC-H Q14 (2-way join + conditional SUM ratio)",
     ),
     (
@@ -248,8 +248,8 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         19,
         ("lineitem", "part"),
         True,
-        False,
-        False,
+        True,
+        True,
         "Standard TPC-H Q19 (2-way join with disjunctive OR predicates + SUM)",
     ),
     (
@@ -990,12 +990,17 @@ def validate_plan(
         return
 
     # mode == "required"
-    table = workload.tables[0]
-    if not plan.startswith("MorselExec:") or f"NativeParquet[{table}" not in plan:
+    if not plan.startswith("MorselExec:"):
         raise ValueError(
-            f"{arm.name}/{workload.name}: expected MorselExec with NativeParquet[{table}...], got:\n{plan}"
+            f"{arm.name}/{workload.name}: expected MorselExec plan, got:\n{plan}"
         )
-    expected_rgs = table_row_groups[table]
+    missing_tables = [t for t in workload.tables if f"NativeParquet[{t}" not in plan]
+    if missing_tables:
+        raise ValueError(
+            f"{arm.name}/{workload.name}: expected NativeParquet for {workload.tables} "
+            f"(missing {missing_tables}), got:\n{plan}"
+        )
+    expected_rgs = sum(table_row_groups[t] for t in workload.tables)
     claimed = evidence["parquet_morsels_claimed"]
     if arm.profile == "no_pushdown":
         if claimed != expected_rgs:
