@@ -32,18 +32,22 @@ use super::Pipeline;
 use super::batch::{
     BatchView, Selection, collect_expr_column_indices, remap_expr_columns,
 };
+use super::join_filter::{
+    DynamicJoinFilterConfig, DynamicJoinFilterData, JoinMembershipFilter,
+    LocalJoinKeySummary, SplitBlockBloomFilter, try_build_small_inlist_from_chunks,
+};
 
 const FINALIZE_YIELD_CHUNK: usize = 4096;
 
 // Fixed hash seed shared between build and probe workers within a run.
 const JOIN_HASH_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
-fn join_random_state() -> RandomState {
+pub(super) fn join_random_state() -> RandomState {
     RandomState::with_seed(JOIN_HASH_SEED)
 }
 
 #[inline]
-fn mix_u64(mut x: u64) -> u64 {
+pub(super) fn mix_u64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -194,6 +198,17 @@ impl ProbeJoinKind {
     pub(super) fn is_null_aware_anti(self) -> bool {
         matches!(self, Self::ProbeAnti { null_aware: true })
     }
+
+    pub(super) fn allows_dynamic_filter_pushdown(self) -> bool {
+        matches!(
+            self,
+            Self::Inner
+                | Self::BuildOuter
+                | Self::ProbeSemi
+                | Self::BuildSemi
+                | Self::BuildAnti
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -251,7 +266,7 @@ pub(super) enum JoinOutputCol {
     Probe(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum KeyKind {
     Cross,
     Int32,
@@ -301,7 +316,7 @@ fn normalize_key_arrays(keys: Vec<ArrayRef>, has_floats: bool) -> Vec<ArrayRef> 
     keys.into_iter().map(float_semantics::normalize).collect()
 }
 
-fn valid_key_mask(keys: &[ArrayRef]) -> Option<BooleanBuffer> {
+pub(super) fn valid_key_mask(keys: &[ArrayRef]) -> Option<BooleanBuffer> {
     let mut combined: Option<BooleanBuffer> = None;
     for key in keys {
         if key.null_count() == 0 {
@@ -430,6 +445,7 @@ pub(super) struct HashJoinBuildConfig {
     pub(super) needs_matched_bitset: bool,
     pub(super) payload_columns: Vec<usize>,
     pub(super) payload_schema: SchemaRef,
+    pub(super) dynamic_filter: Option<DynamicJoinFilterConfig>,
 }
 
 #[derive(Debug)]
@@ -445,6 +461,7 @@ pub(super) struct HashJoinBuildSink {
     has_floats: bool,
     payload_columns: Vec<usize>,
     payload_schema: SchemaRef,
+    dynamic_filter: Option<DynamicJoinFilterConfig>,
     #[cfg(test)]
     pub(super) finalize_gate: Option<super::tests::FinalizeGate>,
 }
@@ -477,12 +494,16 @@ impl HashJoinBuildSink {
             has_floats,
             payload_columns: config.payload_columns,
             payload_schema: config.payload_schema,
+            dynamic_filter: config.dynamic_filter,
             #[cfg(test)]
             finalize_gate: None,
         }))
     }
 
     pub(super) fn new_state(&self, reservation: MemoryReservation) -> HashJoinBuildState {
+        let key_summary = self
+            .dynamic_filter
+            .map(|_| LocalJoinKeySummary::new(self.key_types.len()));
         HashJoinBuildState {
             key_exprs: self.key_exprs.clone(),
             key_kind: self.key_kind,
@@ -495,6 +516,7 @@ impl HashJoinBuildSink {
             key_batches: Vec::new(),
             hash_chunks: Vec::new(),
             valid_masks: Vec::new(),
+            key_summary,
             num_rows: 0,
             has_null_key: false,
             reservation,
@@ -526,6 +548,7 @@ impl HashJoinBuildSink {
             mut key_batches,
             hash_chunks,
             valid_masks,
+            key_summary,
             num_rows,
             has_null_key,
             reservation,
@@ -534,9 +557,18 @@ impl HashJoinBuildSink {
 
         if num_rows == 0 {
             reservation.resize(0);
+            let dynamic_filter = self.dynamic_filter.map(|_| {
+                Arc::new(DynamicJoinFilterData::empty(
+                    self.key_kind,
+                    self.null_equality,
+                    self.has_floats,
+                    self.key_types.len(),
+                ))
+            });
             return Ok(Some(Arc::new(FinalizedHashTable::empty(
                 Arc::clone(&self.payload_schema),
                 has_null_key,
+                dynamic_filter,
                 reservation,
             ))));
         }
@@ -597,6 +629,7 @@ impl HashJoinBuildSink {
                 mask: 0,
                 next: Vec::new(),
                 matched: Vec::new(),
+                dynamic_filter: None,
                 _reservation: reservation,
             })));
         }
@@ -640,6 +673,14 @@ impl HashJoinBuildSink {
             let final_bytes =
                 get_record_batch_memory_size(&payload).saturating_add(matched_bytes);
             reservation.try_resize(final_bytes)?;
+            let dynamic_filter = self.dynamic_filter.map(|_| {
+                Arc::new(DynamicJoinFilterData::empty(
+                    self.key_kind,
+                    self.null_equality,
+                    self.has_floats,
+                    self.key_types.len(),
+                ))
+            });
             return Ok(Some(Arc::new(FinalizedHashTable {
                 num_rows,
                 hash_entries: 0,
@@ -650,6 +691,7 @@ impl HashJoinBuildSink {
                 mask: 0,
                 next: Vec::new(),
                 matched,
+                dynamic_filter,
                 _reservation: reservation,
             })));
         }
@@ -733,8 +775,8 @@ impl HashJoinBuildSink {
         drop(batches);
 
         let mask = bucket_count - 1;
-        let (build_keys, buckets, next) = if is_flat_int {
-            let Some(keys) = self
+        let (build_keys, buckets, next, dynamic_filter) = if is_flat_int {
+            let Some((keys, distinct_count)) = self
                 .build_flat_int_keys(
                     &mut key_batches,
                     &hash_chunks,
@@ -750,8 +792,42 @@ impl HashJoinBuildSink {
             drop(key_batches);
             drop(hash_chunks);
             drop(valid_masks);
-            (keys, Vec::new(), Vec::new())
+            let dynamic_filter = match (self.dynamic_filter, key_summary) {
+                (Some(cfg), Some(summary)) => {
+                    let membership = Self::build_flat_int_membership(
+                        &keys,
+                        distinct_count,
+                        cfg,
+                        &reservation,
+                    );
+                    Some(Arc::new(DynamicJoinFilterData {
+                        key_kind: self.key_kind,
+                        null_equality: self.null_equality,
+                        has_floats: self.has_floats,
+                        bounds: summary.into_bounds(),
+                        membership,
+                    }))
+                }
+                _ => None,
+            };
+            (keys, Vec::new(), Vec::new(), dynamic_filter)
         } else {
+            let small_inlist = if let Some(cfg) = self.dynamic_filter
+                && self.key_types.len() == 1
+                && !self.has_floats
+                && hash_entries > 1
+                && hash_entries <= cfg.max_inlist_values
+            {
+                try_build_small_inlist_from_chunks(
+                    &key_batches,
+                    &valid_masks,
+                    self.null_equality,
+                    cfg.max_inlist_values,
+                    cfg.max_inlist_bytes,
+                )?
+            } else {
+                None
+            };
             let build_keys =
                 self.build_chained_keys(&mut key_batches, &hash_chunks, num_rows)?;
             drop(key_batches);
@@ -780,17 +856,51 @@ impl HashJoinBuildSink {
                     }
                 }
             }
+            let dynamic_filter = match (self.dynamic_filter, key_summary) {
+                (Some(_), Some(summary)) => {
+                    let membership = if let Some(arr) = small_inlist {
+                        let bytes = arr.get_array_memory_size();
+                        if reservation.try_grow(bytes).is_ok() {
+                            JoinMembershipFilter::InList(arr)
+                        } else {
+                            JoinMembershipFilter::None
+                        }
+                    } else if hash_entries > 1
+                        || self.key_types.len() > 1
+                        || self.has_floats
+                    {
+                        Self::build_chained_bloom_membership(
+                            &hash_chunks,
+                            &valid_masks,
+                            hash_entries,
+                            &reservation,
+                        )
+                    } else {
+                        JoinMembershipFilter::None
+                    };
+                    Some(Arc::new(DynamicJoinFilterData {
+                        key_kind: self.key_kind,
+                        null_equality: self.null_equality,
+                        has_floats: self.has_floats,
+                        bounds: summary.into_bounds(),
+                        membership,
+                    }))
+                }
+                _ => None,
+            };
             drop(hash_chunks);
             drop(valid_masks);
-            (build_keys, buckets, next)
+            (build_keys, buckets, next, dynamic_filter)
         };
 
         let matched: Vec<AtomicU64> =
             (0..matched_words).map(|_| AtomicU64::new(0)).collect();
+        let filter_bytes = dynamic_filter.as_ref().map_or(0, |f| f.memory_bytes());
         let final_bytes = get_record_batch_memory_size(&payload)
             .saturating_add(build_keys.memory_bytes())
             .saturating_add(dir_bytes)
-            .saturating_add(matched_bytes);
+            .saturating_add(matched_bytes)
+            .saturating_add(filter_bytes);
         reservation.try_resize(final_bytes)?;
 
         Ok(Some(Arc::new(FinalizedHashTable {
@@ -803,8 +913,101 @@ impl HashJoinBuildSink {
             mask,
             next,
             matched,
+            dynamic_filter,
             _reservation: reservation,
         })))
+    }
+
+    fn build_flat_int_membership(
+        keys: &BuildKeys,
+        distinct_count: usize,
+        cfg: DynamicJoinFilterConfig,
+        reservation: &MemoryReservation,
+    ) -> JoinMembershipFilter {
+        if distinct_count <= 1 {
+            return JoinMembershipFilter::None;
+        }
+        macro_rules! build_int_membership {
+            ($table:expr, $Arr:ty, $K:ty, $to_u64:expr) => {{
+                let inlist_bytes = distinct_count.saturating_mul(size_of::<$K>());
+                if distinct_count <= cfg.max_inlist_values
+                    && inlist_bytes <= cfg.max_inlist_bytes
+                {
+                    let mut vals: Vec<$K> = Vec::with_capacity(distinct_count);
+                    for slot in &$table.slots {
+                        if slot.first_row != 0 {
+                            vals.push(slot.key);
+                        }
+                    }
+                    vals.sort_unstable();
+                    let arr: ArrayRef = Arc::new(<$Arr>::from(vals));
+                    let arr_bytes = arr.get_array_memory_size();
+                    if reservation.try_grow(arr_bytes).is_ok() {
+                        return JoinMembershipFilter::InList(arr);
+                    }
+                    return JoinMembershipFilter::None;
+                }
+                let Some(num_blocks) =
+                    SplitBlockBloomFilter::num_blocks_for_entries(distinct_count)
+                else {
+                    return JoinMembershipFilter::None;
+                };
+                let est_bytes = SplitBlockBloomFilter::estimated_bytes(num_blocks);
+                if reservation.try_grow(est_bytes).is_err() {
+                    return JoinMembershipFilter::None;
+                }
+                let mut bloom = SplitBlockBloomFilter::with_blocks(num_blocks);
+                let to_u64: fn($K) -> u64 = $to_u64;
+                for slot in &$table.slots {
+                    if slot.first_row != 0 {
+                        bloom.insert(mix_u64(to_u64(slot.key)));
+                    }
+                }
+                JoinMembershipFilter::Bloom(Arc::new(bloom))
+            }};
+        }
+        match keys {
+            BuildKeys::Int32(t) => {
+                build_int_membership!(t, Int32Array, i32, |v: i32| v as u32 as u64)
+            }
+            BuildKeys::Int64(t) => {
+                build_int_membership!(t, Int64Array, i64, |v: i64| v as u64)
+            }
+            BuildKeys::UInt32(t) => {
+                build_int_membership!(t, UInt32Array, u32, |v: u32| v as u64)
+            }
+            BuildKeys::UInt64(t) => {
+                build_int_membership!(t, UInt64Array, u64, |v: u64| v)
+            }
+            _ => JoinMembershipFilter::None,
+        }
+    }
+
+    fn build_chained_bloom_membership(
+        hash_chunks: &[Vec<u64>],
+        valid_masks: &[Option<BooleanBuffer>],
+        hash_entries: usize,
+        reservation: &MemoryReservation,
+    ) -> JoinMembershipFilter {
+        let Some(num_blocks) =
+            SplitBlockBloomFilter::num_blocks_for_entries(hash_entries)
+        else {
+            return JoinMembershipFilter::None;
+        };
+        let est_bytes = SplitBlockBloomFilter::estimated_bytes(num_blocks);
+        if reservation.try_grow(est_bytes).is_err() {
+            return JoinMembershipFilter::None;
+        }
+        let mut bloom = SplitBlockBloomFilter::with_blocks(num_blocks);
+        for (chunk_idx, chunk) in hash_chunks.iter().enumerate() {
+            let valid_opt = valid_masks.get(chunk_idx).and_then(Option::as_ref);
+            for (i, &h) in chunk.iter().enumerate() {
+                if valid_opt.is_none_or(|bits| bits.value(i)) {
+                    bloom.insert(h);
+                }
+            }
+        }
+        JoinMembershipFilter::Bloom(Arc::new(bloom))
     }
 
     async fn build_flat_int_keys(
@@ -815,12 +1018,13 @@ impl HashJoinBuildSink {
         num_rows: usize,
         slot_count: usize,
         tx: &mpsc::Sender<RecordBatch>,
-    ) -> Result<Option<BuildKeys>> {
+    ) -> Result<Option<(BuildKeys, usize)>> {
         macro_rules! build_flat {
             ($Arr:ty, $K:ty, $Variant:ident) => {{
                 let mask = slot_count - 1;
                 let mut slots = vec![IntSlot::<$K>::empty(); slot_count];
                 let mut dup_next: Vec<u32> = Vec::new();
+                let mut distinct_count = 0usize;
                 let mut row_idx = 0usize;
                 let mut since_yield = 0usize;
                 for (chunk_idx, (kb, hashes)) in
@@ -842,6 +1046,7 @@ impl HashJoinBuildSink {
                                 if slot.first_row == 0 {
                                     slot.key = key;
                                     slot.first_row = (row_idx + 1) as u32;
+                                    distinct_count += 1;
                                     break;
                                 }
                                 if slot.key == key {
@@ -866,11 +1071,14 @@ impl HashJoinBuildSink {
                         }
                     }
                 }
-                Ok(Some(BuildKeys::$Variant(FlatIntTable {
-                    slots,
-                    mask,
-                    dup_next,
-                })))
+                Ok(Some((
+                    BuildKeys::$Variant(FlatIntTable {
+                        slots,
+                        mask,
+                        dup_next,
+                    }),
+                    distinct_count,
+                )))
             }};
         }
 
@@ -1004,6 +1212,7 @@ pub(super) struct HashJoinBuildState {
     key_batches: Vec<Vec<ArrayRef>>,
     hash_chunks: Vec<Vec<u64>>,
     valid_masks: Vec<Option<BooleanBuffer>>,
+    key_summary: Option<LocalJoinKeySummary>,
     num_rows: usize,
     has_null_key: bool,
     reservation: MemoryReservation,
@@ -1072,6 +1281,13 @@ impl HashJoinBuildState {
                 valid_mask.as_ref(),
             );
             self.reservation.try_grow(delta)?;
+            if let Some(summary) = &mut self.key_summary {
+                summary.update(
+                    &normalized_keys,
+                    valid_mask.as_ref(),
+                    self.null_equality,
+                )?;
+            }
             if let Some(payload) = payload_batch {
                 self.batches.push(payload);
             }
@@ -1128,6 +1344,9 @@ impl HashJoinBuildState {
             None,
         );
         self.reservation.try_grow(delta)?;
+        if let Some(summary) = &mut self.key_summary {
+            summary.update(&normalized_keys, None, self.null_equality)?;
+        }
 
         if let Some(payload) = payload_batch {
             self.batches.push(payload);
@@ -1198,6 +1417,13 @@ impl HashJoinBuildState {
                 valid_mask.as_ref(),
             );
             self.reservation.try_grow(delta)?;
+            if let Some(summary) = &mut self.key_summary {
+                summary.update(
+                    &normalized_keys,
+                    valid_mask.as_ref(),
+                    self.null_equality,
+                )?;
+            }
             if let Some(payload) = payload_batch {
                 self.batches.push(payload);
             }
@@ -1252,6 +1478,9 @@ impl HashJoinBuildState {
             None,
         );
         self.reservation.try_grow(delta)?;
+        if let Some(summary) = &mut self.key_summary {
+            summary.update(&normalized_keys, None, self.null_equality)?;
+        }
 
         if let Some(payload) = payload_batch {
             self.batches.push(payload);
@@ -1276,6 +1505,9 @@ impl HashJoinBuildState {
             other.has_null_key = combined_null;
             std::mem::swap(self, &mut other);
             return;
+        }
+        if let (Some(mine), Some(theirs)) = (&mut self.key_summary, &other.key_summary) {
+            mine.merge(theirs);
         }
         self.batches.append(&mut other.batches);
         self.key_batches.append(&mut other.key_batches);
@@ -1379,6 +1611,7 @@ pub(super) struct FinalizedHashTable {
     mask: usize,
     next: Vec<u32>,
     matched: Vec<AtomicU64>,
+    dynamic_filter: Option<Arc<DynamicJoinFilterData>>,
     _reservation: MemoryReservation,
 }
 
@@ -1386,6 +1619,7 @@ impl FinalizedHashTable {
     fn empty(
         payload_schema: SchemaRef,
         has_null_key: bool,
+        dynamic_filter: Option<Arc<DynamicJoinFilterData>>,
         reservation: MemoryReservation,
     ) -> Self {
         Self {
@@ -1398,8 +1632,14 @@ impl FinalizedHashTable {
             mask: 0,
             next: Vec::new(),
             matched: Vec::new(),
+            dynamic_filter,
             _reservation: reservation,
         }
+    }
+
+    #[cfg(any(feature = "parquet", test))]
+    pub(super) fn dynamic_filter(&self) -> Option<&Arc<DynamicJoinFilterData>> {
+        self.dynamic_filter.as_ref()
     }
 
     pub(super) fn num_rows(&self) -> usize {
@@ -1624,6 +1864,11 @@ impl HashJoinProbe {
 
     pub(super) fn needs_build_emission(&self) -> bool {
         self.kind.needs_build_emission()
+    }
+
+    #[cfg(any(feature = "parquet", test))]
+    pub(super) fn probe_key_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.probe_key_exprs
     }
 
     pub(super) fn empty_build_short_circuits(&self) -> bool {
@@ -4012,6 +4257,7 @@ mod tests {
                 needs_matched_bitset: false,
                 payload_columns: vec![1],
                 payload_schema: Arc::clone(&payload_schema),
+                dynamic_filter: None,
             })?
             .expect("valid build sink"),
         );
@@ -4208,6 +4454,7 @@ mod tests {
                 needs_matched_bitset: false,
                 payload_columns: vec![1],
                 payload_schema,
+                dynamic_filter: None,
             })?
             .expect("valid build sink"),
         );

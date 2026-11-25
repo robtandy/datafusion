@@ -59,6 +59,7 @@ mod dag;
 mod fallback;
 mod group_count;
 mod hash_join;
+mod join_filter;
 mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
@@ -2509,6 +2510,7 @@ impl Pipeline {
                         &mut tasks,
                         build_pipeline.workers,
                         measurement,
+                        nested_tables.as_deref().map(Vec::as_slice),
                     )?;
                     for id in 0..build_pipeline.workers.get() {
                         let (pipeline, ready, output) = (
@@ -3351,8 +3353,13 @@ impl Pipeline {
                 }
                 #[cfg(feature = "parquet")]
                 Source::Parquet(source) => {
-                    let ready =
-                        source.start(context, &mut tasks, self.workers, measurement)?;
+                    let ready = source.start(
+                        context,
+                        &mut tasks,
+                        self.workers,
+                        measurement,
+                        finalized_tables.as_deref().map(Vec::as_slice),
+                    )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =
                             (Arc::clone(&self), ready.clone(), output.clone());

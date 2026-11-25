@@ -50,6 +50,8 @@ use super::hash_join::{
     HashJoinProbeConfig, JoinOutputCol, ProbeJoinKind, is_supported_join_key_type,
 };
 #[cfg(feature = "parquet")]
+use super::join_filter::DynamicJoinFilterConfig;
+#[cfg(feature = "parquet")]
 use super::parquet::ParquetScan;
 use super::sort::{SortSink, TopNSink};
 use super::{
@@ -171,7 +173,7 @@ impl MorselQueryPlanner {
         let (pipeline, schema, root_ordering) = match root_node {
             LoweredNode::Open(mut open) => {
                 builder.optimize_open_pipeline(&mut open, OpenOptimizeHint::default())?;
-                assign_join_build_ids(&mut open.operators)?;
+                builder.finalize_pipeline_joins(&mut open.source, &mut open.operators)?;
                 let pipeline = Pipeline {
                     source: open.source,
                     operators: open.operators,
@@ -182,7 +184,10 @@ impl MorselQueryPlanner {
                 (pipeline, open.schema, open.ordering)
             }
             LoweredNode::Blocking(mut blocking) => {
-                assign_join_build_ids(&mut blocking.operators)?;
+                builder.finalize_pipeline_joins(
+                    &mut blocking.source,
+                    &mut blocking.operators,
+                )?;
                 let sink_capacity = sink_result_capacity(&blocking.sink, self.workers);
                 let pipeline = Pipeline {
                     source: blocking.source,
@@ -619,7 +624,7 @@ impl DagBuilder<'_> {
         let (pipeline, output_schema, ordering, estimate) = match node {
             LoweredNode::Open(mut open) => {
                 self.optimize_open_pipeline(&mut open, OpenOptimizeHint::default())?;
-                assign_join_build_ids(&mut open.operators)?;
+                self.finalize_pipeline_joins(&mut open.source, &mut open.operators)?;
                 let estimate =
                     estimate_side_size(&open.source, &open.operators, &self.stages);
                 let pipeline = Arc::new(Pipeline {
@@ -632,7 +637,10 @@ impl DagBuilder<'_> {
                 (pipeline, open.schema, open.ordering, estimate)
             }
             LoweredNode::Blocking(mut blocking) => {
-                assign_join_build_ids(&mut blocking.operators)?;
+                self.finalize_pipeline_joins(
+                    &mut blocking.source,
+                    &mut blocking.operators,
+                )?;
                 let sink_capacity = sink_result_capacity(&blocking.sink, self.workers);
                 let pipeline = Arc::new(Pipeline {
                     source: blocking.source,
@@ -668,6 +676,27 @@ impl DagBuilder<'_> {
             ordered,
             ordering,
         })
+    }
+
+    fn finalize_pipeline_joins(
+        &self,
+        source: &mut Source,
+        operators: &mut [Operator],
+    ) -> Result<()> {
+        assign_join_build_ids(operators)?;
+        #[cfg(not(feature = "parquet"))]
+        let _ = source;
+        #[cfg(feature = "parquet")]
+        {
+            let opt = &self.session.config_options().optimizer;
+            if opt.enable_dynamic_filter_pushdown
+                && opt.enable_join_dynamic_filter_pushdown
+                && let Source::Parquet(parquet_scan) = source
+            {
+                parquet_scan.bind_join_dynamic_filters(operators)?;
+            }
+        }
+        Ok(())
     }
 
     fn optimize_open_pipeline(
@@ -1659,7 +1688,7 @@ impl DagBuilder<'_> {
         )?;
 
         let (
-            build_source,
+            mut build_source,
             mut build_ops,
             build_schema,
             build_key_exprs,
@@ -1889,6 +1918,29 @@ impl DagBuilder<'_> {
         prune_filter_input(&mut post_ops, &probe_output_schema);
 
         let payload_schema = Arc::new(build_schema.project(&build_payload_columns)?);
+        #[cfg(feature = "parquet")]
+        let dynamic_filter = {
+            let opt = &self.session.config_options().optimizer;
+            let blocked_by_intervening_build_emit = probe_ops.iter().any(
+                |op| matches!(op, Operator::HashProbe(p) if p.needs_build_emission()),
+            );
+            if opt.enable_dynamic_filter_pushdown
+                && opt.enable_join_dynamic_filter_pushdown
+                && matches!(probe_source, Source::Parquet(_))
+                && kind.allows_dynamic_filter_pushdown()
+                && !blocked_by_intervening_build_emit
+            {
+                Some(DynamicJoinFilterConfig {
+                    max_inlist_values: opt.hash_join_inlist_pushdown_max_distinct_values,
+                    max_inlist_bytes: opt.hash_join_inlist_pushdown_max_size,
+                })
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "parquet"))]
+        let dynamic_filter = None;
+
         let build_sink = match HashJoinBuildSink::try_new(HashJoinBuildConfig {
             key_exprs: build_key_exprs,
             key_names: build_key_names,
@@ -1899,12 +1951,13 @@ impl DagBuilder<'_> {
             needs_matched_bitset: kind.needs_matched_bitset(),
             payload_columns: build_payload_columns,
             payload_schema,
+            dynamic_filter,
         })? {
             Ok(sink) => Arc::new(sink),
             Err(reason) => return Ok(Err(reason)),
         };
 
-        assign_join_build_ids(&mut build_ops)?;
+        self.finalize_pipeline_joins(&mut build_source, &mut build_ops)?;
         let build_pipeline = Arc::new(Pipeline {
             source: build_source,
             operators: build_ops,

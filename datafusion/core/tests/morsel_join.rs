@@ -2197,3 +2197,590 @@ async fn chained_mixed_joins_short_circuit_and_build_emit_metrics() -> Result<()
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_minmax_prunes_parquet_row_groups_and_bytes_scanned()
+-> Result<()> {
+    // 16 sorted row groups of 10,000 rows each (k in 0..160_000), wide payload.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("val", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(16);
+    for rg in 0..16i64 {
+        let base = rg * 10_000;
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(base..base + 10_000)),
+                Arc::new(Int64Array::from_iter_values(
+                    (base..base + 10_000).map(|v| v * 3),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000)
+                        .map(|v| format!("payload-{v:08}-padding-to-make-rg-wide")),
+                )),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 4, 10_000)?;
+
+    // Selective build side: 500 keys strictly inside RG 5 (50_000..55_000),
+    // above the default 150-value InList cap so both min/max AND Bloom activate.
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..500i64).map(|i| 50_000 + i * 10),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..500i64)),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 10_000)?;
+
+    let make_ctx = |mode: &str, pushdown: bool, dyn_join: bool| {
+        let fact_path = fact_dir.path().to_str().unwrap().to_owned();
+        let dim_path = dim_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            cfg.options_mut()
+                .optimizer
+                .enable_join_dynamic_filter_pushdown = dyn_join;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("fact", &fact_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim", &dim_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT COUNT(*) AS n, SUM(f.val + d.weight) AS total \
+               FROM fact f INNER JOIN dim d ON f.k = d.dk";
+
+    for pushdown in [false, true] {
+        let stock = make_ctx("off", pushdown, true).await?;
+        let native_off = make_ctx("required", pushdown, false).await?;
+        let native_on = make_ctx("required", pushdown, true).await?;
+
+        let (plan_off, _) = assert_native_parity(&stock, &native_off, sql).await?;
+        let (plan_on, _) = assert_native_parity(&stock, &native_on, sql).await?;
+
+        let bytes_off = metric(plan_off.as_ref(), "bytes_scanned");
+        let bytes_on = metric(plan_on.as_ref(), "bytes_scanned");
+        assert!(
+            bytes_on < bytes_off / 3,
+            "pushdown={pushdown}: expected dynamic min/max pruning to slash bytes_scanned \
+             (on={bytes_on}, off={bytes_off})"
+        );
+        let morsels_off = metric(plan_off.as_ref(), "parquet_morsels_claimed");
+        let morsels_on = metric(plan_on.as_ref(), "parquet_morsels_claimed");
+        assert!(
+            morsels_on < morsels_off,
+            "pushdown={pushdown}: expected fewer claimed row groups (on={morsels_on}, off={morsels_off})"
+        );
+        assert!(
+            metric(plan_on.as_ref(), "join_dynamic_filters_pushed") > 0,
+            "pushdown={pushdown}: expected join_dynamic_filters_pushed > 0"
+        );
+        assert_eq!(
+            metric(plan_off.as_ref(), "join_dynamic_filters_pushed"),
+            0,
+            "pushdown={pushdown}: expected 0 dynamic filters when disabled"
+        );
+        if pushdown {
+            // `k >= min AND k <= max AND bloom(k)` on the 1 surviving file must
+            // group into 1 ArrowPredicate so `k` is decoded once, not 3x.
+            assert_eq!(
+                metric(plan_on.as_ref(), "row_filter_predicates"),
+                1,
+                "expected dynamic bounds + bloom on `k` to group into 1 RowFilter predicate"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_bloom_filters_full_domain_parquet_probe_rows() -> Result<()>
+{
+    // 10 row groups of 10,000 rows each (k in 0..100_000), plus Date32, Utf8, and wide payload.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("skey", DataType::Utf8, false),
+        Field::new("dkey", DataType::Date32, false),
+        Field::new("k2", DataType::Int32, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(10);
+    for rg in 0..10i64 {
+        let base = rg * 10_000;
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(base..base + 10_000)),
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000).map(|v| format!("key-{v:06}")),
+                )),
+                Arc::new(Date32Array::from_iter_values(
+                    (base..base + 10_000).map(|v| (v % 3650) as i32),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (base..base + 10_000).map(|v| (v % 1000) as i32),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000)
+                        .map(|v| format!("wide-payload-column-value-{v:08}")),
+                )),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 2, 10_000)?;
+
+    // 500 keys spanning the ENTIRE domain [0, 99_800] (every 200th key), so min/max
+    // prunes ZERO row groups — all probe row pruning comes from the split-block Bloom filter!
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("dskey", DataType::Utf8, false),
+        Field::new("ddkey", DataType::Date32, false),
+        Field::new("dk2", DataType::Int32, false),
+        Field::new("tag", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values((0..500i64).map(|i| i * 200))),
+            Arc::new(StringArray::from_iter_values(
+                (0..500i64).map(|i| format!("key-{:06}", i * 200)),
+            )),
+            Arc::new(Date32Array::from_iter_values(
+                (0..500i64).map(|i| ((i * 200) % 3650) as i32),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..500i64).map(|i| ((i * 200) % 1000) as i32),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..500i64)),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 10_000)?;
+
+    // Also create a tiny 10-row dim table to exercise the InList tier (<= 150 distinct keys).
+    let tiny_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..10i64).map(|i| i * 10_000 + 7),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..10i64).map(|i| format!("key-{:06}", i * 10_000 + 7)),
+            )),
+            Arc::new(Date32Array::from_iter_values(
+                (0..10i64).map(|i| ((i * 10_000 + 7) % 3650) as i32),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..10i64).map(|i| ((i * 10_000 + 7) % 1000) as i32),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..10i64)),
+        ],
+    )?;
+    let tiny_dir = write_parquet_files(&[tiny_batch], 1, 10_000)?;
+
+    let make_ctx = |mode: &str, pushdown: bool, dyn_join: bool| {
+        let fact_path = fact_dir.path().to_str().unwrap().to_owned();
+        let dim_path = dim_dir.path().to_str().unwrap().to_owned();
+        let tiny_path = tiny_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            cfg.options_mut()
+                .optimizer
+                .enable_join_dynamic_filter_pushdown = dyn_join;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("fact", &fact_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim", &dim_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("tiny", &tiny_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off", true, true).await?;
+    let native = make_ctx("required", true, true).await?;
+
+    // 1. Int64 Bloom filter over full domain: prunes >95% of probe rows inside RowFilter!
+    let (plan_int, _) = assert_native_parity(
+        &stock,
+        &native,
+        "SELECT f.k, f.payload, d.tag FROM fact f INNER JOIN dim d ON f.k = d.dk",
+    )
+    .await?;
+    let pruned_int = metric(plan_int.as_ref(), "pushdown_rows_pruned");
+    let matched_int = metric(plan_int.as_ref(), "pushdown_rows_matched");
+    assert!(
+        pruned_int > 95_000,
+        "expected Int64 Bloom RowFilter to prune >95,000 rows, got {pruned_int}"
+    );
+    assert!(
+        matched_int < 3_000,
+        "expected Int64 Bloom RowFilter to pass <3,000 rows (500 true + <2% FP), got {matched_int}"
+    );
+
+    // 2. Utf8 string Bloom filter over full domain: prunes >95% of probe rows!
+    let (plan_str, _) = assert_native_parity(
+        &stock,
+        &native,
+        "SELECT f.k, f.payload, d.tag FROM fact f INNER JOIN dim d ON f.skey = d.dskey",
+    )
+    .await?;
+    assert!(
+        metric(plan_str.as_ref(), "pushdown_rows_pruned") > 95_000,
+        "expected Utf8 Bloom RowFilter to prune >95,000 rows"
+    );
+
+    // 3. Date32 Bloom filter!
+    let (plan_date, _) = assert_native_parity(
+        &stock,
+        &native,
+        "SELECT COUNT(*) FROM fact f INNER JOIN dim d ON f.dkey = d.ddkey",
+    )
+    .await?;
+    assert!(
+        metric(plan_date.as_ref(), "pushdown_rows_pruned") > 50_000,
+        "expected Date32 Bloom RowFilter to prune >50,000 rows"
+    );
+
+    // 4. Multi-column composite Bloom filter (k, k2)!
+    let (plan_multi, _) = assert_native_parity(
+        &stock,
+        &native,
+        "SELECT f.k, f.payload, d.tag FROM fact f INNER JOIN dim d ON f.k = d.dk AND f.k2 = d.dk2",
+    )
+    .await?;
+    assert!(
+        metric(plan_multi.as_ref(), "pushdown_rows_pruned") > 95_000,
+        "expected multi-column Bloom RowFilter to prune >95,000 rows"
+    );
+
+    // 5. Small build InList tier (10 exact keys -> zero false positives in RowFilter!).
+    let (plan_inlist, _) = assert_native_parity(
+        &stock,
+        &native,
+        "SELECT f.k, f.payload, t.tag FROM fact f INNER JOIN tiny t ON f.k = t.dk",
+    )
+    .await?;
+    assert_eq!(
+        metric(plan_inlist.as_ref(), "pushdown_rows_matched"),
+        10,
+        "expected exact InList RowFilter to match exactly 10 rows with 0 false positives"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_semantics_parity_outer_semi_anti_nulls_empty_floats_and_chained()
+-> Result<()> {
+    // Fact Parquet table (4000 rows across 4 row groups) with NULLs, duplicates, and float edge cases.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+        Field::new("fk", DataType::Float64, true),
+        Field::new("fv", DataType::Int64, false),
+    ]));
+    let fact_batch = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int64Array::from_iter(
+                (0..4000i64).map(|i| if i % 10 == 0 { None } else { Some(i % 200) }),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..4000i64).map(|i| if i % 13 == 0 { None } else { Some(i % 25) }),
+            )),
+            Arc::new(Float64Array::from_iter((0..4000i64).map(|i| {
+                match i % 20 {
+                    0 => None,
+                    1 => Some(f64::NAN),
+                    2 => Some(-0.0),
+                    3 => Some(0.0),
+                    m => Some(m as f64),
+                }
+            }))),
+            Arc::new(Int64Array::from_iter_values(0..4000i64)),
+        ],
+    )?;
+    let fact_dir = write_parquet_files(&[fact_batch], 1, 1000)?;
+
+    // Dim1 Parquet table (30 rows, keys 10..40 plus NULLs and float NaN/-0.0).
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, true),
+        Field::new("dk2", DataType::Int64, true),
+        Field::new("dfk", DataType::Float64, true),
+        Field::new("dv", DataType::Int64, false),
+    ]));
+    let dim1_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter(
+                (0..30i64).map(|i| if i % 7 == 0 { None } else { Some(10 + i) }),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..30i64).map(|i| if i % 5 == 0 { None } else { Some(i % 10) }),
+            )),
+            Arc::new(Float64Array::from_iter((0..30i64).map(|i| match i % 6 {
+                0 => None,
+                1 => Some(f64::NAN),
+                2 => Some(0.0),
+                3 => Some(-0.0),
+                m => Some(m as f64),
+            }))),
+            Arc::new(Int64Array::from_iter_values(100..130i64)),
+        ],
+    )?;
+    let dim1_dir = write_parquet_files(&[dim1_batch], 1, 100)?;
+
+    // Dim2 Parquet table (20 rows, keys 15..35 plus NULLs).
+    let dim2_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter(
+                (0..20i64).map(|i| if i == 0 { None } else { Some(15 + i) }),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..20i64)),
+            Arc::new(Float64Array::from_iter_values((0..20i64).map(|i| i as f64))),
+            Arc::new(Int64Array::from_iter_values(200..220i64)),
+        ],
+    )?;
+    let dim2_dir = write_parquet_files(&[dim2_batch], 1, 100)?;
+
+    // All-NULL build Parquet table (5 rows, all keys NULL!).
+    let all_null_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![None; 5])),
+            Arc::new(Int64Array::from(vec![None; 5])),
+            Arc::new(Float64Array::from(vec![None; 5])),
+            Arc::new(Int64Array::from_iter_values(300..305i64)),
+        ],
+    )?;
+    let all_null_dir = write_parquet_files(&[all_null_batch], 1, 100)?;
+
+    // Empty Parquet table (0 rows).
+    let empty_batch = RecordBatch::new_empty(Arc::clone(&dim_schema));
+    let empty_dir = write_parquet_files(&[empty_batch], 1, 100)?;
+
+    for pushdown in [false, true] {
+        let make_ctx = |mode: &str| {
+            let paths = [
+                ("fact", fact_dir.path().to_str().unwrap().to_owned()),
+                ("dim1", dim1_dir.path().to_str().unwrap().to_owned()),
+                ("dim2", dim2_dir.path().to_str().unwrap().to_owned()),
+                ("all_null", all_null_dir.path().to_str().unwrap().to_owned()),
+                ("empty_dim", empty_dir.path().to_str().unwrap().to_owned()),
+            ];
+            let mode = mode.to_owned();
+            async move {
+                let mut cfg = SessionConfig::new().with_target_partitions(4);
+                cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+                cfg.options_mut().execution.parquet.pruning = true;
+                cfg.options_mut().execution.collect_statistics = false;
+                let ctx = SessionContext::new_with_config(cfg);
+                for (name, path) in paths {
+                    ctx.register_parquet(name, &path, ParquetReadOptions::default())
+                        .await?;
+                }
+                ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                    .await?;
+                Ok::<_, DataFusionError>(ctx)
+            }
+        };
+
+        let stock = make_ctx("off").await?;
+        let native = make_ctx("required").await?;
+
+        let queries = [
+            // Standard join types with NULLs on both sides
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN dim1 d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f LEFT OUTER JOIN dim1 d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f RIGHT OUTER JOIN dim1 d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f FULL OUTER JOIN dim1 d ON f.k = d.dk",
+            "SELECT f.fv FROM fact f WHERE EXISTS (SELECT 1 FROM dim1 d WHERE d.dk = f.k)",
+            "SELECT d.dv FROM dim1 d WHERE EXISTS (SELECT 1 FROM fact f WHERE f.k = d.dk)",
+            "SELECT f.fv FROM fact f WHERE NOT EXISTS (SELECT 1 FROM dim1 d WHERE d.dk = f.k)",
+            "SELECT d.dv FROM dim1 d WHERE NOT EXISTS (SELECT 1 FROM fact f WHERE f.k = d.dk)",
+            // Null-aware NOT IN (with NULLs, non-NULLs, empty)
+            "SELECT f.fv FROM fact f WHERE f.k NOT IN (SELECT dk FROM dim1)",
+            "SELECT f.fv FROM fact f WHERE f.k NOT IN (SELECT dk FROM dim1 WHERE dk IS NOT NULL)",
+            "SELECT f.fv FROM fact f WHERE f.k NOT IN (SELECT dk FROM empty_dim)",
+            // IS NOT DISTINCT FROM (NullEqualsNull): single-key & multi-key
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN dim1 d ON f.k IS NOT DISTINCT FROM d.dk",
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN dim1 d \
+             ON f.k IS NOT DISTINCT FROM d.dk AND f.k2 IS NOT DISTINCT FROM d.dk2",
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN all_null d ON f.k IS NOT DISTINCT FROM d.dk",
+            // Empty build & all-NULL build across INNER / OUTER / ANTI
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN empty_dim d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f LEFT OUTER JOIN empty_dim d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f RIGHT OUTER JOIN empty_dim d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN all_null d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f LEFT OUTER JOIN all_null d ON f.k = d.dk",
+            "SELECT f.fv, d.dv FROM fact f RIGHT OUTER JOIN all_null d ON f.k = d.dk",
+            "SELECT d.dv FROM all_null d WHERE NOT EXISTS (SELECT 1 FROM fact f WHERE f.k = d.dk)",
+            // Float keys with NaN and -0.0 / +0.0
+            "SELECT COUNT(*) FROM fact f INNER JOIN dim1 d ON f.fk = d.dfk",
+            // Multi-column equi-join with NULLs
+            "SELECT f.fv, d.dv FROM fact f INNER JOIN dim1 d ON f.k = d.dk AND f.k2 = d.dk2",
+            // Chained INNER -> INNER (both push into fact)
+            "SELECT f.fv, d1.dv, d2.dv FROM fact f \
+             INNER JOIN dim1 d1 ON f.k = d1.dk \
+             INNER JOIN dim2 d2 ON f.k2 = d2.dk2",
+            // Chained RIGHT OUTER (BuildOuter) -> INNER: dim2 MUST NOT push past BuildOuter!
+            "SELECT f.fv, d1.dv, d2.dv FROM fact f \
+             RIGHT OUTER JOIN dim1 d1 ON f.k = d1.dk \
+             INNER JOIN dim2 d2 ON d1.dk IS NOT DISTINCT FROM d2.dk",
+            // Chained LEFT OUTER (ProbeOuter) -> INNER on fact column
+            "SELECT f.fv, d1.dv, d2.dv FROM fact f \
+             LEFT OUTER JOIN dim1 d1 ON f.k = d1.dk \
+             INNER JOIN dim2 d2 ON f.k2 = d2.dk2",
+            // Mixed-origin multi-key join (one key from fact, one key from dim1 build)
+            "SELECT f.fv, d1.dv, d2.dv FROM fact f \
+             INNER JOIN dim1 d1 ON f.k = d1.dk \
+             INNER JOIN dim2 d2 ON f.k2 = d2.dk2 AND d1.dk = d2.dk",
+        ];
+
+        for sql in queries {
+            assert_native_parity(&stock, &native, sql).await?;
+        }
+
+        // Verify ProbeOuter (LEFT OUTER with probe=fact) NEVER pushes dynamic filters into fact!
+        let (left_plan, _) = assert_native_parity(
+            &stock,
+            &native,
+            "SELECT f.fv, d.dv FROM fact f LEFT OUTER JOIN dim1 d ON f.k = d.dk",
+        )
+        .await?;
+        assert_eq!(
+            metric(left_plan.as_ref(), "join_dynamic_filters_pushed"),
+            0,
+            "pushdown={pushdown}: ProbeOuter (LEFT JOIN) must NOT push dynamic join filters into probe"
+        );
+
+        // Verify BuildOuter with all-NULL build short-circuits probe ParquetScan
+        // (0 probe bytes scanned on `fact`) while still emitting all 5 unmatched build rows!
+        let (all_null_right, batches) = assert_native_parity(
+            &stock,
+            &native,
+            "SELECT f.fv, d.dv FROM fact f RIGHT OUTER JOIN all_null d ON f.k = d.dk",
+        )
+        .await?;
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 5);
+        assert_eq!(
+            metric(
+                all_null_right.as_ref(),
+                "join_dynamic_filter_short_circuits"
+            ),
+            1,
+            "pushdown={pushdown}: all-NULL BuildOuter build should short-circuit probe ParquetScan"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_concurrent_repeated_runs_and_memory_cleanup() -> Result<()> {
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let fact_batch = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..20_000i64)),
+            Arc::new(Int64Array::from_iter_values(0..20_000i64)),
+        ],
+    )?;
+    let fact_dir = write_parquet_files(&[fact_batch], 1, 5_000)?;
+
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("dv", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..300i64).map(|i| 5_000 + i * 10),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..300i64)),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 1_000)?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let mut cfg = SessionConfig::new().with_target_partitions(4);
+    cfg.options_mut().execution.parquet.pushdown_filters = true;
+    cfg.options_mut().execution.parquet.pruning = true;
+    let ctx = SessionContext::new_with_config_rt(cfg, runtime);
+    ctx.register_parquet(
+        "fact",
+        fact_dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.register_parquet(
+        "dim",
+        dim_dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+
+    let sql =
+        "SELECT COUNT(*) AS n, SUM(f.v + d.dv) AS s FROM fact f JOIN dim d ON f.k = d.dk";
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let expected = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+    let expected_rows = sorted_rows(&expected)?;
+
+    // Execute the exact same prepared plan 4 times concurrently to prove zero
+    // cross-run mutation of ParquetScan or dynamic join filters.
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let p = Arc::clone(&plan);
+        let task_ctx = ctx.task_ctx();
+        handles.push(tokio::spawn(async move { collect(p, task_ctx).await }));
+    }
+    for h in handles {
+        let got = h.await.unwrap()?;
+        assert_eq!(sorted_rows(&got)?, expected_rows);
+    }
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "memory pool must be fully released after runs"
+    );
+
+    Ok(())
+}
