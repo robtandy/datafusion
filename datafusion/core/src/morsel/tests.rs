@@ -165,6 +165,7 @@ fn observed_count(fail_on: Option<usize>) -> Result<ObservedCount> {
     pipeline.sink = Sink::Count {
         sink,
         result_operators: vec![Operator::Projection(projector)],
+        post_sort: None,
     };
     Ok(ObservedCount {
         plan: MorselExec::new(pipeline, output_schema),
@@ -764,6 +765,7 @@ async fn count_mask_rejects_oversized_physical_mask() -> Result<()> {
     pipeline.sink = Sink::Count {
         sink: CountSink::new(Arc::clone(&schema)),
         result_operators: vec![],
+        post_sort: None,
     };
     assert_oversized_mask_error(pipeline, schema).await
 }
@@ -965,6 +967,7 @@ fn observed_group_count(fail_on: Option<usize>) -> Result<ObservedGroupCount> {
     pipeline.sink = Sink::GroupCount {
         sink,
         result_operators: vec![Operator::Projection(projector)],
+        post_sort: None,
     };
     pipeline.sink_capacity = GROUP_COUNT_RESULT_CAPACITY;
     Ok(ObservedGroupCount {
@@ -1160,6 +1163,7 @@ async fn group_count_mask_rejects_oversized_physical_mask() -> Result<()> {
     pipeline.sink = Sink::GroupCount {
         sink: GroupCountSink::new(Arc::clone(&schema), 0, IntKeyType::Int32, "id".into()),
         result_operators: vec![],
+        post_sort: None,
     };
     assert!(matches!(
         pipeline.group_count_strategy(0),
@@ -1294,6 +1298,7 @@ async fn observed_aggregate(
     pipeline.sink = Sink::Aggregate {
         sink,
         result_operators: vec![Operator::Projection(projector)],
+        post_sort: None,
     };
     pipeline.sink_capacity = AGGREGATE_RESULT_CAPACITY;
     Ok(ObservedAggregate {
@@ -2072,5 +2077,631 @@ async fn hash_join_memory_limit_failure_during_build_and_finalize_frees_all_memo
             "limit={limit_bytes}: probe must not start after build OOM"
         );
     }
+    Ok(())
+}
+
+struct ObservedSortPlan {
+    plan: MorselExec,
+    scans: Observations,
+    finalizing: mpsc::UnboundedReceiver<()>,
+    resume: Arc<Semaphore>,
+    results: mpsc::UnboundedReceiver<Vec<i32>>,
+    peak_retained_rows: Option<Arc<AtomicUsize>>,
+}
+
+fn observed_sort_or_topn(
+    is_topn: bool,
+    skip: usize,
+    fetch: usize,
+    fail_on: Option<usize>,
+) -> Result<ObservedSortPlan> {
+    use arrow::compute::SortOptions;
+    use datafusion_physical_expr::PhysicalSortExpr;
+
+    let (mut pipeline, scans) = observed_pipeline(fail_on)?;
+    let schema = Arc::clone(pipeline.source.schema());
+    let ordering = LexOrdering::from([PhysicalSortExpr::new(
+        Arc::new(Column::new("id", 0)),
+        SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    )]);
+
+    let (entered, finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    let gate = FinalizeGate {
+        entered,
+        resume: Arc::clone(&resume),
+    };
+
+    let (started, results) = mpsc::unbounded_channel();
+    let observe = create_udf(
+        "observe_sort_out",
+        vec![DataType::Int32],
+        DataType::Int32,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            let ColumnarValue::Array(ids) = &args[0] else {
+                unreachable!()
+            };
+            let arr = as_int32_array(ids.as_ref())?;
+            started.send(arr.values().to_vec()).unwrap();
+            Ok(args[0].clone())
+        }),
+    );
+    let expr = ScalarFunctionExpr::try_new(
+        Arc::new(observe),
+        vec![Arc::new(Column::new("id", 0))],
+        &schema,
+        Arc::default(),
+    )?;
+    let projector = ProjectionExprs::new([ProjectionExpr::new(Arc::new(expr), "id")])
+        .make_projector(&schema)?;
+    let output_schema = Arc::clone(projector.output_schema());
+
+    let peak_retained_rows = if is_topn {
+        let mut sink =
+            TopNSink::try_new(Arc::clone(&schema), ordering, skip, fetch)?.unwrap();
+        sink.finalize_gate = Some(gate);
+        let peak = Arc::clone(&sink.peak_retained_rows);
+        pipeline.sink = Sink::TopN {
+            sink,
+            result_operators: vec![Operator::Projection(projector)],
+        };
+        pipeline.sink_capacity = TOPN_RESULT_CAPACITY;
+        Some(peak)
+    } else {
+        let mut sink =
+            SortSink::try_new(Arc::clone(&schema), ordering, skip, None)?.unwrap();
+        sink.finalize_gate = Some(gate);
+        pipeline.sink = Sink::Sort {
+            sink,
+            result_operators: vec![Operator::Projection(projector)],
+        };
+        pipeline.sink_capacity = SORT_RESULT_CAPACITY;
+        None
+    };
+
+    Ok(ObservedSortPlan {
+        plan: MorselExec::try_new(pipeline, output_schema)?,
+        scans,
+        finalizing,
+        resume,
+        results,
+        peak_retained_rows,
+    })
+}
+
+#[rstest]
+#[case::topn(true)]
+#[case::sort(false)]
+#[tokio::test]
+async fn sort_and_topn_dependent_output_waits_for_finalization(
+    #[case] is_topn: bool,
+) -> Result<()> {
+    let skip = 2;
+    let fetch = 5;
+    let ObservedSortPlan {
+        plan,
+        mut scans,
+        mut finalizing,
+        resume,
+        mut results,
+        peak_retained_rows,
+    } = observed_sort_or_topn(is_topn, skip, fetch, None)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 3)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, ctx)?;
+
+    // Start polling; supervisor runs workers to completion and pauses at finalize_gate.
+    assert!(futures::poll!(stream.next()).is_pending());
+    let seen = observe_n(&mut scans, INPUT_BATCHES).await;
+    assert_eq!(seen.len(), INPUT_BATCHES);
+    timeout(DEADLINE, finalizing.recv())
+        .await
+        .expect("did not reach finalize gate")
+        .unwrap();
+
+    // Dependent output MUST NOT have started yet!
+    tokio::task::yield_now().await;
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(results.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    let metric_name = if is_topn {
+        "topn_finalizations"
+    } else {
+        "sort_finalizations"
+    };
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name(metric_name))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+
+    // Release finalization gate and collect exact DESC output with skip.
+    resume.add_permits(1);
+    let mut actual = Vec::new();
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        let batch = batch?;
+        actual.extend_from_slice(as_int32_array(batch.column(0))?.values());
+    }
+
+    let mut expected: Vec<i32> = (0..INPUT_BATCHES as i32).rev().skip(skip).collect();
+    if is_topn {
+        expected.truncate(fetch);
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name(metric_name))
+            .map_or(0, |v| v.as_usize()),
+        1
+    );
+
+    let mut observed_out = Vec::new();
+    while let Ok(chunk) = results.try_recv() {
+        observed_out.extend(chunk);
+    }
+    assert_eq!(observed_out, expected);
+
+    if let Some(peak) = peak_retained_rows {
+        let limit = skip + fetch;
+        assert!(
+            peak.load(Ordering::Relaxed) <= 3 * limit,
+            "TopN peak_retained_rows {} exceeded 3 * (K+O) = {}",
+            peak.load(Ordering::Relaxed),
+            3 * limit
+        );
+    }
+
+    assert_eq!(pool.reserved(), 0);
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&pipeline).await;
+    Ok(())
+}
+
+#[rstest]
+#[case::topn(true)]
+#[case::sort(false)]
+#[tokio::test]
+async fn sort_and_topn_drop_and_error_before_finalization_tear_down_cleanly(
+    #[case] is_topn: bool,
+) -> Result<()> {
+    let metric_name = if is_topn {
+        "topn_finalizations"
+    } else {
+        "sort_finalizations"
+    };
+
+    // 1. Drop while paused at finalize_gate: never finalizes, never runs dependent output.
+    {
+        let ObservedSortPlan {
+            plan,
+            mut scans,
+            mut finalizing,
+            resume,
+            mut results,
+            ..
+        } = observed_sort_or_topn(is_topn, 1, 4, None)?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 2)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        let _ = observe_n(&mut scans, INPUT_BATCHES).await;
+        timeout(DEADLINE, finalizing.recv()).await.unwrap().unwrap();
+        drop(stream);
+        resume.add_permits(1);
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name(metric_name))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 2. Worker error aborts peers without finalizing and releases all memory.
+    {
+        let ObservedSortPlan {
+            plan,
+            scans: _scans,
+            mut results,
+            ..
+        } = observed_sort_or_topn(is_topn, 1, 4, Some(3))?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 2)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let err = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("test morsel failure"), "{err}");
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name(metric_name))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(
+            results.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 3. Early drop mid-emission (after 1 batch) tears down cleanly and frees memory.
+    {
+        let ObservedSortPlan {
+            plan,
+            scans: _scans,
+            mut finalizing,
+            resume,
+            results: _results,
+            ..
+        } = observed_sort_or_topn(is_topn, 0, 10, None)?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 2)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        timeout(DEADLINE, finalizing.recv()).await.unwrap().unwrap();
+        resume.add_permits(1);
+        let first = timeout(DEADLINE, stream.next()).await.unwrap().unwrap()?;
+        assert_eq!(first.num_rows(), 2);
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn topn_succeeds_under_bounded_pool_where_full_sort_fails_and_cleans_up()
+-> Result<()> {
+    use arrow::array::StringArray;
+    use arrow::compute::SortOptions;
+    use datafusion_physical_expr::PhysicalSortExpr;
+
+    // 20 batches x 500 rows = 10,000 rows (~400+ KiB) in strictly descending order
+    // (worst-case reverse input for ASC TopN).
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("pad", DataType::Utf8, false),
+    ]));
+    let batches: Vec<RecordBatch> = (0..20)
+        .rev()
+        .map(|b| {
+            let start = b * 500;
+            let ks: Vec<i32> = (start..start + 500).rev().collect();
+            let pads: Vec<String> = ks
+                .iter()
+                .map(|v| format!("payload-{v:06}-xxxxxxxxxxxxxxxxxxxxxxxx"))
+                .collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(ks)),
+                    Arc::new(StringArray::from(pads)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let ordering = LexOrdering::from([PhysicalSortExpr::new(
+        Arc::new(Column::new("k", 0)),
+        SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    )]);
+
+    // 1. Medium pool (64 KiB << 400+ KiB dataset): TopN (LIMIT 5 OFFSET 3) succeeds!
+    {
+        let sink =
+            TopNSink::try_new(Arc::clone(&schema), ordering.clone(), 3, 5)?.unwrap();
+        let peak = Arc::clone(&sink.peak_retained_rows);
+        let pipeline = Pipeline {
+            source: Source::Memory(MemorySource {
+                table: "big".into(),
+                batches: batches.clone(),
+                projection: None,
+                schema: Arc::clone(&schema),
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(2).unwrap(),
+            sink: Sink::TopN {
+                sink,
+                result_operators: vec![],
+            },
+            sink_capacity: TOPN_RESULT_CAPACITY,
+        };
+        let plan = MorselExec::try_new(pipeline, Arc::clone(&schema))?;
+        let weak = Arc::downgrade(&plan.pipeline);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 64)?;
+        let mut stream = plan.execute(0, ctx)?;
+        let mut got = Vec::new();
+        while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+            let batch = batch?;
+            got.extend_from_slice(as_int32_array(batch.column(0))?.values());
+        }
+        assert_eq!(got, vec![3, 4, 5, 6, 7]);
+        assert!(
+            peak.load(Ordering::Relaxed) <= 3 * 8,
+            "per-worker peak_retained_rows {} exceeded 3*(K+O)=24",
+            peak.load(Ordering::Relaxed)
+        );
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&weak).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 2. Same 64 KiB pool (and tiny 256 B pool): full Sort fails cleanly with OOM and frees 100%.
+    for limit_bytes in [256usize, 64 * 1024] {
+        let sink =
+            SortSink::try_new(Arc::clone(&schema), ordering.clone(), 0, None)?.unwrap();
+        let pipeline = Pipeline {
+            source: Source::Memory(MemorySource {
+                table: "big".into(),
+                batches: batches.clone(),
+                projection: None,
+                schema: Arc::clone(&schema),
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(2).unwrap(),
+            sink: Sink::Sort {
+                sink,
+                result_operators: vec![],
+            },
+            sink_capacity: SORT_RESULT_CAPACITY,
+        };
+        let plan = MorselExec::try_new(pipeline, Arc::clone(&schema))?;
+        let weak = Arc::downgrade(&plan.pipeline);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit_bytes));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 64)?;
+        let mut stream = plan.execute(0, ctx)?;
+        let err = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                datafusion_common::DataFusionError::ResourcesExhausted(_)
+            ),
+            "limit={limit_bytes}: expected ResourcesExhausted, got {err}"
+        );
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&weak).await;
+        assert_eq!(pool.reserved(), 0, "limit={limit_bytes}");
+    }
+
+    // 3. Tiny 64 B pool: TopN also fails cleanly with ResourcesExhausted and frees 100%.
+    {
+        let sink = TopNSink::try_new(Arc::clone(&schema), ordering, 0, 5)?.unwrap();
+        let pipeline = Pipeline {
+            source: Source::Memory(MemorySource {
+                table: "big".into(),
+                batches,
+                projection: None,
+                schema: Arc::clone(&schema),
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(2).unwrap(),
+            sink: Sink::TopN {
+                sink,
+                result_operators: vec![],
+            },
+            sink_capacity: TOPN_RESULT_CAPACITY,
+        };
+        let plan = MorselExec::try_new(pipeline, schema)?;
+        let weak = Arc::downgrade(&plan.pipeline);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 64)?;
+        let mut stream = plan.execute(0, ctx)?;
+        let err = timeout(DEADLINE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                datafusion_common::DataFusionError::ResourcesExhausted(_)
+            ),
+            "{err}"
+        );
+        assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&weak).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn post_aggregate_sort_and_topn_lifecycle_gate_and_drop_cleanup() -> Result<()> {
+    use arrow::compute::SortOptions;
+    use datafusion_physical_expr::PhysicalSortExpr;
+
+    let (mut pipeline, mut scans) = observed_pipeline(None)?;
+    let agg_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let group_sink =
+        GroupCountSink::new(Arc::clone(&agg_schema), 0, IntKeyType::Int32, "id".into());
+
+    let ordering = LexOrdering::from([PhysicalSortExpr::new(
+        Arc::new(Column::new("id", 0)),
+        SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    )]);
+    let (entered, mut finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    let mut topn_sink =
+        TopNSink::try_new(Arc::clone(&agg_schema), ordering, 1, 4)?.unwrap();
+    topn_sink.finalize_gate = Some(FinalizeGate {
+        entered,
+        resume: Arc::clone(&resume),
+    });
+
+    pipeline.sink = Sink::GroupCount {
+        sink: group_sink,
+        result_operators: vec![],
+        post_sort: Some(PostSort::TopN {
+            sink: topn_sink,
+            result_operators: vec![],
+        }),
+    };
+    pipeline.sink_capacity = GROUP_COUNT_RESULT_CAPACITY;
+
+    let plan = MorselExec::try_new(pipeline, agg_schema)?;
+    let weak = Arc::downgrade(&plan.pipeline);
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+    let mut stream = plan.execute(0, ctx)?;
+
+    assert!(futures::poll!(stream.next()).is_pending());
+    let _ = observe_n(&mut scans, INPUT_BATCHES).await;
+    timeout(DEADLINE, finalizing.recv()).await.unwrap().unwrap();
+    // Aggregate has finalized, TopN is paused before finalizing.
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("group_count_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        1
+    );
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("topn_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+
+    resume.add_permits(1);
+    let mut got = Vec::new();
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        let batch = batch?;
+        got.extend_from_slice(as_int32_array(batch.column(0))?.values());
+    }
+    let expected: Vec<i32> = (0..INPUT_BATCHES as i32).rev().skip(1).take(4).collect();
+    assert_eq!(got, expected);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("topn_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        1
+    );
+
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&weak).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn sort_with_shared_utf8view_slices_keeps_one_run_per_worker_and_bounded_pool()
+-> Result<()> {
+    use arrow::array::StringViewBuilder;
+    use arrow::compute::SortOptions;
+    use datafusion_physical_expr::PhysicalSortExpr;
+
+    // 100K-row (~6.6 MB) Utf8View batch stored as 400 zero-copy slices of 250 rows.
+    // Without deduplicating buffer accounting, 400 * 6.6 MB = 2.6 GB would OOM and
+    // trigger hundreds of local sort run flushes.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8View, false),
+    ]));
+    let total_rows = 100_000usize;
+    let ids: Vec<i32> = (0..total_rows as i32).rev().collect();
+    let mut vb = StringViewBuilder::with_capacity(total_rows);
+    for i in 0..total_rows {
+        vb.append_value(format!(
+            "item-name-{:06}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            (i * 37) % total_rows
+        ));
+    }
+    let big_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+    )?;
+    let slices: Vec<RecordBatch> = (0..total_rows)
+        .step_by(250)
+        .map(|s| big_batch.slice(s, 250))
+        .collect();
+    assert_eq!(slices.len(), 400);
+
+    let ordering = LexOrdering::from([
+        PhysicalSortExpr::new(Arc::new(Column::new("name", 1)), SortOptions::default()),
+        PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default()),
+    ]);
+    let workers = 4usize;
+    let sink = SortSink::try_new(Arc::clone(&schema), ordering, 0, None)?.unwrap();
+    let run_count = Arc::clone(&sink.completed_run_count);
+    let pipeline = Pipeline {
+        source: Source::Memory(MemorySource {
+            table: "sliced_views".into(),
+            batches: slices,
+            projection: None,
+            schema: Arc::clone(&schema),
+        }),
+        operators: vec![],
+        workers: NonZeroUsize::new(workers).unwrap(),
+        sink: Sink::Sort {
+            sink,
+            result_operators: vec![],
+        },
+        sink_capacity: SORT_RESULT_CAPACITY,
+    };
+    let plan = MorselExec::try_new(pipeline, schema)?;
+    let weak = Arc::downgrade(&plan.pipeline);
+    // 48 MiB pool: vastly smaller than 400 * 6.6 MB (~2.6 GB), easily fits 1x shared buffer + rows.
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(48 * 1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 256)?;
+    let mut stream = plan.execute(0, ctx)?;
+    let mut out_rows = 0usize;
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        out_rows += batch?.num_rows();
+    }
+    assert_eq!(out_rows, total_rows);
+    let produced_runs = run_count.load(Ordering::Relaxed);
+    assert!(
+        (1..=workers).contains(&produced_runs),
+        "expected at most 1 sorted run per worker (<= {workers}), got {produced_runs}"
+    );
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&weak).await;
+    assert_eq!(pool.reserved(), 0);
     Ok(())
 }

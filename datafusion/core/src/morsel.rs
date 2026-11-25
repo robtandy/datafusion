@@ -17,6 +17,7 @@ use datafusion_common::config::MorselMode;
 use datafusion_common::instant::Instant;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::utils::combine_limit;
 use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{
     JoinType, NullEquality, Result, exec_datafusion_err, internal_err, plan_err,
@@ -27,12 +28,13 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::expr::physical_name;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion_expr::{Expr, LogicalPlan};
+use datafusion_expr::{Expr, FetchType, LogicalPlan, SkipType};
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs, Projector};
 use datafusion_physical_expr::{
-    EquivalenceProperties, PhysicalExpr, create_physical_expr,
+    EquivalenceProperties, LexOrdering, PhysicalExpr, create_physical_expr,
+    create_physical_sort_exprs,
 };
 use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
@@ -64,11 +66,12 @@ mod hash_join;
 mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
+mod sort;
 
-use aggregate::{AggregateSink, AggregateState};
+use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
-use group_count::{GroupCountSink, GroupCountState, IntKeyType};
+use group_count::{FinalizedGroupCounts, GroupCountSink, GroupCountState, IntKeyType};
 use hash_join::{
     BuildSide, FinalizedHashTable, HashJoinBuildSink, HashJoinBuildState, HashJoinProbe,
     HashJoinProbeConfig, JoinOutputCol, OperatorStep, ProbeCursor, ProbeScratch,
@@ -78,6 +81,7 @@ pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
 use parquet::{ClaimedWork, ParquetScan, ReadyReaders};
+use sort::{SharedSortMemory, SortSink, SortState, SortedRun, TopNSink, TopNState};
 #[cfg(test)]
 mod tests;
 
@@ -85,17 +89,20 @@ const BATCHES_PER_MORSEL: usize = 4;
 const COUNT_RESULT_CAPACITY: usize = 2;
 const GROUP_COUNT_RESULT_CAPACITY: usize = 2;
 const AGGREGATE_RESULT_CAPACITY: usize = 2;
+const TOPN_RESULT_CAPACITY: usize = 2;
+const SORT_RESULT_CAPACITY: usize = 2;
 const MAX_RESULT_CAPACITY: usize = 32;
 
 fn result_capacity(workers: NonZeroUsize) -> usize {
     workers.get().saturating_mul(2).min(MAX_RESULT_CAPACITY)
 }
 
-/// Opt-in planner for an experimental, unordered pipeline over [`MemTable`]
+/// Opt-in planner for an experimental morsel pipeline over [`MemTable`]
 /// and supported Parquet listing scans (with the `parquet` feature).
 /// Lowers scans, filters, and projections with synchronous scalar expressions,
 /// `INNER` equi-joins (two-pipeline build sink + lock-free probe operator),
-/// and ungrouped or grouped aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`).
+/// ungrouped or grouped aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`),
+/// and ordered `TopN` (`ORDER BY ... LIMIT K [OFFSET O]`) or full parallel `Sort`.
 /// Installing this planner explicitly opts in even when the session mode is off.
 /// Unsupported queries use [`DefaultPhysicalPlanner`] unless the mode is
 /// [`MorselMode::Required`], which produces a planning error instead.
@@ -145,6 +152,13 @@ enum LoweredAggregate<'a> {
     },
 }
 
+struct LoweredSort<'a> {
+    sort: &'a datafusion_expr::logical_plan::Sort,
+    skip: usize,
+    fetch: Option<usize>,
+    result_nodes: Vec<&'a LogicalPlan>,
+}
+
 impl MorselQueryPlanner {
     /// Set the maximum number of workers per execution of a native pipeline.
     pub fn new(workers: NonZeroUsize) -> Self {
@@ -156,16 +170,113 @@ impl MorselQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Lowering> {
-        let mut nodes = Vec::new();
+        let mut nodes: Vec<&LogicalPlan> = Vec::new();
+        let mut pending_limit: Option<(usize, Option<usize>)> = None;
+        let mut lowered_sort = None;
         let mut lowered_aggregate = None;
         let mut node = plan;
         enum Leaf<'a> {
             Scan(&'a datafusion_expr::logical_plan::TableScan),
             Join(&'a datafusion_expr::logical_plan::Join),
+            Empty(SchemaRef),
         }
         let leaf = loop {
             match node {
+                LogicalPlan::Limit(limit) => {
+                    if lowered_aggregate.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET below Aggregate: {}",
+                            node.display()
+                        )));
+                    }
+                    if lowered_sort.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET below Sort: {}",
+                            node.display()
+                        )));
+                    }
+                    if !nodes
+                        .iter()
+                        .all(|n| matches!(n, LogicalPlan::Projection(_)))
+                    {
+                        return Ok(Lowering::Unsupported(
+                            "only projection is supported above LIMIT/OFFSET".into(),
+                        ));
+                    }
+                    let SkipType::Literal(skip) = limit.get_skip_type()? else {
+                        return Ok(Lowering::Unsupported(format!(
+                            "unsupported non-literal OFFSET expression in native morsels: {}",
+                            node.display()
+                        )));
+                    };
+                    let FetchType::Literal(fetch) = limit.get_fetch_type()? else {
+                        return Ok(Lowering::Unsupported(format!(
+                            "unsupported non-literal LIMIT expression in native morsels: {}",
+                            node.display()
+                        )));
+                    };
+                    pending_limit = Some(match pending_limit {
+                        Some((p_skip, p_fetch)) => {
+                            combine_limit(p_skip, p_fetch, skip, fetch)
+                        }
+                        None => (skip, fetch),
+                    });
+                    node = &limit.input;
+                }
+                LogicalPlan::Sort(sort) => {
+                    if lowered_aggregate.is_some() {
+                        return Ok(Lowering::Unsupported(
+                            "Sort below Aggregate is not supported in native morsels"
+                                .into(),
+                        ));
+                    }
+                    if lowered_sort.is_some() {
+                        return Ok(Lowering::Unsupported(
+                            "nested Sort is not supported in native morsels".into(),
+                        ));
+                    }
+                    if !nodes
+                        .iter()
+                        .all(|n| matches!(n, LogicalPlan::Projection(_)))
+                    {
+                        return Ok(Lowering::Unsupported(
+                            "only projection and limit are supported above Sort".into(),
+                        ));
+                    }
+                    if sort.expr.is_empty() {
+                        return Ok(Lowering::Unsupported(
+                            "Sort requires at least one sort expression".into(),
+                        ));
+                    }
+                    for sort_expr in &sort.expr {
+                        if !supported_expr(&sort_expr.expr)? {
+                            return Ok(Lowering::Unsupported(format!(
+                                "unsupported sort expression: {}",
+                                sort_expr.expr
+                            )));
+                        }
+                    }
+                    let (skip, fetch) = match pending_limit.take() {
+                        Some((p_skip, p_fetch)) => {
+                            combine_limit(p_skip, p_fetch, 0, sort.fetch)
+                        }
+                        None => (0, sort.fetch),
+                    };
+                    lowered_sort = Some(LoweredSort {
+                        sort,
+                        skip,
+                        fetch,
+                        result_nodes: std::mem::take(&mut nodes),
+                    });
+                    node = &sort.input;
+                }
                 LogicalPlan::Filter(filter) => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
+                            node.display()
+                        )));
+                    }
                     if !supported_expr(&filter.predicate)? {
                         return Ok(Lowering::Unsupported(format!(
                             "unsupported filter predicate: {}",
@@ -187,6 +298,12 @@ impl MorselQueryPlanner {
                     node = &projection.input;
                 }
                 LogicalPlan::Aggregate(aggregate) if lowered_aggregate.is_none() => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
+                            node.display()
+                        )));
+                    }
                     if !nodes
                         .iter()
                         .all(|node| matches!(node, LogicalPlan::Projection(_)))
@@ -243,15 +360,40 @@ impl MorselQueryPlanner {
                             .into(),
                     ));
                 }
-                LogicalPlan::TableScan(scan) => break Leaf::Scan(scan),
-                LogicalPlan::Join(join) => break Leaf::Join(join),
-                LogicalPlan::Limit(_) => {
-                    return Ok(Lowering::Unsupported(format!(
-                        "native morsels do not support LIMIT/OFFSET: {}",
-                        node.display()
-                    )));
+                LogicalPlan::TableScan(scan) => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
+                            node.display()
+                        )));
+                    }
+                    break Leaf::Scan(scan);
+                }
+                LogicalPlan::Join(join) => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
+                            node.display()
+                        )));
+                    }
+                    break Leaf::Join(join);
+                }
+                LogicalPlan::EmptyRelation(empty) if !empty.produce_one_row => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
+                            node.display()
+                        )));
+                    }
+                    break Leaf::Empty(Arc::clone(empty.schema.inner()));
                 }
                 _ => {
+                    if pending_limit.is_some() {
+                        return Ok(Lowering::Unsupported(format!(
+                            "native morsels do not support LIMIT/OFFSET: {}",
+                            node.display()
+                        )));
+                    }
                     return Ok(Lowering::Unsupported(format!(
                         "unsupported logical operator: {}",
                         node.display()
@@ -286,6 +428,7 @@ impl MorselQueryPlanner {
                                 lowered_aggregate,
                                 Some(LoweredAggregate::General { .. })
                             )
+                            || lowered_sort.is_some()
                     }
                     #[cfg(feature = "parquet")]
                     Source::Parquet(_) => true,
@@ -317,8 +460,19 @@ impl MorselQueryPlanner {
                     Err(reason) => return Ok(Lowering::Unsupported(reason)),
                 }
             }
+            Leaf::Empty(empty_schema) => {
+                let source = Source::Memory(MemorySource {
+                    table: "EmptyRelation".to_owned(),
+                    batches: Vec::new(),
+                    projection: None,
+                    schema: empty_schema,
+                });
+                let (operators, schema) =
+                    Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
+                (source, operators, schema)
+            }
         };
-        let sink = match lowered_aggregate {
+        let mut sink = match lowered_aggregate {
             Some(LoweredAggregate::Count {
                 aggregate,
                 count_expr,
@@ -345,6 +499,7 @@ impl MorselQueryPlanner {
                 Sink::Count {
                     sink,
                     result_operators,
+                    post_sort: None,
                 }
             }
             Some(LoweredAggregate::GroupCount {
@@ -408,6 +563,7 @@ impl MorselQueryPlanner {
                 Sink::GroupCount {
                     sink,
                     result_operators,
+                    post_sort: None,
                 }
             }
             Some(LoweredAggregate::General {
@@ -427,18 +583,118 @@ impl MorselQueryPlanner {
                 Sink::Aggregate {
                     sink,
                     result_operators,
+                    post_sort: None,
                 }
             }
             None => Sink::Result,
         };
+        if let Some(LoweredSort {
+            sort,
+            skip,
+            fetch,
+            result_nodes,
+        }) = lowered_sort
+        {
+            let sort_exprs = create_physical_sort_exprs(
+                &sort.expr,
+                sort.input.schema(),
+                session.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )?;
+            let Some(ordering) = LexOrdering::new(sort_exprs) else {
+                return Ok(Lowering::Unsupported(
+                    "Sort requires at least one sort expression".into(),
+                ));
+            };
+            let (sort_result_operators, out_schema) =
+                Self::lower_operators(result_nodes, Arc::clone(&schema), session)?;
+            let post_sort = if let Some(k) = fetch
+                && (k == 0 || skip.checked_add(k).is_some())
+            {
+                let topn_sink =
+                    match TopNSink::try_new(Arc::clone(&schema), ordering, skip, k)? {
+                        Ok(s) => s,
+                        Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                    };
+                PostSort::TopN {
+                    sink: topn_sink,
+                    result_operators: sort_result_operators,
+                }
+            } else {
+                let sort_sink = match SortSink::try_new(
+                    Arc::clone(&schema),
+                    ordering,
+                    skip,
+                    fetch,
+                )? {
+                    Ok(s) => s,
+                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                };
+                PostSort::Sort {
+                    sink: sort_sink,
+                    result_operators: sort_result_operators,
+                }
+            };
+            schema = out_schema;
+            sink = match sink {
+                Sink::Result => match post_sort {
+                    PostSort::TopN {
+                        sink,
+                        result_operators,
+                    } => Sink::TopN {
+                        sink,
+                        result_operators,
+                    },
+                    PostSort::Sort {
+                        sink,
+                        result_operators,
+                    } => Sink::Sort {
+                        sink,
+                        result_operators,
+                    },
+                },
+                Sink::Count {
+                    sink,
+                    result_operators,
+                    ..
+                } => Sink::Count {
+                    sink,
+                    result_operators,
+                    post_sort: Some(post_sort),
+                },
+                Sink::GroupCount {
+                    sink,
+                    result_operators,
+                    ..
+                } => Sink::GroupCount {
+                    sink,
+                    result_operators,
+                    post_sort: Some(post_sort),
+                },
+                Sink::Aggregate {
+                    sink,
+                    result_operators,
+                    ..
+                } => Sink::Aggregate {
+                    sink,
+                    result_operators,
+                    post_sort: Some(post_sort),
+                },
+                Sink::TopN { .. } | Sink::Sort { .. } | Sink::HashJoinBuild(_) => {
+                    unreachable!()
+                }
+            };
+        }
         let sink_capacity = match sink {
             Sink::Result => result_capacity(self.workers),
             Sink::Count { .. } => COUNT_RESULT_CAPACITY,
             Sink::GroupCount { .. } => GROUP_COUNT_RESULT_CAPACITY,
             Sink::Aggregate { .. } => AGGREGATE_RESULT_CAPACITY,
+            Sink::TopN { .. } => TOPN_RESULT_CAPACITY,
+            Sink::Sort { .. } => SORT_RESULT_CAPACITY,
             Sink::HashJoinBuild(_) => unreachable!(),
         };
-        Ok(Lowering::Native(MorselExec::new(
+        Ok(Lowering::Native(MorselExec::try_new(
             Pipeline {
                 source,
                 operators,
@@ -447,7 +703,7 @@ impl MorselQueryPlanner {
                 sink_capacity,
             },
             schema,
-        )))
+        )?))
     }
 
     async fn lower_scan_source(
@@ -1659,21 +1915,161 @@ impl ResultBuffer {
 }
 
 #[derive(Debug)]
+enum PostSort {
+    TopN {
+        sink: TopNSink,
+        result_operators: Vec<Operator>,
+    },
+    Sort {
+        sink: SortSink,
+        result_operators: Vec<Operator>,
+    },
+}
+
+impl PostSort {
+    fn ordering_and_result_ops(&self) -> (&SchemaRef, &LexOrdering, &[Operator]) {
+        match self {
+            Self::TopN {
+                sink,
+                result_operators,
+            } => (sink.input_schema(), sink.ordering(), result_operators),
+            Self::Sort {
+                sink,
+                result_operators,
+            } => (sink.input_schema(), sink.ordering(), result_operators),
+        }
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        let (sink_status, result_ops) = match self {
+            Self::TopN {
+                sink,
+                result_operators,
+            } => (sink.apply_expressions(f)?, result_operators.as_slice()),
+            Self::Sort {
+                sink,
+                result_operators,
+            } => (sink.apply_expressions(f)?, result_operators.as_slice()),
+        };
+        if sink_status == TreeNodeRecursion::Stop {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        apply_operator_expressions(result_ops, f)
+    }
+
+    fn display_summary(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TopN {
+                sink,
+                result_operators,
+            } => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+                write!(f, "; FinalizedTopNSource")?;
+                display_operators(result_operators, f)
+            }
+            Self::Sort {
+                sink,
+                result_operators,
+            } => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+                write!(f, "; FinalizedSortSource")?;
+                display_operators(result_operators, f)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 enum Sink {
     Result,
     Count {
         sink: CountSink,
         result_operators: Vec<Operator>,
+        post_sort: Option<PostSort>,
     },
     GroupCount {
         sink: GroupCountSink,
         result_operators: Vec<Operator>,
+        post_sort: Option<PostSort>,
     },
     Aggregate {
         sink: AggregateSink,
         result_operators: Vec<Operator>,
+        post_sort: Option<PostSort>,
+    },
+    TopN {
+        sink: TopNSink,
+        result_operators: Vec<Operator>,
+    },
+    Sort {
+        sink: SortSink,
+        result_operators: Vec<Operator>,
     },
     HashJoinBuild(Arc<HashJoinBuildSink>),
+}
+
+impl Sink {
+    fn root_sort_ordering(&self) -> Option<(&SchemaRef, &LexOrdering, &[Operator])> {
+        match self {
+            Self::TopN {
+                sink,
+                result_operators,
+            } => Some((sink.input_schema(), sink.ordering(), result_operators)),
+            Self::Sort {
+                sink,
+                result_operators,
+            } => Some((sink.input_schema(), sink.ordering(), result_operators)),
+            Self::Count {
+                post_sort: Some(ps),
+                ..
+            }
+            | Self::GroupCount {
+                post_sort: Some(ps),
+                ..
+            }
+            | Self::Aggregate {
+                post_sort: Some(ps),
+                ..
+            } => Some(ps.ordering_and_result_ops()),
+            Self::Result
+            | Self::Count {
+                post_sort: None, ..
+            }
+            | Self::GroupCount {
+                post_sort: None, ..
+            }
+            | Self::Aggregate {
+                post_sort: None, ..
+            }
+            | Self::HashJoinBuild(_) => None,
+        }
+    }
+}
+
+enum WorkerSinkMemory {
+    Reservation(MemoryReservation),
+    SharedSort(Arc<SharedSortMemory>),
+}
+
+impl WorkerSinkMemory {
+    fn into_reservation(self) -> MemoryReservation {
+        match self {
+            Self::Reservation(r) => r,
+            Self::SharedSort(_) => panic!("expected MemoryReservation"),
+        }
+    }
+
+    fn into_shared_sort(self) -> Arc<SharedSortMemory> {
+        match self {
+            Self::SharedSort(s) => s,
+            Self::Reservation(_) => panic!("expected SharedSortMemory"),
+        }
+    }
 }
 
 enum WorkerSink {
@@ -1681,6 +2077,8 @@ enum WorkerSink {
     Count(CountState),
     GroupCount(GroupCountState),
     Aggregate(AggregateState),
+    TopN(TopNState),
+    Sort(SortState),
     HashJoinBuild(HashJoinBuildState),
 }
 
@@ -1689,6 +2087,7 @@ enum WorkerState {
     Count(CountState),
     GroupCount(GroupCountState),
     Aggregate(AggregateState),
+    SortedRuns(Vec<SortedRun>),
     HashJoinBuild(HashJoinBuildState),
 }
 
@@ -1741,6 +2140,27 @@ fn plain_column_index(projector: &Projector, output_index: usize) -> Option<usiz
     } else {
         None
     }
+}
+
+fn apply_operator_expressions(
+    operators: &[Operator],
+    f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+) -> Result<TreeNodeRecursion> {
+    for operator in operators {
+        let status = match operator {
+            Operator::Filter { predicate, .. } => {
+                apply_expression_roots(std::iter::once(predicate), f)?
+            }
+            Operator::Projection(projector) => {
+                apply_expression_roots(projector.projection().iter().map(|e| &e.expr), f)?
+            }
+            Operator::HashProbe(probe) => probe.apply_expressions(f)?,
+        };
+        if status == TreeNodeRecursion::Stop {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+    }
+    Ok(TreeNodeRecursion::Continue)
 }
 
 async fn abort_and_drain<T: 'static>(tasks: &mut JoinSet<T>) {
@@ -1802,6 +2222,16 @@ impl Pipeline {
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
+            Sink::TopN { sink, .. } => {
+                if sink.apply_expressions(f)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Sink::Sort { sink, .. } => {
+                if sink.apply_expressions(f)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
             Sink::HashJoinBuild(sink) => {
                 if sink.apply_expressions(f)? == TreeNodeRecursion::Stop {
                     return Ok(TreeNodeRecursion::Stop);
@@ -1809,32 +2239,40 @@ impl Pipeline {
             }
             Sink::Result | Sink::Count { .. } | Sink::GroupCount { .. } => {}
         }
-        let result_operators = match &self.sink {
-            Sink::Result | Sink::HashJoinBuild(_) => &[][..],
+        let (result_operators, post_sort) = match &self.sink {
+            Sink::Result | Sink::HashJoinBuild(_) => (&[][..], None),
             Sink::Count {
-                result_operators, ..
+                result_operators,
+                post_sort,
+                ..
             }
             | Sink::GroupCount {
-                result_operators, ..
+                result_operators,
+                post_sort,
+                ..
             }
             | Sink::Aggregate {
+                result_operators,
+                post_sort,
+                ..
+            } => (result_operators.as_slice(), post_sort.as_ref()),
+            Sink::TopN {
                 result_operators, ..
-            } => result_operators.as_slice(),
-        };
-        for operator in self.operators.iter().chain(result_operators) {
-            let status = match operator {
-                Operator::Filter { predicate, .. } => {
-                    apply_expression_roots(std::iter::once(predicate), f)?
-                }
-                Operator::Projection(projector) => apply_expression_roots(
-                    projector.projection().iter().map(|e| &e.expr),
-                    f,
-                )?,
-                Operator::HashProbe(probe) => probe.apply_expressions(f)?,
-            };
-            if status == TreeNodeRecursion::Stop {
-                return Ok(TreeNodeRecursion::Stop);
             }
+            | Sink::Sort {
+                result_operators, ..
+            } => (result_operators.as_slice(), None),
+        };
+        if apply_operator_expressions(&self.operators, f)? == TreeNodeRecursion::Stop {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        if apply_operator_expressions(result_operators, f)? == TreeNodeRecursion::Stop {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        if let Some(post_sort) = post_sort
+            && post_sort.apply_expressions(f)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
         }
         Ok(TreeNodeRecursion::Continue)
     }
@@ -1957,7 +2395,7 @@ impl Pipeline {
     fn worker_sink(
         &self,
         batch_size: usize,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
     ) -> Result<WorkerSink> {
         Ok(match &self.sink {
             Sink::Result => {
@@ -1973,13 +2411,35 @@ impl Pipeline {
             }
             Sink::Count { .. } => WorkerSink::Count(CountState::default()),
             Sink::GroupCount { sink, .. } => WorkerSink::GroupCount(
-                sink.new_state(reservation.expect("group count reservation")),
+                sink.new_state(
+                    sink_memory
+                        .expect("group count reservation")
+                        .into_reservation(),
+                ),
             ),
             Sink::Aggregate { sink, .. } => WorkerSink::Aggregate(
-                sink.new_state(reservation.expect("aggregate reservation"))?,
+                sink.new_state(
+                    sink_memory
+                        .expect("aggregate reservation")
+                        .into_reservation(),
+                )?,
             ),
+            Sink::TopN { sink, .. } => {
+                WorkerSink::TopN(sink.new_state(
+                    sink_memory.expect("topn reservation").into_reservation(),
+                )?)
+            }
+            Sink::Sort { sink, .. } => {
+                WorkerSink::Sort(sink.new_state(
+                    sink_memory.expect("sort shared memory").into_shared_sort(),
+                ))
+            }
             Sink::HashJoinBuild(sink) => WorkerSink::HashJoinBuild(
-                sink.new_state(reservation.expect("hash join build reservation")),
+                sink.new_state(
+                    sink_memory
+                        .expect("hash join build reservation")
+                        .into_reservation(),
+                ),
             ),
         })
     }
@@ -1989,11 +2449,11 @@ impl Pipeline {
         source: &MemorySource,
         next: &AtomicUsize,
         output: WorkerOutput,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
         join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
         let mut join_state =
             join_context.map(|(tables, probe_reservation)| JoinWorkerState {
                 tables,
@@ -2043,11 +2503,11 @@ impl Pipeline {
         &self,
         ready: ReadyReaders,
         output: WorkerOutput,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
         join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
         let mut join_state =
             join_context.map(|(tables, probe_reservation)| JoinWorkerState {
                 tables,
@@ -2219,6 +2679,14 @@ impl Pipeline {
                 local.add_view(&view)?;
                 Ok(true)
             }),
+            WorkerSink::TopN(local) => worker.process(|| {
+                local.add_view(&view)?;
+                Ok(true)
+            }),
+            WorkerSink::Sort(local) => worker.process(|| {
+                local.add_view(view)?;
+                Ok(true)
+            }),
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
                 local.add_view(&view)?;
                 Ok(true)
@@ -2367,6 +2835,20 @@ impl Pipeline {
                 }
                 Ok(true)
             }),
+            WorkerSink::TopN(local) => worker.process(|| {
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                if !view.is_empty() {
+                    local.add_view(&view)?;
+                }
+                Ok(true)
+            }),
+            WorkerSink::Sort(local) => worker.process(|| {
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                if !view.is_empty() {
+                    local.add_view(view)?;
+                }
+                Ok(true)
+            }),
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
                 let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
@@ -2400,6 +2882,20 @@ impl Pipeline {
             WorkerSink::Count(local) => return Ok(WorkerState::Count(local)),
             WorkerSink::GroupCount(local) => return Ok(WorkerState::GroupCount(local)),
             WorkerSink::Aggregate(local) => return Ok(WorkerState::Aggregate(local)),
+            WorkerSink::TopN(local) => {
+                if output.tx.is_closed() {
+                    return Ok(WorkerState::None);
+                }
+                let run = worker.process(|| local.finish(output.batch_size))?;
+                return Ok(WorkerState::SortedRuns(run.into_iter().collect()));
+            }
+            WorkerSink::Sort(local) => {
+                if output.tx.is_closed() {
+                    return Ok(WorkerState::None);
+                }
+                let runs = worker.process(|| local.finish())?;
+                return Ok(WorkerState::SortedRuns(runs));
+            }
             WorkerSink::HashJoinBuild(local) => {
                 return Ok(WorkerState::HashJoinBuild(local));
             }
@@ -2547,7 +3043,9 @@ impl Pipeline {
                         Arc::clone(&next),
                         build_output.clone(),
                     );
-                    let reservation = Some(build_reservation.new_empty());
+                    let reservation = Some(WorkerSinkMemory::Reservation(
+                        build_reservation.new_empty(),
+                    ));
                     let join_ctx = nested_tables.as_ref().map(|t| {
                         (
                             Arc::clone(t),
@@ -2595,7 +3093,9 @@ impl Pipeline {
                         ready.clone(),
                         build_output.clone(),
                     );
-                    let reservation = Some(build_reservation.new_empty());
+                    let reservation = Some(WorkerSinkMemory::Reservation(
+                        build_reservation.new_empty(),
+                    ));
                     let join_ctx = nested_tables.as_ref().map(|t| {
                         (
                             Arc::clone(t),
@@ -2701,6 +3201,289 @@ impl Pipeline {
         Ok(finalized)
     }
 
+    fn post_sort(&self) -> Option<&PostSort> {
+        match &self.sink {
+            Sink::Count { post_sort, .. }
+            | Sink::GroupCount { post_sort, .. }
+            | Sink::Aggregate { post_sort, .. } => post_sort.as_ref(),
+            Sink::Result
+            | Sink::TopN { .. }
+            | Sink::Sort { .. }
+            | Sink::HashJoinBuild(_) => None,
+        }
+    }
+
+    async fn finalize_direct_sort(
+        sink: &SortSink,
+        result_operators: &[Operator],
+        sorted_runs: Vec<SortedRun>,
+        fin: SortFinalizeCtx<'_>,
+        tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(gate) = &sink.finalize_gate {
+            gate.wait().await;
+        }
+        if tx.is_closed() {
+            return Ok(());
+        }
+        let finalize_start = fin.measurement.map(|_| Instant::now());
+        MetricBuilder::new(fin.metrics)
+            .counter("sort_finalizations", 0)
+            .add(1);
+        sink.finalize_and_emit(
+            sorted_runs,
+            result_operators,
+            fin.batch_size,
+            fin.context.memory_pool(),
+            tx,
+            fin.measurement,
+        )
+        .await?;
+        if let (Some(run), Some(start)) = (fin.measurement, finalize_start) {
+            run.record_pipeline_time(
+                "sort",
+                "morsel_sort_finalize_work",
+                start.elapsed(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn finalize_direct_topn(
+        sink: &TopNSink,
+        result_operators: &[Operator],
+        sorted_runs: Vec<SortedRun>,
+        fin: SortFinalizeCtx<'_>,
+        tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(gate) = &sink.finalize_gate {
+            gate.wait().await;
+        }
+        if tx.is_closed() {
+            return Ok(());
+        }
+        let finalize_start = fin.measurement.map(|_| Instant::now());
+        MetricBuilder::new(fin.metrics)
+            .counter("topn_finalizations", 0)
+            .add(1);
+        sink.finalize_and_emit(
+            sorted_runs,
+            result_operators,
+            fin.batch_size,
+            fin.context.memory_pool(),
+            tx,
+            fin.measurement,
+        )
+        .await?;
+        if let (Some(run), Some(start)) = (fin.measurement, finalize_start) {
+            run.record_pipeline_time(
+                "topn",
+                "morsel_topn_finalize_work",
+                start.elapsed(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn run_post_sort_stage(
+        self: &Arc<Self>,
+        finalized_agg: FinalizedAggOutput,
+        batch_size: usize,
+        context: &Arc<TaskContext>,
+        metrics: &ExecutionPlanMetricsSet,
+        tx: mpsc::Sender<RecordBatch>,
+        measurement: Option<&Arc<RunMetrics>>,
+    ) -> Result<()> {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        let Some(post_sort) = self.post_sort() else {
+            return internal_err!("Expected PostSort stage on aggregate sink");
+        };
+        let (consumer_name, stage_label) = match post_sort {
+            PostSort::TopN { .. } => ("MorselTopN", "topn"),
+            PostSort::Sort { .. } => ("MorselSort", "sort"),
+        };
+        let sort_workers = match &finalized_agg {
+            FinalizedAggOutput::Count(_) => 1,
+            FinalizedAggOutput::GroupCount(_) | FinalizedAggOutput::Aggregate(_) => {
+                self.workers.get()
+            }
+        };
+
+        let (agg_tx, agg_rx) = mpsc::channel(result_capacity(self.workers));
+        let agg_rx = Arc::new(tokio::sync::Mutex::new(agg_rx));
+        let mut tasks: JoinSet<Result<Vec<SortedRun>>> = JoinSet::new();
+
+        // Producer task: streams finalized aggregate output through agg_result_operators.
+        {
+            let pipeline = Arc::clone(self);
+            tasks.spawn(async move {
+                match finalized_agg {
+                    FinalizedAggOutput::Count(finalized) => {
+                        let Sink::Count {
+                            result_operators, ..
+                        } = &pipeline.sink
+                        else {
+                            unreachable!()
+                        };
+                        Self::run_count_result(finalized, result_operators, agg_tx, None)
+                            .await?;
+                    }
+                    FinalizedAggOutput::GroupCount(finalized) => {
+                        let Sink::GroupCount {
+                            result_operators, ..
+                        } = &pipeline.sink
+                        else {
+                            unreachable!()
+                        };
+                        finalized
+                            .emit(result_operators, batch_size, agg_tx, None)
+                            .await?;
+                    }
+                    FinalizedAggOutput::Aggregate(finalized) => {
+                        let Sink::Aggregate {
+                            result_operators, ..
+                        } = &pipeline.sink
+                        else {
+                            unreachable!()
+                        };
+                        finalized
+                            .emit(result_operators, batch_size, agg_tx, None)
+                            .await?;
+                    }
+                }
+                Ok(Vec::new())
+            });
+        }
+
+        // Consumer tasks: dynamically claim finalized aggregate batches and feed local TopN / Sort.
+        let stage_reservation =
+            MemoryConsumer::new(consumer_name).register(context.memory_pool());
+        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. })
+            .then(|| SharedSortMemory::new(stage_reservation.new_empty()));
+        for id in 0..sort_workers {
+            let pipeline = Arc::clone(self);
+            let agg_rx = Arc::clone(&agg_rx);
+            let output_tx = tx.clone();
+            let reservation = stage_reservation.new_empty();
+            let shared_sort = shared_sort_memory.as_ref().map(Arc::clone);
+            let mut worker =
+                WorkerMetrics::for_pipeline(measurement.cloned(), id, stage_label);
+            tasks.spawn(async move {
+                let Some(ps) = pipeline.post_sort() else {
+                    unreachable!()
+                };
+                enum LocalPostState {
+                    TopN(TopNState),
+                    Sort(SortState),
+                }
+                let mut local = match ps {
+                    PostSort::TopN { sink, .. } => {
+                        LocalPostState::TopN(sink.new_state(reservation)?)
+                    }
+                    PostSort::Sort { sink, .. } => LocalPostState::Sort(
+                        sink.new_state(shared_sort.expect("shared sort memory")),
+                    ),
+                };
+                loop {
+                    let maybe_batch = tokio::select! {
+                        biased;
+                        _ = output_tx.closed() => return Ok(Vec::new()),
+                        batch = async { agg_rx.lock().await.recv().await } => batch,
+                    };
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+                    if output_tx.is_closed() {
+                        return Ok(Vec::new());
+                    }
+                    worker.claim();
+                    worker.process(|| match &mut local {
+                        LocalPostState::TopN(s) => s.add_view(&BatchView::all(batch)),
+                        LocalPostState::Sort(s) => s.add_view(BatchView::all(batch)),
+                    })?;
+                    worker.complete();
+                    tokio::task::yield_now().await;
+                }
+                if output_tx.is_closed() {
+                    return Ok(Vec::new());
+                }
+                let runs = worker.process(|| match local {
+                    LocalPostState::TopN(s) => {
+                        Ok(s.finish(batch_size)?.into_iter().collect())
+                    }
+                    LocalPostState::Sort(s) => s.finish(),
+                })?;
+                Ok(runs)
+            });
+        }
+        drop(stage_reservation);
+        drop(shared_sort_memory);
+        drop(agg_rx);
+
+        let mut sorted_runs = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let runs = match result {
+                Ok(Ok(runs)) => runs,
+                Ok(Err(err)) => {
+                    drop(sorted_runs);
+                    abort_and_drain(&mut tasks).await;
+                    return Err(err);
+                }
+                Err(err) if err.is_panic() => {
+                    drop(sorted_runs);
+                    abort_and_drain(&mut tasks).await;
+                    std::panic::resume_unwind(err.into_panic())
+                }
+                Err(err) => {
+                    drop(sorted_runs);
+                    abort_and_drain(&mut tasks).await;
+                    return Err(exec_datafusion_err!(
+                        "Morsel post-sort task failed: {err}"
+                    ));
+                }
+            };
+            sorted_runs.extend(runs);
+            if tx.is_closed() {
+                drop(sorted_runs);
+                abort_and_drain(&mut tasks).await;
+                return Ok(());
+            }
+        }
+
+        let fin = SortFinalizeCtx {
+            batch_size,
+            context,
+            metrics,
+            measurement: measurement.map(Arc::as_ref),
+        };
+        match post_sort {
+            PostSort::TopN {
+                sink,
+                result_operators,
+            } => {
+                Self::finalize_direct_topn(sink, result_operators, sorted_runs, fin, tx)
+                    .await
+            }
+            PostSort::Sort {
+                sink,
+                result_operators,
+            } => {
+                Self::finalize_direct_sort(sink, result_operators, sorted_runs, fin, tx)
+                    .await
+            }
+        }
+    }
+
     async fn run_count_result(
         finalized: FinalizedCount,
         operators: &[Operator],
@@ -2767,8 +3550,17 @@ impl Pipeline {
                     MemoryConsumer::new("MorselAggregate")
                         .register(context.memory_pool()),
                 ),
+                Sink::TopN { .. } => Some(
+                    MemoryConsumer::new("MorselTopN").register(context.memory_pool()),
+                ),
+                Sink::Sort { .. } => None,
                 Sink::Result | Sink::Count { .. } | Sink::HashJoinBuild(_) => None,
             };
+            let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
+                SharedSortMemory::new(
+                    MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+                )
+            });
             let mut combined_group = match (&self.sink, &sink_reservation) {
                 (Sink::GroupCount { sink, .. }, Some(reservation)) => {
                     Some(sink.new_state(reservation.new_empty()))
@@ -2782,6 +3574,7 @@ impl Pipeline {
                 _ => None,
             };
             let mut combined_count = CountState::default();
+            let mut sorted_runs: Vec<SortedRun> = Vec::new();
 
             // Phase 2: execute probe/scan pipeline unless short-circuited by an
             // empty INNER JOIN build table (DuckDB's EmptyResultIfRHSIsEmpty).
@@ -2798,9 +3591,13 @@ impl Pipeline {
                         for id in 0..self.workers.get().min(morsels) {
                             let (pipeline, next, output) =
                                 (Arc::clone(&self), Arc::clone(&next), output.clone());
-                            let reservation = sink_reservation
-                                .as_ref()
-                                .map(MemoryReservation::new_empty);
+                            let sink_memory = if let Some(shared) = &shared_sort_memory {
+                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            } else {
+                                sink_reservation
+                                    .as_ref()
+                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                            };
                             let join_ctx = finalized_tables.as_ref().map(|t| {
                                 (
                                     Arc::clone(t),
@@ -2830,7 +3627,7 @@ impl Pipeline {
                                         source,
                                         &next,
                                         output,
-                                        reservation,
+                                        sink_memory,
                                         join_ctx,
                                         worker,
                                     )
@@ -2849,9 +3646,13 @@ impl Pipeline {
                         for id in 0..self.workers.get() {
                             let (pipeline, ready, output) =
                                 (Arc::clone(&self), ready.clone(), output.clone());
-                            let reservation = sink_reservation
-                                .as_ref()
-                                .map(MemoryReservation::new_empty);
+                            let sink_memory = if let Some(shared) = &shared_sort_memory {
+                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            } else {
+                                sink_reservation
+                                    .as_ref()
+                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                            };
                             let join_ctx = finalized_tables.as_ref().map(|t| {
                                 (
                                     Arc::clone(t),
@@ -2875,7 +3676,7 @@ impl Pipeline {
                                     .run_parquet_worker(
                                         ready,
                                         output,
-                                        reservation,
+                                        sink_memory,
                                         join_ctx,
                                         worker,
                                     )
@@ -2885,6 +3686,7 @@ impl Pipeline {
                     }
                 }
                 drop(sink_reservation);
+                drop(shared_sort_memory);
                 drop(probe_reservation);
                 while let Some(result) = tasks.join_next().await {
                     let local = match result {
@@ -2892,6 +3694,7 @@ impl Pipeline {
                         Ok(Err(err)) => {
                             drop(combined_group);
                             drop(combined_agg);
+                            drop(sorted_runs);
                             abort_and_drain(&mut tasks).await;
                             drop(finalized_tables);
                             return Err(err);
@@ -2899,6 +3702,7 @@ impl Pipeline {
                         Err(err) if err.is_panic() => {
                             drop(combined_group);
                             drop(combined_agg);
+                            drop(sorted_runs);
                             abort_and_drain(&mut tasks).await;
                             drop(finalized_tables);
                             std::panic::resume_unwind(err.into_panic())
@@ -2906,6 +3710,7 @@ impl Pipeline {
                         Err(err) => {
                             drop(combined_group);
                             drop(combined_agg);
+                            drop(sorted_runs);
                             abort_and_drain(&mut tasks).await;
                             drop(finalized_tables);
                             return Err(exec_datafusion_err!(
@@ -2919,6 +3724,7 @@ impl Pipeline {
                             if let Err(err) = combined_count.combine(local) {
                                 drop(combined_group);
                                 drop(combined_agg);
+                                drop(sorted_runs);
                                 abort_and_drain(&mut tasks).await;
                                 drop(finalized_tables);
                                 return Err(err);
@@ -2931,6 +3737,7 @@ impl Pipeline {
                                     Ok(false) => {
                                         drop(combined_group);
                                         drop(combined_agg);
+                                        drop(sorted_runs);
                                         abort_and_drain(&mut tasks).await;
                                         drop(finalized_tables);
                                         return Ok(());
@@ -2938,6 +3745,7 @@ impl Pipeline {
                                     Err(err) => {
                                         drop(combined_group);
                                         drop(combined_agg);
+                                        drop(sorted_runs);
                                         abort_and_drain(&mut tasks).await;
                                         drop(finalized_tables);
                                         return Err(err);
@@ -2952,6 +3760,7 @@ impl Pipeline {
                                     Ok(false) => {
                                         drop(combined_group);
                                         drop(combined_agg);
+                                        drop(sorted_runs);
                                         abort_and_drain(&mut tasks).await;
                                         drop(finalized_tables);
                                         return Ok(());
@@ -2959,6 +3768,7 @@ impl Pipeline {
                                     Err(err) => {
                                         drop(combined_group);
                                         drop(combined_agg);
+                                        drop(sorted_runs);
                                         abort_and_drain(&mut tasks).await;
                                         drop(finalized_tables);
                                         return Err(err);
@@ -2966,10 +3776,20 @@ impl Pipeline {
                                 }
                             }
                         }
+                        WorkerState::SortedRuns(runs) => {
+                            sorted_runs.extend(runs);
+                            if output.tx.is_closed() {
+                                drop(sorted_runs);
+                                abort_and_drain(&mut tasks).await;
+                                drop(finalized_tables);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             } else {
                 drop(sink_reservation);
+                drop(shared_sort_memory);
             }
             // Release finalized join build tables as soon as probe workers finish,
             // before publishing tails or finalizing downstream aggregate sinks.
@@ -2991,6 +3811,7 @@ impl Pipeline {
                 Sink::Count {
                     sink,
                     result_operators,
+                    post_sort,
                 } => {
                     if !tx.is_closed() {
                         // Run the dependent pipeline only on successful finalization. It
@@ -3004,19 +3825,32 @@ impl Pipeline {
                             MetricBuilder::new(&metrics)
                                 .counter("count_finalizations", 0)
                                 .add(1);
-                            Self::run_count_result(
-                                finalized,
-                                result_operators,
-                                tx,
-                                measurement.as_deref(),
-                            )
-                            .await?;
+                            if post_sort.is_some() {
+                                self.run_post_sort_stage(
+                                    FinalizedAggOutput::Count(finalized),
+                                    output.batch_size,
+                                    &context,
+                                    &metrics,
+                                    tx,
+                                    measurement.as_ref(),
+                                )
+                                .await?;
+                            } else {
+                                Self::run_count_result(
+                                    finalized,
+                                    result_operators,
+                                    tx,
+                                    measurement.as_deref(),
+                                )
+                                .await?;
+                            }
                         }
                     }
                 }
                 Sink::GroupCount {
                     sink,
                     result_operators,
+                    post_sort,
                 } => {
                     if !tx.is_closed() {
                         #[cfg(test)]
@@ -3030,20 +3864,33 @@ impl Pipeline {
                             MetricBuilder::new(&metrics)
                                 .counter("group_count_finalizations", 0)
                                 .add(1);
-                            finalized
-                                .emit(
-                                    result_operators,
+                            if post_sort.is_some() {
+                                self.run_post_sort_stage(
+                                    FinalizedAggOutput::GroupCount(finalized),
                                     output.batch_size,
+                                    &context,
+                                    &metrics,
                                     tx,
-                                    measurement.as_deref(),
+                                    measurement.as_ref(),
                                 )
                                 .await?;
+                            } else {
+                                finalized
+                                    .emit(
+                                        result_operators,
+                                        output.batch_size,
+                                        tx,
+                                        measurement.as_deref(),
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                 }
                 Sink::Aggregate {
                     sink,
                     result_operators,
+                    post_sort,
                 } => {
                     if !tx.is_closed() {
                         #[cfg(test)]
@@ -3057,16 +3904,64 @@ impl Pipeline {
                             MetricBuilder::new(&metrics)
                                 .counter("aggregate_finalizations", 0)
                                 .add(1);
-                            finalized
-                                .emit(
-                                    result_operators,
+                            if post_sort.is_some() {
+                                self.run_post_sort_stage(
+                                    FinalizedAggOutput::Aggregate(finalized),
                                     output.batch_size,
+                                    &context,
+                                    &metrics,
                                     tx,
-                                    measurement.as_deref(),
+                                    measurement.as_ref(),
                                 )
                                 .await?;
+                            } else {
+                                finalized
+                                    .emit(
+                                        result_operators,
+                                        output.batch_size,
+                                        tx,
+                                        measurement.as_deref(),
+                                    )
+                                    .await?;
+                            }
                         }
                     }
+                }
+                Sink::TopN {
+                    sink,
+                    result_operators,
+                } => {
+                    Self::finalize_direct_topn(
+                        sink,
+                        result_operators,
+                        sorted_runs,
+                        SortFinalizeCtx {
+                            batch_size: output.batch_size,
+                            context: &context,
+                            metrics: &metrics,
+                            measurement: measurement.as_deref(),
+                        },
+                        tx,
+                    )
+                    .await?;
+                }
+                Sink::Sort {
+                    sink,
+                    result_operators,
+                } => {
+                    Self::finalize_direct_sort(
+                        sink,
+                        result_operators,
+                        sorted_runs,
+                        SortFinalizeCtx {
+                            batch_size: output.batch_size,
+                            context: &context,
+                            metrics: &metrics,
+                            measurement: measurement.as_deref(),
+                        },
+                        tx,
+                    )
+                    .await?;
                 }
             }
             Ok(())
@@ -3077,6 +3972,19 @@ impl Pipeline {
             measurement,
         }
     }
+}
+
+struct SortFinalizeCtx<'a> {
+    batch_size: usize,
+    context: &'a Arc<TaskContext>,
+    metrics: &'a ExecutionPlanMetricsSet,
+    measurement: Option<&'a RunMetrics>,
+}
+
+enum FinalizedAggOutput {
+    Count(FinalizedCount),
+    GroupCount(FinalizedGroupCounts),
+    Aggregate(FinalizedAggregate),
 }
 
 struct PipelineRun {
@@ -3110,32 +4018,55 @@ struct MorselExec {
 }
 
 impl MorselExec {
+    #[cfg(test)]
     fn new(pipeline: Pipeline, schema: SchemaRef) -> Self {
+        Self::try_new(pipeline, schema).expect("valid test MorselExec")
+    }
+
+    fn try_new(pipeline: Pipeline, schema: SchemaRef) -> Result<Self> {
         let emission = match pipeline.sink {
             Sink::Result => EmissionType::Incremental,
             Sink::Count { .. }
             | Sink::GroupCount { .. }
             | Sink::Aggregate { .. }
+            | Sink::TopN { .. }
+            | Sink::Sort { .. }
             | Sink::HashJoinBuild(_) => EmissionType::Final,
+        };
+        let eq_properties = if let Some((sort_schema, ordering, result_ops)) =
+            pipeline.sink.root_sort_ordering()
+        {
+            let mut eq = EquivalenceProperties::new(Arc::clone(sort_schema));
+            eq.add_ordering(ordering.clone());
+            for op in result_ops {
+                if let Operator::Projection(projector) = op {
+                    let mapping =
+                        projector.projection().projection_mapping(eq.schema())?;
+                    eq = eq.project(&mapping, Arc::clone(projector.output_schema()));
+                }
+            }
+            eq
+        } else {
+            EquivalenceProperties::new(schema)
         };
         let metrics = match &pipeline.source {
             Source::Memory(_) => ExecutionPlanMetricsSet::new(),
             #[cfg(feature = "parquet")]
             Source::Parquet(source) => source.metrics.clone(),
         };
-        Self {
+        Ok(Self {
             metrics,
             pipeline: Arc::new(pipeline),
             properties: Arc::new(
                 PlanProperties::new(
-                    EquivalenceProperties::new(schema),
+                    eq_properties,
                     Partitioning::UnknownPartitioning(1),
                     emission,
                     Boundedness::Bounded,
                 )
                 .with_scheduling_type(SchedulingType::Cooperative),
             ),
-        }
+        })
     }
 }
 
@@ -3187,14 +4118,20 @@ impl DisplayAs for MorselExec {
         match &pipeline.sink {
             Sink::Result => {}
             Sink::Count {
-                result_operators, ..
+                result_operators,
+                post_sort,
+                ..
             } => {
                 write!(f, " -> CountSink; FinalizedCountSource")?;
                 display_operators(result_operators, f)?;
+                if let Some(ps) = post_sort {
+                    ps.display_summary(f)?;
+                }
             }
             Sink::GroupCount {
                 sink,
                 result_operators,
+                post_sort,
             } => {
                 write!(
                     f,
@@ -3202,14 +4139,39 @@ impl DisplayAs for MorselExec {
                     sink.key_name, sink.key_index
                 )?;
                 display_operators(result_operators, f)?;
+                if let Some(ps) = post_sort {
+                    ps.display_summary(f)?;
+                }
             }
             Sink::Aggregate {
+                sink,
+                result_operators,
+                post_sort,
+            } => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+                write!(f, "; FinalizedAggregateSource")?;
+                display_operators(result_operators, f)?;
+                if let Some(ps) = post_sort {
+                    ps.display_summary(f)?;
+                }
+            }
+            Sink::TopN {
                 sink,
                 result_operators,
             } => {
                 write!(f, " -> ")?;
                 sink.display_summary(f)?;
-                write!(f, "; FinalizedAggregateSource")?;
+                write!(f, "; FinalizedTopNSource")?;
+                display_operators(result_operators, f)?;
+            }
+            Sink::Sort {
+                sink,
+                result_operators,
+            } => {
+                write!(f, " -> ")?;
+                sink.display_summary(f)?;
+                write!(f, "; FinalizedSortSource")?;
                 display_operators(result_operators, f)?;
             }
             Sink::HashJoinBuild(sink) => {
