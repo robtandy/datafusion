@@ -2619,3 +2619,115 @@ async fn parquet_group_count_high_cardinality_concurrent_oom_error_and_cancellat
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_column_row_filter_conjuncts_decode_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let n: i64 = 10_000;
+    let batch = RecordBatch::try_from_iter([
+        ("x", Arc::new(Int64Array::from_iter_values(0..n)) as _),
+        (
+            "y",
+            Arc::new(Int64Array::from_iter_values((0..n).map(|i| i % 100))) as _,
+        ),
+        (
+            "z",
+            Arc::new(Int64Array::from_iter(
+                (0..n).map(|i| if i % 17 == 0 { None } else { Some(i % 50) }),
+            )) as _,
+        ),
+        (
+            "payload",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| format!("row-{i:06}")),
+            )) as _,
+        ),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(n as usize))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("data.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let make_ctx = |mode: &str, reorder: bool| {
+        let dir_path = dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut config = SessionConfig::new().with_target_partitions(2);
+            config.options_mut().execution.parquet.pushdown_filters = true;
+            config.options_mut().execution.parquet.reorder_filters = reorder;
+            config.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_parquet("t", &dir_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(ctx)
+        }
+    };
+
+    // Single-column range + inequality (3 conjuncts on `x`): with grouping,
+    // `x` must be decoded once (10,000 inner records), not 3x (~27,001).
+    let sql_single_col =
+        "SELECT COUNT(*) FROM t WHERE x >= 1000 AND x <= 9000 AND x <> 5000";
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder).await?;
+        let native = make_ctx("required", reorder).await?;
+        let expected = stock.sql(sql_single_col).await?.collect().await?;
+        let plan = native
+            .sql(sql_single_col)
+            .await?
+            .create_physical_plan()
+            .await?;
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec")
+        );
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        // Single-column range + inequality (3 conjuncts on `x`) must be grouped
+        // into 1 ArrowPredicate so `x` is decoded once instead of 3x.
+        assert_eq!(
+            metric(plan.as_ref(), "row_filter_predicates"),
+            1,
+            "reorder={reorder}: expected 3 same-column conjuncts on `x` to group into 1 ArrowPredicate"
+        );
+    }
+
+    // Multi-column Q6-like range predicates with NULLs: 6 conjuncts across 3 columns
+    // (`x` 2x, `y` 2x, `z` 2x) must group into 3 ArrowPredicates (1 per column).
+    let sql_multi_col = "SELECT x, payload FROM t \
+        WHERE x >= 1000 AND x < 9000 AND y >= 10 AND y <= 60 AND z >= 5 AND z < 40";
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder).await?;
+        let native = make_ctx("required", reorder).await?;
+        let expected = stock.sql(sql_multi_col).await?.collect().await?;
+        let plan = native
+            .sql(sql_multi_col)
+            .await?
+            .create_physical_plan()
+            .await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(
+            metric(plan.as_ref(), "row_filter_predicates"),
+            3,
+            "reorder={reorder}: expected 6 conjuncts across 3 columns to group into 3 ArrowPredicates"
+        );
+    }
+
+    Ok(())
+}

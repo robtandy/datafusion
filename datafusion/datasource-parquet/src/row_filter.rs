@@ -66,7 +66,7 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_physical_expr::utils::reassign_expr_columns;
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
+use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 
 use datafusion_physical_plan::metrics;
 
@@ -180,6 +180,9 @@ pub(crate) struct FilterCandidate {
     required_bytes: usize,
     /// The resolved Parquet read plan (leaf indices + projected schema).
     read_plan: ParquetReadPlan,
+    /// Sorted, deduplicated Parquet leaf column indices required to evaluate
+    /// `expr`. Used to merge conjuncts that read the exact same column set.
+    leaf_indices: Vec<usize>,
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -213,10 +216,11 @@ impl FilterCandidateBuilder {
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
         Ok(
             build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
-                |(read_plan, required_bytes)| FilterCandidate {
+                |(read_plan, leaf_indices, required_bytes)| FilterCandidate {
                     expr: self.expr,
                     required_bytes,
                     read_plan,
+                    leaf_indices,
                 },
             ),
         )
@@ -262,7 +266,7 @@ pub(crate) fn build_parquet_read_plan(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &Schema,
     metadata: &ParquetMetaData,
-) -> Result<Option<(ParquetReadPlan, usize)>> {
+) -> Result<Option<(ParquetReadPlan, Vec<usize>, usize)>> {
     let schema_descr = metadata.file_metadata().schema_descr();
 
     let Some(required_columns) = pushdown_columns(expr, file_schema, true)? else {
@@ -273,7 +277,7 @@ pub(crate) fn build_parquet_read_plan(
     // read is clipped to those leaves rather than decoding the whole root.
     // A cast whose target covers every leaf, or that cannot be clipped safely,
     // falls back to a full read of that root inside the helper.
-    let (read_plan, leaf_indices) = if required_columns.cast_accesses.is_empty() {
+    let (read_plan, mut leaf_indices) = if required_columns.cast_accesses.is_empty() {
         assemble_read_plan(
             &required_columns.required_columns,
             &required_columns.struct_field_accesses,
@@ -289,10 +293,12 @@ pub(crate) fn build_parquet_read_plan(
             &required_columns.cast_accesses,
         )
     };
+    leaf_indices.sort_unstable();
+    leaf_indices.dedup();
 
     let required_bytes = size_of_columns(&leaf_indices, metadata)?;
 
-    Ok(Some((read_plan, required_bytes)))
+    Ok(Some((read_plan, leaf_indices, required_bytes)))
 }
 
 /// Checks if a predicate expression can be pushed down to the parquet decoder.
@@ -477,6 +483,18 @@ pub(crate) fn prebuild_row_filter_candidates(
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
+    prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false)
+}
+
+/// Like [`prebuild_row_filter_candidates`], optionally merging pushable
+/// conjuncts that read the exact same Parquet leaf set and projected schema
+/// into a single `ArrowPredicate` so each predicate column is decoded once.
+pub(crate) fn prebuild_row_filter_candidates_with_grouping(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    group_same_column: bool,
+) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr);
@@ -494,6 +512,25 @@ pub(crate) fn prebuild_row_filter_candidates(
     if candidates.is_empty() {
         return Ok(None);
     }
+
+    let candidates = if group_same_column && candidates.len() > 1 {
+        let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            if !cand.leaf_indices.is_empty()
+                && let Some(existing) = grouped.iter_mut().find(|g| {
+                    g.leaf_indices == cand.leaf_indices
+                        && g.read_plan.projected_schema == cand.read_plan.projected_schema
+                })
+            {
+                existing.expr = conjunction([Arc::clone(&existing.expr), cand.expr]);
+            } else {
+                grouped.push(cand);
+            }
+        }
+        grouped
+    } else {
+        candidates
+    };
 
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
@@ -2113,5 +2150,114 @@ mod test {
         );
         assert_eq!(file_metrics.pushdown_rows_pruned.value(), 2);
         assert_eq!(file_metrics.pushdown_rows_matched.value(), 2);
+    }
+
+    #[test]
+    fn test_group_same_column_conjuncts_merges_and_preserves_distinct_struct_leaves() {
+        let s_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+            Field::new("s", DataType::Struct(s_fields.clone()), true),
+        ]));
+        let s_arr = StructArray::new(
+            s_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), None, Some(30)])) as _,
+                Arc::new(Int32Array::from(vec![Some(5), Some(15), Some(25), None])) as _,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(5), None, Some(10)])),
+                Arc::new(Int32Array::from(vec![
+                    Some(100),
+                    Some(200),
+                    Some(300),
+                    None,
+                ])),
+                Arc::new(s_arr),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let parquet_reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = parquet_reader_builder.metadata().clone();
+        let file_schema = parquet_reader_builder.schema().clone();
+
+        // 6 conjuncts: 2 on `x`, 2 on `y`, 2 on `s.a`, 1 on `s.b` -> 7 total.
+        let s_a = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("a".to_string())), None),
+        ]);
+        let s_b = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("b".to_string())), None),
+        ]);
+        let expr = col("x")
+            .gt_eq(lit(2i32))
+            .and(col("x").lt_eq(lit(10i32)))
+            .and(col("y").gt_eq(lit(100i32)))
+            .and(col("y").lt_eq(lit(250i32)))
+            .and(s_a.clone().gt(lit(5i32)))
+            .and(s_a.lt(lit(25i32)))
+            .and(s_b.gt(lit(10i32)));
+        let phys = logical2physical(&expr, &file_schema);
+
+        // Ungrouped (stock default) keeps all 7 conjuncts separate.
+        let ungrouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ungrouped.len(), 7);
+
+        // Grouped merges same-leaf conjuncts into 4 predicates: x, y, s.a, s.b
+        // (crucially NOT merging s.a with s.b!).
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(grouped.len(), 4);
+        // Each leaf (0=x, 1=y, 2=s.a, 3=s.b) is read by exactly 1 candidate.
+        for leaf in 0..4 {
+            let readers = grouped.iter().filter(|c| c.reads_leaf(leaf)).count();
+            assert_eq!(readers, 1, "leaf {leaf} should be read by 1 candidate");
+        }
+
+        // Verify exact row evaluation matches on the Parquet reader.
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "grouped.parquet", &metrics);
+        let row_filter = row_filter_from_prebuilt(&grouped, false, &file_metrics);
+        let reader = parquet_reader_builder
+            .with_row_filter(row_filter)
+            .build()
+            .unwrap();
+        let total_rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        // Only row 1 (x=5, y=200, s.a=20, s.b=15) satisfies all 7 conjuncts.
+        assert_eq!(total_rows, 1);
+        assert_eq!(file_metrics.pushdown_rows_pruned.value(), 3);
+        assert_eq!(file_metrics.pushdown_rows_matched.value(), 1);
     }
 }

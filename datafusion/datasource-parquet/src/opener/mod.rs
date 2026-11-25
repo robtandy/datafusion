@@ -477,6 +477,7 @@ struct PreparedParquetOpen {
     virtual_state: Option<Arc<VirtualColumnsState>>,
     reorder_predicates: bool,
     pushdown_filters: bool,
+    group_row_filter_conjuncts: bool,
     force_filter_selections: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
@@ -589,6 +590,7 @@ impl DecoderReadPlans {
                 prepared.reorder_predicates,
                 prepared.file_metrics.clone(),
                 prepared.max_predicate_cache_size,
+                prepared.group_row_filter_conjuncts,
             )
         });
         Ok(Self {
@@ -1033,6 +1035,7 @@ impl ParquetMorselizer {
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
+            group_row_filter_conjuncts: self.buffered,
             force_filter_selections: self.force_filter_selections,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
@@ -1885,6 +1888,9 @@ impl RowGroupsPrunedParquetOpen {
         byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
 
         if buffered && let Some(row_filter_context) = precomputed_context {
+            MetricBuilder::new(&prepared.metrics)
+                .counter("row_filter_predicates", prepared.partition_index)
+                .add(row_filter_context.num_predicates());
             let pending: VecDeque<_> = prepared_access_plan
                 .row_groups
                 .into_iter()

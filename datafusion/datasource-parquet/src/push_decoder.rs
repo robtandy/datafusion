@@ -54,7 +54,8 @@ use crate::ParquetFileMetrics;
 use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::row_filter::{
-    PrebuiltRowFilterCandidate, prebuild_row_filter_candidates, row_filter_from_prebuilt,
+    PrebuiltRowFilterCandidate, prebuild_row_filter_candidates_with_grouping,
+    row_filter_from_prebuilt,
 };
 use crate::row_group_filter::RowGroupPruningStatistics;
 
@@ -361,11 +362,13 @@ impl RowFilterContext {
         reorder_predicates: bool,
         file_metrics: ParquetFileMetrics,
         max_predicate_cache_size: Option<usize>,
+        group_same_column: bool,
     ) -> Option<Self> {
-        match prebuild_row_filter_candidates(
+        match prebuild_row_filter_candidates_with_grouping(
             predicate,
             physical_file_schema,
             file_metadata.as_ref(),
+            group_same_column,
         ) {
             Ok(Some(prebuilt)) => Some(Self {
                 prebuilt: PrebuiltRowFilterCandidateList::new(prebuilt),
