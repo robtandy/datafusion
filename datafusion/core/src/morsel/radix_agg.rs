@@ -169,8 +169,14 @@ impl RadixPartitionStore {
             .saturating_add(batch_bytes)
             .saturating_add(extra_bytes);
 
-        let should_spill = self.spilled
-            || spill.is_some_and(SpillContext::is_spilled)
+        // Buffer in memory until `try_resize` actually hits the pool ceiling
+        // (or buffered bytes reach 16 MiB while in spill mode) so spilled runs
+        // write large coalesced partition files instead of 64 tiny files/batch.
+        const SPILLED_FLUSH_CAP_BYTES: usize = 16 * 1024 * 1024;
+        let in_spill_mode = self.spilled || spill.is_some_and(SpillContext::is_spilled);
+        let should_spill = (in_spill_mode
+            && self.total_mem_bytes.saturating_add(batch_bytes)
+                >= SPILLED_FLUSH_CAP_BYTES)
             || reservation.try_resize(target_bytes).is_err();
         if should_spill {
             let Some(spill_ctx) = spill else {

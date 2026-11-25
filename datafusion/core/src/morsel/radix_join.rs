@@ -28,8 +28,9 @@ use super::spill::{SpillContext, spill_batches_async, spill_batches_sync};
 /// once build rows exceed this threshold (keeps tiny dimension builds fast).
 pub(super) const RADIX_JOIN_THRESHOLD_ROWS: usize = 16_384;
 
-/// Flush threshold for `LocalProbeSpill` per-worker buffered probe batches.
-const PROBE_SPILL_FLUSH_BYTES: usize = 256 * 1024;
+/// Flush threshold for `LocalProbeSpill` per-worker buffered probe batches
+/// (falls back immediately if `MemoryReservation::try_grow` fails earlier).
+const PROBE_SPILL_FLUSH_BYTES: usize = 2 * 1024 * 1024;
 
 /// Build canonical schema for radix-partitioned and spilled build batches:
 /// `[payload_cols..., key_cols..., __morsel_hash: UInt64]`.
@@ -178,8 +179,14 @@ impl RadixBuildStore {
             .saturating_add(batch_bytes)
             .saturating_add(extra_bytes);
 
-        let should_spill = self.spilled
-            || spill.is_some_and(SpillContext::is_spilled)
+        // Buffer in memory until `try_resize` hits the pool ceiling (or
+        // buffered bytes reach 16 MiB while in spill mode) so spilled builds
+        // write large coalesced partition files instead of 64 tiny files/batch.
+        const SPILLED_FLUSH_CAP_BYTES: usize = 16 * 1024 * 1024;
+        let in_spill_mode = self.spilled || spill.is_some_and(SpillContext::is_spilled);
+        let should_spill = (in_spill_mode
+            && self.total_mem_bytes.saturating_add(batch_bytes)
+                >= SPILLED_FLUSH_CAP_BYTES)
             || reservation.try_resize(target_bytes).is_err();
 
         if should_spill {

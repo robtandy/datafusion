@@ -1940,19 +1940,7 @@ impl HashJoinBuildState {
                         &v_keys,
                         v_hashes.clone(),
                     )?;
-                    let extra = self.null_key_mem_bytes;
-                    let radix =
-                        self.radix.get_or_insert_with(RadixBuildStore::new_default);
-                    radix
-                        .push_packed_batch(
-                            packed,
-                            &v_hashes,
-                            extra,
-                            &self.reservation,
-                            self.build_spill.as_ref(),
-                            tx,
-                        )
-                        .await?;
+                    self.push_radix_packed(packed, v_hashes, tx).await?;
                 }
             } else {
                 let packed = pack_build_spill_batch(
@@ -1961,18 +1949,7 @@ impl HashJoinBuildState {
                     keys,
                     hashes.clone(),
                 )?;
-                let extra = self.null_key_mem_bytes;
-                let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
-                radix
-                    .push_packed_batch(
-                        packed,
-                        hashes,
-                        extra,
-                        &self.reservation,
-                        self.build_spill.as_ref(),
-                        tx,
-                    )
-                    .await?;
+                self.push_radix_packed(packed, hashes.clone(), tx).await?;
             }
         }
         Ok(())
@@ -2071,17 +2048,9 @@ impl HashJoinBuildState {
         if rows == 0 {
             return Ok(());
         }
-        let spilled = self.radix.as_ref().is_some_and(|r| r.spilled)
-            || self
-                .build_spill
-                .as_ref()
-                .is_some_and(SpillContext::is_spilled);
         // Fast path: full-sized batch with nothing pending goes straight into
         // radix permutation without an extra concat copy.
-        if !spilled
-            && self.pending_radix_batches.is_empty()
-            && rows >= RADIX_COALESCE_TARGET_ROWS
-        {
+        if self.pending_radix_batches.is_empty() && rows >= RADIX_COALESCE_TARGET_ROWS {
             let extra = self.null_key_mem_bytes;
             let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
             return radix
@@ -2096,7 +2065,7 @@ impl HashJoinBuildState {
                 .await;
         }
         let bytes = get_record_batch_memory_size(&packed);
-        if spilled || self.reservation.try_grow(bytes).is_err() {
+        if self.reservation.try_grow(bytes).is_err() {
             self.flush_pending_radix(tx).await?;
             let extra = self.null_key_mem_bytes;
             let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
