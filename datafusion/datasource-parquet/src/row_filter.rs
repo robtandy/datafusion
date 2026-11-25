@@ -203,13 +203,12 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         let mut timer = self.time.timer();
 
         self.eval_staged(&batch)
-            .map(|bool_arr| {
+            .inspect(|bool_arr| {
                 let num_matched = bool_arr.true_count();
                 let num_pruned = bool_arr.len() - num_matched;
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
                 timer.stop();
-                bool_arr
             })
             // `ExternalError` is the only `ArrowError` variant that keeps a
             // source, and therefore the only one that leaves the original error
