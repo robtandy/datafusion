@@ -477,6 +477,7 @@ struct PreparedParquetOpen {
     virtual_state: Option<Arc<VirtualColumnsState>>,
     reorder_predicates: bool,
     pushdown_filters: bool,
+    group_row_filter_conjuncts: bool,
     force_filter_selections: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
@@ -559,6 +560,7 @@ impl DecoderReadPlans {
     fn try_new(
         prepared: &PreparedParquetOpen,
         metadata: &ArrowReaderMetadata,
+        surviving_row_groups: &[usize],
     ) -> Result<Self> {
         // Build the decoder projection (mask + per-batch transform) in a
         // single call. Encapsulating it behind `DecoderProjection` keeps the
@@ -589,6 +591,10 @@ impl DecoderReadPlans {
                 prepared.reorder_predicates,
                 prepared.file_metrics.clone(),
                 prepared.max_predicate_cache_size,
+                prepared.group_row_filter_conjuncts,
+                (prepared.group_row_filter_conjuncts
+                    && prepared.enable_row_group_stats_pruning)
+                    .then_some(surviving_row_groups),
             )
         });
         Ok(Self {
@@ -1033,6 +1039,7 @@ impl ParquetMorselizer {
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
+            group_row_filter_conjuncts: self.buffered,
             force_filter_selections: self.force_filter_selections,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
@@ -1442,10 +1449,15 @@ impl RowGroupsPrunedParquetOpen {
             // combined projection solely for this index check.
             let read_plans = match &self.decoder_read_plans {
                 Some(plans) => plans,
-                None => self.decoder_read_plans.insert(DecoderReadPlans::try_new(
-                    &self.prepared.loaded.prepared,
-                    &self.prepared.loaded.reader_metadata,
-                )?),
+                None => {
+                    let surviving: Vec<usize> =
+                        self.row_groups.row_group_indexes().collect();
+                    self.decoder_read_plans.insert(DecoderReadPlans::try_new(
+                        &self.prepared.loaded.prepared,
+                        &self.prepared.loaded.reader_metadata,
+                        &surviving,
+                    )?)
+                }
             };
             // Partial indexes are supported: only a column read from a row group
             // with a partial selection needs an offset index to benefit.
@@ -1506,10 +1518,15 @@ impl RowGroupsPrunedParquetOpen {
             if has_large_rg {
                 let read_plans = match &self.decoder_read_plans {
                     Some(plans) => plans,
-                    None => self.decoder_read_plans.insert(DecoderReadPlans::try_new(
-                        &self.prepared.loaded.prepared,
-                        &self.prepared.loaded.reader_metadata,
-                    )?),
+                    None => {
+                        let surviving: Vec<usize> =
+                            self.row_groups.row_group_indexes().collect();
+                        self.decoder_read_plans.insert(DecoderReadPlans::try_new(
+                            &self.prepared.loaded.prepared,
+                            &self.prepared.loaded.reader_metadata,
+                            &surviving,
+                        )?)
+                    }
                 };
                 if split_ctx.has_index_load_candidate(
                     parquet_metadata,
@@ -1838,7 +1855,10 @@ impl RowGroupsPrunedParquetOpen {
             row_filter_context: precomputed_context,
         } = match decoder_read_plans {
             Some(plans) => plans,
-            None => DecoderReadPlans::try_new(&prepared, &reader_metadata)?,
+            None => {
+                let surviving = access_plan.row_group_indexes();
+                DecoderReadPlans::try_new(&prepared, &reader_metadata, &surviving)?
+            }
         };
 
         // Lazily-registered suppression counter shared by the open-time first-RG
@@ -1885,6 +1905,9 @@ impl RowGroupsPrunedParquetOpen {
         byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
 
         if buffered && let Some(row_filter_context) = precomputed_context {
+            MetricBuilder::new(&prepared.metrics)
+                .counter("row_filter_predicates", prepared.partition_index)
+                .add(row_filter_context.num_predicates());
             let pending: VecDeque<_> = prepared_access_plan
                 .row_groups
                 .into_iter()

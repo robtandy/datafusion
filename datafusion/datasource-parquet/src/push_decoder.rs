@@ -54,7 +54,8 @@ use crate::ParquetFileMetrics;
 use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::row_filter::{
-    PrebuiltRowFilterCandidate, prebuild_row_filter_candidates, row_filter_from_prebuilt,
+    PrebuiltRowFilterCandidate, prebuild_row_filter_candidates_with_grouping,
+    row_filter_from_prebuilt,
 };
 use crate::row_group_filter::RowGroupPruningStatistics;
 
@@ -354,6 +355,7 @@ impl RowFilterContext {
     /// Precompute the candidate list from the raw predicate + file schema +
     /// metadata. Returns `None` when the predicate has no push-downable
     /// conjuncts (mirrors the file-open path behaviour).
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         predicate: &Arc<dyn PhysicalExpr>,
         physical_file_schema: &SchemaRef,
@@ -361,11 +363,15 @@ impl RowFilterContext {
         reorder_predicates: bool,
         file_metrics: ParquetFileMetrics,
         max_predicate_cache_size: Option<usize>,
+        group_same_column: bool,
+        surviving_row_groups: Option<&[usize]>,
     ) -> Option<Self> {
-        match prebuild_row_filter_candidates(
+        match prebuild_row_filter_candidates_with_grouping(
             predicate,
             physical_file_schema,
             file_metadata.as_ref(),
+            group_same_column,
+            surviving_row_groups,
         ) {
             Ok(Some(prebuilt)) => Some(Self {
                 prebuilt: PrebuiltRowFilterCandidateList::new(prebuilt),

@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_catalog::{ScanArgs, TableProvider};
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{DFSchema, Result, internal_datafusion_err, internal_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::PartitionedFile;
@@ -22,6 +23,7 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, TableScan};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
@@ -34,8 +36,13 @@ use datafusion_session::Session;
 
 use crate::datasource::listing::ListingTable;
 
+use super::hash_join::{JoinOutputCol, ProbeJoinKind};
+use super::join_filter::{
+    BoundJoinPredicates, DynamicJoinFilterConfig, DynamicJoinFilterData,
+    JoinFilterBinding,
+};
 use super::metrics::RunMetrics;
-use super::{Operator, WorkerState, supported_expr};
+use super::{Operator, Sink, Source, WorkerState, supported_expr};
 
 mod ready;
 #[cfg(test)]
@@ -54,6 +61,7 @@ pub(super) struct ParquetScan {
     config: Option<Box<FileScanConfig>>,
     files: Arc<[PartitionedFile]>,
     pushdown_filters: bool,
+    dynamic_join_filters: Vec<JoinFilterBinding>,
     pub(super) metrics: ExecutionPlanMetricsSet,
 }
 
@@ -106,6 +114,7 @@ impl ParquetScan {
             config: None,
             files: Arc::default(),
             pushdown_filters: false,
+            dynamic_join_filters: Vec::new(),
             metrics: ExecutionPlanMetricsSet::new(),
         };
         if source.schema.as_ref() != scan.projected_schema.as_arrow() {
@@ -408,6 +417,10 @@ impl ParquetScan {
         Ok(())
     }
 
+    pub(super) fn pushdown_filters(&self) -> bool {
+        self.pushdown_filters
+    }
+
     pub(super) fn pushed_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.config.as_ref()?.file_source().exact_filter()
     }
@@ -433,12 +446,19 @@ impl ParquetScan {
         }
     }
 
+    pub(super) fn add_dynamic_join_filter(&mut self, binding: JoinFilterBinding) {
+        if self.config.is_some() && !self.files.is_empty() {
+            self.dynamic_join_filters.push(binding);
+        }
+    }
+
     pub(super) fn start(
         &self,
         context: &TaskContext,
         tasks: &mut JoinSet<Result<WorkerState>>,
         workers: NonZeroUsize,
         measurement: Option<&Arc<RunMetrics>>,
+        published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
         let (publish, phase2, ready) = ready::channel(
@@ -446,14 +466,63 @@ impl ParquetScan {
             measurement.cloned(),
             MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
         );
-        if let Some(config) = &self.config {
+        if let Some(base_config) = &self.config {
+            let mut runtime_config_owned: Option<FileScanConfig> = None;
+            if !self.dynamic_join_filters.is_empty() && !published_filters.is_empty() {
+                let mut dynamic_preds = Vec::new();
+                for binding in &self.dynamic_join_filters {
+                    let Some(filter_data) = published_filters.get(&binding.filter_id)
+                    else {
+                        continue;
+                    };
+                    match binding.build_predicates(
+                        filter_data,
+                        self.pushdown_filters,
+                        &self.schema,
+                    )? {
+                        BoundJoinPredicates::ShortCircuitEmpty => {
+                            MetricBuilder::new(&self.metrics)
+                                .counter("join_dynamic_filter_short_circuits", 0)
+                                .add(1);
+                            return Ok(ready);
+                        }
+                        BoundJoinPredicates::Predicates(preds) => {
+                            dynamic_preds.extend(preds);
+                        }
+                    }
+                }
+                if !dynamic_preds.is_empty() {
+                    let mut runtime_opts =
+                        context.session_config().options().as_ref().clone();
+                    runtime_opts.execution.parquet.pushdown_filters =
+                        self.pushdown_filters;
+                    let pushed_count = dynamic_preds.len();
+                    let update =
+                        base_config.try_pushdown_filters(dynamic_preds, &runtime_opts)?;
+                    if let Some(updated) = update.updated_node {
+                        let updated_cfg = updated
+                            .downcast_ref::<FileScanConfig>()
+                            .ok_or_else(|| {
+                                internal_datafusion_err!(
+                                    "Expected FileScanConfig from dynamic join filter pushdown"
+                                )
+                            })?
+                            .clone();
+                        MetricBuilder::new(&self.metrics)
+                            .counter("join_dynamic_filters_pushed", 0)
+                            .add(pushed_count);
+                        runtime_config_owned = Some(updated_cfg);
+                    }
+                }
+            }
+            let config = runtime_config_owned.as_ref().unwrap_or(base_config);
             let parquet = config
                 .file_source()
                 .downcast_ref::<ParquetSource>()
                 .ok_or_else(|| {
                     internal_datafusion_err!("Expected the admitted ParquetSource")
                 })?;
-            let has_pushed_filter = self.pushed_predicate().is_some();
+            let has_pushed_filter = parquet.exact_filter().is_some();
             let work = Arc::new(FileWork {
                 morselizer: parquet.create_buffered_morselizer(config, context)?,
                 files: Arc::clone(&self.files),
@@ -485,6 +554,329 @@ impl ParquetScan {
         }
         Ok(ready)
     }
+}
+
+fn source_schema(source: &Source) -> SchemaRef {
+    match source {
+        Source::Memory(m) => Arc::clone(&m.schema),
+        Source::Parquet(p) => Arc::clone(&p.schema),
+        Source::Stage(s) => Arc::clone(&s.schema),
+    }
+}
+
+fn compute_pipeline_schemas(
+    source: &Source,
+    operators: &[Operator],
+) -> Result<Vec<SchemaRef>> {
+    let mut schemas = Vec::with_capacity(operators.len() + 1);
+    schemas.push(source_schema(source));
+    for op in operators {
+        let prev = schemas.last().expect("non-empty schemas");
+        let next = match op {
+            Operator::Filter {
+                projection: None, ..
+            } => Arc::clone(prev),
+            Operator::Filter {
+                projection: Some(indices),
+                ..
+            } => Arc::new(prev.project(indices)?),
+            Operator::Projection(projector) => Arc::clone(projector.output_schema()),
+            Operator::HashProbe(probe) => Arc::clone(&probe.output_schema),
+        };
+        schemas.push(next);
+    }
+    Ok(schemas)
+}
+
+/// Bind dynamic join filters from every eligible `HashProbe` in `operators`
+/// onto both `source` (if `Source::Parquet`) and any earlier `Inner` join's
+/// `build_pipeline` (recursively), enabling cascading pushdown across
+/// multi-join star schemas (e.g., TPC-H Q5 `region -> nation -> supplier ->
+/// customer -> orders -> lineitem`).
+pub(super) fn bind_pipeline_dynamic_join_filters(
+    source: &mut Source,
+    operators: &mut [Operator],
+    max_inlist_values: usize,
+    max_inlist_bytes: usize,
+) -> Result<()> {
+    let schemas = compute_pipeline_schemas(source, operators)?;
+
+    for op_idx in 0..operators.len() {
+        let (filter_id, probe_keys) = match &operators[op_idx] {
+            Operator::HashProbe(probe) if probe.kind.allows_dynamic_filter_pushdown() => {
+                (probe.filter_id, probe.probe_key_exprs().to_vec())
+            }
+            _ => continue,
+        };
+        if probe_keys.is_empty() {
+            continue;
+        }
+
+        let key_opts: Vec<Option<Arc<dyn PhysicalExpr>>> =
+            probe_keys.into_iter().map(Some).collect();
+        let (bound_any, any_pushdown) = push_filter_into_prefix(
+            source,
+            &mut operators[..op_idx],
+            &schemas[..=op_idx],
+            filter_id,
+            &key_opts,
+        )?;
+        if bound_any
+            && let Operator::HashProbe(probe_arc) = &mut operators[op_idx]
+            && let Some(probe) = Arc::get_mut(probe_arc)
+            && let Some(build_pipeline) = Arc::get_mut(&mut probe.build_pipeline)
+            && let Sink::HashJoinBuild(sink_arc) = &mut build_pipeline.sink
+            && let Some(sink) = Arc::get_mut(sink_arc)
+        {
+            sink.enable_dynamic_filter(DynamicJoinFilterConfig {
+                max_inlist_values,
+                max_inlist_bytes,
+                build_bloom: any_pushdown,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Push `key_exprs` (in `schemas[prefix_ops.len()]` coordinates) into:
+/// 1. `source` (if `Source::Parquet`), and
+/// 2. any `Inner` `HashProbe` inside `prefix_ops` (recursively into its
+///    `build_pipeline`) when no non-`Inner` join lies in between.
+///
+/// Returns `(bound_any, any_target_has_pushdown_filters)`.
+fn push_filter_into_prefix(
+    source: &mut Source,
+    prefix_ops: &mut [Operator],
+    schemas: &[SchemaRef],
+    filter_id: usize,
+    key_exprs: &[Option<Arc<dyn PhysicalExpr>>],
+) -> Result<(bool, bool)> {
+    let mut bound_any = false;
+    let mut any_pushdown = false;
+
+    // 1. Try pushing directly onto `source` (if Parquet).
+    if let Source::Parquet(pq) = source
+        && pq.config.is_some()
+        && !pq.files.is_empty()
+    {
+        let mut mapped_keys = Vec::with_capacity(key_exprs.len());
+        for expr_opt in key_exprs {
+            let mapped = match expr_opt {
+                Some(e) => remap_probe_key_to_scan(Arc::clone(e), prefix_ops, schemas)?,
+                None => None,
+            };
+            mapped_keys.push(mapped);
+        }
+        let all_keys_bound =
+            !mapped_keys.is_empty() && mapped_keys.iter().all(Option::is_some);
+        let any_key_bound = mapped_keys.iter().any(Option::is_some);
+        if any_key_bound {
+            pq.add_dynamic_join_filter(JoinFilterBinding {
+                filter_id,
+                probe_key_exprs: mapped_keys,
+                all_keys_bound,
+            });
+            bound_any = true;
+            any_pushdown |= pq.pushdown_filters();
+        }
+    }
+
+    // 2. Try pushing onto earlier `Inner` joins' build pipelines in `prefix_ops`.
+    // Walk backwards from the end of `prefix_ops`; stop as soon as we cross a
+    // non-`Inner` join (whose unmatched rows could be altered by build pruning).
+    for u in (0..prefix_ops.len()).rev() {
+        let is_inner = match &prefix_ops[u] {
+            Operator::HashProbe(p) => p.kind == ProbeJoinKind::Inner,
+            _ => continue,
+        };
+        if !is_inner {
+            break;
+        }
+        let mut build_key_opts: Vec<Option<Arc<dyn PhysicalExpr>>> =
+            Vec::with_capacity(key_exprs.len());
+        let mut any_mapped_to_build = false;
+        for expr_opt in key_exprs {
+            let mapped_to_u_out = match expr_opt {
+                Some(e) => remap_probe_key_to_scan(
+                    Arc::clone(e),
+                    &prefix_ops[u + 1..],
+                    &schemas[u + 1..],
+                )?,
+                None => None,
+            };
+            let mapped_to_build = match mapped_to_u_out {
+                Some(e) => {
+                    let Operator::HashProbe(p) = &prefix_ops[u] else {
+                        unreachable!()
+                    };
+                    let Sink::HashJoinBuild(build_sink) = &p.build_pipeline.sink else {
+                        unreachable!()
+                    };
+                    let build_schemas = compute_pipeline_schemas(
+                        &p.build_pipeline.source,
+                        &p.build_pipeline.operators,
+                    )?;
+                    let build_sink_input_schema = build_schemas.last().unwrap();
+                    remap_expr_to_build_input(
+                        e,
+                        &p.output_projection,
+                        build_sink.payload_columns(),
+                        build_sink_input_schema,
+                    )?
+                }
+                None => None,
+            };
+            if mapped_to_build.is_some() {
+                any_mapped_to_build = true;
+            }
+            build_key_opts.push(mapped_to_build);
+        }
+        if any_mapped_to_build
+            && let Operator::HashProbe(probe_arc) = &mut prefix_ops[u]
+            && let Some(probe) = Arc::get_mut(probe_arc)
+            && let Some(build_pipeline) = Arc::get_mut(&mut probe.build_pipeline)
+        {
+            let build_schemas = compute_pipeline_schemas(
+                &build_pipeline.source,
+                &build_pipeline.operators,
+            )?;
+            let (sub_bound, sub_pushdown) = push_filter_into_prefix(
+                &mut build_pipeline.source,
+                &mut build_pipeline.operators,
+                &build_schemas,
+                filter_id,
+                &build_key_opts,
+            )?;
+            bound_any |= sub_bound;
+            any_pushdown |= sub_pushdown;
+        }
+    }
+
+    Ok((bound_any, any_pushdown))
+}
+
+fn remap_expr_to_build_input(
+    expr: Arc<dyn PhysicalExpr>,
+    output_projection: &[JoinOutputCol],
+    payload_columns: &[usize],
+    build_input_schema: &SchemaRef,
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    let mut saw_col = false;
+    let mut unmappable = false;
+    let mapped = expr
+        .transform_up(|node| {
+            if let Some(col) = node.downcast_ref::<Column>() {
+                saw_col = true;
+                match output_projection[col.index()] {
+                    JoinOutputCol::Build(payload_pos) => {
+                        let build_col_idx = payload_columns[payload_pos];
+                        return Ok(Transformed::yes(Arc::new(Column::new(
+                            build_input_schema.field(build_col_idx).name(),
+                            build_col_idx,
+                        ))));
+                    }
+                    JoinOutputCol::Probe(_) => {
+                        unmappable = true;
+                    }
+                }
+            }
+            Ok(Transformed::no(node))
+        })?
+        .data;
+    if !saw_col || unmappable {
+        return Ok(None);
+    }
+    let has_subquery = mapped.exists(|e| Ok(e.is::<ScalarSubqueryExpr>()))?;
+    if is_volatile(&mapped) || has_subquery {
+        return Ok(None);
+    }
+    Ok(Some(mapped))
+}
+
+fn remap_probe_key_to_scan(
+    mut expr: Arc<dyn PhysicalExpr>,
+    preceding_ops: &[Operator],
+    schemas: &[SchemaRef],
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    let mut crossed_residual_filter = false;
+    for step in (0..preceding_ops.len()).rev() {
+        let prev_schema = &schemas[step];
+        match &preceding_ops[step] {
+            Operator::Filter {
+                projection: None, ..
+            } => {
+                crossed_residual_filter = true;
+            }
+            Operator::Filter {
+                projection: Some(indices),
+                ..
+            } => {
+                crossed_residual_filter = true;
+                expr = expr
+                    .transform_up(|node| {
+                        if let Some(col) = node.downcast_ref::<Column>() {
+                            let src_idx = indices[col.index()];
+                            return Ok(Transformed::yes(Arc::new(Column::new(
+                                prev_schema.field(src_idx).name(),
+                                src_idx,
+                            ))));
+                        }
+                        Ok(Transformed::no(node))
+                    })?
+                    .data;
+            }
+            Operator::Projection(projector) => {
+                let proj_exprs = projector.projection().as_ref();
+                expr = expr
+                    .transform_up(|node| {
+                        if let Some(col) = node.downcast_ref::<Column>() {
+                            return Ok(Transformed::yes(Arc::clone(
+                                &proj_exprs[col.index()].expr,
+                            )));
+                        }
+                        Ok(Transformed::no(node))
+                    })?
+                    .data;
+            }
+            Operator::HashProbe(mid_probe) => {
+                if mid_probe.needs_build_emission() {
+                    return Ok(None);
+                }
+                let mut unmappable = false;
+                expr = expr
+                    .transform_up(|node| {
+                        if let Some(col) = node.downcast_ref::<Column>() {
+                            match mid_probe.output_projection[col.index()] {
+                                JoinOutputCol::Probe(p_idx) => {
+                                    return Ok(Transformed::yes(Arc::new(Column::new(
+                                        prev_schema.field(p_idx).name(),
+                                        p_idx,
+                                    ))));
+                                }
+                                JoinOutputCol::Build(_) => {
+                                    unmappable = true;
+                                }
+                            }
+                        }
+                        Ok(Transformed::no(node))
+                    })?
+                    .data;
+                if unmappable {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    // Never push a potentially-fallible expression (e.g. `CAST(s AS BIGINT)`)
+    // below an unpushed residual `Operator::Filter` that may guard it.
+    if crossed_residual_filter && !expr.is::<Column>() {
+        return Ok(None);
+    }
+    let has_subquery = expr.exists(|e| Ok(e.is::<ScalarSubqueryExpr>()))?;
+    if is_volatile(&expr) || has_subquery {
+        return Ok(None);
+    }
+    Ok(Some(expr))
 }
 
 async fn run_phase2_lane(

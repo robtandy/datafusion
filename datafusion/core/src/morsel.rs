@@ -4,7 +4,7 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use datafusion_physical_expr::expressions::Column;
 #[cfg(test)]
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
+use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
@@ -59,6 +60,7 @@ mod dag;
 mod fallback;
 mod group_count;
 mod hash_join;
+mod join_filter;
 mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
@@ -80,6 +82,7 @@ use hash_join::{
     FinalizedHashTable, HashJoinBuildSink, HashJoinBuildState, HashJoinProbe,
     OperatorStep, ProbeCursor, ProbeScratch,
 };
+use join_filter::DynamicJoinFilterData;
 pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
@@ -215,6 +218,62 @@ fn estimate_side_size(
     SideEstimate { is_empty, ..base }
 }
 
+/// Join-specific cardinality estimate used only by [`choose_build_side`].
+///
+/// Counts distinct referenced column sets across conjunctive predicates on
+/// non-`Stage` inputs so range pairs on the same column (e.g. `l_shipdate >= a
+/// AND l_shipdate <= b` in TPC-H Q7) count as one filter group rather than two,
+/// and `StageSource` estimates (which already carry aggregate reduction) are
+/// never double-discounted (TPC-H Q20), while heavily multi-predicate scans
+/// (e.g. TPC-H Q12 `lineitem` vs unfiltered `orders`) still place the smaller
+/// filtered side on build.
+fn estimate_join_side_size(
+    source: &Source,
+    operators: &[Operator],
+    stages: &[StageSpec],
+) -> SideEstimate {
+    let base = estimate_side_size(source, operators, stages);
+    if base.is_empty || matches!(source, Source::Stage(_)) {
+        return base;
+    }
+    let mut distinct_groups: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
+        for conjunct in split_conjunction(pred) {
+            let mut cols: Vec<String> = collect_columns(conjunct)
+                .into_iter()
+                .map(|c| c.name().to_owned())
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            if !cols.is_empty() {
+                distinct_groups.insert(cols);
+            }
+        }
+    };
+    #[cfg(feature = "parquet")]
+    if let Source::Parquet(pq) = source
+        && let Some(pred) = pq.pushed_predicate()
+    {
+        record_predicate(&pred);
+    }
+    for op in operators {
+        if let Operator::Filter { predicate, .. } = op {
+            record_predicate(predicate);
+        }
+    }
+    let shift = (distinct_groups.len() as u32).min(4);
+    if shift == 0 {
+        return base;
+    }
+    let approx_bytes = (base.approx_bytes >> shift).max(1);
+    let mem_rows = base.mem_rows.map(|rows| (rows >> shift).max(1));
+    SideEstimate {
+        is_empty: base.is_empty,
+        mem_rows,
+        approx_bytes,
+    }
+}
+
 fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::BuildSide {
     use hash_join::BuildSide;
     if left.is_empty && !right.is_empty {
@@ -237,7 +296,10 @@ fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::Buil
     }
 }
 
-fn assign_join_build_ids(operators: &mut [Operator]) -> Result<()> {
+fn assign_join_build_ids(
+    operators: &mut [Operator],
+    next_filter_id: &mut usize,
+) -> Result<()> {
     let mut next_id = 0usize;
     for op in operators {
         if let Operator::HashProbe(probe) = op {
@@ -247,7 +309,9 @@ fn assign_join_build_ids(operators: &mut [Operator]) -> Result<()> {
                 );
             };
             p.build_id = next_id;
+            p.filter_id = *next_filter_id;
             next_id += 1;
+            *next_filter_id += 1;
         }
     }
     Ok(())
@@ -2015,10 +2079,12 @@ impl Pipeline {
         Ok(WorkerState::None)
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn run_build_pipelines<'a>(
         &'a self,
         label_prefix: Option<&'a str>,
         stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        published_filters: &'a mut HashMap<usize, Arc<DynamicJoinFilterData>>,
         context: &'a Arc<TaskContext>,
         plan_metrics: &'a ExecutionPlanMetricsSet,
         measurement: Option<&'a Arc<RunMetrics>>,
@@ -2042,9 +2108,14 @@ impl Pipeline {
                 });
             }
             let multi = probes.len() > 1;
-            let mut tables = Vec::with_capacity(probes.len());
+            let mut slots: Vec<Option<Arc<FinalizedHashTable>>> =
+                vec![None; probes.len()];
             let mut short_circuit_op = None;
-            for (idx, (op_idx, probe)) in probes.iter().enumerate() {
+            // Execute builds in reverse probe order (`probes[N-1]` down to
+            // `probes[0]`) so downstream selective builds publish dynamic
+            // filters before earlier builds open their Parquet scans.
+            for idx in (0..probes.len()).rev() {
+                let (op_idx, probe) = probes[idx];
                 if tx.is_closed() {
                     return Ok(BuildRunOutcome::Cancelled);
                 }
@@ -2058,6 +2129,7 @@ impl Pipeline {
                     &probe.build_pipeline,
                     &build_label,
                     stage_inputs,
+                    published_filters,
                     context,
                     plan_metrics,
                     measurement,
@@ -2067,6 +2139,10 @@ impl Pipeline {
                 else {
                     return Ok(BuildRunOutcome::Cancelled);
                 };
+                #[cfg(feature = "parquet")]
+                if let Some(df) = table.dynamic_filter() {
+                    published_filters.insert(probe.filter_id, Arc::clone(df));
+                }
                 if probe.short_circuits_on_table(&table) {
                     if table.is_empty() && probe.empty_build_short_circuits() {
                         MetricBuilder::new(plan_metrics)
@@ -2082,13 +2158,19 @@ impl Pipeline {
                         .any(|(_, p)| p.needs_build_emission());
                     if !has_later_build_emission {
                         drop(table);
-                        drop(tables);
+                        drop(slots);
                         return Ok(BuildRunOutcome::ShortCircuitAll);
                     }
-                    short_circuit_op = Some(*op_idx);
+                    if short_circuit_op.is_none() {
+                        short_circuit_op = Some(op_idx);
+                    }
                 }
-                tables.push(table);
+                slots[idx] = Some(table);
             }
+            let tables: Vec<Arc<FinalizedHashTable>> = slots
+                .into_iter()
+                .map(|slot| slot.expect("every build slot populated"))
+                .collect();
             Ok(BuildRunOutcome::Ready {
                 tables: Arc::new(tables),
                 short_circuit_op,
@@ -2346,10 +2428,12 @@ impl Pipeline {
         Ok(true)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn run_single_build_pipeline(
         build_pipeline: &Arc<Pipeline>,
         build_label: &str,
         stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        published_filters: &mut HashMap<usize, Arc<DynamicJoinFilterData>>,
         context: &Arc<TaskContext>,
         plan_metrics: &ExecutionPlanMetricsSet,
         measurement: Option<&Arc<RunMetrics>>,
@@ -2364,6 +2448,7 @@ impl Pipeline {
                 .run_build_pipelines(
                     Some(build_label),
                     stage_inputs,
+                    published_filters,
                     context,
                     plan_metrics,
                     measurement,
@@ -2509,6 +2594,7 @@ impl Pipeline {
                         &mut tasks,
                         build_pipeline.workers,
                         measurement,
+                        published_filters,
                     )?;
                     for id in 0..build_pipeline.workers.get() {
                         let (pipeline, ready, output) = (
@@ -3169,11 +3255,14 @@ impl Pipeline {
 
         // Phase 1: execute all join build pipelines and finalize hash tables
         // strictly before any probe work begins.
+        let mut published_filters: HashMap<usize, Arc<DynamicJoinFilterData>> =
+            HashMap::new();
         let (finalized_tables, short_circuit_op, skip_all) = if has_join {
             match self
                 .run_build_pipelines(
                     label_prefix,
                     stage_inputs,
+                    &mut published_filters,
                     context,
                     metrics,
                     measurement,
@@ -3351,8 +3440,13 @@ impl Pipeline {
                 }
                 #[cfg(feature = "parquet")]
                 Source::Parquet(source) => {
-                    let ready =
-                        source.start(context, &mut tasks, self.workers, measurement)?;
+                    let ready = source.start(
+                        context,
+                        &mut tasks,
+                        self.workers,
+                        measurement,
+                        &published_filters,
+                    )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =
                             (Arc::clone(&self), ready.clone(), output.clone());

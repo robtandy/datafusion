@@ -54,8 +54,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{Array, BooleanArray, BooleanBufferBuilder};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
@@ -65,12 +66,19 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_physical_expr::utils::reassign_expr_columns;
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+};
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 
 use datafusion_physical_plan::metrics;
+use datafusion_pruning::PruningPredicateBuilder;
 
 use super::ParquetFileMetrics;
+use super::pruning::build_inverted_predicate;
+use super::row_group_filter::RowGroupPruningStatistics;
 use super::supported_predicates::supports_list_predicates;
 use crate::projection_read_plan::{
     ParquetReadPlan, PushdownChecker, PushdownColumns, assemble_read_plan,
@@ -94,8 +102,13 @@ use crate::projection_read_plan::{
 ///   decoding.
 #[derive(Debug)]
 pub(crate) struct DatafusionArrowPredicate {
-    /// the filter expression
-    physical_expr: Arc<dyn PhysicalExpr>,
+    /// Ordered filter expressions over `projection_mask`. In the common case
+    /// (ungrouped, or grouped infallible conjuncts) this holds a single
+    /// expression. When a potentially-fallible conjunct (e.g. `CAST`, division)
+    /// follows a guard on the same column (`s <> '' AND CAST(s AS INT) > 5`),
+    /// stages run sequentially on only the surviving rows so earlier guards
+    /// prevent errors while still decoding the column once.
+    physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
@@ -120,16 +133,63 @@ impl DatafusionArrowPredicate {
         rows_matched: metrics::Count,
         time: metrics::Time,
     ) -> Result<Self> {
-        let physical_expr =
-            reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let physical_exprs = candidate
+            .exprs
+            .into_iter()
+            .map(|expr| {
+                reassign_expr_columns(expr, &candidate.read_plan.projected_schema)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            physical_expr,
+            physical_exprs,
             projection_mask: candidate.read_plan.projection_mask,
             rows_pruned,
             rows_matched,
             time,
         })
+    }
+
+    fn eval_single_mask(
+        expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<BooleanArray> {
+        let array = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        Ok(as_boolean_array(&array)?.clone())
+    }
+
+    fn eval_staged(&self, batch: &RecordBatch) -> Result<BooleanArray> {
+        let mut mask = Self::eval_single_mask(&self.physical_exprs[0], batch)?;
+        if self.physical_exprs.len() == 1 {
+            return Ok(mask);
+        }
+        let num_rows = batch.num_rows();
+        for expr in &self.physical_exprs[1..] {
+            let surviving = mask.true_count();
+            if surviving == 0 {
+                break;
+            }
+            if surviving == num_rows {
+                mask = Self::eval_single_mask(expr, batch)?;
+                continue;
+            }
+            let sub_batch = filter_record_batch(batch, &mask)?;
+            let sub_mask = Self::eval_single_mask(expr, &sub_batch)?;
+            let mut builder = BooleanBufferBuilder::new(num_rows);
+            builder.append_n(num_rows, false);
+            let mut sub_idx = 0usize;
+            for row_idx in 0..num_rows {
+                if mask.is_valid(row_idx) && mask.value(row_idx) {
+                    if sub_mask.is_valid(sub_idx) && sub_mask.value(sub_idx) {
+                        builder.set_bit(row_idx, true);
+                    }
+                    sub_idx += 1;
+                }
+            }
+            debug_assert_eq!(sub_idx, sub_mask.len());
+            mask = BooleanArray::new(builder.finish(), None);
+        }
+        Ok(mask)
     }
 }
 
@@ -142,17 +202,13 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
 
-        self.physical_expr
-            .evaluate(&batch)
-            .and_then(|v| v.into_array(batch.num_rows()))
-            .and_then(|array| {
-                let bool_arr = as_boolean_array(&array)?.clone();
+        self.eval_staged(&batch)
+            .inspect(|bool_arr| {
                 let num_matched = bool_arr.true_count();
                 let num_pruned = bool_arr.len() - num_matched;
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
                 timer.stop();
-                Ok(bool_arr)
             })
             // `ExternalError` is the only `ArrowError` variant that keeps a
             // source, and therefore the only one that leaves the original error
@@ -172,7 +228,8 @@ impl ArrowPredicate for DatafusionArrowPredicate {
 ///
 /// See the module level documentation for more information.
 pub(crate) struct FilterCandidate {
-    expr: Arc<dyn PhysicalExpr>,
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    last_is_infallible: bool,
     /// Estimate for the total number of bytes that will need to be processed
     /// to evaluate this filter. This is used to estimate the cost of evaluating
     /// the filter and to order the filters when `reorder_predicates` is true.
@@ -180,6 +237,51 @@ pub(crate) struct FilterCandidate {
     required_bytes: usize,
     /// The resolved Parquet read plan (leaf indices + projected schema).
     read_plan: ParquetReadPlan,
+    /// Sorted, deduplicated Parquet leaf column indices required to evaluate
+    /// `exprs`. Used to merge conjuncts that read the exact same column set.
+    leaf_indices: Vec<usize>,
+}
+
+/// Returns `true` when `expr` is a simple column/literal predicate that cannot
+/// error on valid Arrow input values, so consecutive infallible conjuncts on
+/// the same column can be fused directly into a single `BinaryExpr(And)`
+/// without staging.
+fn is_infallible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if expr.is::<Column>() || expr.is::<Literal>() {
+        return true;
+    }
+    if let Some(e) = expr.downcast_ref::<IsNullExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<IsNotNullExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<NotExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<InListExpr>() {
+        return is_infallible_expr(e.expr()) && e.list().iter().all(is_infallible_expr);
+    }
+    if let Some(e) = expr.downcast_ref::<LikeExpr>() {
+        return is_infallible_expr(e.expr()) && is_infallible_expr(e.pattern());
+    }
+    if let Some(e) = expr.downcast_ref::<BinaryExpr>() {
+        return matches!(
+            e.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom
+                | Operator::And
+                | Operator::Or
+        ) && is_infallible_expr(e.left())
+            && is_infallible_expr(e.right());
+    }
+    false
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -213,10 +315,15 @@ impl FilterCandidateBuilder {
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
         Ok(
             build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
-                |(read_plan, required_bytes)| FilterCandidate {
-                    expr: self.expr,
-                    required_bytes,
-                    read_plan,
+                |(read_plan, leaf_indices, required_bytes)| {
+                    let last_is_infallible = is_infallible_expr(&self.expr);
+                    FilterCandidate {
+                        exprs: vec![self.expr],
+                        last_is_infallible,
+                        required_bytes,
+                        read_plan,
+                        leaf_indices,
+                    }
                 },
             ),
         )
@@ -262,7 +369,7 @@ pub(crate) fn build_parquet_read_plan(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &Schema,
     metadata: &ParquetMetaData,
-) -> Result<Option<(ParquetReadPlan, usize)>> {
+) -> Result<Option<(ParquetReadPlan, Vec<usize>, usize)>> {
     let schema_descr = metadata.file_metadata().schema_descr();
 
     let Some(required_columns) = pushdown_columns(expr, file_schema, true)? else {
@@ -273,7 +380,7 @@ pub(crate) fn build_parquet_read_plan(
     // read is clipped to those leaves rather than decoding the whole root.
     // A cast whose target covers every leaf, or that cannot be clipped safely,
     // falls back to a full read of that root inside the helper.
-    let (read_plan, leaf_indices) = if required_columns.cast_accesses.is_empty() {
+    let (read_plan, mut leaf_indices) = if required_columns.cast_accesses.is_empty() {
         assemble_read_plan(
             &required_columns.required_columns,
             &required_columns.struct_field_accesses,
@@ -289,10 +396,12 @@ pub(crate) fn build_parquet_read_plan(
             &required_columns.cast_accesses,
         )
     };
+    leaf_indices.sort_unstable();
+    leaf_indices.dedup();
 
     let required_bytes = size_of_columns(&leaf_indices, metadata)?;
 
-    Ok(Some((read_plan, required_bytes)))
+    Ok(Some((read_plan, leaf_indices, required_bytes)))
 }
 
 /// Checks if a predicate expression can be pushed down to the parquet decoder.
@@ -442,9 +551,9 @@ pub fn build_row_filter(
 /// on `fully_matched → not-fully-matched` boundaries.
 #[derive(Clone, Debug)]
 pub(crate) struct PrebuiltRowFilterCandidate {
-    /// The predicate expression with all `Column` indices rewritten to point
-    /// into the projected file schema.
-    physical_expr: Arc<dyn PhysicalExpr>,
+    /// Ordered predicate expressions with all `Column` indices rewritten to
+    /// point into the projected file schema.
+    physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
@@ -453,6 +562,11 @@ pub(crate) struct PrebuiltRowFilterCandidate {
     /// `reorder_predicates` is enabled. Stable across row groups within a
     /// file, so we cache it once.
     required_bytes: usize,
+    /// True (on the grouped morsel path) when any stage in `physical_exprs`
+    /// may fail on unfiltered rows (e.g. `CAST`, division, UDF, or dynamic
+    /// expression key). Used so `reorder_predicates` never moves a fallible
+    /// candidate ahead of preceding infallible guards.
+    has_fallible: bool,
 }
 
 impl PrebuiltRowFilterCandidate {
@@ -477,11 +591,98 @@ pub(crate) fn prebuild_row_filter_candidates(
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
+    prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false, None)
+}
+
+fn contains_float_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => contains_float_type(f.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|f| contains_float_type(f.data_type()))
+        }
+        DataType::Dictionary(_, v) => contains_float_type(v),
+        _ => false,
+    }
+}
+
+/// Returns `true` when Parquet row-group statistics prove `expr` evaluates to
+/// `TRUE` for every row in every surviving row group of the file (accounting
+/// for NULLs via [`build_inverted_predicate`]).
+fn conjunct_is_always_true(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    pruning_stats: &RowGroupPruningStatistics<'_>,
+) -> bool {
+    // Parquet min/max statistics omit IEEE-754 NaN values, so a row group
+    // whose stats satisfy e.g. `f <= 10.0` may still contain NaN rows that
+    // fail the predicate. Never elide conjuncts referencing floating-point
+    // columns based on min/max statistics.
+    if collect_columns(expr).iter().any(|c| {
+        file_schema
+            .fields()
+            .get(c.index())
+            .is_none_or(|f| contains_float_type(f.data_type()))
+    }) {
+        return false;
+    }
+    let Ok(pp) = PruningPredicateBuilder::new()
+        .with_file_schema(Arc::clone(file_schema))
+        .try_build(Arc::clone(expr))
+    else {
+        return false;
+    };
+    let Some(inverted) = build_inverted_predicate(&pp, file_schema.as_ref()) else {
+        return false;
+    };
+    let Ok(could_fail) = inverted.prune(pruning_stats) else {
+        return false;
+    };
+    !could_fail.is_empty() && could_fail.iter().all(|&c| !c)
+}
+
+/// Like [`prebuild_row_filter_candidates`], optionally eliminating conjuncts
+/// already proven always-true by surviving row-group statistics and merging
+/// remaining pushable conjuncts that read the exact same Parquet leaf set and
+/// projected schema into a single `ArrowPredicate` so each predicate column is
+/// decoded once.
+pub(crate) fn prebuild_row_filter_candidates_with_grouping(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    group_same_column: bool,
+    surviving_row_groups: Option<&[usize]>,
+) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr);
+    let pruning_stats = group_same_column
+        .then_some(surviving_row_groups)
+        .flatten()
+        .filter(|rgs| !rgs.is_empty())
+        .map(|rgs| {
+            let file_meta = metadata.file_metadata();
+            let row_group_metadatas =
+                rgs.iter().map(|&idx| metadata.row_group(idx)).collect();
+            RowGroupPruningStatistics {
+                parquet_schema: file_meta.schema_descr(),
+                column_orders: file_meta.column_orders().map(Vec::as_slice),
+                row_group_metadatas,
+                arrow_schema: file_schema.as_ref(),
+            }
+        });
     let candidates: Vec<FilterCandidate> = predicates
         .into_iter()
+        .filter(|pred| {
+            pruning_stats
+                .as_ref()
+                .is_none_or(|stats| !conjunct_is_always_true(pred, file_schema, stats))
+        })
         .map(|expr| {
             FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
                 .build(metadata)
@@ -495,17 +696,59 @@ pub(crate) fn prebuild_row_filter_candidates(
         return Ok(None);
     }
 
+    let candidates = if group_same_column && candidates.len() > 1 {
+        let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
+        for mut cand in candidates {
+            let same_leaves = |g: &FilterCandidate, c: &FilterCandidate| {
+                !c.leaf_indices.is_empty()
+                    && g.leaf_indices == c.leaf_indices
+                    && g.read_plan.projected_schema == c.read_plan.projected_schema
+            };
+            // Only merge into an earlier non-adjacent group when `cand` is
+            // infallible; never move a potentially-fallible conjunct (e.g.
+            // `CAST`, division, or dynamic expression key) ahead of an
+            // intervening guard on another column.
+            let target = if cand.last_is_infallible {
+                grouped.iter_mut().find(|g| same_leaves(g, &cand))
+            } else {
+                grouped.last_mut().filter(|g| same_leaves(g, &cand))
+            };
+            if let Some(existing) = target {
+                let next_expr = cand.exprs.pop().expect("non-empty candidate exprs");
+                if existing.last_is_infallible && cand.last_is_infallible {
+                    let tail =
+                        existing.exprs.last_mut().expect("non-empty grouped exprs");
+                    *tail = conjunction([Arc::clone(tail), next_expr]);
+                } else {
+                    existing.exprs.push(next_expr);
+                    existing.last_is_infallible = cand.last_is_infallible;
+                }
+            } else {
+                grouped.push(cand);
+            }
+        }
+        grouped
+    } else {
+        candidates
+    };
+
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
-            let physical_expr = reassign_expr_columns(
-                Arc::clone(&candidate.expr),
-                &candidate.read_plan.projected_schema,
-            )?;
+            let has_fallible =
+                group_same_column && !candidate.exprs.iter().all(is_infallible_expr);
+            let physical_exprs = candidate
+                .exprs
+                .into_iter()
+                .map(|expr| {
+                    reassign_expr_columns(expr, &candidate.read_plan.projected_schema)
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(PrebuiltRowFilterCandidate {
-                physical_expr,
+                physical_exprs,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
+                has_fallible,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -530,7 +773,18 @@ pub(crate) fn row_filter_from_prebuilt(
     // can sort without disturbing the shared cache.
     let mut ordered: Vec<&PrebuiltRowFilterCandidate> = prebuilt.iter().collect();
     if reorder_predicates {
-        ordered.sort_unstable_by_key(|c| c.required_bytes);
+        if ordered.iter().any(|c| c.has_fallible) {
+            // Keep infallible guards ahead of potentially-fallible candidates
+            // and preserve the original order among fallible candidates.
+            ordered.sort_by_key(|c| {
+                (
+                    c.has_fallible,
+                    if c.has_fallible { 0 } else { c.required_bytes },
+                )
+            });
+        } else {
+            ordered.sort_unstable_by_key(|c| c.required_bytes);
+        }
     }
 
     let total = ordered.len();
@@ -546,7 +800,7 @@ pub(crate) fn row_filter_from_prebuilt(
                 metrics::Count::new()
             };
             Box::new(DatafusionArrowPredicate {
-                physical_expr: Arc::clone(&candidate.physical_expr),
+                physical_exprs: candidate.physical_exprs.clone(),
                 projection_mask: candidate.projection_mask.clone(),
                 rows_pruned: predicate_rows_pruned,
                 rows_matched: predicate_rows_matched,
@@ -2113,5 +2367,256 @@ mod test {
         );
         assert_eq!(file_metrics.pushdown_rows_pruned.value(), 2);
         assert_eq!(file_metrics.pushdown_rows_matched.value(), 2);
+    }
+
+    #[test]
+    fn test_group_same_column_conjuncts_merges_and_preserves_distinct_struct_leaves() {
+        let s_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+            Field::new("s", DataType::Struct(s_fields.clone()), true),
+        ]));
+        let s_arr = StructArray::new(
+            s_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), None, Some(30)])) as _,
+                Arc::new(Int32Array::from(vec![Some(5), Some(15), Some(25), None])) as _,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(5), None, Some(10)])),
+                Arc::new(Int32Array::from(vec![
+                    Some(100),
+                    Some(200),
+                    Some(300),
+                    None,
+                ])),
+                Arc::new(s_arr),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let parquet_reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = parquet_reader_builder.metadata().clone();
+        let file_schema = parquet_reader_builder.schema().clone();
+
+        // 6 conjuncts: 2 on `x`, 2 on `y`, 2 on `s.a`, 1 on `s.b` -> 7 total.
+        let s_a = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("a".to_string())), None),
+        ]);
+        let s_b = get_field().call(vec![
+            col("s"),
+            Expr::Literal(ScalarValue::Utf8(Some("b".to_string())), None),
+        ]);
+        let expr = col("x")
+            .gt_eq(lit(2i32))
+            .and(col("x").lt_eq(lit(10i32)))
+            .and(col("y").gt_eq(lit(100i32)))
+            .and(col("y").lt_eq(lit(250i32)))
+            .and(s_a.clone().gt(lit(5i32)))
+            .and(s_a.lt(lit(25i32)))
+            .and(s_b.gt(lit(10i32)));
+        let phys = logical2physical(&expr, &file_schema);
+
+        // Ungrouped (stock default) keeps all 7 conjuncts separate.
+        let ungrouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ungrouped.len(), 7);
+
+        // Grouped merges same-leaf conjuncts into 4 predicates: x, y, s.a, s.b
+        // (crucially NOT merging s.a with s.b!).
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(grouped.len(), 4);
+        // Each leaf (0=x, 1=y, 2=s.a, 3=s.b) is read by exactly 1 candidate.
+        for leaf in 0..4 {
+            let readers = grouped.iter().filter(|c| c.reads_leaf(leaf)).count();
+            assert_eq!(readers, 1, "leaf {leaf} should be read by 1 candidate");
+        }
+
+        // Verify exact row evaluation matches on the Parquet reader.
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "grouped.parquet", &metrics);
+        let row_filter = row_filter_from_prebuilt(&grouped, false, &file_metrics);
+        let reader = parquet_reader_builder
+            .with_row_filter(row_filter)
+            .build()
+            .unwrap();
+        let total_rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        // Only row 1 (x=5, y=200, s.a=20, s.b=15) satisfies all 7 conjuncts.
+        assert_eq!(total_rows, 1);
+        assert_eq!(file_metrics.pushdown_rows_pruned.value(), 3);
+        assert_eq!(file_metrics.pushdown_rows_matched.value(), 1);
+    }
+
+    #[test]
+    fn test_group_same_column_elides_always_true_conjuncts_safely() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("non_null_k", DataType::Int32, false),
+            Field::new("nullable_k", DataType::Int32, true),
+            Field::new("selective", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // `non_null_k >= 1 AND non_null_k <= 100` is strictly contained in RG stats
+        // (10..=40, 0 nulls) -> elided! `nullable_k >= 1` has a NULL -> MUST be kept!
+        // `selective > 2` is not contained -> kept!
+        let expr = col("non_null_k")
+            .gt_eq(lit(1i32))
+            .and(col("non_null_k").lt_eq(lit(100i32)))
+            .and(col("nullable_k").gt_eq(lit(1i32)))
+            .and(col("selective").gt(lit(2i32)));
+        let phys = logical2physical(&expr, &file_schema);
+
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        // Only `nullable_k >= 1` (leaf 1) and `selective > 2` (leaf 2) remain;
+        // leaf 0 (`non_null_k`) is completely elided!
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.iter().all(|c| !c.reads_leaf(0)));
+        assert_eq!(grouped.iter().filter(|c| c.reads_leaf(1)).count(), 1);
+        assert_eq!(grouped.iter().filter(|c| c.reads_leaf(2)).count(), 1);
+    }
+
+    #[test]
+    fn test_group_same_column_keeps_float_nan_and_does_not_reorder_fallible_past_guard() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    1.0,
+                    f64::NAN,
+                    2.0,
+                    3.0,
+                ])),
+                Arc::new(StringArray::from(vec!["", "abc", "4", "10"])),
+                Arc::new(StringArray::from(vec!["num", "txt", "num", "num"])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // 1. Float column with NaN: `f <= 10.0` MUST NOT be elided even though
+        // Parquet min/max stats are [1.0, 3.0] with 0 nulls!
+        let float_expr = col("f").lt_eq(lit(10.0f64)).and(col("kind").eq(lit("num")));
+        let float_phys = logical2physical(&float_expr, &file_schema);
+        let float_grouped = prebuild_row_filter_candidates_with_grouping(
+            &float_phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            float_grouped.len(),
+            2,
+            "f <= 10.0 must not be elided on Float64"
+        );
+        assert_eq!(float_grouped.iter().filter(|c| c.reads_leaf(0)).count(), 1);
+
+        // 2. Fallible conjunct `CAST(s AS INT) > 5` after intervening `kind = 'num'`
+        // MUST NOT be merged into the earlier `s <> ''` group ahead of `kind = 'num'`.
+        let guard_expr = col("s")
+            .not_eq(lit(""))
+            .and(col("kind").eq(lit("num")))
+            .and(
+                Expr::Cast(Cast::new(Box::new(col("s")), DataType::Int32)).gt(lit(5i32)),
+            );
+        let guard_phys = logical2physical(&guard_expr, &file_schema);
+        let guard_grouped = prebuild_row_filter_candidates_with_grouping(
+            &guard_phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            guard_grouped.len(),
+            3,
+            "fallible CAST(s AS INT) must stay after intervening `kind = 'num'` guard"
+        );
+        assert!(!guard_grouped[0].has_fallible);
+        assert!(!guard_grouped[1].has_fallible);
+        assert!(guard_grouped[2].has_fallible);
     }
 }

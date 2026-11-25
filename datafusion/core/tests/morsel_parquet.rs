@@ -11,7 +11,8 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::common::test_util::batches_to_sort_string;
@@ -2617,5 +2618,401 @@ async fn parquet_group_count_high_cardinality_concurrent_oom_error_and_cancellat
             "{bad_sql}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_column_row_filter_conjuncts_decode_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let n: i64 = 10_000;
+    let batch = RecordBatch::try_from_iter([
+        ("x", Arc::new(Int64Array::from_iter_values(0..n)) as _),
+        (
+            "y",
+            Arc::new(Int64Array::from_iter_values((0..n).map(|i| i % 100))) as _,
+        ),
+        (
+            "z",
+            Arc::new(Int64Array::from_iter(
+                (0..n).map(|i| if i % 17 == 0 { None } else { Some(i % 50) }),
+            )) as _,
+        ),
+        (
+            "payload",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| format!("row-{i:06}")),
+            )) as _,
+        ),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(n as usize))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("data.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let make_ctx = |mode: &str, reorder: bool| {
+        let dir_path = dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut config = SessionConfig::new().with_target_partitions(2);
+            config.options_mut().execution.parquet.pushdown_filters = true;
+            config.options_mut().execution.parquet.reorder_filters = reorder;
+            config.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_parquet("t", &dir_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(ctx)
+        }
+    };
+
+    // Single-column range + inequality (3 conjuncts on `x`): with grouping,
+    // `x` must be decoded once (10,000 inner records), not 3x (~27,001).
+    let sql_single_col =
+        "SELECT COUNT(*) FROM t WHERE x >= 1000 AND x <= 9000 AND x <> 5000";
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder).await?;
+        let native = make_ctx("required", reorder).await?;
+        let expected = stock.sql(sql_single_col).await?.collect().await?;
+        let plan = native
+            .sql(sql_single_col)
+            .await?
+            .create_physical_plan()
+            .await?;
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec")
+        );
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        // Single-column range + inequality (3 conjuncts on `x`) must be grouped
+        // into 1 ArrowPredicate so `x` is decoded once instead of 3x.
+        assert_eq!(
+            metric(plan.as_ref(), "row_filter_predicates"),
+            1,
+            "reorder={reorder}: expected 3 same-column conjuncts on `x` to group into 1 ArrowPredicate"
+        );
+    }
+
+    // Multi-column Q6-like range predicates with NULLs: 6 conjuncts across 3 columns
+    // (`x` 2x, `y` 2x, `z` 2x) must group into 3 ArrowPredicates (1 per column).
+    let sql_multi_col = "SELECT x, payload FROM t \
+        WHERE x >= 1000 AND x < 9000 AND y >= 10 AND y <= 60 AND z >= 5 AND z < 40";
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder).await?;
+        let native = make_ctx("required", reorder).await?;
+        let expected = stock.sql(sql_multi_col).await?.collect().await?;
+        let plan = native
+            .sql(sql_multi_col)
+            .await?
+            .create_physical_plan()
+            .await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(
+            metric(plan.as_ref(), "row_filter_predicates"),
+            3,
+            "reorder={reorder}: expected 6 conjuncts across 3 columns to group into 3 ArrowPredicates"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_column_row_filter_preserves_guarded_filters_and_respects_pruning_setting()
+-> Result<()> {
+    let dir = TempDir::new()?;
+    let n = 2_000usize;
+    let s_values: Vec<Option<String>> = (0..n)
+        .map(|i| match i % 7 {
+            0 => Some(String::new()),
+            1 => None,
+            2 => Some("3".to_owned()),
+            3 => Some("6".to_owned()),
+            4 => Some("42".to_owned()),
+            5 => Some("-10".to_owned()),
+            _ => Some((i % 20).to_string()),
+        })
+        .collect();
+    let x_values: Vec<Option<i32>> = (0..n)
+        .map(|i| match i % 6 {
+            0 => Some(0),
+            1 => None,
+            2 => Some(-5),
+            3 => Some(10),
+            4 => Some(25),
+            _ => Some(50),
+        })
+        .collect();
+    let non_null_values: Vec<i64> = (10..10 + n as i64).collect();
+    let batch = RecordBatch::try_from_iter([
+        ("s", Arc::new(StringArray::from(s_values)) as _),
+        ("x", Arc::new(Int32Array::from(x_values)) as _),
+        ("k", Arc::new(Int64Array::from(non_null_values)) as _),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(500))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("guarded.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let make_ctx = |mode: &str, reorder: bool, pruning: bool| {
+        let dir_path = dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut config = SessionConfig::new().with_target_partitions(2);
+            config.options_mut().execution.parquet.pushdown_filters = true;
+            config.options_mut().execution.parquet.reorder_filters = reorder;
+            config.options_mut().execution.parquet.pruning = pruning;
+            config.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_parquet("t", &dir_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(ctx)
+        }
+    };
+
+    // 1. Guarded CAST and guarded division must never evaluate the fallible
+    // conjunct on rows rejected by the earlier guard, while still grouping
+    // same-column conjuncts into 1 ArrowPredicate so the column decodes once.
+    let guarded_queries = [
+        "SELECT COUNT(*) FROM t WHERE s <> '' AND CAST(s AS INT) > 5",
+        "SELECT COUNT(*) FROM t WHERE x <> 0 AND 100 / x > 3",
+        "SELECT k FROM t WHERE s <> '' AND CAST(s AS INT) > 5 AND x <> 0 AND 100 / x > 3",
+    ];
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder, true).await?;
+        let native = make_ctx("required", reorder, true).await?;
+        for sql in guarded_queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            assert!(
+                displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string()
+                    .contains("MorselExec")
+            );
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "reorder={reorder}: {sql}"
+            );
+            let expected_preds = if sql.contains("AND x") { 2 } else { 1 };
+            assert_eq!(
+                metric(plan.as_ref(), "row_filter_predicates"),
+                expected_preds,
+                "reorder={reorder}: {sql}"
+            );
+        }
+    }
+
+    // 2. Always-true conjunct elision MUST respect `execution.parquet.pruning=false`:
+    // `k >= 0` is strictly contained in every RG's stats (min=10, 0 nulls), so with
+    // `pruning=true` it is elided (only `x > 5` remains -> 1 predicate), whereas
+    // with `pruning=false` row-group stats are NOT consulted (`k >= 0` and `x > 5`
+    // both remain -> 2 predicates).
+    let sql_elision = "SELECT COUNT(*) FROM t WHERE k >= 0 AND x > 5";
+    let native_pruning_off = make_ctx("required", false, false).await?;
+    let plan_off = native_pruning_off
+        .sql(sql_elision)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let _ = collect(Arc::clone(&plan_off), native_pruning_off.task_ctx()).await?;
+    assert_eq!(
+        metric(plan_off.as_ref(), "row_filter_predicates"),
+        2,
+        "pruning=false must NOT elide conjuncts using row-group statistics"
+    );
+
+    let native_pruning_on = make_ctx("required", false, true).await?;
+    let plan_on = native_pruning_on
+        .sql(sql_elision)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let _ = collect(Arc::clone(&plan_on), native_pruning_on.task_ctx()).await?;
+    assert_eq!(
+        metric(plan_on.as_ref(), "row_filter_predicates"),
+        1,
+        "pruning=true should elide always-true `k >= 0` using row-group statistics"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_filter_elision_preserves_float_nan_and_cross_column_guards() -> Result<()> {
+    // 1. Float NaN regression: Parquet min/max stats omit NaN, so `f <= 10.0`
+    // MUST NOT be elided when `f` is Float64 (NaN every 10th row, 0..4 otherwise).
+    let nan_dir = TempDir::new()?;
+    let f_vals: Vec<f64> = (0..1000)
+        .map(|i| {
+            if i % 10 == 0 {
+                f64::NAN
+            } else {
+                (i % 5) as f64
+            }
+        })
+        .collect();
+    let g_vals: Vec<i64> = (0..1000).collect();
+    let nan_batch = RecordBatch::try_from_iter([
+        ("f", Arc::new(Float64Array::from(f_vals)) as _),
+        ("g", Arc::new(Int64Array::from(g_vals)) as _),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(250))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(nan_dir.path().join("float_nan.parquet"))?,
+        nan_batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&nan_batch)?;
+    writer.close()?;
+
+    for reorder in [false, true] {
+        let mut stock_cfg = SessionConfig::new().with_target_partitions(2);
+        stock_cfg.options_mut().execution.parquet.pushdown_filters = true;
+        stock_cfg.options_mut().execution.parquet.reorder_filters = reorder;
+        stock_cfg.options_mut().execution.parquet.pruning = true;
+        stock_cfg.options_mut().execution.collect_statistics = false;
+        let stock = SessionContext::new_with_config(stock_cfg.clone());
+        let native = SessionContext::new_with_config(stock_cfg);
+        for (ctx, mode) in [(&stock, "off"), (&native, "required")] {
+            ctx.register_parquet(
+                "t",
+                nan_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+        }
+        let sql = "SELECT COUNT(*) FROM t WHERE f <= 10.0 AND g % 3 = 0";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec")
+        );
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "reorder={reorder}: float NaN filter must match stock (expected 300)"
+        );
+    }
+
+    // 2. Cross-column guard regression: `s <> '' AND kind = 'num' AND CAST(s AS INT) > 5`
+    // must never move the fallible `CAST(s AS INT) > 5` ahead of `kind = 'num'`.
+    // Also test a wide `kind` column so `required_bytes(s) < required_bytes(kind)` under
+    // `reorder_filters = true`.
+    let guard_dir = TempDir::new()?;
+    let n = 1000usize;
+    let s_vals: Vec<String> = (0..n)
+        .map(|i| match i % 4 {
+            0 => String::new(),
+            1 => format!("abc{i}"),
+            2 => "3".to_owned(),
+            _ => format!("{}", 6 + (i % 50)),
+        })
+        .collect();
+    let kind_vals: Vec<&str> = (0..n)
+        .map(|i| if i % 4 == 1 { "txt" } else { "num" })
+        .collect();
+    let wide_kind_vals: Vec<String> = (0..n)
+        .map(|i| {
+            if i % 4 == 1 {
+                format!("txt-wide-unique-padding-{i:08}")
+            } else {
+                "num".to_owned()
+            }
+        })
+        .collect();
+    let guard_batch = RecordBatch::try_from_iter([
+        ("s", Arc::new(StringArray::from(s_vals)) as _),
+        ("kind", Arc::new(StringArray::from(kind_vals)) as _),
+        (
+            "wide_kind",
+            Arc::new(StringArray::from(wide_kind_vals)) as _,
+        ),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(250))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(guard_dir.path().join("cross_guard.parquet"))?,
+        guard_batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&guard_batch)?;
+    writer.close()?;
+
+    for reorder in [false, true] {
+        let mut cfg = SessionConfig::new().with_target_partitions(2);
+        cfg.options_mut().execution.parquet.pushdown_filters = true;
+        cfg.options_mut().execution.parquet.reorder_filters = reorder;
+        cfg.options_mut().execution.parquet.pruning = true;
+        cfg.options_mut().execution.collect_statistics = false;
+        let stock = SessionContext::new_with_config(cfg.clone());
+        let native = SessionContext::new_with_config(cfg);
+        for (ctx, mode) in [(&stock, "off"), (&native, "required")] {
+            ctx.register_parquet(
+                "t",
+                guard_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+        }
+        let sql = "SELECT COUNT(*) FROM t WHERE s <> '' AND kind = 'num' AND CAST(s AS INT) > 5";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "reorder={reorder}: {sql}"
+        );
+
+        // Even when the guard column (`wide_kind`) is wider than `s`, morsel
+        // keeps infallible guards ahead of the fallible `CAST` under `reorder=true`.
+        let sql_wide = "SELECT COUNT(*) FROM t WHERE s <> '' AND wide_kind = 'num' AND CAST(s AS INT) > 5";
+        let plan_wide = native.sql(sql_wide).await?.create_physical_plan().await?;
+        let actual_wide = collect(Arc::clone(&plan_wide), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual_wide),
+            batches_to_sort_string(&expected),
+            "reorder={reorder}: {sql_wide}"
+        );
+    }
+
     Ok(())
 }
