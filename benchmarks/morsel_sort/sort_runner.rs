@@ -405,6 +405,24 @@ const WORKLOADS: &[Workload] = &[
         key_cols: &[0, 1, 2],
     },
     Workload {
+        name: "topn_limit_100k",
+        sql: "SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 100000",
+        expected_sink: "TopNSink",
+        key_cols: &[1, 0],
+    },
+    Workload {
+        name: "topn_limit_1m",
+        sql: "SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 1000000",
+        expected_sink: "TopNSink",
+        key_cols: &[1, 0],
+    },
+    Workload {
+        name: "topn_limit_gt_rows",
+        sql: "SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 10000000",
+        expected_sink: "TopNSink",
+        key_cols: &[1, 0],
+    },
+    Workload {
         name: "sort_uniform_single_key",
         sql: "SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST",
         expected_sink: "SortSink",

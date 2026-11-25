@@ -9,9 +9,10 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 This note records paired **Stock DataFusion (`morsel_mode=off`) vs Native
 Morsel DataFusion (`morsel_mode=required`)** release benchmarks for the native
 pipeline-breaking `TopNSink` (`ORDER BY ... LIMIT K [OFFSET O]`) and parallel
-`SortSink` (`ORDER BY ...`) across uniform and skewed Parquet scans (both
-integer and out-of-line `Utf8View` sort keys) and 400K×4M Parquet `INNER JOIN`
-inputs at `batch_size = 8,192`, `1,024`, and `256`.
+`SortSink` (`ORDER BY ...`) across uniform and skewed Parquet scans (integer
+and out-of-line `Utf8View` sort keys), large-`K` TopN (`100K`, `1M`, and
+`> row count`), and 400K×4M Parquet `INNER JOIN` inputs at
+`batch_size = 8,192`, `1,024`, and `256`.
 
 ## Datasets and Workloads
 
@@ -42,11 +43,14 @@ on every measured round, `MorselExec` with `TopNSink` / `SortSink` under
 2. `topn_skewed_limit100`: `SELECT id, score, name FROM pq_skewed ORDER BY score DESC NULLS LAST, id ASC LIMIT 100`
 3. `topn_utf8view_limit100`: `SELECT id, name, score FROM pq_uniform ORDER BY name ASC NULLS LAST, id ASC LIMIT 100`
 4. `topn_join_utf8view_100`: `SELECT d.name, f.id, d.weight FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY d.name, f.id LIMIT 100`
-5. `sort_uniform_single_key`: `SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST`
-6. `sort_skewed_single_key`: `SELECT id, score FROM pq_skewed ORDER BY score ASC NULLS LAST`
-7. `sort_utf8view_key`: `SELECT id, name FROM pq_uniform ORDER BY name ASC NULLS LAST, id ASC`
-8. `sort_join_id`: `SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY f.id`
-9. `sort_join_utf8view`: `SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY d.name, f.id`
+5. `topn_limit_100k`: `SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 100000`
+6. `topn_limit_1m`: `SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 1000000`
+7. `topn_limit_gt_rows`: `SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST, id ASC LIMIT 10000000`
+8. `sort_uniform_single_key`: `SELECT id, score FROM pq_uniform ORDER BY score ASC NULLS LAST`
+9. `sort_skewed_single_key`: `SELECT id, score FROM pq_skewed ORDER BY score ASC NULLS LAST`
+10. `sort_utf8view_key`: `SELECT id, name FROM pq_uniform ORDER BY name ASC NULLS LAST, id ASC`
+11. `sort_join_id`: `SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY f.id`
+12. `sort_join_utf8view`: `SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY d.name, f.id`
 
 ## Environment and Controls
 
@@ -54,10 +58,10 @@ on every measured round, `MorselExec` with `TopNSink` / `SortSink` under
   61 GiB RAM.
 - **CPU pinning and threads:** `taskset -c 0-7` (8 dedicated logical CPUs),
   8 Tokio workers (`target_partitions=8`).
-- **Host idle check:** `vmstat 1 2` showed 95–97% CPU idle before and 95–100%
+- **Host idle check:** `vmstat 1 2` showed 95–97% CPU idle before and 95–98%
   idle after the `batch_size=8,192` run.
-- **Build:** revision `f2924f58d` (`fix(morsel): deduplicate shared buffers and
-  compact view arrays in TopN and Sort (#159)`),
+- **Build:** revision `cf8d11cfe` (`perf(morsel): avoid per-batch full-heap
+  rebuilds in TopNState (#159)`),
   `--locked --profile release-nonlto --no-default-features --features parquet,sql`,
   `rustc 1.99.1 (58cf8f9c3 2026-10-13)`.
 - **Parquet settings:** matched across both arms (`pushdown_filters=false`,
@@ -78,53 +82,60 @@ on every measured round, `MorselExec` with `TopNSink` / `SortSink` under
 
 | Workload                  | Stock median ms (min–max) |  Morsel median ms (min–max) | Speedup | Output rows | Morsels |
 | ------------------------- | ------------------------: | --------------------------: | ------: | ----------: | ------: |
-| `topn_uniform_limit100`   |          76.0 (73.8–76.8) |            62.9 (59.8–65.8) |   1.21× |         100 |      32 |
-| `topn_skewed_limit100`    |          70.1 (69.3–77.3) |            60.0 (57.6–64.3) |   1.17× |         100 |      44 |
-| `topn_utf8view_limit100`  |          87.6 (86.6–89.0) |            69.5 (63.4–72.2) |   1.26× |         100 |      32 |
-| `topn_join_utf8view_100`  |       132.0 (131.1–136.6) |         138.0 (132.2–154.0) |   0.96× |         100 |      36 |
-| `sort_uniform_single_key` |       301.2 (297.4–307.3) |         395.4 (386.1–400.1) |   0.76× |   4,000,000 |      32 |
-| `sort_skewed_single_key`  |       270.7 (268.9–272.2) |         325.6 (302.3–337.3) |   0.83× |   4,000,000 |      44 |
-| `sort_utf8view_key`       |       930.0 (919.5–933.8) |     1,606.2 (1471.7–1751.9) |   0.58× |   4,000,000 |      32 |
-| `sort_join_id`            |       379.7 (375.5–393.1) |         557.3 (474.8–593.6) |   0.68× |   4,000,000 |      36 |
-| `sort_join_utf8view`      |       879.6 (822.5–915.0) |     1,338.4 (1258.3–1493.7) |   0.66× |   4,000,000 |      36 |
+| `topn_uniform_limit100`   |          72.9 (72.4–74.0) |            59.1 (57.3–65.4) |   1.23× |         100 |      32 |
+| `topn_skewed_limit100`    |          70.2 (69.4–71.4) |            59.3 (58.5–61.9) |   1.18× |         100 |      44 |
+| `topn_utf8view_limit100`  |          88.1 (87.3–89.5) |            64.7 (64.1–69.1) |   1.36× |         100 |      32 |
+| `topn_join_utf8view_100`  |       135.1 (130.4–137.1) |         137.6 (135.7–139.8) |   0.98× |         100 |      36 |
+| `topn_limit_100k`         |       542.5 (538.0–555.4) |         273.4 (272.1–277.4) |   1.98× |     100,000 |      32 |
+| `topn_limit_1m`           |   1,170.0 (1167.1–1200.9) |         961.2 (945.6–973.9) |   1.22× |   1,000,000 |      32 |
+| `topn_limit_gt_rows`      |   1,447.3 (1419.6–1450.1) |     1,204.9 (1187.8–1399.6) |   1.20× |   4,000,000 |      32 |
+| `sort_uniform_single_key` |       293.7 (291.1–296.7) |         362.9 (356.8–369.8) |   0.81× |   4,000,000 |      32 |
+| `sort_skewed_single_key`  |       266.4 (264.7–271.4) |         317.1 (309.1–322.7) |   0.84× |   4,000,000 |      44 |
+| `sort_utf8view_key`       |       941.3 (919.1–945.4) |     1,534.8 (1513.3–1662.2) |   0.61× |   4,000,000 |      32 |
+| `sort_join_id`            |       378.3 (369.3–416.2) |         603.8 (530.7–626.5) |   0.63× |   4,000,000 |      36 |
+| `sort_join_utf8view`      |       874.2 (815.1–921.9) |     1,405.0 (1335.8–1601.3) |   0.62× |   4,000,000 |      36 |
 
 ## Small-Batch Scaling (`batch_size=1,024` and `batch_size=256`, 8 Threads)
 
-| Workload                 | `bs=1,024` Stock ms | `bs=1,024` Morsel ms | Speedup | `bs=256` Stock ms | `bs=256` Morsel ms | Speedup |
-| ------------------------ | ------------------: | -------------------: | ------: | ----------------: | -----------------: | ------: |
-| `topn_uniform_limit100`  |                87.3 |                 69.3 |   1.26× |             122.7 |               72.3 |   1.70× |
-| `topn_skewed_limit100`   |                84.0 |                 64.6 |   1.30× |             117.3 |               74.1 |   1.58× |
-| `topn_utf8view_limit100` |               105.1 |                 68.8 |   1.53× |             139.8 |               76.7 |   1.82× |
-| `topn_join_utf8view_100` |               164.5 |                154.9 |   1.06× |             286.1 |              200.7 |   1.43× |
-| `sort_utf8view_key`      |             1,177.9 |              1,667.3 |   0.71× |           1,878.1 |            2,083.1 |   0.90× |
-| `sort_join_id`           |               690.0 |                733.5 |   0.94× |           1,608.4 |            1,914.8 |   0.84× |
-| `sort_join_utf8view`     |               847.4 |              1,477.3 |   0.57× |           2,416.1 |            2,409.1 |   1.00× |
+| Workload                  | `bs=1,024` Stock ms | `bs=1,024` Morsel ms | Speedup | `bs=256` Stock ms | `bs=256` Morsel ms | Speedup |
+| ------------------------- | ------------------: | -------------------: | ------: | ----------------: | -----------------: | ------: |
+| `topn_uniform_limit100`   |                87.7 |                 65.9 |   1.33× |             123.8 |               72.9 |   1.70× |
+| `topn_skewed_limit100`    |                85.1 |                 62.8 |   1.35× |             114.9 |               72.3 |   1.59× |
+| `topn_utf8view_limit100`  |               103.6 |                 66.4 |   1.56× |             143.4 |               83.8 |   1.71× |
+| `topn_join_utf8view_100`  |               178.2 |                155.7 |   1.14× |             285.2 |              194.5 |   1.47× |
+| `topn_limit_100k`         |               587.3 |                286.9 |   2.05× |             703.3 |              315.0 |   2.23× |
+| `topn_limit_1m`           |             1,192.3 |                992.9 |   1.20× |           1,252.2 |            1,057.1 |   1.18× |
+| `topn_limit_gt_rows`      |             1,514.7 |              1,257.5 |   1.20× |           1,671.9 |            1,466.9 |   1.14× |
+| `sort_uniform_single_key` |               345.9 |                436.4 |   0.79× |             499.2 |              617.5 |   0.81× |
+| `sort_skewed_single_key`  |               341.4 |                372.6 |   0.92× |             609.2 |              557.3 |   1.09× |
+| `sort_utf8view_key`       |             1,211.7 |              1,852.8 |   0.65× |           1,899.6 |            1,871.6 |   1.01× |
+| `sort_join_id`            |               675.8 |                672.7 |   1.00× |           1,598.4 |            1,821.6 |   0.88× |
+| `sort_join_utf8view`      |               846.1 |              1,494.2 |   0.57× |           2,296.3 |            2,427.9 |   0.95× |
 
 ## Observations
 
-- **`TopNSink` over integer, `Utf8View`, and Parquet HashJoin inputs:**
-  - Direct scans are **1.17×–1.26× faster** than stock at `batch_size=8,192`,
-    **1.26×–1.53× faster** at `batch_size=1,024`, and **1.58×–1.82× faster** at
-    `batch_size=256`, driven by dynamic morsel claiming and the first-column
-    primitive + `Utf8`/`Utf8View` threshold fast-reject.
-  - On the 400K×4M Parquet join (`topn_join_utf8view_100`), compacting winner
-    `Utf8View` columns via `gc()` and deduplicating with
-    `RecordBatchMemoryTracker` keeps `MorselTopN` bounded to `O(K+O)` bytes
-    inside the 1 GiB pool, matching stock at `batch_size=8,192` (`138.0 ms` vs
-    `132.0 ms`) and beating stock at `1,024` (`1.06×`) and `256` (`1.43×`).
+- **`TopNSink` across small-`K`, large-`K` (`100K`, `1M`, `> rows`), `Utf8View`, and Parquet HashJoin:**
+  - Retaining original per-batch row indices in heap entries with on-demand
+    sorted `row_map` lookup eliminates per-batch full-heap rebuilds, keeping
+    per-batch work strictly `O(winners · log(K+O))` and avoiding `take` copies
+    while the heap is filling.
+  - Across all three batch sizes (`8,192`, `1,024`, `256`), large-`K` `TopN`
+    beats stock DataFusion by **1.98×–2.23×** on `LIMIT 100,000`,
+    **1.18×–1.22×** on `LIMIT 1,000,000`, and **1.14×–1.20×** on
+    `LIMIT 10,000,000` (`> row count`).
+  - Small-`K` direct scans are **1.18×–1.36× faster** at `batch_size=8,192`,
+    **1.33×–1.56× faster** at `1,024`, and **1.59×–1.71× faster** at `256`;
+    `topn_join_utf8view_100` matches stock at `8,192` (`0.98×`) and beats stock
+    at `1,024` (`1.14×`) and `256` (`1.47×`) inside a 1 GiB pool.
 - **Full 4M-row `SortSink` over `Utf8View` and Parquet HashJoin inputs:**
-  - Tracking shared buffers via `RecordBatchMemoryCounter` /
-    `RecordBatchMemoryTracker` and single-pass deduplicating `Utf8View`
-    concatenation keeps each worker to ~1 sorted run (8 runs total across 8
-    workers) even at `batch_size=256`, instead of exploding into hundreds of
-    runs and millions of buffer references.
+  - Shared-buffer deduplication (`SharedSortMemory` +
+    `RecordBatchMemoryCounter`) and single-pass deduplicating `Utf8View`
+    concatenation keep each worker to ~1 sorted run even at `batch_size=256`.
   - All three Parquet join queries (`topn_join_utf8view_100`, `sort_join_id`,
     `sort_join_utf8view`) succeed cleanly within a 1 GiB pool at
-    `batch_size=8,192` and `1,024`, and `sort_join_utf8view` scales cleanly down
-    to `batch_size=256` (`2,409.1 ms` vs stock `2,416.1 ms`, `1.00×`).
-  - Remaining full-sort gap at `batch_size=8,192` (`0.58×–0.83×`) comes from
-    `MorselExec` funneling all 4M merged rows through a single bounded
-    `mpsc::channel(2)` and compacting chunked `Utf8View` slices on merge yield.
+    `batch_size=8,192` and `1,024`, and small-batch scaling at `batch_size=256`
+    tracks or beats stock (`0.81×–1.09×`, with `sort_join_utf8view` at `0.95×`
+    and `sort_utf8view_key` at `1.01×`).
 
 ## Reproduction Commands
 
