@@ -30,6 +30,7 @@ use datafusion_physical_expr::expressions::Column;
 #[cfg(test)]
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
+use datafusion_physical_expr::utils::split_conjunction;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
@@ -213,7 +214,39 @@ fn estimate_side_size(
             }
         }
     }
-    SideEstimate { is_empty, ..base }
+    let mut filter_conjuncts = 0u32;
+    #[cfg(feature = "parquet")]
+    if let Source::Parquet(pq) = source
+        && let Some(pred) = pq.pushed_predicate()
+    {
+        filter_conjuncts =
+            filter_conjuncts.saturating_add(split_conjunction(&pred).len() as u32);
+    }
+    for op in operators {
+        if let Operator::Filter { predicate, .. } = op {
+            filter_conjuncts = filter_conjuncts
+                .saturating_add(split_conjunction(predicate).len() as u32);
+        }
+    }
+    // Discount filtered scans by 2x per conjunctive filter (capped at 32x) so
+    // heavily selective fact-table filters (e.g. TPC-H Q12 `lineitem` vs
+    // unfiltered `orders`) place the smaller filtered side on build and push
+    // dynamic join filters into the larger unfiltered table.
+    let shift = filter_conjuncts.min(5);
+    let approx_bytes = if is_empty || shift == 0 {
+        base.approx_bytes
+    } else {
+        (base.approx_bytes >> shift).max(1)
+    };
+    let mem_rows = match base.mem_rows {
+        Some(rows) if !is_empty && shift > 0 => Some((rows >> shift).max(1)),
+        other => other,
+    };
+    SideEstimate {
+        is_empty,
+        mem_rows,
+        approx_bytes,
+    }
 }
 
 fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::BuildSide {

@@ -69,8 +69,11 @@ use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 
 use datafusion_physical_plan::metrics;
+use datafusion_pruning::PruningPredicateBuilder;
 
 use super::ParquetFileMetrics;
+use super::pruning::build_inverted_predicate;
+use super::row_group_filter::RowGroupPruningStatistics;
 use super::supported_predicates::supports_list_predicates;
 use crate::projection_read_plan::{
     ParquetReadPlan, PushdownChecker, PushdownColumns, assemble_read_plan,
@@ -483,23 +486,69 @@ pub(crate) fn prebuild_row_filter_candidates(
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
-    prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false)
+    prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false, None)
 }
 
-/// Like [`prebuild_row_filter_candidates`], optionally merging pushable
-/// conjuncts that read the exact same Parquet leaf set and projected schema
-/// into a single `ArrowPredicate` so each predicate column is decoded once.
+/// Returns `true` when Parquet row-group statistics prove `expr` evaluates to
+/// `TRUE` for every row in every surviving row group of the file (accounting
+/// for NULLs via [`build_inverted_predicate`]).
+fn conjunct_is_always_true(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    pruning_stats: &RowGroupPruningStatistics<'_>,
+) -> bool {
+    let Ok(pp) = PruningPredicateBuilder::new()
+        .with_file_schema(Arc::clone(file_schema))
+        .try_build(Arc::clone(expr))
+    else {
+        return false;
+    };
+    let Some(inverted) = build_inverted_predicate(&pp, file_schema.as_ref()) else {
+        return false;
+    };
+    let Ok(could_fail) = inverted.prune(pruning_stats) else {
+        return false;
+    };
+    !could_fail.is_empty() && could_fail.iter().all(|&c| !c)
+}
+
+/// Like [`prebuild_row_filter_candidates`], optionally eliminating conjuncts
+/// already proven always-true by surviving row-group statistics and merging
+/// remaining pushable conjuncts that read the exact same Parquet leaf set and
+/// projected schema into a single `ArrowPredicate` so each predicate column is
+/// decoded once.
 pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     expr: &Arc<dyn PhysicalExpr>,
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
     group_same_column: bool,
+    surviving_row_groups: Option<&[usize]>,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr);
+    let pruning_stats = group_same_column
+        .then_some(surviving_row_groups)
+        .flatten()
+        .filter(|rgs| !rgs.is_empty())
+        .map(|rgs| {
+            let file_meta = metadata.file_metadata();
+            let row_group_metadatas =
+                rgs.iter().map(|&idx| metadata.row_group(idx)).collect();
+            RowGroupPruningStatistics {
+                parquet_schema: file_meta.schema_descr(),
+                column_orders: file_meta.column_orders().map(Vec::as_slice),
+                row_group_metadatas,
+                arrow_schema: file_schema.as_ref(),
+            }
+        });
     let candidates: Vec<FilterCandidate> = predicates
         .into_iter()
+        .filter(|pred| {
+            pruning_stats
+                .as_ref()
+                .is_none_or(|stats| !conjunct_is_always_true(pred, file_schema, stats))
+        })
         .map(|expr| {
             FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
                 .build(metadata)
@@ -2224,6 +2273,7 @@ mod test {
             &file_schema,
             &metadata,
             false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2236,6 +2286,7 @@ mod test {
             &file_schema,
             &metadata,
             true,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2259,5 +2310,62 @@ mod test {
         assert_eq!(total_rows, 1);
         assert_eq!(file_metrics.pushdown_rows_pruned.value(), 3);
         assert_eq!(file_metrics.pushdown_rows_matched.value(), 1);
+    }
+
+    #[test]
+    fn test_group_same_column_elides_always_true_conjuncts_safely() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("non_null_k", DataType::Int32, false),
+            Field::new("nullable_k", DataType::Int32, true),
+            Field::new("selective", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // `non_null_k >= 1 AND non_null_k <= 100` is strictly contained in RG stats
+        // (10..=40, 0 nulls) -> elided! `nullable_k >= 1` has a NULL -> MUST be kept!
+        // `selective > 2` is not contained -> kept!
+        let expr = col("non_null_k")
+            .gt_eq(lit(1i32))
+            .and(col("non_null_k").lt_eq(lit(100i32)))
+            .and(col("nullable_k").gt_eq(lit(1i32)))
+            .and(col("selective").gt(lit(2i32)));
+        let phys = logical2physical(&expr, &file_schema);
+
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        // Only `nullable_k >= 1` (leaf 1) and `selective > 2` (leaf 2) remain;
+        // leaf 0 (`non_null_k`) is completely elided!
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.iter().all(|c| !c.reads_leaf(0)));
+        assert_eq!(grouped.iter().filter(|c| c.reads_leaf(1)).count(), 1);
+        assert_eq!(grouped.iter().filter(|c| c.reads_leaf(2)).count(), 1);
     }
 }
