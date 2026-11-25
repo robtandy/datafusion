@@ -367,6 +367,9 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "parquet_morsels_claimed": metric(plan.as_ref(), "parquet_morsels_claimed"),
             "count_finalizations": metric(plan.as_ref(), "count_finalizations"),
             "aggregate_finalizations": metric(plan.as_ref(), "aggregate_finalizations"),
+            "join_build_finalizations": metric(plan.as_ref(), "join_build_finalizations"),
+            "sort_finalizations": metric(plan.as_ref(), "sort_finalizations"),
+            "topn_finalizations": metric(plan.as_ref(), "topn_finalizations"),
             "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
             "worker_claims": native.as_ref().map(|r| &r.claims),
             "worker_completions": native.as_ref().map(|r| &r.completions),
@@ -375,12 +378,62 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "morsel_ready_wait_ms": native.as_ref().map(|r| r.ready_wait_ms),
             "morsel_output_wait_ms": native.as_ref().map(|r| r.output_wait_ms),
             "morsel_pending_io_ms": native.as_ref().map(|r| r.pending_io_ms),
+            "morsel_join_combine_work_ms": native.as_ref().map(|r| r.join_combine_ms),
+            "morsel_join_finalize_work_ms": native.as_ref().map(|r| r.join_finalize_ms),
+            "morsel_sort_finalize_work_ms": native.as_ref().map(|r| r.sort_finalize_ms),
+            "morsel_topn_finalize_work_ms": native.as_ref().map(|r| r.topn_finalize_ms),
             "morsel_peak_ready_depth": native.as_ref().map(|r| r.peak_ready_depth),
             "morsel_peak_output_depth": native.as_ref().map(|r| r.peak_output_depth),
+            "morsel_pipelines": native.as_ref().map(|r| r.pipelines_json()),
             "operator_compute_ms": operator_compute_ms,
         })
     );
     Ok(())
+}
+
+struct PipelineReport {
+    claims: Vec<usize>,
+    completions: Vec<usize>,
+    decode_ms: f64,
+    process_ms: f64,
+    ready_wait_ms: f64,
+    output_wait_ms: f64,
+    join_combine_ms: f64,
+    join_finalize_ms: f64,
+    sort_finalize_ms: f64,
+    topn_finalize_ms: f64,
+}
+
+impl PipelineReport {
+    fn new(workers: usize) -> Self {
+        Self {
+            claims: vec![0; workers],
+            completions: vec![0; workers],
+            decode_ms: 0.0,
+            process_ms: 0.0,
+            ready_wait_ms: 0.0,
+            output_wait_ms: 0.0,
+            join_combine_ms: 0.0,
+            join_finalize_ms: 0.0,
+            sort_finalize_ms: 0.0,
+            topn_finalize_ms: 0.0,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "worker_claims": self.claims,
+            "worker_completions": self.completions,
+            "decode_work_ms": self.decode_ms,
+            "process_work_ms": self.process_ms,
+            "ready_wait_ms": self.ready_wait_ms,
+            "output_wait_ms": self.output_wait_ms,
+            "join_combine_work_ms": self.join_combine_ms,
+            "join_finalize_work_ms": self.join_finalize_ms,
+            "sort_finalize_work_ms": self.sort_finalize_ms,
+            "topn_finalize_work_ms": self.topn_finalize_ms,
+        })
+    }
 }
 
 struct NativeReport {
@@ -391,8 +444,13 @@ struct NativeReport {
     ready_wait_ms: f64,
     output_wait_ms: f64,
     pending_io_ms: f64,
+    join_combine_ms: f64,
+    join_finalize_ms: f64,
+    sort_finalize_ms: f64,
+    topn_finalize_ms: f64,
     peak_ready_depth: usize,
     peak_output_depth: usize,
+    pipelines: BTreeMap<String, PipelineReport>,
 }
 
 impl NativeReport {
@@ -405,10 +463,118 @@ impl NativeReport {
             ready_wait_ms: run_time_ms(run, "morsel_ready_wait"),
             output_wait_ms: run_time_ms(run, "morsel_output_wait"),
             pending_io_ms: run_time_ms(run, "morsel_pending_io"),
+            join_combine_ms: run_time_ms(run, "morsel_join_combine_work"),
+            join_finalize_ms: run_time_ms(run, "morsel_join_finalize_work"),
+            sort_finalize_ms: run_time_ms(run, "morsel_sort_finalize_work"),
+            topn_finalize_ms: run_time_ms(run, "morsel_topn_finalize_work"),
             peak_ready_depth: run_usize(run, "morsel_peak_ready_depth"),
             peak_output_depth: run_usize(run, "morsel_peak_output_depth"),
+            pipelines: collect_pipeline_reports(run, workers)?,
         })
     }
+
+    fn pipelines_json(&self) -> BTreeMap<String, serde_json::Value> {
+        self.pipelines
+            .iter()
+            .map(|(name, report)| (name.clone(), report.to_json()))
+            .collect()
+    }
+}
+
+fn collect_pipeline_reports(
+    run: &MetricsSet,
+    workers: usize,
+) -> Result<BTreeMap<String, PipelineReport>, Box<dyn Error>> {
+    let mut pipelines: BTreeMap<String, PipelineReport> = BTreeMap::new();
+    let mut seen_worker_counts: BTreeSet<(&str, String, usize)> = BTreeSet::new();
+    for metric in run.iter() {
+        let name = metric.value().name();
+        let pipeline_label = metric
+            .labels()
+            .iter()
+            .find(|label| label.name() == "pipeline")
+            .map(|label| label.value().to_owned());
+        let worker_label = metric
+            .labels()
+            .iter()
+            .find(|label| label.name() == "worker")
+            .map(|label| label.value().parse::<usize>())
+            .transpose()?;
+
+        let is_pipeline_metric = matches!(
+            name,
+            "morsels_claimed"
+                | "morsels_completed"
+                | "morsel_decode_work"
+                | "morsel_process_work"
+                | "morsel_ready_wait"
+                | "morsel_output_wait"
+                | "morsel_join_combine_work"
+                | "morsel_join_finalize_work"
+                | "morsel_sort_finalize_work"
+                | "morsel_topn_finalize_work"
+        );
+        if !is_pipeline_metric {
+            continue;
+        }
+        let pipeline = pipeline_label.unwrap_or_else(|| "main".to_owned());
+        let entry = pipelines
+            .entry(pipeline.clone())
+            .or_insert_with(|| PipelineReport::new(workers));
+        match name {
+            "morsels_claimed" => {
+                let worker = worker_label.ok_or("missing worker label")?;
+                if !seen_worker_counts.insert(("morsels_claimed", pipeline, worker)) {
+                    return Err(
+                        format!("duplicate morsels_claimed for worker {worker}").into()
+                    );
+                }
+                *entry
+                    .claims
+                    .get_mut(worker)
+                    .ok_or("worker index out of bounds")? += metric.value().as_usize();
+            }
+            "morsels_completed" => {
+                let worker = worker_label.ok_or("missing worker label")?;
+                if !seen_worker_counts.insert(("morsels_completed", pipeline, worker)) {
+                    return Err(format!(
+                        "duplicate morsels_completed for worker {worker}"
+                    )
+                    .into());
+                }
+                *entry
+                    .completions
+                    .get_mut(worker)
+                    .ok_or("worker index out of bounds")? += metric.value().as_usize();
+            }
+            "morsel_decode_work" => {
+                entry.decode_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_process_work" => {
+                entry.process_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_ready_wait" => {
+                entry.ready_wait_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_output_wait" => {
+                entry.output_wait_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_join_combine_work" => {
+                entry.join_combine_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_join_finalize_work" => {
+                entry.join_finalize_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_sort_finalize_work" => {
+                entry.sort_finalize_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            "morsel_topn_finalize_work" => {
+                entry.topn_finalize_ms += metric.value().as_usize() as f64 / 1e6
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(pipelines)
 }
 
 fn run_usize(run: &MetricsSet, name: &str) -> usize {
