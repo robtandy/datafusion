@@ -50,7 +50,7 @@ out-of-core spilling implementation from `#194` (design in
   run and **97% idle** immediately after.
 - **Revisions compared (`--profile release-nonlto`, `rustc 1.99.1 (58cf8f9c3 2026-10-13)`):**
   - **Before (`morsel-execution` base):** `c21850bd6`
-  - **After (`agent/morsel-issue-194`):** `1d8b6ffb4` (paired full-RAM + tight-memory suite) and `45fca6ad9` (`q10_128mb` nested-P2 parent spill headroom fix)
+  - **After (`agent/morsel-issue-194`):** `1d8b6ffb4` (paired full-RAM suite) and `4ee44a08b` (tight-memory spill suite with shared appendable partition writers and sorted-run compaction under `RLIMIT_NOFILE=1024`)
 - **Dataset:** Standard deterministic SF=5 TPC-H Parquet tables (35 files, 353
   row groups, 43.3M rows, 1.34 GiB Zstd level 3, pre-warmed in Linux page
   cache).
@@ -91,18 +91,20 @@ out-of-core spilling implementation from `#194` (design in
 ## Results: Tight-Memory SF=5 Spill Completion (`GreedyMemoryPool`)
 
 Every workload below was executed on SF=5 under a strict `GreedyMemoryPool`
-budget with `DiskManagerMode::OsTmpDirectory` and `morsel_mode=required`, and
-verified for exact Arrow IPC result parity against unconstrained Stock
-DataFusion:
+budget with `DiskManagerMode::OsTmpDirectory`, `RLIMIT_NOFILE=1024`, and
+`morsel_mode=required`, and verified for exact Arrow IPC result parity against
+unconstrained Stock DataFusion (measured at `4ee44a08b` after introducing
+shared appendable per-partition spill writers and per-worker sorted-run
+compaction):
 
-| Workload | `GreedyMemoryPool` | Before (`c21850bd6`) | After (`45fca6ad9`) | Wall ms | Spilled MiB | Spill files | Exact parity |
+| Workload | `GreedyMemoryPool` | Before (`c21850bd6`) | After (`4ee44a08b`) | Wall ms | Spilled MiB | Spill files | Exact parity |
 | --- | ---: | --- | --- | ---: | ---: | ---: | --- |
-| **TPC-H Q3** | 32 MiB | `ResourcesExhausted` | **Completed** | 4,660.6 | 506.4 MiB | 11,344 | Exact (10 rows) |
-| **TPC-H Q9** | 256 MiB | `ResourcesExhausted` | **Completed** | 22,804.6 | 673.5 MiB | 4,784 | Exact (175 rows) |
-| **TPC-H Q10** | 128 MiB | `ResourcesExhausted` | **Completed** | 5,046.2 | 472.7 MiB | 7,675 | Exact (20 rows) |
-| **TPC-H Q13** | 64 MiB | `ResourcesExhausted` | **Completed** | 3,041.0 | 239.7 MiB | 2,452 | Exact (42 rows) |
-| **TPC-H Q18** | 128 MiB | `ResourcesExhausted` | **Completed** | 1,851.4 | 222.0 MiB | 1,024 | Exact (100 rows) |
-| **SF=5 `orders` `ORDER BY`**\* | 128 MiB | `ResourcesExhausted` | **Completed** | 720.0 | 173.8 MiB | 75 | Exact (1.14M rows) |
+| **TPC-H Q3** | 32 MiB | `ResourcesExhausted` | **Completed** | 2,362.9 | 503.4 MiB | 112 | Exact (10 rows) |
+| **TPC-H Q9** | 256 MiB | `ResourcesExhausted` | **Completed** | 21,975.0 | 671.5 MiB | 224 | Exact (175 rows) |
+| **TPC-H Q10** | 128 MiB | `ResourcesExhausted` | **Completed** | 3,240.1 | 469.0 MiB | 224 | Exact (20 rows) |
+| **TPC-H Q13** | 64 MiB | `ResourcesExhausted` | **Completed** | 2,397.1 | 239.3 MiB | 176 | Exact (42 rows) |
+| **TPC-H Q18** | 128 MiB | `ResourcesExhausted` | **Completed** | 3,449.2 | 767.9 MiB | 288 | Exact (100 rows) |
+| **SF=5 `orders` `ORDER BY`**\* | 128 MiB | `ResourcesExhausted` | **Completed** | 750.0 | 173.8 MiB | 75 | Exact (1.14M rows) |
 
 \*`SELECT o_orderkey, o_custkey, o_totalprice, o_orderdate, o_comment FROM orders WHERE o_orderdate < DATE '1993-01-01' ORDER BY o_totalprice DESC, o_orderkey ASC` (1.14M filtered rows with wide `Utf8View` comments; ordered parity verified via SHA-256 over the full sorted stream).
 
@@ -113,8 +115,15 @@ DataFusion:
   `l_orderkey` groups. L2 pre-aggregation collapses 4× before radix scattering
   into 64 partitions, and parallel finalize runs merge +
   `HAVING sum(l_quantity) > 300` across all 8 cores simultaneously (beating
-  `stock_pushdown`'s `773.6 ms` by **135.0 ms**). Under a 128 MiB pool, Q18
-  completes cleanly in **1,851.4 ms** by spilling 222.0 MiB across 1,024 files.
+  `stock_pushdown`'s `773.6 ms` by **135.0 ms**). Under a 128 MiB pool and
+  `RLIMIT_NOFILE=1024`, Q18 completes cleanly in **3,449.2 ms** across 288
+  bounded spill files (767.9 MiB spilled).
+- **Bounded spill FDs (`RLIMIT_NOFILE=1024`):** Reusing one appendable
+  `InProgressSpillFile` per partition across workers and flush cycles keeps
+  spill file counts in the 75–288 range across all six SF=5 tight-memory
+  workloads (cutting Q3@32 MiB wall time nearly in half to **2,362.9 ms**
+  with 112 files, Q10@128 MiB to **3,240.1 ms** with 224 files, and Q13@64 MiB
+  to **2,397.1 ms** with 176 files).
 - **TPC-H Q13 (`926.9 -> 552.8 ms`, `1.68×` pushdown; `881.4 -> 534.4 ms`,
   `1.65×` pruning):** Adaptive direct radix scatter on `DirectGroupedState`
   skips worker-local hash-table lookups on 7.5M `orders` rows across 750K
