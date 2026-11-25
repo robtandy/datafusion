@@ -1225,7 +1225,7 @@ async fn group_by_recursive_radix_split_and_sorted_spill_fallback_parity() -> Re
         create_hashes(&[a0, a1], &rs, &mut hashes)?;
         for (i, &h) in hashes.iter().enumerate() {
             // Collide on bits [47..57) (both L0 [51..57) and L1 [47..51) == 0).
-            if ((h >> 47) & 0x3ff) == 0 {
+            if (h >> 47).trailing_zeros() >= 10 {
                 colliding_ints.push(cand_ints[i]);
                 colliding_strs.push(cand_strs[i].clone());
                 if colliding_ints.len() >= target_keys {

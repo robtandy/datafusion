@@ -23,17 +23,21 @@ out-of-core spilling implementation from `#194` (design in
    pressure.
 2. **Radix-partitioned `HashJoin` & out-of-core `ProbeSpill` child pipeline**:
    small builds (`<= 16,384` rows) remain on `R = 0`; large builds scatter into
-   64 radix partitions with parallel partition finalization (and lock-free
-   atomic split-block Bloom construction); under tight memory limits, excess
-   build partitions and matching probe partitions spill via `SpillManager`
-   (preserving sound bounds-only dynamic filter pushdown across `M ∪ S`) and
-   replay in a follow-up `P2` child pipeline with recursive radix splitting and
-   a block-nested-loop hash sub-pass for unsplittable duplicate-key skew across
+   64 radix partitions with parallel partition finalization (lock-free atomic
+   split-block Bloom construction, single shared non-spillable resident
+   `MemoryConsumer` for `FairSpillPool` fairness), batch-level inlined flat-int
+   radix probing with direct primitive / `StringView` build-column gather; under
+   tight memory limits, excess build partitions and matching probe partitions
+   spill via `SpillManager` (preserving sound bounds-only dynamic filter
+   pushdown across `M ∪ S`) and replay in a follow-up `P2` child pipeline with
+   recursive radix splitting and a block-nested-loop hash sub-pass for
+   unsplittable duplicate-key skew across
    `INNER`/`LEFT`/`RIGHT`/`FULL`/`SEMI`/`ANTI`.
 3. **External spill-merge for parallel `Sort` (and `TopN` overflow fallback)**:
    worker-local sorted runs spill to disk via `SpillManager` on `MemoryPool`
    pressure and stream-merge through DataFusion's `StreamingMergeBuilder` /
-   `MultiLevelMergeBuilder` in bounded memory.
+   `MultiLevelMergeBuilder` in bounded memory, reusing the pipeline's
+   `SpillContext` across finalize.
 
 ## Environment and Controls
 
@@ -42,11 +46,11 @@ out-of-core spilling implementation from `#194` (design in
 - **CPU pinning and threads:** `taskset -c 0-7` (8 pinned CPUs), 8 Tokio
   workers (`worker_threads=8`, `max_blocking_threads=8`,
   `target_partitions=8`), `batch_size=8,192`.
-- **Host idle verification:** `vmstat -y 1 3` reported **100% idle** before the
+- **Host idle verification:** `vmstat -y 1 3` reported **98% idle** before the
   run and **97% idle** immediately after.
 - **Revisions compared (`--profile release-nonlto`, `rustc 1.99.1 (58cf8f9c3 2026-10-13)`):**
   - **Before (`morsel-execution` base):** `c21850bd6`
-  - **After (`agent/morsel-issue-194`):** `ebb8b2916`
+  - **After (`agent/morsel-issue-194`):** `1d8b6ffb4` (paired full-RAM + tight-memory suite) and `45fca6ad9` (`q10_128mb` nested-P2 parent spill headroom fix)
 - **Dataset:** Standard deterministic SF=5 TPC-H Parquet tables (35 files, 353
   row groups, 43.3M rows, 1.34 GiB Zstd level 3, pre-warmed in Linux page
   cache).
@@ -62,36 +66,27 @@ out-of-core spilling implementation from `#194` (design in
 
 | Query | Before wall ms (min–max) | After wall ms (min–max) | Wall speedup | Before `jfin` ms | After `jfin` ms | `stock_pushdown` ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **TPC-H Q3** | 380.9 (373.6–389.4) | **359.9 (353.5–364.3)** | **1.06×** (−21.0 ms) | 64.9 | **27.2** | 356.6 |
-| **TPC-H Q9** | 1,890.3 (1,867.1–1,912.2) | **1,368.4 (1,328.6–1,373.9)** | **1.38×** (−521.9 ms) | 975.5 | **260.6** | 1,473.3 |
-| **TPC-H Q10** | 647.3 (642.3–651.2) | **563.9 (563.1–565.8)** | **1.15×** (−83.4 ms) | 122.9 | **91.3** | 492.7 |
-| **TPC-H Q13** | 884.8 (851.6–987.6) | **606.2 (593.9–609.5)** | **1.46×** (−278.6 ms) | 57.9 | **25.0** | 529.7 |
-| **TPC-H Q18** | 1,619.7 (1,591.9–1,623.2) | **626.4 (624.0–645.4)** | **2.59×** (−993.3 ms) | 65.1 | **27.6** | 773.9 |
-| **5-Query Sum** | **5,423.0** | **3,524.8** | **1.54×** (−1,898.2 ms) | **1,286.3** | **431.7** | **3,626.2** |
-| **TPC-H Q1** *(low-card check)* | 693.8 (684.1–715.3) | **694.2 (684.6–703.1)** | **1.00×** (+0.4 ms) | 0.0 | 0.0 | 733.5 |
-| **TPC-H Q12** *(small-build check)* | 241.9 (236.0–243.0) | **238.3 (236.3–239.8)** | **1.02×** (−3.6 ms) | 13.3 | **5.4** | 275.9 |
+| **TPC-H Q3** | 386.5 (376.2–388.2) | **354.3 (350.8–361.1)** | **1.09×** (−32.2 ms) | 65.8 | **27.2** | 356.3 |
+| **TPC-H Q9** | 1,895.2 (1,873.1–1,906.0) | **1,337.0 (1,313.9–1,363.3)** | **1.42×** (−558.2 ms) | 975.8 | **263.1** | 1,449.8 |
+| **TPC-H Q10** | 641.7 (634.1–648.4) | **562.7 (559.4–571.5)** | **1.14×** (−79.0 ms) | 119.1 | **91.4** | 499.6 |
+| **TPC-H Q13** | 926.9 (903.5–950.8) | **552.8 (546.5–563.4)** | **1.68×** (−374.1 ms) | 58.1 | **25.3** | 527.8 |
+| **TPC-H Q18** | 1,621.6 (1,586.2–1,625.9) | **638.6 (629.3–645.9)** | **2.54×** (−983.0 ms) | 65.6 | **27.8** | 773.6 |
+| **5-Query Sum** | **5,471.9** | **3,445.4** | **1.59×** (−2,026.5 ms) | **1,284.4** | **434.8** | **3,607.1** |
+| **TPC-H Q1** *(low-card check)* | 690.8 (682.6–704.8) | **699.3 (686.1–701.7)** | **0.99×** (+8.5 ms) | 0.0 | 0.0 | 729.6 |
+| **TPC-H Q12** *(small-build check)* | 239.2 (237.1–244.9) | **236.8 (234.9–246.1)** | **1.01×** (−2.4 ms) | 13.1 | **5.9** | 275.4 |
 
 ### Companion Profile: `pruning` (`pushdown_filters=false, pruning=true`)
 
-| Query | Before wall ms | After wall ms | Wall speedup | Before `jfin` ms | After `jfin` ms | `stock_pruning` ms |
+| Query | Before wall ms (min–max) | After wall ms (min–max) | Wall speedup | Before `jfin` ms | After `jfin` ms | `stock_pruning` ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **TPC-H Q3** | 506.8 | 580.0 | 0.87× | 59.8 | **10.2** | 472.1 |
-| **TPC-H Q9** | 1,871.4 | **1,376.6** | **1.36×** | 938.1 | **179.2** | 980.3 |
-| **TPC-H Q10** | 773.9 | 783.7 | 0.99× | 141.9 | **74.0** | 743.8 |
-| **TPC-H Q13** | 836.3 | **541.1** | **1.55×** | 50.8 | **8.9** | 459.8 |
-| **TPC-H Q18** | 2,768.6 | **1,846.1** | **1.50×** | 807.6 | **259.1** | 1,370.8 |
-| **5-Query Sum** | **6,757.0** | **5,127.5** | **1.32×** | **1,998.2** | **531.4** | **4,026.8** |
-| **TPC-H Q1** *(low-card check)* | 702.6 | 711.3 | 0.99× | 0.0 | 0.0 | 713.0 |
-| **TPC-H Q12** *(small-build check)* | 207.5 | 248.6 | 0.83× | 19.6 | **2.5** | 190.7 |
-
-*Note on `pruning` Q3/Q12:* Without `pushdown_filters=true`, unpruned probe
-batches hit 64 radix build partitions and materialize build payload columns via
-Arrow `interleave` across 64 partition arrays rather than single-array `take`,
-adding ~40–70 ms on probe-heavy non-pushdown scans while parallel radix finalize
-slashes `jfin` by **5.8×–7.8×** (`59.8 -> 10.2 ms` on Q3, `19.6 -> 2.5 ms` on
-Q12). Under `pushdown` (where the Bloom `RowFilter` eliminates ~95–98% of
-non-matching probe rows before probing), **all five target queries plus Q12
-speed up** and the 5-query sum beats `stock_pushdown` (`3,524.8` vs `3,626.2 ms`).
+| **TPC-H Q3** | 510.8 (500.3–512.4) | **519.6 (509.4–521.0)** | **0.98×** (+8.8 ms) | 60.7 | **10.3** | 478.4 |
+| **TPC-H Q9** | 1,857.8 (1,839.6–1,878.1) | **1,234.6 (1,228.6–1,236.8)** | **1.50×** (−623.2 ms) | 929.4 | **178.4** | 971.4 |
+| **TPC-H Q10** | 775.4 (767.0–780.4) | **715.1 (712.1–723.8)** | **1.08×** (−60.3 ms) | 142.6 | **72.4** | 727.6 |
+| **TPC-H Q13** | 881.4 (849.2–908.9) | **534.4 (521.6–582.5)** | **1.65×** (−347.0 ms) | 52.3 | **8.9** | 466.4 |
+| **TPC-H Q18** | 2,777.1 (2,726.6–2,801.4) | **1,730.8 (1,708.1–1,744.8)** | **1.60×** (−1,046.3 ms) | 790.9 | **274.4** | 1,366.0 |
+| **5-Query Sum** | **6,802.5** | **4,734.5** | **1.44×** (−2,068.0 ms) | **1,975.9** | **544.4** | **4,009.8** |
+| **TPC-H Q1** *(low-card check)* | 701.5 (694.0–709.4) | **694.2 (690.0–702.4)** | **1.01×** (−7.3 ms) | 0.0 | 0.0 | 704.5 |
+| **TPC-H Q12** *(small-build check)* | 204.0 (200.2–207.2) | **198.2 (195.8–202.5)** | **1.03×** (−5.8 ms) | 18.4 | **2.4** | 195.6 |
 
 ## Results: Tight-Memory SF=5 Spill Completion (`GreedyMemoryPool`)
 
@@ -100,38 +95,41 @@ budget with `DiskManagerMode::OsTmpDirectory` and `morsel_mode=required`, and
 verified for exact Arrow IPC result parity against unconstrained Stock
 DataFusion:
 
-| Workload | `GreedyMemoryPool` | Before (`c21850bd6`) | After (`ebb8b2916`) | Wall ms | Spilled MiB | Spill files | Exact parity |
+| Workload | `GreedyMemoryPool` | Before (`c21850bd6`) | After (`45fca6ad9`) | Wall ms | Spilled MiB | Spill files | Exact parity |
 | --- | ---: | --- | --- | ---: | ---: | ---: | --- |
-| **TPC-H Q3** | 32 MiB | `ResourcesExhausted` | **Completed** | 4,711.1 | 506.4 MiB | 11,344 | Exact (10 rows) |
-| **TPC-H Q9** | 256 MiB | `ResourcesExhausted` | **Completed** | 23,271.3 | 673.5 MiB | 4,811 | Exact (175 rows) |
-| **TPC-H Q10** | 128 MiB | `ResourcesExhausted` | **Completed** | 6,232.7 | 519.3 MiB | 12,246 | Exact (20 rows) |
-| **TPC-H Q13** | 64 MiB | `ResourcesExhausted` | **Completed** | 3,000.6 | 239.7 MiB | 2,356 | Exact (42 rows) |
-| **TPC-H Q18** | 128 MiB | `ResourcesExhausted` | **Completed** | 1,837.6 | 222.1 MiB | 1,024 | Exact (100 rows) |
-| **SF=5 `orders` `ORDER BY`**\* | 128 MiB | `ResourcesExhausted` | **Completed** | 721.2 | 173.4 MiB | 75 | Exact (1.14M rows) |
+| **TPC-H Q3** | 32 MiB | `ResourcesExhausted` | **Completed** | 4,660.6 | 506.4 MiB | 11,344 | Exact (10 rows) |
+| **TPC-H Q9** | 256 MiB | `ResourcesExhausted` | **Completed** | 22,804.6 | 673.5 MiB | 4,784 | Exact (175 rows) |
+| **TPC-H Q10** | 128 MiB | `ResourcesExhausted` | **Completed** | 5,046.2 | 472.7 MiB | 7,675 | Exact (20 rows) |
+| **TPC-H Q13** | 64 MiB | `ResourcesExhausted` | **Completed** | 3,041.0 | 239.7 MiB | 2,452 | Exact (42 rows) |
+| **TPC-H Q18** | 128 MiB | `ResourcesExhausted` | **Completed** | 1,851.4 | 222.0 MiB | 1,024 | Exact (100 rows) |
+| **SF=5 `orders` `ORDER BY`**\* | 128 MiB | `ResourcesExhausted` | **Completed** | 720.0 | 173.8 MiB | 75 | Exact (1.14M rows) |
 
 \*`SELECT o_orderkey, o_custkey, o_totalprice, o_orderdate, o_comment FROM orders WHERE o_orderdate < DATE '1993-01-01' ORDER BY o_totalprice DESC, o_orderkey ASC` (1.14M filtered rows with wide `Utf8View` comments; ordered parity verified via SHA-256 over the full sorted stream).
 
 ## Key Takeaways
 
-- **TPC-H Q18 (`1,619.7 -> 626.4 ms`, `2.59×`, `-16.6%` CPU):** Stage 0 groups
-  30M `lineitem` rows into 7.5M distinct `l_orderkey` groups. L2 pre-aggregation
-  collapses 4× before radix scattering into 64 partitions, and parallel finalize
-  runs merge + `HAVING sum(l_quantity) > 300` across all 8 cores simultaneously
-  (beating `stock_pushdown`'s `773.9 ms` by **147.5 ms**). Under a 128 MiB
-  pool, Q18 completes cleanly in **1,837.6 ms** by spilling 222.1 MiB across
-  1,024 files instead of crashing with `ResourcesExhausted`.
-- **TPC-H Q9 (`1,890.3 -> 1,368.4 ms`, `1.38×`, `-521.9 ms`):** Parallel 64-way
-  radix `HashJoin` build finalization cuts `join_finalize` across the 4M-row
-  `partsupp` (`Rows` key) and 7.5M-row `orders` (`Int64` key) builds by **3.7×–5.2×**
-  (`975.5 -> 260.6 ms` pushdown; `938.1 -> 179.2 ms` pruning), overtaking
-  `stock_pushdown` (`1,473.3 ms`) by **104.9 ms**.
-- **TPC-H Q13 (`884.8 -> 606.2 ms`, `1.46×` pushdown; `836.3 -> 541.1 ms`,
-  `1.55×` pruning):** Adaptive direct radix scatter on `DirectGroupedState`
-  detects low pre-aggregation reduction on 7.5M `orders` rows across 750K
-  `c_custkey` groups, skips worker-local hash-table lookups, and finalizes 64
-  L2-resident (~187 KiB) partitions in parallel across 8 cores.
-- **TPC-H Q10 (`647.3 -> 563.9 ms`, `1.15×`) & Q3 (`380.9 -> 359.9 ms`,
-  `1.06×`):** Parallel radix `HashJoin` build finalization plus parallel radix
-  `GROUP BY` finalization cut both join build and multi-column/string
-  aggregation tail latency, while keeping low-cardinality Q1 (`1.00×`) and
-  small-build Q12 (`1.02×`) regression-free.
+- **TPC-H Q18 (`1,621.6 -> 638.6 ms`, `2.54×` pushdown; `2,777.1 -> 1,730.8 ms`,
+  `1.60×` pruning):** Stage 0 groups 30M `lineitem` rows into 7.5M distinct
+  `l_orderkey` groups. L2 pre-aggregation collapses 4× before radix scattering
+  into 64 partitions, and parallel finalize runs merge +
+  `HAVING sum(l_quantity) > 300` across all 8 cores simultaneously (beating
+  `stock_pushdown`'s `773.6 ms` by **135.0 ms**). Under a 128 MiB pool, Q18
+  completes cleanly in **1,851.4 ms** by spilling 222.0 MiB across 1,024 files.
+- **TPC-H Q13 (`926.9 -> 552.8 ms`, `1.68×` pushdown; `881.4 -> 534.4 ms`,
+  `1.65×` pruning):** Adaptive direct radix scatter on `DirectGroupedState`
+  skips worker-local hash-table lookups on 7.5M `orders` rows across 750K
+  `c_custkey` groups, finalizes 64 L2-resident (~187 KiB) partitions in
+  parallel across 8 cores, and lowers total process CPU by **−7.1%**.
+- **TPC-H Q9 (`1,895.2 -> 1,337.0 ms`, `1.42×` pushdown; `1,857.8 -> 1,234.6 ms`,
+  `1.50×` pruning):** Parallel 64-way radix `HashJoin` build finalization cuts
+  `join_finalize` across the 4M-row `partsupp` (`Rows` key) and 7.5M-row
+  `orders` (`Int64` key) builds by **3.7×–5.2×** (`975.8 -> 263.1 ms` pushdown;
+  `929.4 -> 178.4 ms` pruning), beating `stock_pushdown` (`1,449.8 ms`) by
+  **112.8 ms**.
+- **TPC-H Q10 (`641.7 -> 562.7 ms`, `1.14×` pushdown; `775.4 -> 715.1 ms`,
+  `1.08×` pruning) & Q3 (`386.5 -> 354.3 ms`, `1.09×` pushdown; `510.8 -> 519.6 ms`,
+  `0.98×` pruning):** Batch-level inlined flat-int radix probing plus direct
+  primitive/`StringView` build-column gather eliminate the earlier `interleave`
+  probe overhead on `pushdown_filters=false` (bringing Q12 to **1.03×** on
+  `pruning` and **1.01×** on `pushdown`, and Q10 to **1.08×** on `pruning`,
+  beating `stock_pruning` `727.6 ms`).

@@ -799,7 +799,7 @@ impl HashJoinBuildSink {
                     mask: 0,
                     next: Vec::new(),
                     matched: Vec::new(),
-                    _reservation: reservation,
+                    reservation,
                 },
                 None,
             ))));
@@ -863,7 +863,7 @@ impl HashJoinBuildSink {
                     mask: 0,
                     next: Vec::new(),
                     matched,
-                    _reservation: reservation,
+                    reservation,
                 },
                 dynamic_filter,
             ))));
@@ -1090,7 +1090,7 @@ impl HashJoinBuildSink {
                 mask,
                 next,
                 matched,
-                _reservation: reservation,
+                reservation,
             },
             dynamic_filter,
         ))))
@@ -2770,7 +2770,7 @@ pub(super) struct SingleHashTable {
     mask: usize,
     next: Vec<u32>,
     matched: Vec<AtomicU64>,
-    _reservation: MemoryReservation,
+    reservation: MemoryReservation,
 }
 
 impl SingleHashTable {
@@ -2789,7 +2789,7 @@ impl SingleHashTable {
             mask: 0,
             next: Vec::new(),
             matched: Vec::new(),
-            _reservation: reservation,
+            reservation,
         }
     }
 
@@ -3269,7 +3269,7 @@ pub(super) fn build_single_table_from_packed_batches(
         mask,
         next,
         matched,
-        _reservation: reservation,
+        reservation,
     })
 }
 
@@ -6213,10 +6213,10 @@ fn transfer_to_resident_lease(
     table: &mut SingleHashTable,
     resident_res: &MemoryReservation,
 ) {
-    let bytes = table._reservation.size();
+    let bytes = table.reservation.size();
     let lease = resident_res.new_empty();
     lease.grow(bytes);
-    let prev = std::mem::replace(&mut table._reservation, lease);
+    let prev = std::mem::replace(&mut table.reservation, lease);
     drop(prev);
 }
 
@@ -6507,7 +6507,7 @@ fn gather_radix_build_column(
     }
     arr_refs.push(null_holder.as_ref());
     let raw = interleave(&arr_refs, pairs)?;
-    if let DataType::BinaryView = raw.data_type() {
+    if matches!(raw.data_type(), DataType::BinaryView) {
         let bv = raw
             .as_any()
             .downcast_ref::<arrow::array::BinaryViewArray>()
