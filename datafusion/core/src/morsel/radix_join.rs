@@ -155,7 +155,6 @@ impl RadixBuildStore {
 
     /// Permute a packed build batch into `2^R` radix slices, retaining slices
     /// in memory when budget allows or spilling to disk on OOM.
-    #[expect(clippy::too_many_arguments)]
     pub(super) async fn push_packed_batch(
         &mut self,
         packed: RecordBatch,

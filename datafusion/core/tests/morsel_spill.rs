@@ -147,23 +147,19 @@ fn high_cardinality_group_table(
         let mut gate = Vec::with_capacity(rows_per_batch);
         for i in 0..rows_per_batch {
             let gid = (b * rows_per_batch + i) % (num_batches * rows_per_batch / 2);
-            if gid % 1009 == 0 {
+            if gid.is_multiple_of(1009) {
                 k_int.push(None);
                 k_str.push(None);
             } else {
                 k_int.push(Some(gid as i64));
                 k_str.push(Some(format!("group-key-{gid:08}-padding-payload-xyz")));
             }
-            v.push(if i % 17 == 0 {
+            v.push(if i.is_multiple_of(17) {
                 None
             } else {
                 Some(((gid * 7 + i) % 10_000) as i64)
             });
-            gate.push(if b == num_batches / 2 && i == 10 {
-                0
-            } else {
-                1
-            });
+            gate.push(i32::from(!(b == num_batches / 2 && i == 10)));
         }
         partitions[b % 4].push(
             RecordBatch::try_new(
@@ -218,7 +214,7 @@ fn large_join_tables(
             vals.push(Some(format!(
                 "build-payload-{i:08}-padding-bytes-0123456789"
             )));
-            gates.push(if i == build_rows / 2 { 0 } else { 1 });
+            gates.push(i32::from(i != build_rows / 2));
         }
         b_parts[idx % 4].push(
             RecordBatch::try_new(
@@ -253,7 +249,7 @@ fn large_join_tables(
             vals.push(Some(format!(
                 "probe-payload-{i:08}-padding-bytes-abcdefghij"
             )));
-            gates.push(if i == probe_rows / 2 { 0 } else { 1 });
+            gates.push(i32::from(i != probe_rows / 2));
         }
         p_parts[idx % 4].push(
             RecordBatch::try_new(
@@ -301,11 +297,7 @@ fn large_sort_table(num_batches: usize, rows_per_batch: usize) -> Arc<MemTable> 
             payload.append_value(format!(
                 "sort-row-{row:08}-payload-padding-0123456789abcdef0123456789abcdef"
             ));
-            gate.push(if b == num_batches / 2 && i == 10 {
-                0
-            } else {
-                1
-            });
+            gate.push(i32::from(!(b == num_batches / 2 && i == 10)));
         }
         partitions[b % 4].push(
             RecordBatch::try_new(

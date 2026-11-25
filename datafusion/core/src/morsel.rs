@@ -1178,20 +1178,20 @@ impl WorkerSinkMemory {
 enum WorkerSink {
     Result(Box<ResultBuffer>),
     Count(CountState),
-    GroupCount(GroupCountState),
-    Aggregate(AggregateState),
-    TopN(TopNState),
-    Sort(SortState),
-    HashJoinBuild(HashJoinBuildState),
+    GroupCount(Box<GroupCountState>),
+    Aggregate(Box<AggregateState>),
+    TopN(Box<TopNState>),
+    Sort(Box<SortState>),
+    HashJoinBuild(Box<HashJoinBuildState>),
 }
 
 enum WorkerState {
     None,
     Count(CountState),
-    GroupCount(GroupCountState),
-    Aggregate(AggregateState),
+    GroupCount(Box<GroupCountState>),
+    Aggregate(Box<AggregateState>),
     SortedRuns(Vec<SortedRun>),
-    HashJoinBuild(HashJoinBuildState),
+    HashJoinBuild(Box<HashJoinBuildState>),
 }
 
 struct JoinWorkerState {
@@ -1588,30 +1588,36 @@ impl Pipeline {
                 let (res, spill) = sink_memory
                     .expect("group count reservation")
                     .into_spillable_reservation();
-                WorkerSink::GroupCount(sink.new_state_with_spill(res, spill))
+                WorkerSink::GroupCount(Box::new(sink.new_state_with_spill(res, spill)))
             }
             Sink::Aggregate { sink, .. } => {
                 let (res, spill) = sink_memory
                     .expect("aggregate reservation")
                     .into_spillable_reservation();
-                WorkerSink::Aggregate(sink.new_state_with_spill(res, spill)?)
+                WorkerSink::Aggregate(Box::new(sink.new_state_with_spill(res, spill)?))
             }
             Sink::TopN { sink, .. } => {
                 let (res, spill) = sink_memory
                     .expect("topn reservation")
                     .into_spillable_reservation();
-                WorkerSink::TopN(sink.new_state_with_spill(res, spill, batch_size)?)
+                WorkerSink::TopN(Box::new(
+                    sink.new_state_with_spill(res, spill, batch_size)?,
+                ))
             }
             Sink::Sort { sink, .. } => {
                 let (shared, spill) =
                     sink_memory.expect("sort shared memory").into_shared_sort();
-                WorkerSink::Sort(sink.new_state_with_spill(shared, spill, batch_size))
+                WorkerSink::Sort(Box::new(
+                    sink.new_state_with_spill(shared, spill, batch_size),
+                ))
             }
             Sink::HashJoinBuild(sink) => {
                 let (res, bs, nks) = sink_memory
                     .expect("hash join build reservation")
                     .into_hash_join_build();
-                WorkerSink::HashJoinBuild(sink.new_state_with_spill(res, bs, nks))
+                WorkerSink::HashJoinBuild(Box::new(
+                    sink.new_state_with_spill(res, bs, nks),
+                ))
             }
         })
     }
@@ -2252,7 +2258,7 @@ impl Pipeline {
                     (Some(prefix), false) => format!("{prefix}_build"),
                     (Some(prefix), true) => format!("{prefix}_build_{idx}"),
                 };
-                let Some(table) = Self::run_single_build_pipeline(
+                let Some(table) = Box::pin(Self::run_single_build_pipeline(
                     &probe.build_pipeline,
                     &build_label,
                     stage_inputs,
@@ -2261,7 +2267,7 @@ impl Pipeline {
                     plan_metrics,
                     measurement,
                     tx,
-                )
+                ))
                 .await?
                 else {
                     return Ok(BuildRunOutcome::Cancelled);
@@ -2395,14 +2401,14 @@ impl Pipeline {
             }
             WorkerState::GroupCount(local) => {
                 if let Some(Some(combined)) = targets.combined_group.as_deref_mut() {
-                    combined.merge_from(local, tx).await
+                    combined.merge_from(*local, tx).await
                 } else {
                     Ok(!tx.is_closed())
                 }
             }
             WorkerState::Aggregate(local) => {
                 if let Some(Some(combined)) = targets.combined_agg.as_deref_mut() {
-                    combined.merge_from(local, tx).await
+                    combined.merge_from(*local, tx).await
                 } else {
                     Ok(!tx.is_closed())
                 }
@@ -2415,7 +2421,7 @@ impl Pipeline {
             }
             WorkerState::HashJoinBuild(local) => {
                 if let Some(combined_build) = targets.combined_build.as_deref_mut() {
-                    combined_build.combine_async(local, tx).await?;
+                    combined_build.combine_async(*local, tx).await?;
                 }
                 Ok(!tx.is_closed())
             }
@@ -3565,7 +3571,7 @@ impl Pipeline {
                 };
                 if let WorkerState::HashJoinBuild(local) = local {
                     let start = measurement.map(|_| Instant::now());
-                    if let Err(err) = combined_build.combine_async(local, tx).await {
+                    if let Err(err) = combined_build.combine_async(*local, tx).await {
                         drop(combined_build);
                         abort_and_drain(&mut tasks).await;
                         drop(nested_tables);
@@ -3598,18 +3604,17 @@ impl Pipeline {
                 shared_sort_memory: None,
                 sort_spill: None,
             };
-            let cont = build_pipeline
-                .run_build_emission_pipelines(
-                    tables,
-                    nested_short_circuit_op,
-                    Some(build_label),
-                    &build_output,
-                    context,
-                    plan_metrics,
-                    measurement,
-                    &mut targets,
-                )
-                .await;
+            let cont = Box::pin(build_pipeline.run_build_emission_pipelines(
+                tables,
+                nested_short_circuit_op,
+                Some(build_label),
+                &build_output,
+                context,
+                plan_metrics,
+                measurement,
+                &mut targets,
+            ))
+            .await;
             match cont {
                 Ok(true) => {}
                 Ok(false) => {
@@ -4039,38 +4044,39 @@ impl Pipeline {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(super) async fn run_pipeline_to_tx(
+    pub(super) fn run_pipeline_to_tx<'a>(
         self: Arc<Self>,
-        label_prefix: Option<&str>,
-        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
-        context: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
-        measurement: Option<&Arc<RunMetrics>>,
+        label_prefix: Option<&'a str>,
+        stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        context: &'a Arc<TaskContext>,
+        metrics: &'a ExecutionPlanMetricsSet,
+        measurement: Option<&'a Arc<RunMetrics>>,
         tx: mpsc::Sender<RecordBatch>,
         cancel_tx: mpsc::Sender<RecordBatch>,
-    ) -> Result<()> {
-        if let Sink::Limit {
-            skip,
-            fetch,
-            result_operators,
-        } = &self.sink
-        {
-            if *fetch == Some(0) || cancel_tx.is_closed() || tx.is_closed() {
-                return Ok(());
-            }
-            let (limit_tx, mut limit_rx) = mpsc::channel(result_capacity(self.workers));
-            let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Sink::Limit {
+                skip,
+                fetch,
+                result_operators,
+            } = &self.sink
             {
-                let pipeline = Arc::clone(&self);
-                let stage_inputs = Arc::clone(stage_inputs);
-                let ctx = Arc::clone(context);
-                let metrics = metrics.clone();
-                let meas = measurement.cloned();
-                let label = label_prefix.map(str::to_owned);
-                let cancel = cancel_tx.clone();
-                inner_tasks.spawn(async move {
-                    pipeline
-                        .run_pipeline_body_to_tx(
+                if *fetch == Some(0) || cancel_tx.is_closed() || tx.is_closed() {
+                    return Ok(());
+                }
+                let (limit_tx, mut limit_rx) =
+                    mpsc::channel(result_capacity(self.workers));
+                let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
+                {
+                    let pipeline = Arc::clone(&self);
+                    let stage_inputs = Arc::clone(stage_inputs);
+                    let ctx = Arc::clone(context);
+                    let metrics = metrics.clone();
+                    let meas = measurement.cloned();
+                    let label = label_prefix.map(str::to_owned);
+                    let cancel = cancel_tx.clone();
+                    inner_tasks.spawn(async move {
+                        Box::pin(pipeline.run_pipeline_body_to_tx(
                             label.as_deref(),
                             &stage_inputs,
                             &ctx,
@@ -4078,139 +4084,140 @@ impl Pipeline {
                             meas.as_ref(),
                             limit_tx,
                             cancel,
-                        )
+                        ))
                         .await
-                });
-            }
+                    });
+                }
 
-            let mut remaining_skip = *skip;
-            let mut remaining_fetch = *fetch;
-            let mut inner_done = false;
+                let mut remaining_skip = *skip;
+                let mut remaining_fetch = *fetch;
+                let mut inner_done = false;
 
-            loop {
-                let maybe_batch = if !inner_done {
-                    tokio::select! {
-                        biased;
-                        _ = cancel_tx.closed() => {
+                loop {
+                    let maybe_batch = if !inner_done {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_tx.closed() => {
+                                drop(limit_rx);
+                                abort_and_drain(&mut inner_tasks).await;
+                                return Ok(());
+                            }
+                            result = inner_tasks.join_next() => {
+                                inner_done = true;
+                                match result {
+                                    Some(Ok(Ok(()))) | None => continue,
+                                    Some(Ok(Err(err))) => {
+                                        drop(limit_rx);
+                                        return Err(err);
+                                    }
+                                    Some(Err(err)) if err.is_panic() => {
+                                        drop(limit_rx);
+                                        std::panic::resume_unwind(err.into_panic())
+                                    }
+                                    Some(Err(err)) => {
+                                        drop(limit_rx);
+                                        return Err(exec_datafusion_err!(
+                                            "Morsel limit task failed: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            batch = limit_rx.recv() => batch,
+                        }
+                    } else {
+                        limit_rx.recv().await
+                    };
+
+                    let Some(mut batch) = maybe_batch else {
+                        break;
+                    };
+                    if cancel_tx.is_closed() || tx.is_closed() {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                    let orig_rows = batch.num_rows();
+                    if orig_rows == 0 {
+                        continue;
+                    }
+                    if remaining_skip >= orig_rows {
+                        remaining_skip -= orig_rows;
+                        continue;
+                    }
+                    if remaining_skip > 0 {
+                        batch = batch.slice(remaining_skip, orig_rows - remaining_skip);
+                        remaining_skip = 0;
+                    }
+                    if let Some(rem) = remaining_fetch.as_mut() {
+                        if *rem == 0 {
                             drop(limit_rx);
                             abort_and_drain(&mut inner_tasks).await;
                             return Ok(());
                         }
-                        result = inner_tasks.join_next() => {
-                            inner_done = true;
-                            match result {
-                                Some(Ok(Ok(()))) | None => continue,
-                                Some(Ok(Err(err))) => {
-                                    drop(limit_rx);
-                                    return Err(err);
-                                }
-                                Some(Err(err)) if err.is_panic() => {
-                                    drop(limit_rx);
-                                    std::panic::resume_unwind(err.into_panic())
-                                }
-                                Some(Err(err)) => {
-                                    drop(limit_rx);
-                                    return Err(exec_datafusion_err!(
-                                        "Morsel limit task failed: {err}"
-                                    ));
-                                }
+                        if batch.num_rows() > *rem {
+                            batch = batch.slice(0, *rem);
+                        }
+                        *rem -= batch.num_rows();
+                    }
+                    if batch.num_columns() > 0
+                        && batch.num_rows().saturating_mul(2) < orig_rows
+                        && u32::try_from(batch.num_rows()).is_ok()
+                    {
+                        let indices =
+                            UInt32Array::from_iter_values(0..batch.num_rows() as u32);
+                        let compacted = take_record_batch(&batch, &indices)?;
+                        batch = sort::gc_view_batch(&compacted)?;
+                    }
+                    let out = apply_operators(result_operators, batch)?;
+                    if out.num_rows() > 0 {
+                        let sent = if let Some(run) = measurement {
+                            metrics::send(run, None, &tx, out).await
+                        } else {
+                            tx.send(out).await.is_ok()
+                        };
+                        if !sent {
+                            drop(limit_rx);
+                            abort_and_drain(&mut inner_tasks).await;
+                            return Ok(());
+                        }
+                    }
+                    if remaining_fetch == Some(0) {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                }
+
+                if !inner_done {
+                    while let Some(result) = inner_tasks.join_next().await {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => return Err(err),
+                            Err(err) if err.is_panic() => {
+                                std::panic::resume_unwind(err.into_panic())
+                            }
+                            Err(err) => {
+                                return Err(exec_datafusion_err!(
+                                    "Morsel limit task failed: {err}"
+                                ));
                             }
                         }
-                        batch = limit_rx.recv() => batch,
-                    }
-                } else {
-                    limit_rx.recv().await
-                };
-
-                let Some(mut batch) = maybe_batch else {
-                    break;
-                };
-                if cancel_tx.is_closed() || tx.is_closed() {
-                    drop(limit_rx);
-                    abort_and_drain(&mut inner_tasks).await;
-                    return Ok(());
-                }
-                let orig_rows = batch.num_rows();
-                if orig_rows == 0 {
-                    continue;
-                }
-                if remaining_skip >= orig_rows {
-                    remaining_skip -= orig_rows;
-                    continue;
-                }
-                if remaining_skip > 0 {
-                    batch = batch.slice(remaining_skip, orig_rows - remaining_skip);
-                    remaining_skip = 0;
-                }
-                if let Some(rem) = remaining_fetch.as_mut() {
-                    if *rem == 0 {
-                        drop(limit_rx);
-                        abort_and_drain(&mut inner_tasks).await;
-                        return Ok(());
-                    }
-                    if batch.num_rows() > *rem {
-                        batch = batch.slice(0, *rem);
-                    }
-                    *rem -= batch.num_rows();
-                }
-                if batch.num_columns() > 0
-                    && batch.num_rows().saturating_mul(2) < orig_rows
-                    && u32::try_from(batch.num_rows()).is_ok()
-                {
-                    let indices =
-                        UInt32Array::from_iter_values(0..batch.num_rows() as u32);
-                    let compacted = take_record_batch(&batch, &indices)?;
-                    batch = sort::gc_view_batch(&compacted)?;
-                }
-                let out = apply_operators(result_operators, batch)?;
-                if out.num_rows() > 0 {
-                    let sent = if let Some(run) = measurement {
-                        metrics::send(run, None, &tx, out).await
-                    } else {
-                        tx.send(out).await.is_ok()
-                    };
-                    if !sent {
-                        drop(limit_rx);
-                        abort_and_drain(&mut inner_tasks).await;
-                        return Ok(());
                     }
                 }
-                if remaining_fetch == Some(0) {
-                    drop(limit_rx);
-                    abort_and_drain(&mut inner_tasks).await;
-                    return Ok(());
-                }
+                return Ok(());
             }
 
-            if !inner_done {
-                while let Some(result) = inner_tasks.join_next().await {
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => return Err(err),
-                        Err(err) if err.is_panic() => {
-                            std::panic::resume_unwind(err.into_panic())
-                        }
-                        Err(err) => {
-                            return Err(exec_datafusion_err!(
-                                "Morsel limit task failed: {err}"
-                            ));
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        self.run_pipeline_body_to_tx(
-            label_prefix,
-            stage_inputs,
-            context,
-            metrics,
-            measurement,
-            tx,
-            cancel_tx,
-        )
-        .await
+            Box::pin(self.run_pipeline_body_to_tx(
+                label_prefix,
+                stage_inputs,
+                context,
+                metrics,
+                measurement,
+                tx,
+                cancel_tx,
+            ))
+            .await
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -4542,7 +4549,7 @@ impl Pipeline {
                     }
                     WorkerState::GroupCount(local) => {
                         if let Some(combined) = combined_group.as_mut() {
-                            match combined.merge_from(local, &cancel_tx).await {
+                            match combined.merge_from(*local, &cancel_tx).await {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     drop(combined_group);
@@ -4569,7 +4576,7 @@ impl Pipeline {
                     }
                     WorkerState::Aggregate(local) => {
                         if let Some(combined) = combined_agg.as_mut() {
-                            match combined.merge_from(local, &cancel_tx).await {
+                            match combined.merge_from(*local, &cancel_tx).await {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     drop(combined_group);
@@ -4626,18 +4633,17 @@ impl Pipeline {
                 shared_sort_memory: shared_sort_memory.as_ref(),
                 sort_spill: sort_spill.as_ref(),
             };
-            match self
-                .run_build_emission_pipelines(
-                    tables,
-                    short_circuit_op,
-                    label_prefix,
-                    &output,
-                    context,
-                    metrics,
-                    measurement,
-                    &mut targets,
-                )
-                .await
+            match Box::pin(self.run_build_emission_pipelines(
+                tables,
+                short_circuit_op,
+                label_prefix,
+                &output,
+                context,
+                metrics,
+                measurement,
+                &mut targets,
+            ))
+            .await
             {
                 Ok(true) => {}
                 Ok(false) => {
@@ -4735,7 +4741,7 @@ impl Pipeline {
                             .add(1);
                         if post_sort.is_some() {
                             self.run_post_sort_stage(
-                                FinalizedAggOutput::GroupCount(finalized),
+                                FinalizedAggOutput::GroupCount(Box::new(finalized)),
                                 output.batch_size,
                                 context,
                                 metrics,
@@ -4776,7 +4782,7 @@ impl Pipeline {
                             .add(1);
                         if post_sort.is_some() {
                             self.run_post_sort_stage(
-                                FinalizedAggOutput::Aggregate(finalized),
+                                FinalizedAggOutput::Aggregate(Box::new(finalized)),
                                 output.batch_size,
                                 context,
                                 metrics,
@@ -4955,8 +4961,8 @@ struct SortFinalizeCtx<'a> {
 
 enum FinalizedAggOutput {
     Count(FinalizedCount),
-    GroupCount(FinalizedGroupCounts),
-    Aggregate(FinalizedAggregate),
+    GroupCount(Box<FinalizedGroupCounts>),
+    Aggregate(Box<FinalizedAggregate>),
 }
 
 struct PipelineRun {

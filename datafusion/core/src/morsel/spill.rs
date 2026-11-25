@@ -75,7 +75,6 @@ impl SpillContext {
 
 /// Verify that `reservation` can temporarily admit `min_headroom_bytes` when no
 /// other consumers hold memory.
-#[allow(dead_code)]
 pub(super) fn check_spill_headroom(
     reservation: &MemoryReservation,
     min_headroom_bytes: usize,

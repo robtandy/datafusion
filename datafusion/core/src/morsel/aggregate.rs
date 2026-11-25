@@ -2460,7 +2460,11 @@ where
             })?;
         let values = key_arr.values();
         self.group_indices.clear();
-        self.group_indices.reserve(values.len());
+        self.group_indices.try_reserve(values.len()).map_err(|e| {
+            datafusion_common::exec_datafusion_err!(
+                "Morsel DirectGrouped index buffer allocation failed: {e}"
+            )
+        })?;
         if key_arr.null_count() == 0 {
             for &k in values.iter() {
                 let gid = self.intern_key_unchecked(k);
@@ -3276,7 +3280,6 @@ impl FinalizedAggregate {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub(super) async fn emit(
         self,
         result_operators: ResultOpsRef,

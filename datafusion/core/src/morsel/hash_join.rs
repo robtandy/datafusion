@@ -1262,20 +1262,20 @@ impl HashJoinBuildSink {
         };
 
         // Spill any remaining in-memory NULL-key rows so RAM is dedicated to M / ProbeSpill.
-        if !null_key_payloads.is_empty() {
-            if let Some(nk_spill) = null_key_spill.as_ref() {
-                if let Some((sf, _)) = spill_batches_async(
-                    &nk_spill.manager,
-                    &null_key_payloads,
-                    "MorselHashJoinNullKeySpill",
-                    tx,
-                )
-                .await?
-                {
-                    null_key_spill_files.push(sf);
-                }
-                null_key_payloads.clear();
+        if !null_key_payloads.is_empty()
+            && let Some(nk_spill) = null_key_spill.as_ref()
+        {
+            if let Some((sf, _)) = spill_batches_async(
+                &nk_spill.manager,
+                &null_key_payloads,
+                "MorselHashJoinNullKeySpill",
+                tx,
+            )
+            .await?
+            {
+                null_key_spill_files.push(sf);
             }
+            null_key_payloads.clear();
         }
 
         // Spill all in-memory chunks in `store` so 100% of sink memory is freed
@@ -3390,7 +3390,7 @@ pub(super) struct RadixProbeCursor {
     filtered_unmatched_pos: usize,
     filtered_part: usize,
     filtered_part_cursor: Option<SingleProbeCursor>,
-    _reservation: MemoryReservation,
+    reservation: MemoryReservation,
 }
 
 impl RadixProbeCursor {
@@ -3414,7 +3414,7 @@ impl RadixProbeCursor {
 }
 
 pub(super) enum ProbeCursor {
-    Single(SingleProbeCursor),
+    Single(Box<SingleProbeCursor>),
     Radix(Box<RadixProbeCursor>),
 }
 
@@ -3709,7 +3709,7 @@ impl HashJoinProbe {
         match &table.kind {
             FinalizedHashTableKind::Single(single) => self
                 .start_single_table_probe(view, single, probe_reservation)
-                .map(|opt| opt.map(ProbeCursor::Single)),
+                .map(|opt| opt.map(|c| ProbeCursor::Single(Box::new(c)))),
             FinalizedHashTableKind::Radix(radix) => self
                 .start_radix_probe_view(
                     view,
@@ -3867,7 +3867,7 @@ impl HashJoinProbe {
         view: BatchView,
         radix: &RadixHashTable,
         resident: &Arc<ResidentRadixPartitions>,
-        mut local_probe_spill: Option<&mut LocalProbeSpill>,
+        local_probe_spill: Option<&mut LocalProbeSpill>,
         probe_spill_env: Option<&ProbeSpillEnv>,
         probe_reservation: &MemoryReservation,
     ) -> Result<Option<RadixProbeCursor>> {
@@ -3994,9 +3994,7 @@ impl HashJoinProbe {
                 pos += 1;
             }
             let env = probe_spill_env.expect("probe spill env for spilled join");
-            let lps = local_probe_spill
-                .as_deref_mut()
-                .expect("local probe spill for spilled join");
+            let lps = local_probe_spill.expect("local probe spill for spilled join");
             for (p, p_rows) in spill_buckets.into_iter().enumerate() {
                 if p_rows.is_empty() {
                     continue;
@@ -4031,7 +4029,7 @@ impl HashJoinProbe {
                 filtered_unmatched_pos: 0,
                 filtered_part: 0,
                 filtered_part_cursor: None,
-                _reservation: cursor_reservation,
+                reservation: cursor_reservation,
             }));
         }
 
@@ -4086,7 +4084,7 @@ impl HashJoinProbe {
             filtered_unmatched_pos: 0,
             filtered_part: 0,
             filtered_part_cursor: None,
-            _reservation: cursor_reservation,
+            reservation: cursor_reservation,
         }))
     }
 
@@ -4556,7 +4554,11 @@ impl HashJoinProbe {
         );
         scratch.interleave_build.clear();
         scratch.probe_indices.clear();
-        scratch.interleave_build.reserve(limit);
+        scratch.interleave_build.try_reserve(limit).map_err(|e| {
+            datafusion_common::exec_datafusion_err!(
+                "Morsel HashJoin interleave index allocation failed: {e}"
+            )
+        })?;
         reserve_indices(&mut scratch.probe_indices, limit)?;
         let mut has_null_build = false;
         let mut single_part_hit: Option<usize> = None;
@@ -4848,7 +4850,7 @@ impl HashJoinProbe {
                         pos: 0,
                         next_entry: 0,
                         row_matched: false,
-                        _reservation: cursor._reservation.new_empty(),
+                        _reservation: cursor.reservation.new_empty(),
                     };
                     cursor.filtered_part_cursor = Some(sc);
                     continue;
@@ -4863,7 +4865,7 @@ impl HashJoinProbe {
                 pos: 0,
                 next_entry: 0,
                 row_matched: false,
-                _reservation: cursor._reservation.new_empty(),
+                _reservation: cursor.reservation.new_empty(),
             };
             cursor.filtered_part_cursor = Some(sc);
         }
@@ -5026,6 +5028,7 @@ impl HashJoinProbe {
     /// starting at `probe_row_offset`) for `ProbeOuter`/`FullOuter`/`ProbeSemi`/`ProbeAnti`,
     /// emits matches (deduplicating `ProbeSemi` on first `0 -> 1` bit transition),
     /// and never emits unmatched probe rows until all build slices finish.
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn probe_bnl_slice_batch(
         &self,
         probe_batch: &RecordBatch,

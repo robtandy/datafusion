@@ -148,7 +148,11 @@ pub(super) fn hash_int_key_array(
                     )
                 })?;
             hashes.clear();
-            hashes.reserve(arr.len());
+            hashes.try_reserve(arr.len()).map_err(|e| {
+                datafusion_common::exec_datafusion_err!(
+                    "Morsel GROUP BY hash buffer allocation failed: {e}"
+                )
+            })?;
             if arr.null_count() == 0 {
                 for &v in arr.values().iter() {
                     hashes.push(v.hash_group_key());
@@ -508,11 +512,10 @@ where
             self.reservation.try_grow(next_bytes)?;
             self.counts.insert(key, count);
             self.reservation.shrink(next_bytes);
-            self.sync_reservation()?;
         } else {
             self.counts.insert(key, count);
-            self.sync_reservation()?;
         }
+        self.sync_reservation()?;
         Ok(())
     }
 
@@ -1533,7 +1536,6 @@ impl FinalizedGroupCounts {
         self.state.radix.as_ref().is_some_and(|r| r.spilled)
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub(super) async fn emit(
         mut self,
         result_operators: ResultOpsRef,

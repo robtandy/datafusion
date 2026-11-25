@@ -145,7 +145,6 @@ impl RadixPartitionStore {
     ///
     /// `extra_bytes` is the caller's other live reservation bytes (e.g. empty
     /// pre-agg table overhead) so `reservation.try_resize` tracks total bytes.
-    #[expect(clippy::too_many_arguments)]
     pub(super) async fn push_partial_batch(
         &mut self,
         partial_batch: RecordBatch,
@@ -199,17 +198,16 @@ impl RadixPartitionStore {
                 if len > 0 {
                     to_spill.push(permuted.slice(offset, len));
                 }
-                if !to_spill.is_empty() {
-                    if let Some((sf, _)) = spill_batches_async(
+                if !to_spill.is_empty()
+                    && let Some((sf, _)) = spill_batches_async(
                         &spill_ctx.manager,
                         &to_spill,
                         "MorselGroupBySpill",
                         tx,
                     )
                     .await?
-                    {
-                        self.spill_files[p].push(sf);
-                    }
+                {
+                    self.spill_files[p].push(sf);
                 }
                 self.mem_part_bytes[p] = 0;
             }
