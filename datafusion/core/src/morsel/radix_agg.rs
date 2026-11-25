@@ -33,7 +33,7 @@ use super::radix::{
     DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, level0_shift,
     next_level_shift, radix_permute_indices,
 };
-use super::spill::{SpillContext, spill_batches_async};
+use super::spill::{SpillContext, SyncSpillWriter, spill_batches_async};
 use super::{Operator, abort_and_drain, apply_operators};
 
 /// Stay on the unpartitioned `R = 0` fast path while worker-local distinct
@@ -136,7 +136,8 @@ impl RadixPartitionStore {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.mem_batches.iter().all(Vec::is_empty)
+        !self.spilled
+            && self.mem_batches.iter().all(Vec::is_empty)
             && self.spill_files.iter().all(Vec::is_empty)
     }
 
@@ -145,7 +146,7 @@ impl RadixPartitionStore {
     ///
     /// `extra_bytes` is the caller's other live reservation bytes (e.g. empty
     /// pre-agg table overhead) so `reservation.try_resize` tracks total bytes.
-    pub(super) async fn push_partial_batch(
+    pub(super) fn push_partial_batch(
         &mut self,
         partial_batch: RecordBatch,
         hashes: &[u64],
@@ -185,9 +186,12 @@ impl RadixPartitionStore {
             };
             self.spilled = true;
             spill_ctx.mark_spilled();
-            // Spill previously buffered in-memory slices together with the new
-            // batch's per-partition slices so all backing buffers drop at once.
+            // Append previously buffered slices together with the new batch's
+            // per-partition slices into the stage-shared partition writers
+            // (at most 1 open spill file per partition across all workers!).
             let num_parts = self.num_partitions();
+            let writers =
+                spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
             for (p, &(offset, len)) in ranges.iter().enumerate() {
                 if tx.is_closed() {
                     self.clear_mem_batches();
@@ -198,16 +202,8 @@ impl RadixPartitionStore {
                 if len > 0 {
                     to_spill.push(permuted.slice(offset, len));
                 }
-                if !to_spill.is_empty()
-                    && let Some((sf, _)) = spill_batches_async(
-                        &spill_ctx.manager,
-                        &to_spill,
-                        "MorselGroupBySpill",
-                        tx,
-                    )
-                    .await?
-                {
-                    self.spill_files[p].push(sf);
+                if !to_spill.is_empty() {
+                    writers.append_batches(p, &to_spill)?;
                 }
                 self.mem_part_bytes[p] = 0;
             }
@@ -234,7 +230,7 @@ impl RadixPartitionStore {
 
     /// Spill all currently buffered in-memory batches in this store and reset
     /// `total_mem_bytes` to 0.
-    pub(super) async fn spill_all_mem(
+    pub(super) fn spill_all_mem(
         &mut self,
         extra_bytes: usize,
         reservation: &MemoryReservation,
@@ -243,7 +239,10 @@ impl RadixPartitionStore {
     ) -> Result<()> {
         self.spilled = true;
         spill.mark_spilled();
-        for p in 0..self.num_partitions() {
+        let num_parts = self.num_partitions();
+        let writers =
+            spill.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+        for p in 0..num_parts {
             if tx.is_closed() {
                 self.clear_mem_batches();
                 reservation.resize(extra_bytes);
@@ -251,16 +250,8 @@ impl RadixPartitionStore {
             }
             let batches = std::mem::take(&mut self.mem_batches[p]);
             self.mem_part_bytes[p] = 0;
-            if !batches.is_empty()
-                && let Some((sf, _)) = spill_batches_async(
-                    &spill.manager,
-                    &batches,
-                    "MorselGroupBySpill",
-                    tx,
-                )
-                .await?
-            {
-                self.spill_files[p].push(sf);
+            if !batches.is_empty() {
+                writers.append_batches(p, &batches)?;
             }
         }
         self.total_mem_bytes = 0;
@@ -392,8 +383,10 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     for p in 0..num_parts {
         let mem = store.mem_batches[p].clone();
         let files = store.spill_files[p].clone();
-        if !mem.is_empty() || !files.is_empty() {
-            non_empty += 1;
+        if !mem.is_empty() || !files.is_empty() || any_spilled {
+            if !mem.is_empty() || !files.is_empty() {
+                non_empty += 1;
+            }
             slots.push(Mutex::new(Some(PartitionInput {
                 mem_batches: mem,
                 spill_files: files,
@@ -405,7 +398,7 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     }
     drop(store);
 
-    if non_empty == 0 {
+    if !any_spilled && non_empty == 0 {
         drop(input_reservation);
         return Ok(());
     }
@@ -428,9 +421,9 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
         let ok = probe.try_grow(probe_bytes).is_ok();
         drop(probe);
         if !ok {
-            // Spill all in-memory partitions to disk up front so 100% of
-            // MemoryPool is freed for sequential 1-partition-at-a-time replay.
-            for slot in &slots {
+            let writers =
+                spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+            for (p, slot) in slots.iter().enumerate() {
                 if tx.is_closed() {
                     return Ok(());
                 }
@@ -441,18 +434,11 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                         .map(|input| std::mem::take(&mut input.mem_batches))
                         .unwrap_or_default()
                 };
-                if !batches.is_empty()
-                    && let Some((sf, _)) = spill_batches_async(
-                        &spill_ctx.manager,
-                        &batches,
-                        "MorselGroupBySpill",
-                        &tx,
-                    )
-                    .await?
-                    && let Some(input) = slot.lock().as_mut()
-                {
-                    input.spill_files.push(sf);
-                    input.est_bytes = 0;
+                if !batches.is_empty() {
+                    writers.append_batches(p, &batches)?;
+                    if let Some(input) = slot.lock().as_mut() {
+                        input.est_bytes = 0;
+                    }
                 }
             }
             input_reservation.resize(0);
@@ -470,9 +456,12 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                 "Spilled GROUP BY partitions require SpillContext"
             );
         };
-        // Flush any remaining in-memory batches across all partitions first so
-        // 100% of sink memory is freed before replaying partition 0.
-        for slot in &slots {
+        // Flush any remaining in-memory batches into the stage-shared partition
+        // writers and finish them so every partition has at most 1 spill file
+        // and 100% of sink memory is freed before replaying partition 0.
+        let writers =
+            spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+        for (p, slot) in slots.iter().enumerate() {
             if tx.is_closed() {
                 drop(slots);
                 drop(input_reservation);
@@ -485,18 +474,21 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                     .map(|i| std::mem::take(&mut i.mem_batches))
                     .unwrap_or_default()
             };
-            if !batches.is_empty()
-                && let Some((sf, _)) = spill_batches_async(
-                    &spill_ctx.manager,
-                    &batches,
-                    "MorselGroupBySpill",
-                    &tx,
-                )
-                .await?
-                && let Some(input) = slot.lock().as_mut()
-            {
-                input.spill_files.push(sf);
-                input.est_bytes = 0;
+            if !batches.is_empty() {
+                writers.append_batches(p, &batches)?;
+                if let Some(input) = slot.lock().as_mut() {
+                    input.est_bytes = 0;
+                }
+            }
+        }
+        drop(writers);
+        if let Some(finished) = spill_ctx.finish_partition_writers()? {
+            for (p, sf_opt) in finished.into_iter().enumerate() {
+                if let Some(sf) = sf_opt
+                    && let Some(input) = slots[p].lock().as_mut()
+                {
+                    input.spill_files.push(sf);
+                }
             }
         }
         drop(input_reservation);
@@ -508,6 +500,9 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
             let Some(input) = slot.lock().take() else {
                 continue;
             };
+            if input.spill_files.is_empty() {
+                continue;
+            }
             finalize_spilled_partition(
                 &merger,
                 input.spill_files,
@@ -733,12 +728,14 @@ fn finalize_spilled_partition<'a, M: RadixGroupMerger>(
         // Drop partial table so 100% of MemoryPool is free for re-partitioning.
         drop(table);
 
-        // Try recursive radix re-partitioning on the next lower disjoint window.
+        // Try recursive radix re-partitioning on the next lower disjoint window,
+        // reusing one appendable writer per sub-partition (`<= 16` files total).
         if depth < MAX_RADIX_DEPTH
             && let Some(next_shift) = next_level_shift(shift, RECURSIVE_RADIX_BITS)
         {
             let sub_parts = 1usize << RECURSIVE_RADIX_BITS;
-            let mut sub_files: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+            let mut sub_writers: Vec<Option<SyncSpillWriter>> =
+                (0..sub_parts).map(|_| None).collect();
             let mut sub_rows = vec![0usize; sub_parts];
             let mut total_rows = 0usize;
             let mut hashes = Vec::new();
@@ -768,21 +765,28 @@ fn finalize_spilled_partition<'a, M: RadixGroupMerger>(
                             continue;
                         }
                         let slice = permuted.slice(offset, len);
-                        if let Some((out_sf, _)) = spill_batches_async(
-                            &spill.manager,
-                            std::slice::from_ref(&slice),
-                            "MorselGroupByRecursiveSpill",
-                            tx,
-                        )
-                        .await?
-                        {
-                            sub_files[sp].push(out_sf);
-                            sub_rows[sp] += len;
-                            total_rows += len;
+                        if sub_writers[sp].is_none() {
+                            sub_writers[sp] = Some(SyncSpillWriter::try_new(
+                                &spill.manager,
+                                "MorselGroupByRecursiveSpill",
+                            )?);
                         }
+                        sub_writers[sp].as_mut().unwrap().append_batch(&slice)?;
+                        sub_rows[sp] += len;
+                        total_rows += len;
                     }
                 }
             }
+
+            let mut sub_files: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+            for (sp, writer_opt) in sub_writers.iter_mut().enumerate() {
+                if let Some(writer) = writer_opt.as_mut()
+                    && let Some((out_sf, _)) = writer.finish()?
+                {
+                    sub_files[sp].push(out_sf);
+                }
+            }
+            drop(sub_writers);
 
             // Unlink parent partition files immediately!
             drop(spill_files);
@@ -878,8 +882,61 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
         )
     })?;
 
-    // Sort each batch of each spill file into sorted spill runs.
+    // Coalesce batches into bounded runs (~128 KiB) before sorting & spilling
+    // so sorted fallback keeps open file count small instead of 1 file/batch.
+    const SORTED_FALLBACK_RUN_BYTES: usize = 128 * 1024;
     let mut sorted_runs = Vec::new();
+    let mut run_batches: Vec<RecordBatch> = Vec::new();
+    let mut run_bytes = 0usize;
+
+    let flush_sorted_run = async |batches: Vec<RecordBatch>,
+                                  sorted_runs: &mut Vec<SortedSpillFile>|
+           -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let merged_batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            arrow::compute::concat_batches(&partial_schema, &batches)?
+        };
+        if merged_batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let sort_cols = ordering
+            .iter()
+            .map(|e| e.evaluate_to_sort_column(&merged_batch))
+            .collect::<Result<Vec<_>>>()?;
+        let indices = lexsort_to_indices(&sort_cols, None)?;
+        drop(sort_cols);
+        let sorted = take_record_batch(&merged_batch, &indices)?;
+        drop(merged_batch);
+        // Write in `batch_size` slices so `max_record_batch_memory` stays small
+        // for `MultiLevelMergeBuilder`'s tight-pool fan-in sizing!
+        let chunk_size = batch_size.max(1);
+        let mut chunks = Vec::with_capacity(sorted.num_rows().div_ceil(chunk_size));
+        let mut off = 0usize;
+        while off < sorted.num_rows() {
+            let len = (sorted.num_rows() - off).min(chunk_size);
+            chunks.push(sorted.slice(off, len));
+            off += len;
+        }
+        if let Some((run_sf, max_mem)) = spill_batches_async(
+            &spill.manager,
+            &chunks,
+            "MorselGroupBySortedFallback",
+            tx,
+        )
+        .await?
+        {
+            sorted_runs.push(SortedSpillFile {
+                file: run_sf,
+                max_record_batch_memory: max_mem,
+            });
+        }
+        Ok(())
+    };
+
     for sf in spill_files {
         if tx.is_closed() {
             return Ok(());
@@ -893,28 +950,20 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let sort_cols = ordering
-                .iter()
-                .map(|e| e.evaluate_to_sort_column(&batch))
-                .collect::<Result<Vec<_>>>()?;
-            let indices = lexsort_to_indices(&sort_cols, None)?;
-            drop(sort_cols);
-            let sorted = take_record_batch(&batch, &indices)?;
-            drop(batch);
-            if let Some((run_sf, max_mem)) = spill_batches_async(
-                &spill.manager,
-                std::slice::from_ref(&sorted),
-                "MorselGroupBySortedFallback",
-                tx,
-            )
-            .await?
+            let b_bytes = get_record_batch_memory_size(&batch);
+            if !run_batches.is_empty()
+                && run_bytes.saturating_add(b_bytes) >= SORTED_FALLBACK_RUN_BYTES
             {
-                sorted_runs.push(SortedSpillFile {
-                    file: run_sf,
-                    max_record_batch_memory: max_mem,
-                });
+                let to_flush = std::mem::take(&mut run_batches);
+                run_bytes = 0;
+                flush_sorted_run(to_flush, &mut sorted_runs).await?;
             }
+            run_bytes = run_bytes.saturating_add(b_bytes);
+            run_batches.push(batch);
         }
+    }
+    if !run_batches.is_empty() {
+        flush_sorted_run(run_batches, &mut sorted_runs).await?;
     }
     if tx.is_closed() || sorted_runs.is_empty() {
         return Ok(());

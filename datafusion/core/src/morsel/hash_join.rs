@@ -59,7 +59,7 @@ use super::radix_join::{
     RadixBuildStore, SpilledBuildPartition, SpilledProbeManifest,
     build_join_spill_schema, pack_build_spill_batch, unpack_build_spill_batch,
 };
-use super::spill::{SpillContext, spill_batches_async};
+use super::spill::{SpillContext, SyncSpillWriter};
 use super::{Pipeline, abort_and_drain};
 
 const FINALIZE_YIELD_CHUNK: usize = 4096;
@@ -644,8 +644,8 @@ impl HashJoinBuildSink {
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<Option<Arc<FinalizedHashTable>>> {
         if combined.radix.is_some() || !combined.pending_radix_batches.is_empty() {
-            combined.flush_r0_to_radix(tx).await?;
-            combined.flush_pending_radix(tx).await?;
+            combined.flush_r0_to_radix(tx)?;
+            combined.flush_pending_radix(tx)?;
             return self
                 .finalize_radix(
                     combined,
@@ -661,8 +661,8 @@ impl HashJoinBuildSink {
         // workers each under threshold combined above threshold), transition to
         // parallel radix finalize for L2 cache locality!
         if self.can_radix_spill() && combined.num_rows > RADIX_JOIN_THRESHOLD_ROWS {
-            combined.flush_r0_to_radix(tx).await?;
-            combined.flush_pending_radix(tx).await?;
+            combined.flush_r0_to_radix(tx)?;
+            combined.flush_pending_radix(tx)?;
             return self
                 .finalize_radix(
                     combined,
@@ -690,7 +690,8 @@ impl HashJoinBuildSink {
             let fits = probe.try_grow(est_peak).is_ok();
             drop(probe);
             if !fits {
-                combined.flush_r0_to_radix(tx).await?;
+                combined.flush_r0_to_radix(tx)?;
+                combined.flush_pending_radix(tx)?;
                 return self
                     .finalize_radix(
                         combined,
@@ -1214,6 +1215,11 @@ impl HashJoinBuildSink {
                         nk_res.grow(nk_mem);
                     }
                     drop(reservation);
+                    if let Some(nk_spill) = null_key_spill.as_ref()
+                        && let Some(sf) = nk_spill.finish_single()?
+                    {
+                        null_key_spill_files.push(sf);
+                    }
                     let null_key_build = if null_key_rows > 0 {
                         Some(NullKeyBuildRows {
                             mem_batches: null_key_payloads,
@@ -1266,30 +1272,29 @@ impl HashJoinBuildSink {
             ));
         };
 
-        // Spill any remaining in-memory NULL-key rows so RAM is dedicated to M / ProbeSpill.
-        if !null_key_payloads.is_empty()
-            && let Some(nk_spill) = null_key_spill.as_ref()
-        {
-            if let Some((sf, _)) = spill_batches_async(
-                &nk_spill.manager,
-                &null_key_payloads,
-                "MorselHashJoinNullKeySpill",
-                tx,
-            )
-            .await?
-            {
+        // Spill any remaining in-memory NULL-key rows into the shared single
+        // null-key writer (`<= 1` file total) so RAM is dedicated to M / ProbeSpill.
+        if let Some(nk_spill) = null_key_spill.as_ref() {
+            if !null_key_payloads.is_empty() {
+                nk_spill
+                    .append_single("MorselHashJoinNullKeySpill", &null_key_payloads)?;
+                null_key_payloads.clear();
+            }
+            if let Some(sf) = nk_spill.finish_single()? {
                 null_key_spill_files.push(sf);
             }
-            null_key_payloads.clear();
         }
 
-        // Spill all in-memory chunks in `store` so 100% of sink memory is freed
-        // before deciding resident subset M vs spilled subset S.
-        // Keeping all non-empty spilled partitions in S when tight guarantees
-        // maximum headroom for LocalProbeSpill and single-partition P2 replay!
-        store
-            .spill_all_mem(0, &reservation, &build_spill_ctx, tx)
-            .await?;
+        // Spill all in-memory chunks in `store` into the stage-shared partition
+        // writers and finish them so every partition has at most 1 spill file!
+        store.spill_all_mem(0, &reservation, &build_spill_ctx, tx)?;
+        if let Some(finished) = build_spill_ctx.finish_partition_writers()? {
+            for (p, sf_opt) in finished.into_iter().enumerate() {
+                if let Some(sf) = sf_opt {
+                    store.spill_files[p].push(sf);
+                }
+            }
+        }
         drop(reservation);
 
         if tx.is_closed() {
@@ -1902,7 +1907,7 @@ impl HashJoinBuildState {
     /// Flush any R=0 buffered chunks into `self.radix`, separating NULL-key
     /// rows (when `keep_null_key_rows == true`) into `null_key_payloads` /
     /// `null_key_spill_files` so every row in `radix` is matchable.
-    async fn flush_r0_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn flush_r0_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let batches = std::mem::take(&mut self.batches);
         let key_batches = std::mem::take(&mut self.key_batches);
         let hash_chunks = std::mem::take(&mut self.hash_chunks);
@@ -1941,7 +1946,7 @@ impl HashJoinBuildState {
                                 .with_row_count(Some(invalid_count)),
                         )?,
                     };
-                    self.push_null_key_batch(nk_batch, tx).await?;
+                    self.push_null_key_batch(nk_batch, tx)?;
                 }
                 if valid_count > 0 {
                     let v_mask = BooleanArray::new(bits.clone(), None);
@@ -1961,7 +1966,7 @@ impl HashJoinBuildState {
                         &v_keys,
                         v_hashes.clone(),
                     )?;
-                    self.push_radix_packed(packed, v_hashes, tx).await?;
+                    self.push_radix_packed(packed, &v_hashes, tx)?;
                 }
             } else {
                 let packed = pack_build_spill_batch(
@@ -1970,13 +1975,13 @@ impl HashJoinBuildState {
                     keys,
                     hashes.clone(),
                 )?;
-                self.push_radix_packed(packed, hashes.clone(), tx).await?;
+                self.push_radix_packed(packed, hashes, tx)?;
             }
         }
         Ok(())
     }
 
-    async fn push_null_key_batch(
+    fn push_null_key_batch(
         &mut self,
         nk_batch: RecordBatch,
         tx: &mpsc::Sender<RecordBatch>,
@@ -2005,16 +2010,8 @@ impl HashJoinBuildState {
                 self.null_key_mem_bytes = 0;
             }
             to_spill.push(nk_batch);
-            if let Some((sf, _)) = spill_batches_async(
-                &nk_spill.manager,
-                &to_spill,
-                "MorselHashJoinNullKeySpill",
-                tx,
-            )
-            .await?
-            {
-                self.null_key_spill_files.push(sf);
-            }
+            nk_spill.append_single("MorselHashJoinNullKeySpill", &to_spill)?;
+            let _ = tx;
             return Ok(());
         }
         // Spilling disabled -> propagate ResourcesExhausted.
@@ -2024,10 +2021,7 @@ impl HashJoinBuildState {
         Ok(())
     }
 
-    async fn flush_pending_radix(
-        &mut self,
-        tx: &mpsc::Sender<RecordBatch>,
-    ) -> Result<()> {
+    fn flush_pending_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         if self.pending_radix_batches.is_empty() {
             return Ok(());
         }
@@ -2046,22 +2040,20 @@ impl HashJoinBuildState {
         };
         let extra = self.null_key_mem_bytes;
         let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
-        radix
-            .push_packed_batch(
-                merged,
-                &hashes,
-                extra,
-                &self.reservation,
-                self.build_spill.as_ref(),
-                tx,
-            )
-            .await
+        radix.push_packed_batch(
+            merged,
+            &hashes,
+            extra,
+            &self.reservation,
+            self.build_spill.as_ref(),
+            tx,
+        )
     }
 
-    async fn push_radix_packed(
+    fn push_radix_packed(
         &mut self,
         packed: RecordBatch,
-        hashes: Vec<u64>,
+        hashes: &[u64],
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<()> {
         const RADIX_COALESCE_TARGET_ROWS: usize = 8_192;
@@ -2074,39 +2066,35 @@ impl HashJoinBuildState {
         if self.pending_radix_batches.is_empty() && rows >= RADIX_COALESCE_TARGET_ROWS {
             let extra = self.null_key_mem_bytes;
             let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
-            return radix
-                .push_packed_batch(
-                    packed,
-                    &hashes,
-                    extra,
-                    &self.reservation,
-                    self.build_spill.as_ref(),
-                    tx,
-                )
-                .await;
+            return radix.push_packed_batch(
+                packed,
+                hashes,
+                extra,
+                &self.reservation,
+                self.build_spill.as_ref(),
+                tx,
+            );
         }
         let bytes = get_record_batch_memory_size(&packed);
         if self.reservation.try_grow(bytes).is_err() {
-            self.flush_pending_radix(tx).await?;
+            self.flush_pending_radix(tx)?;
             let extra = self.null_key_mem_bytes;
             let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
-            return radix
-                .push_packed_batch(
-                    packed,
-                    &hashes,
-                    extra,
-                    &self.reservation,
-                    self.build_spill.as_ref(),
-                    tx,
-                )
-                .await;
+            return radix.push_packed_batch(
+                packed,
+                hashes,
+                extra,
+                &self.reservation,
+                self.build_spill.as_ref(),
+                tx,
+            );
         }
         self.pending_radix_bytes = self.pending_radix_bytes.saturating_add(bytes);
         self.pending_radix_rows = self.pending_radix_rows.saturating_add(rows);
         self.pending_radix_batches.push(packed);
-        self.pending_radix_hashes.extend_from_slice(&hashes);
+        self.pending_radix_hashes.extend_from_slice(hashes);
         if self.pending_radix_rows >= RADIX_COALESCE_TARGET_ROWS {
-            self.flush_pending_radix(tx).await?;
+            self.flush_pending_radix(tx)?;
         }
         Ok(())
     }
@@ -2114,7 +2102,7 @@ impl HashJoinBuildState {
     /// Flush and spill all buffered in-memory build state to disk to release
     /// `MemoryPool` headroom for an upstream spilled operator (e.g. a nested
     /// join's `P2` partition replay).
-    pub(super) async fn spill_in_memory(
+    pub(super) fn spill_in_memory(
         &mut self,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<bool> {
@@ -2128,8 +2116,8 @@ impl HashJoinBuildState {
         if before == 0 {
             return Ok(false);
         }
-        self.flush_r0_to_radix(tx).await?;
-        self.flush_pending_radix(tx).await?;
+        self.flush_r0_to_radix(tx)?;
+        self.flush_pending_radix(tx)?;
         if !self.null_key_payloads.is_empty()
             && let Some(nk_spill) = self.null_key_spill.clone()
         {
@@ -2139,31 +2127,20 @@ impl HashJoinBuildState {
                 self.reservation.shrink(shrink);
                 self.null_key_mem_bytes = 0;
             }
-            if let Some((sf, _)) = spill_batches_async(
-                &nk_spill.manager,
-                &to_spill,
-                "MorselHashJoinNullKeySpill",
-                tx,
-            )
-            .await?
-            {
-                self.null_key_spill_files.push(sf);
-            }
+            nk_spill.append_single("MorselHashJoinNullKeySpill", &to_spill)?;
         }
         if let Some(radix) = self.radix.as_mut() {
-            radix
-                .spill_all_mem(
-                    self.null_key_mem_bytes,
-                    &self.reservation,
-                    &build_spill,
-                    tx,
-                )
-                .await?;
+            radix.spill_all_mem(
+                self.null_key_mem_bytes,
+                &self.reservation,
+                &build_spill,
+                tx,
+            )?;
         }
         Ok(self.reservation.size() < before)
     }
 
-    pub(super) async fn add_view_async(
+    pub(super) fn add_view_spillable(
         &mut self,
         view: &BatchView,
         tx: &mpsc::Sender<RecordBatch>,
@@ -2191,13 +2168,13 @@ impl HashJoinBuildState {
                     if let Some(bs) = &self.build_spill {
                         bs.mark_spilled();
                     }
-                    self.flush_r0_to_radix(tx).await?;
+                    self.flush_r0_to_radix(tx)?;
                     // Fall through to ingest `view` via radix/spill path below!
                 }
                 Err(err) => return Err(err),
             }
         } else if !self.hash_chunks.is_empty() {
-            self.flush_r0_to_radix(tx).await?;
+            self.flush_r0_to_radix(tx)?;
         }
 
         // Radix build path: evaluate keys, update dynamic filter bounds BEFORE
@@ -2256,7 +2233,7 @@ impl HashJoinBuildState {
                         )?;
                         nv.materialize()?
                     };
-                    self.push_null_key_batch(nk_batch, tx).await?;
+                    self.push_null_key_batch(nk_batch, tx)?;
                     self.num_rows =
                         self.num_rows.checked_add(invalid_rows).ok_or_else(|| {
                             datafusion_common::exec_datafusion_err!(
@@ -2312,7 +2289,7 @@ impl HashJoinBuildState {
             &normalized_keys,
             hashes.clone(),
         )?;
-        self.push_radix_packed(packed, hashes, tx).await?;
+        self.push_radix_packed(packed, &hashes, tx)?;
         self.num_rows = self.num_rows.checked_add(valid_rows).ok_or_else(|| {
             datafusion_common::exec_datafusion_err!(
                 "Morsel HashJoin build row count overflow"
@@ -2321,7 +2298,7 @@ impl HashJoinBuildState {
         Ok(())
     }
 
-    pub(super) async fn combine_async(
+    pub(super) fn combine_spillable(
         &mut self,
         mut other: Self,
         tx: &mpsc::Sender<RecordBatch>,
@@ -2347,10 +2324,10 @@ impl HashJoinBuildState {
             self.combine(other);
             return Ok(());
         }
-        self.flush_r0_to_radix(tx).await?;
-        self.flush_pending_radix(tx).await?;
-        other.flush_r0_to_radix(tx).await?;
-        other.flush_pending_radix(tx).await?;
+        self.flush_r0_to_radix(tx)?;
+        self.flush_pending_radix(tx)?;
+        other.flush_r0_to_radix(tx)?;
+        other.flush_pending_radix(tx)?;
         if let (Some(mine), Some(theirs)) = (&mut self.key_summary, &other.key_summary) {
             mine.merge(theirs);
         }
@@ -4074,7 +4051,13 @@ impl HashJoinProbe {
                 }
                 let idx_arr = UInt32Array::from(p_rows);
                 let sub = take_record_batch(&batch, &idx_arr)?;
-                lps.push_batch(p, sub, env, probe_reservation)?;
+                lps.push_batch(
+                    p,
+                    sub,
+                    env,
+                    &radix.probe_spill_manifest,
+                    probe_reservation,
+                )?;
             }
         }
 
@@ -4969,7 +4952,8 @@ impl HashJoinProbe {
             return Ok(None);
         };
         let sub_parts = 1usize << RECURSIVE_RADIX_BITS;
-        let mut sub_build: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+        let mut sub_build_writers: Vec<Option<SyncSpillWriter>> =
+            (0..sub_parts).map(|_| None).collect();
         let mut sub_build_rows = vec![0usize; sub_parts];
         let mut total_build_rows = 0usize;
         let hash_col_idx = meta.num_payload_cols + meta.key_types.len();
@@ -5009,18 +4993,18 @@ impl HashJoinProbe {
                         continue;
                     }
                     let slice = permuted.slice(offset, len);
-                    if let Some((out_sf, _)) = spill_batches_async(
-                        build_mgr,
-                        std::slice::from_ref(&slice),
-                        "MorselHashJoinRecursiveBuildSpill",
-                        tx,
-                    )
-                    .await?
-                    {
-                        sub_build[sp].push(out_sf);
-                        sub_build_rows[sp] += len;
-                        total_build_rows += len;
+                    if sub_build_writers[sp].is_none() {
+                        sub_build_writers[sp] = Some(SyncSpillWriter::try_new(
+                            build_mgr,
+                            "MorselHashJoinRecursiveBuildSpill",
+                        )?);
                     }
+                    sub_build_writers[sp]
+                        .as_mut()
+                        .unwrap()
+                        .append_batch(&slice)?;
+                    sub_build_rows[sp] += len;
+                    total_build_rows += len;
                 }
             }
         }
@@ -5028,11 +5012,24 @@ impl HashJoinProbe {
         // Check if recursive split made meaningful progress (not >=95% in 1 bucket).
         let max_sub = sub_build_rows.iter().copied().max().unwrap_or(0);
         if total_build_rows == 0 || max_sub * 20 >= total_build_rows * 19 {
+            drop(sub_build_writers);
             return Ok(None);
         }
 
-        // Re-partition probe files on the exact same `next_shift`.
-        let mut sub_probe: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+        let mut sub_build: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+        for (sp, writer_opt) in sub_build_writers.iter_mut().enumerate() {
+            if let Some(writer) = writer_opt.as_mut()
+                && let Some((out_sf, _)) = writer.finish()?
+            {
+                sub_build[sp].push(out_sf);
+            }
+        }
+        drop(sub_build_writers);
+
+        // Re-partition probe files on the exact same `next_shift` using 16
+        // reusable writers (`<= 16` probe files total).
+        let mut sub_probe_writers: Vec<Option<SyncSpillWriter>> =
+            (0..sub_parts).map(|_| None).collect();
         for sf in probe_files {
             if tx.is_closed() {
                 return Ok(None);
@@ -5063,19 +5060,29 @@ impl HashJoinProbe {
                         continue;
                     }
                     let slice = permuted.slice(offset, len);
-                    if let Some((out_sf, _)) = spill_batches_async(
-                        probe_mgr,
-                        std::slice::from_ref(&slice),
-                        "MorselHashJoinRecursiveProbeSpill",
-                        tx,
-                    )
-                    .await?
-                    {
-                        sub_probe[sp].push(out_sf);
+                    if sub_probe_writers[sp].is_none() {
+                        sub_probe_writers[sp] = Some(SyncSpillWriter::try_new(
+                            probe_mgr,
+                            "MorselHashJoinRecursiveProbeSpill",
+                        )?);
                     }
+                    sub_probe_writers[sp]
+                        .as_mut()
+                        .unwrap()
+                        .append_batch(&slice)?;
                 }
             }
         }
+
+        let mut sub_probe: Vec<Vec<Arc<dyn SpillFile>>> = vec![Vec::new(); sub_parts];
+        for (sp, writer_opt) in sub_probe_writers.iter_mut().enumerate() {
+            if let Some(writer) = writer_opt.as_mut()
+                && let Some((out_sf, _)) = writer.finish()?
+            {
+                sub_probe[sp].push(out_sf);
+            }
+        }
+        drop(sub_probe_writers);
 
         let pairs = sub_build.into_iter().zip(sub_probe).collect();
         Ok(Some((next_shift, pairs)))

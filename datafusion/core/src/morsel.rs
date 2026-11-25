@@ -1228,12 +1228,9 @@ impl JoinWorkerState {
     }
 
     fn finish_probe_spills(&mut self) -> Result<()> {
-        for (idx, lps_opt) in self.local_probe_spills.iter_mut().enumerate() {
-            if let Some(lps) = lps_opt.take()
-                && let FinalizedHashTableKind::Radix(radix) = &self.tables[idx].kind
-            {
-                let mut manifest = radix.probe_spill_manifest.lock();
-                lps.finish_into(&mut manifest, &self.probe_reservation)?;
+        for lps_opt in &mut self.local_probe_spills {
+            if let Some(lps) = lps_opt.take() {
+                lps.finish_into(&self.probe_reservation)?;
             }
         }
         self.resident_tables.clear();
@@ -1919,17 +1916,15 @@ impl Pipeline {
                 let Sink::GroupCount { sink, .. } = &self.sink else {
                     unreachable!()
                 };
-                worker
-                    .process_async(local.add_view_async(&view, sink.key_index, tx))
-                    .await?;
-                Ok(true)
+                worker.process(|| {
+                    local.add_view_spillable(&view, sink.key_index, tx)?;
+                    Ok(true)
+                })
             }
-            WorkerSink::Aggregate(local) => {
-                worker
-                    .process_async(local.add_view_async(&view, tx))
-                    .await?;
+            WorkerSink::Aggregate(local) => worker.process(|| {
+                local.add_view_spillable(&view, tx)?;
                 Ok(true)
-            }
+            }),
             WorkerSink::TopN(local) => {
                 worker
                     .process_async(local.add_view_async(&view, tx))
@@ -1940,12 +1935,10 @@ impl Pipeline {
                 worker.process_async(local.add_view_async(view, tx)).await?;
                 Ok(true)
             }
-            WorkerSink::HashJoinBuild(local) => {
-                worker
-                    .process_async(local.add_view_async(&view, tx))
-                    .await?;
+            WorkerSink::HashJoinBuild(local) => worker.process(|| {
+                local.add_view_spillable(&view, tx)?;
                 Ok(true)
-            }
+            }),
             WorkerSink::Result(buffer) => {
                 // Avoid copying already-large dense join output batches through the
                 // coalescer; only coalesce sparse/small or filtered batches.
@@ -2074,48 +2067,39 @@ impl Pipeline {
                 let Sink::GroupCount { sink, .. } = &self.sink else {
                     unreachable!()
                 };
-                match self.group_count_strategy(sink.key_index) {
-                    GroupCountStrategy::DirectColumn(col_index) => {
-                        worker
-                            .process_async(
-                                local.add_column_async(batch.column(col_index), tx),
-                            )
-                            .await?;
-                    }
-                    GroupCountStrategy::DirectMask {
-                        predicate,
-                        key_index,
-                    } => {
-                        worker
-                            .process_async(local.add_filtered_batch_async(
+                worker.process(|| {
+                    match self.group_count_strategy(sink.key_index) {
+                        GroupCountStrategy::DirectColumn(col_index) => {
+                            local.add_column_spillable(batch.column(col_index), tx)?;
+                        }
+                        GroupCountStrategy::DirectMask {
+                            predicate,
+                            key_index,
+                        } => {
+                            local.add_filtered_batch_spillable(
                                 &batch, predicate, key_index, tx,
-                            ))
-                            .await?;
-                    }
-                    GroupCountStrategy::General(col_index) => {
-                        let view = worker.process(|| {
-                            apply_operators_view(&self.operators, BatchView::all(batch))
-                        })?;
-                        if !view.is_empty() {
-                            worker
-                                .process_async(local.add_view_async(&view, col_index, tx))
-                                .await?;
+                            )?;
+                        }
+                        GroupCountStrategy::General(col_index) => {
+                            let view = apply_operators_view(
+                                &self.operators,
+                                BatchView::all(batch),
+                            )?;
+                            if !view.is_empty() {
+                                local.add_view_spillable(&view, col_index, tx)?;
+                            }
                         }
                     }
-                }
-                Ok(true)
+                    Ok(true)
+                })
             }
-            WorkerSink::Aggregate(local) => {
-                let view = worker.process(|| {
-                    apply_operators_view(&self.operators, BatchView::all(batch))
-                })?;
+            WorkerSink::Aggregate(local) => worker.process(|| {
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
-                    worker
-                        .process_async(local.add_view_async(&view, tx))
-                        .await?;
+                    local.add_view_spillable(&view, tx)?;
                 }
                 Ok(true)
-            }
+            }),
             WorkerSink::TopN(local) => {
                 let view = worker.process(|| {
                     apply_operators_view(&self.operators, BatchView::all(batch))
@@ -2136,17 +2120,13 @@ impl Pipeline {
                 }
                 Ok(true)
             }
-            WorkerSink::HashJoinBuild(local) => {
-                let view = worker.process(|| {
-                    apply_operators_view(&self.operators, BatchView::all(batch))
-                })?;
+            WorkerSink::HashJoinBuild(local) => worker.process(|| {
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
-                    worker
-                        .process_async(local.add_view_async(&view, tx))
-                        .await?;
+                    local.add_view_spillable(&view, tx)?;
                 }
                 Ok(true)
-            }
+            }),
             WorkerSink::Result(buffer) => {
                 let mut output = worker.process(|| {
                     buffer.push_input(&self.operators, batch)?;
@@ -2421,7 +2401,7 @@ impl Pipeline {
             }
             WorkerState::HashJoinBuild(local) => {
                 if let Some(combined_build) = targets.combined_build.as_deref_mut() {
-                    combined_build.combine_async(*local, tx).await?;
+                    combined_build.combine_spillable(*local, tx)?;
                 }
                 Ok(!tx.is_closed())
             }
@@ -2627,7 +2607,7 @@ impl Pipeline {
                     Err(datafusion_common::DataFusionError::ResourcesExhausted(_)) => {
                         if attempt == 0
                             && let WorkerSink::HashJoinBuild(b) = sink
-                            && b.spill_in_memory(&output.tx).await?
+                            && b.spill_in_memory(&output.tx)?
                         {
                             continue;
                         }
@@ -3266,10 +3246,8 @@ impl Pipeline {
 
                     // Step 2b: Process spilled partition pairs p ∈ S one at a time.
                     if radix.spilled_build_mask != 0 {
-                        let (probe_mgr, mut probe_files_by_part) = {
-                            let mut m = radix.probe_spill_manifest.lock();
-                            (m.manager.take(), std::mem::take(&mut m.files_by_part))
-                        };
+                        let (probe_mgr, mut probe_files_by_part) =
+                            radix.probe_spill_manifest.lock().finish_all()?;
                         let build_mgr = radix
                             .build_spill_manager
                             .as_ref()
@@ -3586,7 +3564,7 @@ impl Pipeline {
                 };
                 if let WorkerState::HashJoinBuild(local) = local {
                     let start = measurement.map(|_| Instant::now());
-                    if let Err(err) = combined_build.combine_async(*local, tx).await {
+                    if let Err(err) = combined_build.combine_spillable(*local, tx) {
                         drop(combined_build);
                         abort_and_drain(&mut tasks).await;
                         drop(nested_tables);
@@ -3609,7 +3587,7 @@ impl Pipeline {
             if nested_any_spilled {
                 // Free memory held by P1 build rows before P2 replays spilled
                 // nested join partitions.
-                let _ = combined_build.spill_in_memory(tx).await?;
+                let _ = combined_build.spill_in_memory(tx)?;
             }
             let mut targets = BuildEmissionTargets {
                 combined_count: None,

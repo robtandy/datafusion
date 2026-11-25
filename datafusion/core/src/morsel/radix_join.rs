@@ -19,10 +19,11 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 use datafusion_physical_plan::spill::SpillManager;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::radix::{DEFAULT_RADIX_BITS, level0_shift, radix_permute_indices};
-use super::spill::{SpillContext, spill_batches_async, spill_batches_sync};
+use super::spill::{SharedPartitionWriters, SpillContext};
 
 /// Switch from `R = 0` single-partition build to `R = 6` (64-way) radix build
 /// once build rows exceed this threshold (keeps tiny dimension builds fast).
@@ -155,7 +156,7 @@ impl RadixBuildStore {
 
     /// Permute a packed build batch into `2^R` radix slices, retaining slices
     /// in memory when budget allows or spilling to disk on OOM.
-    pub(super) async fn push_packed_batch(
+    pub(super) fn push_packed_batch(
         &mut self,
         packed: RecordBatch,
         hashes: &[u64],
@@ -195,6 +196,9 @@ impl RadixBuildStore {
             };
             self.spilled = true;
             spill_ctx.mark_spilled();
+            let num_parts = self.num_partitions();
+            let writers = spill_ctx
+                .get_or_init_partition_writers(num_parts, "MorselHashJoinBuildSpill");
             for (p, &(offset, len)) in ranges.iter().enumerate() {
                 if tx.is_closed() {
                     self.clear_mem_batches();
@@ -209,16 +213,8 @@ impl RadixBuildStore {
                     self.part_est_bytes[p] = self.part_est_bytes[p].saturating_add(share);
                 }
                 self.mem_part_bytes[p] = 0;
-                if !to_spill.is_empty()
-                    && let Some((sf, _)) = spill_batches_async(
-                        &spill_ctx.manager,
-                        &to_spill,
-                        "MorselHashJoinBuildSpill",
-                        tx,
-                    )
-                    .await?
-                {
-                    self.spill_files[p].push(sf);
+                if !to_spill.is_empty() {
+                    writers.append_batches(p, &to_spill)?;
                 }
             }
             self.total_mem_bytes = 0;
@@ -240,7 +236,7 @@ impl RadixBuildStore {
         Ok(())
     }
 
-    pub(super) async fn spill_all_mem(
+    pub(super) fn spill_all_mem(
         &mut self,
         extra_bytes: usize,
         reservation: &MemoryReservation,
@@ -249,7 +245,10 @@ impl RadixBuildStore {
     ) -> Result<()> {
         self.spilled = true;
         spill.mark_spilled();
-        for p in 0..self.num_partitions() {
+        let num_parts = self.num_partitions();
+        let writers =
+            spill.get_or_init_partition_writers(num_parts, "MorselHashJoinBuildSpill");
+        for p in 0..num_parts {
             if tx.is_closed() {
                 self.clear_mem_batches();
                 reservation.resize(extra_bytes);
@@ -257,16 +256,8 @@ impl RadixBuildStore {
             }
             let batches = std::mem::take(&mut self.mem_batches[p]);
             self.mem_part_bytes[p] = 0;
-            if !batches.is_empty()
-                && let Some((sf, _)) = spill_batches_async(
-                    &spill.manager,
-                    &batches,
-                    "MorselHashJoinBuildSpill",
-                    tx,
-                )
-                .await?
-            {
-                self.spill_files[p].push(sf);
+            if !batches.is_empty() {
+                writers.append_batches(p, &batches)?;
             }
         }
         self.total_mem_bytes = 0;
@@ -348,50 +339,77 @@ impl ProbeSpillEnv {
     }
 }
 
-/// Shared manifest populated by `P1` probe workers on EOF (and any upstream
-/// `P2` build-emission/spill workers feeding a downstream spilled join).
+pub(super) type FinishedProbeSpills =
+    (Option<SpillManager>, Vec<Vec<Arc<dyn SpillFile>>>);
+
+/// Shared manifest holding at most one reusable appendable probe spill writer
+/// per radix partition across all `P1` probe workers (and any upstream `P2`
+/// workers feeding a downstream spilled join).
 pub(super) struct SpilledProbeManifest {
-    pub(super) manager: Option<SpillManager>,
-    pub(super) files_by_part: Vec<Vec<Arc<dyn SpillFile>>>,
+    num_parts: usize,
+    manager: Option<SpillManager>,
+    writers: Option<Arc<SharedPartitionWriters>>,
 }
 
 impl SpilledProbeManifest {
     pub(super) fn new(num_parts: usize) -> Self {
         Self {
+            num_parts,
             manager: None,
-            files_by_part: vec![Vec::new(); num_parts],
+            writers: None,
         }
     }
 
-    pub(super) fn merge_from(
+    fn get_or_init_writers(
         &mut self,
-        manager: Option<SpillManager>,
-        mut files: Vec<Vec<Arc<dyn SpillFile>>>,
-    ) {
-        if self.manager.is_none() {
-            self.manager = manager;
+        env: &ProbeSpillEnv,
+        schema: SchemaRef,
+    ) -> Arc<SharedPartitionWriters> {
+        if let Some(existing) = &self.writers {
+            return Arc::clone(existing);
         }
-        for (dst, src) in self.files_by_part.iter_mut().zip(files.iter_mut()) {
-            dst.append(src);
+        let mgr = env.create_manager(schema);
+        let writers = Arc::new(SharedPartitionWriters::new(
+            mgr.clone(),
+            self.num_parts,
+            "MorselHashJoinProbeSpill",
+        ));
+        self.manager = Some(mgr);
+        self.writers = Some(Arc::clone(&writers));
+        writers
+    }
+
+    /// Finish all open probe partition writers, closing write FDs and
+    /// returning `(manager, files_by_part)` with at most 1 file per partition.
+    pub(super) fn finish_all(&mut self) -> Result<FinishedProbeSpills> {
+        let mgr = self.manager.take();
+        let mut files_by_part = vec![Vec::new(); self.num_parts];
+        if let Some(writers) = self.writers.take() {
+            for (p, sf_opt) in writers.finish_all()?.into_iter().enumerate() {
+                if let Some(sf) = sf_opt {
+                    files_by_part[p].push(sf);
+                }
+            }
         }
+        Ok((mgr, files_by_part))
     }
 }
 
 /// Worker-local synchronous probe spill buffer (DuckDB `ProbeSpill` pattern).
+/// Flushes into the join's shared per-partition writers so open spill files
+/// stay bounded by `num_parts` regardless of worker count or flush count.
 pub(super) struct LocalProbeSpill {
-    manager: Option<SpillManager>,
+    writers: Option<Arc<SharedPartitionWriters>>,
     buffers: Vec<Vec<RecordBatch>>,
     buffered_bytes: usize,
-    files: Vec<Vec<Arc<dyn SpillFile>>>,
 }
 
 impl LocalProbeSpill {
     pub(super) fn new(num_parts: usize) -> Self {
         Self {
-            manager: None,
+            writers: None,
             buffers: vec![Vec::new(); num_parts],
             buffered_bytes: 0,
-            files: vec![Vec::new(); num_parts],
         }
     }
 
@@ -400,29 +418,25 @@ impl LocalProbeSpill {
         part: usize,
         batch: RecordBatch,
         env: &ProbeSpillEnv,
+        manifest: &Mutex<SpilledProbeManifest>,
         reservation: &MemoryReservation,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        if self.manager.is_none() {
-            self.manager = Some(env.create_manager(batch.schema()));
+        if self.writers.is_none() {
+            let w = manifest.lock().get_or_init_writers(env, batch.schema());
+            self.writers = Some(w);
         }
         let bytes = get_record_batch_memory_size(&batch);
         if self.buffered_bytes.saturating_add(bytes) >= PROBE_SPILL_FLUSH_BYTES
             || reservation.try_grow(bytes).is_err()
         {
             self.flush_buffers(reservation)?;
-            // If this single batch still exceeds remaining memory, spill it directly.
+            // If this single batch still exceeds remaining memory, append it directly.
             if reservation.try_grow(bytes).is_err() {
-                let mgr = self.manager.as_ref().expect("probe spill manager");
-                if let Some((sf, _)) = spill_batches_sync(
-                    mgr,
-                    std::slice::from_ref(&batch),
-                    "MorselHashJoinProbeSpill",
-                )? {
-                    self.files[part].push(sf);
-                }
+                let writers = self.writers.as_ref().expect("probe spill writers");
+                writers.append_batches(part, std::slice::from_ref(&batch))?;
                 return Ok(());
             }
         }
@@ -438,16 +452,13 @@ impl LocalProbeSpill {
         if self.buffered_bytes == 0 {
             return Ok(());
         }
-        let Some(mgr) = self.manager.as_ref() else {
+        let Some(writers) = self.writers.as_ref() else {
             return Ok(());
         };
         for p in 0..self.buffers.len() {
             let batches = std::mem::take(&mut self.buffers[p]);
-            if !batches.is_empty()
-                && let Some((sf, _)) =
-                    spill_batches_sync(mgr, &batches, "MorselHashJoinProbeSpill")?
-            {
-                self.files[p].push(sf);
+            if !batches.is_empty() {
+                writers.append_batches(p, &batches)?;
             }
         }
         reservation.shrink(self.buffered_bytes);
@@ -455,13 +466,9 @@ impl LocalProbeSpill {
         Ok(())
     }
 
-    pub(super) fn finish_into(
-        mut self,
-        manifest: &mut SpilledProbeManifest,
-        reservation: &MemoryReservation,
-    ) -> Result<()> {
+    pub(super) fn finish_into(mut self, reservation: &MemoryReservation) -> Result<()> {
         self.flush_buffers(reservation)?;
-        manifest.merge_from(self.manager.take(), std::mem::take(&mut self.files));
+        self.writers = None;
         Ok(())
     }
 }

@@ -868,7 +868,7 @@ impl GroupCountState {
         }
     }
 
-    async fn flush_map_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn flush_map_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         if self.map.is_empty() {
             return Ok(());
         }
@@ -878,12 +878,10 @@ impl GroupCountState {
             .get_or_insert_with(RadixPartitionStore::new_default);
         let extra = self.map.tracked_bytes();
         let res = self.map.reservation();
-        radix
-            .push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
-            .await
+        radix.push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
     }
 
-    async fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let len = self.map.len();
         let should_flush = if self.radix.is_some() {
             len >= PREAGG_FLUSH_GROUPS
@@ -891,12 +889,12 @@ impl GroupCountState {
             len >= RADIX_TRANSITION_GROUPS
         };
         if should_flush {
-            self.flush_map_to_radix(tx).await?;
+            self.flush_map_to_radix(tx)?;
         }
         Ok(())
     }
 
-    async fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let Some(spill_ctx) = self.spill.clone() else {
             return Err(DataFusionError::ResourcesExhausted(
                 "GroupCount spilling is disabled".into(),
@@ -904,14 +902,14 @@ impl GroupCountState {
         };
         spill_ctx.mark_spilled();
         if !self.map.is_empty() {
-            self.flush_map_to_radix(tx).await?;
+            self.flush_map_to_radix(tx)?;
         }
         let radix = self
             .radix
             .get_or_insert_with(RadixPartitionStore::new_default);
         let extra = self.map.tracked_bytes();
         let res = self.map.reservation();
-        radix.spill_all_mem(extra, res, &spill_ctx, tx).await?;
+        radix.spill_all_mem(extra, res, &spill_ctx, tx)?;
         Ok(())
     }
 
@@ -944,7 +942,7 @@ impl GroupCountState {
         }
     }
 
-    async fn precheck_spill_headroom(
+    fn precheck_spill_headroom(
         &mut self,
         est_rows: usize,
         tx: &mpsc::Sender<RecordBatch>,
@@ -954,7 +952,7 @@ impl GroupCountState {
             let probe = self.map.reservation().new_empty();
             if probe.try_grow(est_bytes).is_err() {
                 drop(probe);
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
             }
         }
         Ok(())
@@ -989,7 +987,7 @@ impl GroupCountState {
         }
     }
 
-    pub(super) async fn add_column_async(
+    pub(super) fn add_column_spillable(
         &mut self,
         array: &ArrayRef,
         tx: &mpsc::Sender<RecordBatch>,
@@ -999,18 +997,18 @@ impl GroupCountState {
         }
         if self.spill.is_none() {
             self.add_column(array)?;
-            return self.maybe_flush_preagg(tx).await;
+            return self.maybe_flush_preagg(tx);
         }
-        self.precheck_spill_headroom(array.len(), tx).await?;
+        self.precheck_spill_headroom(array.len(), tx)?;
         self.add_column_unchecked(array)?;
         if let Err(err) = self.map.sync_reservation() {
             if matches!(err, DataFusionError::ResourcesExhausted(_)) {
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
                 return Ok(());
             }
             return Err(err);
         }
-        self.maybe_flush_preagg(tx).await
+        self.maybe_flush_preagg(tx)
     }
 
     fn add_column_selected(
@@ -1178,7 +1176,7 @@ impl GroupCountState {
         }
     }
 
-    pub(super) async fn add_view_async(
+    pub(super) fn add_view_spillable(
         &mut self,
         view: &BatchView,
         key_index: usize,
@@ -1189,18 +1187,18 @@ impl GroupCountState {
         }
         if self.spill.is_none() {
             self.add_view(view, key_index)?;
-            return self.maybe_flush_preagg(tx).await;
+            return self.maybe_flush_preagg(tx);
         }
-        self.precheck_spill_headroom(view.num_rows(), tx).await?;
+        self.precheck_spill_headroom(view.num_rows(), tx)?;
         self.add_view_unchecked(view, key_index)?;
         if let Err(err) = self.map.sync_reservation() {
             if matches!(err, DataFusionError::ResourcesExhausted(_)) {
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
                 return Ok(());
             }
             return Err(err);
         }
-        self.maybe_flush_preagg(tx).await
+        self.maybe_flush_preagg(tx)
     }
 
     fn add_column_masked(&mut self, array: &ArrayRef, mask: &BooleanArray) -> Result<()> {
@@ -1265,7 +1263,7 @@ impl GroupCountState {
         }
     }
 
-    pub(super) async fn add_filtered_batch_async(
+    pub(super) fn add_filtered_batch_spillable(
         &mut self,
         batch: &RecordBatch,
         predicate: &Arc<dyn PhysicalExpr>,
@@ -1274,11 +1272,11 @@ impl GroupCountState {
     ) -> Result<()> {
         if self.spill.is_none() {
             self.add_filtered_batch(batch, predicate, key_index)?;
-            return self.maybe_flush_preagg(tx).await;
+            return self.maybe_flush_preagg(tx);
         }
         match predicate.evaluate(batch)? {
             ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => {
-                self.add_column_async(batch.column(key_index), tx).await
+                self.add_column_spillable(batch.column(key_index), tx)
             }
             ColumnarValue::Scalar(ScalarValue::Boolean(Some(false) | None)) => Ok(()),
             ColumnarValue::Scalar(_) => {
@@ -1291,7 +1289,7 @@ impl GroupCountState {
                     );
                 };
                 if mask.len() == batch.num_rows() {
-                    self.precheck_spill_headroom(mask.true_count(), tx).await?;
+                    self.precheck_spill_headroom(mask.true_count(), tx)?;
                     let col = batch.column(key_index);
                     match &mut self.map {
                         GroupCountMapKind::Int8(m) => m.add_array_masked_unchecked(
@@ -1329,16 +1327,16 @@ impl GroupCountState {
                     }
                     if let Err(err) = self.map.sync_reservation() {
                         if matches!(err, DataFusionError::ResourcesExhausted(_)) {
-                            self.spill_on_oom(tx).await?;
+                            self.spill_on_oom(tx)?;
                             return Ok(());
                         }
                         return Err(err);
                     }
-                    self.maybe_flush_preagg(tx).await
+                    self.maybe_flush_preagg(tx)
                 } else {
                     let filtered = filter_batch(batch, mask, Some(&[key_index]))?;
                     if filtered.num_rows() > 0 {
-                        self.add_column_async(filtered.column(0), tx).await?;
+                        self.add_column_spillable(filtered.column(0), tx)?;
                     }
                     Ok(())
                 }
@@ -1352,8 +1350,8 @@ impl GroupCountState {
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<bool> {
         if self.radix.is_some() || other.radix.is_some() {
-            self.flush_map_to_radix(tx).await?;
-            other.flush_map_to_radix(tx).await?;
+            self.flush_map_to_radix(tx)?;
+            other.flush_map_to_radix(tx)?;
             if tx.is_closed() {
                 return Ok(false);
             }
@@ -1371,8 +1369,8 @@ impl GroupCountState {
         // Low-cardinality fast path (`R = 0`): merge directly in memory unless
         // combined cardinality crosses threshold or OOM triggers radix spill.
         if self.map.len().saturating_add(other.map.len()) >= RADIX_TRANSITION_GROUPS {
-            self.flush_map_to_radix(tx).await?;
-            other.flush_map_to_radix(tx).await?;
+            self.flush_map_to_radix(tx)?;
+            other.flush_map_to_radix(tx)?;
             if tx.is_closed() {
                 return Ok(false);
             }
@@ -1546,7 +1544,7 @@ impl FinalizedGroupCounts {
         measurement: Option<Arc<RunMetrics>>,
     ) -> Result<()> {
         if self.state.radix.is_some() {
-            self.state.flush_map_to_radix(&tx).await?;
+            self.state.flush_map_to_radix(&tx)?;
             let store = self.state.radix.take().expect("radix store");
             let spill = self.state.spill.take();
             let key_type = self.state.key_type;

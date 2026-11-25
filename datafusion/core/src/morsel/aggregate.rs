@@ -760,7 +760,7 @@ impl AggregateState {
         }
     }
 
-    pub(super) async fn add_view_async(
+    pub(super) fn add_view_spillable(
         &mut self,
         view: &BatchView,
         tx: &mpsc::Sender<RecordBatch>,
@@ -770,8 +770,8 @@ impl AggregateState {
         }
         match self {
             Self::Ungrouped(state) => state.add_view(view),
-            Self::Grouped(state) => state.add_view_async(view, tx).await,
-            Self::DirectGrouped(state) => state.add_view_async(view, tx).await,
+            Self::Grouped(state) => state.add_view_spillable(view, tx),
+            Self::DirectGrouped(state) => state.add_view_spillable(view, tx),
         }
     }
 
@@ -979,7 +979,7 @@ impl GroupedState {
         probe.try_grow(est_bytes).is_ok()
     }
 
-    async fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         if self.group_values.is_empty() {
             return Ok(());
         }
@@ -1000,19 +1000,17 @@ impl GroupedState {
         let radix = self
             .radix
             .get_or_insert_with(RadixPartitionStore::new_default);
-        radix
-            .push_partial_batch(
-                batch,
-                &self.hash_buf,
-                self.table_tracked_bytes,
-                &self.reservation,
-                self.spill.as_ref(),
-                tx,
-            )
-            .await
+        radix.push_partial_batch(
+            batch,
+            &self.hash_buf,
+            self.table_tracked_bytes,
+            &self.reservation,
+            self.spill.as_ref(),
+            tx,
+        )
     }
 
-    async fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let Some(spill_ctx) = self.spill.clone() else {
             return Err(DataFusionError::ResourcesExhausted(
                 "GroupedAggregate spilling is disabled".into(),
@@ -1020,18 +1018,21 @@ impl GroupedState {
         };
         spill_ctx.mark_spilled();
         if !self.group_values.is_empty() {
-            self.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
         }
         let radix = self
             .radix
             .get_or_insert_with(RadixPartitionStore::new_default);
-        radix
-            .spill_all_mem(self.table_tracked_bytes, &self.reservation, &spill_ctx, tx)
-            .await?;
+        radix.spill_all_mem(
+            self.table_tracked_bytes,
+            &self.reservation,
+            &spill_ctx,
+            tx,
+        )?;
         Ok(())
     }
 
-    async fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let len = self.group_values.len();
         let should_flush = if self.radix.is_some() {
             len >= PREAGG_FLUSH_GROUPS || self.table_tracked_bytes >= PREAGG_FLUSH_BYTES
@@ -1039,7 +1040,7 @@ impl GroupedState {
             len >= RADIX_TRANSITION_GROUPS
         };
         if should_flush {
-            self.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
         }
         Ok(())
     }
@@ -1095,7 +1096,7 @@ impl GroupedState {
         self.update_reservation()
     }
 
-    async fn add_view_async(
+    fn add_view_spillable(
         &mut self,
         view: &BatchView,
         tx: &mpsc::Sender<RecordBatch>,
@@ -1126,7 +1127,7 @@ impl GroupedState {
             };
             let est = self.estimate_batch_delta(batch.num_rows(), &key_arrays);
             if !self.check_batch_headroom(est) {
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
             }
         }
 
@@ -1138,12 +1139,12 @@ impl GroupedState {
                 // Both `group_values` and `accumulators` already include `batch`
                 // and are 100% consistent: spill them cleanly now and verify
                 // minimum headroom.
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
                 return Ok(());
             }
             return Err(err);
         }
-        self.maybe_flush_preagg(tx).await
+        self.maybe_flush_preagg(tx)
     }
 
     async fn merge_from(
@@ -1159,8 +1160,8 @@ impl GroupedState {
                 .saturating_add(other.group_values.len())
                 >= RADIX_TRANSITION_GROUPS
         {
-            self.flush_to_radix(tx).await?;
-            other.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
+            other.flush_to_radix(tx)?;
             if tx.is_closed() {
                 return Ok(false);
             }
@@ -2912,7 +2913,7 @@ impl DirectGroupedState {
         dispatch_direct_kind!(&mut self.kind, m => m.add_view(view))
     }
 
-    async fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         if self.kind.is_empty() {
             return Ok(());
         }
@@ -2922,12 +2923,10 @@ impl DirectGroupedState {
             .get_or_insert_with(RadixPartitionStore::new_default);
         let extra = self.kind.table_tracked_bytes();
         let res = self.kind.reservation();
-        radix
-            .push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
-            .await
+        radix.push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
     }
 
-    async fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+    fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
         let Some(spill_ctx) = self.spill.clone() else {
             return Err(DataFusionError::ResourcesExhausted(
                 "DirectGrouped spilling is disabled".into(),
@@ -2935,18 +2934,18 @@ impl DirectGroupedState {
         };
         spill_ctx.mark_spilled();
         if !self.kind.is_empty() {
-            self.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
         }
         let radix = self
             .radix
             .get_or_insert_with(RadixPartitionStore::new_default);
         let extra = self.kind.table_tracked_bytes();
         let res = self.kind.reservation();
-        radix.spill_all_mem(extra, res, &spill_ctx, tx).await?;
+        radix.spill_all_mem(extra, res, &spill_ctx, tx)?;
         Ok(())
     }
 
-    async fn add_view_async(
+    fn add_view_spillable(
         &mut self,
         view: &BatchView,
         tx: &mpsc::Sender<RecordBatch>,
@@ -2969,16 +2968,14 @@ impl DirectGroupedState {
                 .get_or_insert_with(RadixPartitionStore::new_default);
             let extra = self.kind.table_tracked_bytes();
             let res = self.kind.reservation();
-            return radix
-                .push_partial_batch(
-                    partial,
-                    &self.hash_buf,
-                    extra,
-                    res,
-                    self.spill.as_ref(),
-                    tx,
-                )
-                .await;
+            return radix.push_partial_batch(
+                partial,
+                &self.hash_buf,
+                extra,
+                res,
+                self.spill.as_ref(),
+                tx,
+            );
         }
 
         // Pre-check memory before mutating `kind` when spilling is enabled and
@@ -2989,7 +2986,7 @@ impl DirectGroupedState {
             let probe = self.kind.reservation().new_empty();
             if probe.try_grow(est).is_err() {
                 drop(probe);
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
             }
         }
 
@@ -2999,7 +2996,7 @@ impl DirectGroupedState {
             if matches!(err, DataFusionError::ResourcesExhausted(_))
                 && self.spill.is_some()
             {
-                self.spill_on_oom(tx).await?;
+                self.spill_on_oom(tx)?;
                 self.rows_since_flush = 0;
                 return Ok(());
             }
@@ -3020,7 +3017,7 @@ impl DirectGroupedState {
                 self.direct_scatter = true;
             }
             self.rows_since_flush = 0;
-            self.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
         }
         Ok(())
     }
@@ -3034,8 +3031,8 @@ impl DirectGroupedState {
             || other.radix.is_some()
             || self.kind.len().saturating_add(other.kind.len()) >= RADIX_TRANSITION_GROUPS
         {
-            self.flush_to_radix(tx).await?;
-            other.flush_to_radix(tx).await?;
+            self.flush_to_radix(tx)?;
+            other.flush_to_radix(tx)?;
             if tx.is_closed() {
                 return Ok(false);
             }
@@ -3302,7 +3299,7 @@ impl FinalizedAggregate {
             }
             AggregateState::Grouped(mut state) => {
                 if state.radix.is_some() {
-                    state.flush_to_radix(&tx).await?;
+                    state.flush_to_radix(&tx)?;
                     let store = state.radix.take().expect("radix store");
                     let spill = state.spill.take();
                     let partial_schema = state.partial_schema;
@@ -3346,7 +3343,7 @@ impl FinalizedAggregate {
             }
             AggregateState::DirectGrouped(mut state) => {
                 if state.radix.is_some() {
-                    state.flush_to_radix(&tx).await?;
+                    state.flush_to_radix(&tx)?;
                     let store = state.radix.take().expect("radix store");
                     let spill = state.spill.take();
                     let partial_schema = state.partial_schema;
