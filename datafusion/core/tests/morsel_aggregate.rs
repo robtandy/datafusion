@@ -1125,7 +1125,6 @@ async fn unsupported_aggregates_reject_in_required_and_fallback_in_prefer() -> R
             "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10",
             "only projection",
         ),
-        ("SELECT k, SUM(v) FROM t GROUP BY k ORDER BY k", "Sort"),
         ("SELECT k, SUM(v) FROM t GROUP BY k LIMIT 1", "LIMIT"),
         ("SELECT MEDIAN(v) FROM t", "median"),
         ("SELECT k, ARRAY_AGG(v) FROM t GROUP BY k", "array_agg"),

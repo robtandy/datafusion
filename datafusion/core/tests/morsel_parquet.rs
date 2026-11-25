@@ -406,7 +406,7 @@ async fn unsupported_parquet_queries_delegate_only_in_prefer_mode() -> Result<()
         .await?;
     }
     for (sql, reason) in [
-        ("SELECT id FROM t ORDER BY id DESC", "Sort"),
+        ("SELECT id FROM t LIMIT 3", "LIMIT"),
         ("SELECT id FROM t OFFSET 1", "OFFSET"),
         ("SELECT id, year FROM partitioned", "partition columns"),
         ("SELECT input_file_name() FROM t", "projection expression"),
@@ -435,6 +435,9 @@ async fn unsupported_parquet_queries_delegate_only_in_prefer_mode() -> Result<()
         if reason == "OFFSET" {
             // The particular omitted row is unspecified without ORDER BY.
             assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 15);
+        } else if reason == "LIMIT" {
+            // The particular returned rows are unspecified without ORDER BY.
+            assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
         } else {
             assert_eq!(
                 batches_to_sort_string(&actual),

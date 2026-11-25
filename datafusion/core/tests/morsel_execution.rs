@@ -91,7 +91,7 @@ async fn sql_mode_selects_the_planner_for_new_queries() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_table("items", items(false)?)?;
     let scan = "SELECT id FROM items";
-    let unsupported = "SELECT id FROM items ORDER BY id DESC";
+    let unsupported = "SELECT id FROM items LIMIT 3";
     let before_set = ctx.sql(scan).await?;
     assert_ne!(physical(&ctx, scan).await?.name(), "MorselExec");
 
@@ -111,15 +111,15 @@ async fn sql_mode_selects_the_planner_for_new_queries() -> Result<()> {
         .await?;
     control.clone().collect().await?;
     let (state, _) = control.into_parts();
-    let sorted = ctx.sql(unsupported).await?.into_unoptimized_plan();
-    assert!(state.create_physical_plan(&sorted).await.is_err());
+    let limited = ctx.sql(unsupported).await?.into_unoptimized_plan();
+    assert!(state.create_physical_plan(&limited).await.is_err());
 
     assert_eq!(physical(&ctx, scan).await?.name(), "MorselExec");
     let count = "SELECT COUNT(*) FROM items WHERE threshold > 0";
     assert_eq!(physical(&ctx, count).await?.name(), "MorselExec");
     let err = physical(&ctx, unsupported).await.unwrap_err().to_string();
     assert!(
-        err.contains("morsel_mode=required") && err.contains("Sort"),
+        err.contains("morsel_mode=required") && err.contains("LIMIT"),
         "{err}"
     );
     assert!(
@@ -149,8 +149,8 @@ async fn explain_and_views_do_not_bypass_required_mode() -> Result<()> {
         .await?;
     for query in [
         "SELECT * FROM totals",
-        "SELECT id FROM items WHERE false",
-        "EXPLAIN SELECT id FROM items ORDER BY id",
+        "SELECT 1",
+        "EXPLAIN SELECT id FROM items LIMIT 3",
         "EXPLAIN FORMAT PGJSON SELECT * FROM totals",
         "EXPLAIN ANALYZE SELECT * FROM totals",
     ] {
@@ -253,7 +253,7 @@ async fn required_mode_checks_explicit_planners() -> Result<()> {
         .collect()
         .await?;
     assert_eq!(physical(&explicit, scan).await?.name(), "MorselExec");
-    let err = physical(&explicit, "SELECT id FROM items ORDER BY id")
+    let err = physical(&explicit, "SELECT id FROM items LIMIT 3")
         .await
         .unwrap_err()
         .to_string();
@@ -520,7 +520,6 @@ async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
         )?;
     }
     for sql in [
-        "SELECT id FROM items ORDER BY id DESC",
         "SELECT id FROM items LIMIT 3",
         "SELECT MEDIAN(id) FROM items WHERE threshold > 0",
         "SELECT COUNT(DISTINCT id) FROM items WHERE threshold > 0",
@@ -1063,7 +1062,6 @@ async fn unsupported_group_by_shapes_reject_in_required_and_fallback_in_prefer()
         "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)",
         "SELECT id, COUNT(*) FROM t GROUP BY CUBE(id)",
         "SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 1",
-        "SELECT id, COUNT(*) FROM t GROUP BY id ORDER BY id",
         "SELECT id, COUNT(*) FROM t GROUP BY id LIMIT 2",
     ] {
         let err = physical(&required, sql).await.unwrap_err().to_string();
