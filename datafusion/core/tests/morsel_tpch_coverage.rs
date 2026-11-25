@@ -1626,3 +1626,235 @@ async fn still_unsupported_operators_reject_in_required_and_fallback_in_prefer()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn limit_streams_without_stage_bounds_memory_and_join_prunes_filter_columns()
+-> Result<()> {
+    // 1. One 8 MB MemTable batch (1_048_576 Int64 rows) under a 2 MB GreedyMemoryPool.
+    let n_rows = 1_048_576usize;
+    let big_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let big_batch = RecordBatch::try_new(
+        Arc::clone(&big_schema),
+        vec![Arc::new(Int64Array::from_iter_values(0..n_rows as i64)) as ArrayRef],
+    )?;
+    let big_mem = Arc::new(MemTable::try_new(
+        Arc::clone(&big_schema),
+        vec![vec![big_batch.clone()]],
+    )?);
+
+    // Multi-row-group Parquet table (~16 MB uncompressed: 524_288 rows × 32 bytes/row)
+    // tested with LIMIT 500000 under a tight 4 MB pool to prove streaming without buffering.
+    let pq_dir = TempDir::new()?;
+    let pq_rows = 524_288usize;
+    let pq_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v1", DataType::Int64, false),
+        Field::new("v2", DataType::Int64, false),
+        Field::new("v3", DataType::Int64, false),
+    ]));
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(16_384))
+        .build();
+    let pq_path = pq_dir.path().join("0.parquet");
+    {
+        let mut writer = ArrowWriter::try_new(
+            File::create(&pq_path)?,
+            Arc::clone(&pq_schema),
+            Some(props),
+        )?;
+        let chunk = 65_536usize;
+        for start in (0..pq_rows).step_by(chunk) {
+            let end = (start + chunk).min(pq_rows);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&pq_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start as i64..end as i64))
+                        as ArrayRef,
+                    Arc::new(Int64Array::from_iter_values(start as i64..end as i64)),
+                    Arc::new(Int64Array::from_iter_values(start as i64..end as i64)),
+                    Arc::new(Int64Array::from_iter_values(start as i64..end as i64)),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    let pool_2mb: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2 * 1024 * 1024));
+    let ctx_2mb = morsel_context(
+        4,
+        8192,
+        MorselMode::Required,
+        false,
+        Some(Arc::clone(&pool_2mb)),
+    );
+    ctx_2mb.register_table("big", big_mem.clone())?;
+
+    // EXPLAIN for scan + LIMIT shows NO `[Stage` (single streaming Sink::Limit).
+    for sql in [
+        "SELECT k FROM big LIMIT 1",
+        "SELECT k FROM big LIMIT 500000",
+        "SELECT k + 1 FROM big LIMIT 100 OFFSET 5",
+    ] {
+        let plan = ctx_2mb.sql(sql).await?.create_physical_plan().await?;
+        let display = displayable(plan.as_ref()).indent(false).to_string();
+        assert_eq!(plan.name(), "MorselExec");
+        assert!(
+            !display.contains("[Stage"),
+            "scan+LIMIT should stream without staging for `{sql}`, got:\n{display}"
+        );
+        let batches = collect(plan, ctx_2mb.task_ctx()).await?;
+        let got_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let want_rows = if sql.contains("LIMIT 1 ") || sql.ends_with("LIMIT 1") {
+            1
+        } else if sql.contains("LIMIT 500000") {
+            500_000
+        } else {
+            100
+        };
+        assert_eq!(got_rows, want_rows, "{sql}");
+        assert_eq!(pool_2mb.reserved(), 0, "leaked memory after `{sql}`");
+    }
+
+    // LIMIT feeding an Aggregate or Join must create at most 1 stage (never 2) and
+    // must not charge pre-existing MemTable buffers against the 2 MB pool.
+    let agg_over_limit = "SELECT COUNT(*) FROM (SELECT k FROM big LIMIT 1)";
+    let agg_plan = ctx_2mb
+        .sql(agg_over_limit)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let agg_display = displayable(agg_plan.as_ref()).indent(false).to_string();
+    assert_eq!(
+        agg_display.matches("[Stage").count(),
+        1,
+        "LIMIT feeding Aggregate should create only 1 stage:\n{agg_display}"
+    );
+    let agg_batches = collect(agg_plan, ctx_2mb.task_ctx()).await?;
+    let count_val = agg_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_val, 1);
+    assert_eq!(pool_2mb.reserved(), 0);
+
+    let big_agg_over_limit = "SELECT COUNT(*) FROM (SELECT k FROM big LIMIT 500000)";
+    let big_agg_plan = ctx_2mb
+        .sql(big_agg_over_limit)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let big_agg_display = displayable(big_agg_plan.as_ref()).indent(false).to_string();
+    assert_eq!(
+        big_agg_display.matches("[Stage").count(),
+        1,
+        "large MemTable LIMIT feeding Aggregate should create only 1 stage:\n{big_agg_display}"
+    );
+    let big_agg_batches = collect(big_agg_plan, ctx_2mb.task_ctx()).await?;
+    let big_count_val = big_agg_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(big_count_val, 500_000);
+    assert_eq!(pool_2mb.reserved(), 0);
+
+    // Large Parquet scan + LIMIT 500000 (~16 MB) under a tight 4 MB pool streams
+    // cleanly without staging or OOMing.
+    let pool_4mb: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * 1024 * 1024));
+    let ctx_4mb = morsel_context(
+        4,
+        8192,
+        MorselMode::Required,
+        false,
+        Some(Arc::clone(&pool_4mb)),
+    );
+    ctx_4mb
+        .register_parquet(
+            "pq_big",
+            pq_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    let pq_limit_sql = "SELECT * FROM pq_big LIMIT 500000";
+    let pq_plan = ctx_4mb
+        .sql(pq_limit_sql)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let pq_display = displayable(pq_plan.as_ref()).indent(false).to_string();
+    assert_eq!(pq_plan.name(), "MorselExec");
+    assert!(
+        !pq_display.contains("[Stage"),
+        "Parquet scan+LIMIT should stream without staging:\n{pq_display}"
+    );
+    let mut stream = execute_stream(pq_plan, ctx_4mb.task_ctx())?;
+    let mut pq_got_rows = 0usize;
+    while let Some(batch) = stream.next().await.transpose()? {
+        pq_got_rows += batch.num_rows();
+    }
+    assert_eq!(pq_got_rows, 500_000);
+    drop(stream);
+    timeout(Duration::from_secs(5), async {
+        while pool_4mb.reserved() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pool reservation leaked after large Parquet LIMIT");
+
+    // 2. Join input filter column pruning at workers=4.
+    let t_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("g", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let t_batch = RecordBatch::try_new(
+        Arc::clone(&t_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+        ],
+    )?;
+    let d_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("dname", DataType::Utf8, false),
+    ]));
+    let d_batch = RecordBatch::try_new(
+        Arc::clone(&d_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["d1", "d2", "d3"])),
+        ],
+    )?;
+    let stock = stock_context(4, 8192);
+    let native = morsel_context(4, 8192, MorselMode::Required, false, None);
+    for ctx in [&stock, &native] {
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&t_schema),
+                vec![vec![t_batch.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "d",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&d_schema),
+                vec![vec![d_batch.clone()]],
+            )?),
+        )?;
+    }
+    let join_sql = "SELECT d.dname, x.k FROM d JOIN (SELECT k, v FROM t WHERE g = 'a') x ON d.dk = x.k";
+    let join_plan = assert_native_parity(&stock, &native, join_sql, false).await?;
+    let join_display = displayable(join_plan.as_ref()).indent(false).to_string();
+    assert!(
+        join_display.contains("projection=[0]"),
+        "expected filter-only column pruning on join input at workers=4, got:\n{join_display}"
+    );
+    Ok(())
+}

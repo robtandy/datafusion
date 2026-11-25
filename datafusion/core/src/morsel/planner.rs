@@ -94,6 +94,7 @@ struct OpenOptimizeHint {
     skip_filter_pruning: bool,
     is_general_agg: bool,
     has_sort: bool,
+    always_prune_filter: bool,
 }
 
 impl LoweredNode {
@@ -344,70 +345,27 @@ impl DagBuilder<'_> {
 
             match node {
                 LogicalPlan::TableScan(scan) => {
-                    let source = match self.lower_scan_source(scan).await? {
-                        Ok(s) => s,
-                        Err(reason) => return Ok(Err(reason)),
-                    };
                     if scan.fetch.is_some() || scan.skip.is_some() {
                         let skip = scan.skip.unwrap_or(0);
                         let fetch = scan.fetch;
-                        let input_est = estimate_side_size(&source, &[], &self.stages);
-                        let (result_operators, schema) = match self
-                            .lower_operators(post_nodes, Arc::clone(source.schema()))
-                            .await?
-                        {
-                            Ok(v) => v,
-                            Err(reason) => return Ok(Err(reason)),
-                        };
-                        let estimate = match fetch {
-                            Some(0) => SideEstimate {
-                                is_empty: true,
-                                mem_rows: Some(0),
-                                approx_bytes: 0,
-                            },
-                            Some(k) => SideEstimate {
-                                is_empty: input_est.is_empty,
-                                mem_rows: Some(k),
-                                approx_bytes: (k as u64).saturating_mul(64),
-                            },
-                            None => input_est,
-                        };
-                        return Ok(Ok(LoweredNode::Blocking(Box::new(
-                            BlockingPipeline {
-                                source,
-                                operators: Vec::new(),
-                                sink: Sink::Limit {
-                                    skip,
-                                    fetch,
-                                    result_operators,
-                                },
-                                schema,
-                                ordering: None,
-                                estimate,
-                            },
-                        ))));
+                        let mut open =
+                            match self.lower_scan_open(scan, Vec::new()).await? {
+                                Ok(v) => v,
+                                Err(reason) => return Ok(Err(reason)),
+                            };
+                        self.optimize_open_pipeline(
+                            &mut open,
+                            OpenOptimizeHint::default(),
+                        )?;
+                        return self
+                            .finish_limit_plan(open, skip, fetch, post_nodes)
+                            .await;
                     }
-                    #[cfg(feature = "parquet")]
-                    let parquet_scan_meta =
-                        matches!(source, Source::Parquet(_)).then(|| ParquetScanMeta {
-                            filters: scan.filters.clone(),
-                            projected_schema: Arc::clone(&scan.projected_schema),
-                        });
-                    let (operators, schema) = match self
-                        .lower_operators(post_nodes, Arc::clone(source.schema()))
-                        .await?
-                    {
+                    let open = match self.lower_scan_open(scan, post_nodes).await? {
                         Ok(v) => v,
                         Err(reason) => return Ok(Err(reason)),
                     };
-                    Ok(Ok(LoweredNode::Open(Box::new(OpenPipeline {
-                        source,
-                        #[cfg(feature = "parquet")]
-                        parquet_scan_meta,
-                        operators,
-                        schema,
-                        ordering: None,
-                    }))))
+                    Ok(Ok(LoweredNode::Open(Box::new(open))))
                 }
                 LogicalPlan::EmptyRelation(empty) => {
                     let source = self.lower_empty_relation(empty)?;
@@ -545,10 +503,52 @@ impl DagBuilder<'_> {
         })
     }
 
+    async fn lower_scan_open(
+        &mut self,
+        scan: &TableScan,
+        post_nodes: Vec<&LogicalPlan>,
+    ) -> Result<std::result::Result<OpenPipeline, String>> {
+        let source = match self.lower_scan_source(scan).await? {
+            Ok(s) => s,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        #[cfg(feature = "parquet")]
+        let parquet_scan_meta =
+            matches!(source, Source::Parquet(_)).then(|| ParquetScanMeta {
+                filters: scan.filters.clone(),
+                projected_schema: Arc::clone(&scan.projected_schema),
+            });
+        let (operators, schema) = match self
+            .lower_operators(post_nodes, Arc::clone(source.schema()))
+            .await?
+        {
+            Ok(v) => v,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        Ok(Ok(OpenPipeline {
+            source,
+            #[cfg(feature = "parquet")]
+            parquet_scan_meta,
+            operators,
+            schema,
+            ordering: None,
+        }))
+    }
+
     async fn lower_as_open(
         &mut self,
         plan: &LogicalPlan,
         count_only: bool,
+    ) -> Result<std::result::Result<OpenPipeline, String>> {
+        self.lower_as_open_with_hint(plan, count_only, OpenOptimizeHint::default())
+            .await
+    }
+
+    async fn lower_as_open_with_hint(
+        &mut self,
+        plan: &LogicalPlan,
+        count_only: bool,
+        hint: OpenOptimizeHint,
     ) -> Result<std::result::Result<OpenPipeline, String>> {
         let node = match self.lower_node(plan, count_only).await? {
             Ok(n) => n,
@@ -556,7 +556,7 @@ impl DagBuilder<'_> {
         };
         match node {
             LoweredNode::Open(mut open) => {
-                self.optimize_open_pipeline(&mut open, OpenOptimizeHint::default())?;
+                self.optimize_open_pipeline(&mut open, hint)?;
                 Ok(Ok(*open))
             }
             LoweredNode::Blocking(blocking) => {
@@ -698,6 +698,7 @@ impl DagBuilder<'_> {
                     self.workers == NonZeroUsize::MIN
                         || hint.is_general_agg
                         || hint.has_sort
+                        || hint.always_prune_filter
                 }
                 #[cfg(feature = "parquet")]
                 Source::Parquet(_) => true,
@@ -978,7 +979,7 @@ impl DagBuilder<'_> {
                 is_count_star,
                 skip_filter_pruning,
                 is_general_agg,
-                has_sort: false,
+                ..Default::default()
             },
         )?;
         let input_est = estimate_side_size(&open.source, &open.operators, &self.stages);
@@ -1319,6 +1320,50 @@ impl DagBuilder<'_> {
         }
     }
 
+    async fn finish_limit_plan(
+        &mut self,
+        open: OpenPipeline,
+        skip: usize,
+        fetch: Option<usize>,
+        post_nodes: Vec<&LogicalPlan>,
+    ) -> Result<std::result::Result<LoweredNode, String>> {
+        let input_est = estimate_side_size(&open.source, &open.operators, &self.stages);
+        let (result_operators, out_schema) = match self
+            .lower_operators(post_nodes, Arc::clone(&open.schema))
+            .await?
+        {
+            Ok(v) => v,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let out_ordering =
+            project_ordering(&open.schema, open.ordering, &result_operators)?;
+        let estimate = match fetch {
+            Some(0) => SideEstimate {
+                is_empty: true,
+                mem_rows: Some(0),
+                approx_bytes: 0,
+            },
+            Some(k) => SideEstimate {
+                is_empty: input_est.is_empty,
+                mem_rows: Some(k),
+                approx_bytes: (k as u64).saturating_mul(64),
+            },
+            None => input_est,
+        };
+        Ok(Ok(LoweredNode::Blocking(Box::new(BlockingPipeline {
+            source: open.source,
+            operators: open.operators,
+            sink: Sink::Limit {
+                skip,
+                fetch,
+                result_operators,
+            },
+            schema: out_schema,
+            ordering: out_ordering,
+            estimate,
+        }))))
+    }
+
     async fn lower_limit_plan(
         &mut self,
         first_limit: &Limit,
@@ -1328,7 +1373,7 @@ impl DagBuilder<'_> {
         let mut combined_fetch: Option<usize> = None;
         let mut cur_limit = first_limit;
         let mut between_projections: Vec<&LogicalPlan> = Vec::new();
-        let below_limit = loop {
+        let (below_limit, all_post_nodes) = loop {
             let SkipType::Literal(skip) = cur_limit.get_skip_type()? else {
                 return Ok(Err(format!(
                     "unsupported non-literal OFFSET expression in native morsels: {}",
@@ -1363,65 +1408,53 @@ impl DagBuilder<'_> {
                     _ => break,
                 }
             }
-            if let LogicalPlan::Limit(inner_limit) = next
-                && projs.is_empty()
-            {
-                cur_limit = inner_limit;
-                continue;
+            match next {
+                LogicalPlan::Limit(inner_limit) => {
+                    between_projections.extend(projs);
+                    cur_limit = inner_limit;
+                }
+                LogicalPlan::Sort(sort) => {
+                    // Fold Limit(+Projection*) directly into Sort -> TopN fast path!
+                    let mut all_post = post_nodes;
+                    all_post.extend(between_projections);
+                    all_post.extend(projs);
+                    let (skip, fetch) =
+                        combine_limit(combined_skip, combined_fetch, 0, sort.fetch);
+                    return self.lower_sort_plan(sort, skip, fetch, all_post).await;
+                }
+                LogicalPlan::TableScan(scan) => {
+                    // Fold scan.skip/scan.fetch into the enclosing Limit so scan+LIMIT
+                    // stays a single streaming Sink::Limit over an open scan with no stage.
+                    let (skip, fetch) = combine_limit(
+                        combined_skip,
+                        combined_fetch,
+                        scan.skip.unwrap_or(0),
+                        scan.fetch,
+                    );
+                    between_projections.extend(projs);
+                    let mut open =
+                        match self.lower_scan_open(scan, between_projections).await? {
+                            Ok(v) => v,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                    self.optimize_open_pipeline(&mut open, OpenOptimizeHint::default())?;
+                    return self.finish_limit_plan(open, skip, fetch, post_nodes).await;
+                }
+                _ => {
+                    let mut all_post = post_nodes;
+                    all_post.extend(between_projections);
+                    break (cur_limit.input.as_ref(), all_post);
+                }
             }
-            if let LogicalPlan::Sort(sort) = next {
-                // Fold Limit(+Projection*) directly into Sort -> TopN fast path!
-                let mut all_post = post_nodes;
-                all_post.extend(between_projections);
-                all_post.extend(projs);
-                let (skip, fetch) =
-                    combine_limit(combined_skip, combined_fetch, 0, sort.fetch);
-                return self.lower_sort_plan(sort, skip, fetch, all_post).await;
-            }
-            between_projections.extend(projs);
-            break cur_limit.input.as_ref();
         };
 
-        // Standalone Limit (without Sort directly underneath).
+        // Standalone Limit (without Sort or direct TableScan underneath).
         let open = match self.lower_as_open(below_limit, false).await? {
             Ok(v) => v,
             Err(reason) => return Ok(Err(reason)),
         };
-        let input_est = estimate_side_size(&open.source, &open.operators, &self.stages);
-        let (result_operators, out_schema) = match self
-            .lower_operators(post_nodes, Arc::clone(&open.schema))
-            .await?
-        {
-            Ok(v) => v,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        let out_ordering =
-            project_ordering(&open.schema, open.ordering, &result_operators)?;
-        let estimate = match combined_fetch {
-            Some(0) => SideEstimate {
-                is_empty: true,
-                mem_rows: Some(0),
-                approx_bytes: 0,
-            },
-            Some(k) => SideEstimate {
-                is_empty: input_est.is_empty,
-                mem_rows: Some(k),
-                approx_bytes: (k as u64).saturating_mul(64),
-            },
-            None => input_est,
-        };
-        Ok(Ok(LoweredNode::Blocking(Box::new(BlockingPipeline {
-            source: open.source,
-            operators: open.operators,
-            sink: Sink::Limit {
-                skip: combined_skip,
-                fetch: combined_fetch,
-                result_operators,
-            },
-            schema: out_schema,
-            ordering: out_ordering,
-            estimate,
-        }))))
+        self.finish_limit_plan(open, combined_skip, combined_fetch, all_post_nodes)
+            .await
     }
 
     async fn lower_join_plan(
@@ -1511,11 +1544,21 @@ impl DagBuilder<'_> {
             }
         }
 
-        let left_open = match self.lower_as_open(&join.left, false).await? {
+        let join_side_hint = OpenOptimizeHint {
+            always_prune_filter: true,
+            ..Default::default()
+        };
+        let left_open = match self
+            .lower_as_open_with_hint(&join.left, false, join_side_hint)
+            .await?
+        {
             Ok(v) => v,
             Err(reason) => return Ok(Err(reason)),
         };
-        let right_open = match self.lower_as_open(&join.right, false).await? {
+        let right_open = match self
+            .lower_as_open_with_hint(&join.right, false, join_side_hint)
+            .await?
+        {
             Ok(v) => v,
             Err(reason) => return Ok(Err(reason)),
         };

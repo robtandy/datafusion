@@ -10,8 +10,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{BooleanArray, RecordBatch};
-use arrow::compute::filter_record_batch;
+use arrow::array::{BooleanArray, RecordBatch, UInt32Array};
+use arrow::compute::{filter_record_batch, take_record_batch};
 #[cfg(test)]
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -3061,16 +3061,16 @@ impl Pipeline {
                     abort_and_drain(&mut inner_tasks).await;
                     return Ok(());
                 }
-                if batch.num_rows() == 0 {
+                let orig_rows = batch.num_rows();
+                if orig_rows == 0 {
                     continue;
                 }
-                if remaining_skip >= batch.num_rows() {
-                    remaining_skip -= batch.num_rows();
+                if remaining_skip >= orig_rows {
+                    remaining_skip -= orig_rows;
                     continue;
                 }
                 if remaining_skip > 0 {
-                    batch =
-                        batch.slice(remaining_skip, batch.num_rows() - remaining_skip);
+                    batch = batch.slice(remaining_skip, orig_rows - remaining_skip);
                     remaining_skip = 0;
                 }
                 if let Some(rem) = remaining_fetch.as_mut() {
@@ -3083,6 +3083,15 @@ impl Pipeline {
                         batch = batch.slice(0, *rem);
                     }
                     *rem -= batch.num_rows();
+                }
+                if batch.num_columns() > 0
+                    && batch.num_rows().saturating_mul(2) < orig_rows
+                    && u32::try_from(batch.num_rows()).is_ok()
+                {
+                    let indices =
+                        UInt32Array::from_iter_values(0..batch.num_rows() as u32);
+                    let compacted = take_record_batch(&batch, &indices)?;
+                    batch = sort::gc_view_batch(&compacted)?;
                 }
                 let out = apply_operators(result_operators, batch)?;
                 if out.num_rows() > 0 {
@@ -3754,7 +3763,8 @@ impl Pipeline {
             let _sq_guard = scalar_subqueries
                 .as_ref()
                 .map(ScalarSubqueryState::acquire_run);
-            let mut dag = DagRuntime::new(stages, consumer_counts);
+            let mut dag =
+                DagRuntime::new(stages, consumer_counts, &self, context.memory_pool());
 
             if let Some(sq_state) = &scalar_subqueries {
                 let cont = sq_state

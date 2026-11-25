@@ -277,7 +277,7 @@ fn gc_view_array(array: &ArrayRef) -> Result<(ArrayRef, bool)> {
     }
 }
 
-fn gc_view_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+pub(super) fn gc_view_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     if !schema_has_view(batch.schema().as_ref()) {
         return Ok(batch.clone());
     }

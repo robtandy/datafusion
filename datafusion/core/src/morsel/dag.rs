@@ -17,7 +17,7 @@ use datafusion_common::{
 };
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_expr::{Expr, LogicalPlan, Subquery};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -165,11 +165,107 @@ fn extract_scalar_value(
     }
 }
 
+/// Run-wide buffer-deduplicating memory accounting for materialized intermediate
+/// stages. Pre-existing `MemTable` source buffers are seeded without charging
+/// the pool, and execution-allocated buffers shared across stages are charged
+/// once and released when the last referencing stage drops.
+#[derive(Debug)]
+pub(super) struct SharedStageMemory {
+    inner: Mutex<SharedStageMemoryInner>,
+}
+
+#[derive(Debug)]
+struct SharedStageMemoryInner {
+    tracker: RecordBatchMemoryTracker,
+    reservation: MemoryReservation,
+}
+
+impl SharedStageMemory {
+    pub(super) fn new(
+        stages: &[StageSpec],
+        root_pipeline: &Pipeline,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Arc<Self> {
+        let mut tracker = RecordBatchMemoryTracker::new();
+        for stage in stages {
+            seed_memory_source_buffers(&stage.pipeline, &mut tracker);
+        }
+        seed_memory_source_buffers(root_pipeline, &mut tracker);
+        let reservation = MemoryConsumer::new("MorselStageOutput").register(pool);
+        Arc::new(Self {
+            inner: Mutex::new(SharedStageMemoryInner {
+                tracker,
+                reservation,
+            }),
+        })
+    }
+
+    fn try_add_batch(&self, batch: &RecordBatch) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let delta = inner.tracker.count_batch(batch);
+        if delta > 0
+            && let Err(err) = inner.reservation.try_grow(delta)
+        {
+            inner.tracker.uncount_batch(batch);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn release_batches(&self, batches: &[RecordBatch]) {
+        let mut inner = self.inner.lock();
+        let mut freed = 0usize;
+        for batch in batches {
+            freed = freed.saturating_add(inner.tracker.uncount_batch(batch));
+        }
+        if freed > 0 {
+            inner.reservation.shrink(freed);
+        }
+    }
+}
+
+fn seed_memory_source_buffers(
+    pipeline: &Pipeline,
+    tracker: &mut RecordBatchMemoryTracker,
+) {
+    if let Source::Memory(mem) = &pipeline.source {
+        for batch in &mem.batches {
+            tracker.count_batch(batch);
+        }
+    }
+    for op in &pipeline.operators {
+        if let Operator::HashProbe(probe) = op {
+            seed_memory_source_buffers(&probe.build_pipeline, tracker);
+        }
+    }
+}
+
 /// Finalized, pool-accounted output batches of an intermediate DAG stage.
 #[derive(Debug)]
 pub(super) struct MaterializedStage {
     pub(super) batches: Vec<RecordBatch>,
-    pub(super) _reservation: MemoryReservation,
+    memory: Arc<SharedStageMemory>,
+}
+
+impl MaterializedStage {
+    fn new(memory: Arc<SharedStageMemory>) -> Self {
+        Self {
+            batches: Vec::new(),
+            memory,
+        }
+    }
+
+    fn try_push(&mut self, batch: RecordBatch) -> Result<()> {
+        self.memory.try_add_batch(&batch)?;
+        self.batches.push(batch);
+        Ok(())
+    }
+}
+
+impl Drop for MaterializedStage {
+    fn drop(&mut self) {
+        self.memory.release_batches(&self.batches);
+    }
 }
 
 /// Mutable per-run DAG execution state owned exclusively by the run supervisor.
@@ -177,15 +273,23 @@ pub(super) struct DagRuntime {
     stages: Arc<Vec<StageSpec>>,
     outputs: Vec<Option<Arc<MaterializedStage>>>,
     remaining_consumers: Vec<usize>,
+    memory: Arc<SharedStageMemory>,
 }
 
 impl DagRuntime {
-    pub(super) fn new(stages: Arc<Vec<StageSpec>>, consumer_counts: Vec<usize>) -> Self {
+    pub(super) fn new(
+        stages: Arc<Vec<StageSpec>>,
+        consumer_counts: Vec<usize>,
+        root_pipeline: &Pipeline,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Self {
         let n = stages.len();
+        let memory = SharedStageMemory::new(&stages, root_pipeline, pool);
         Self {
             stages,
             outputs: vec![None; n],
             remaining_consumers: consumer_counts,
+            memory,
         }
     }
 
@@ -430,10 +534,7 @@ pub(super) fn ensure_stage<'a>(
             });
         }
 
-        let reservation =
-            MemoryConsumer::new("MorselStageOutput").register(context.memory_pool());
-        let mut tracker = RecordBatchMemoryTracker::new();
-        let mut batches = Vec::new();
+        let mut stage = MaterializedStage::new(Arc::clone(&dag.memory));
         let mut task_done = false;
 
         loop {
@@ -443,8 +544,7 @@ pub(super) fn ensure_stage<'a>(
                     _ = cancel_tx.closed() => {
                         drop(stage_rx);
                         abort_and_drain(&mut stage_tasks).await;
-                        drop(batches);
-                        drop(reservation);
+                        drop(stage);
                         return Ok(None);
                     }
                     result = stage_tasks.join_next() => {
@@ -453,20 +553,17 @@ pub(super) fn ensure_stage<'a>(
                             Some(Ok(Ok(()))) | None => {}
                             Some(Ok(Err(err))) => {
                                 drop(stage_rx);
-                                drop(batches);
-                                drop(reservation);
+                                drop(stage);
                                 return Err(err);
                             }
                             Some(Err(err)) if err.is_panic() => {
                                 drop(stage_rx);
-                                drop(batches);
-                                drop(reservation);
+                                drop(stage);
                                 std::panic::resume_unwind(err.into_panic())
                             }
                             Some(Err(err)) => {
                                 drop(stage_rx);
-                                drop(batches);
-                                drop(reservation);
+                                drop(stage);
                                 return Err(exec_datafusion_err!(
                                     "Morsel stage task failed: {err}"
                                 ));
@@ -480,15 +577,12 @@ pub(super) fn ensure_stage<'a>(
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        let delta = tracker.count_batch(&batch);
-                        if let Err(err) = reservation.try_grow(delta) {
+                        if let Err(err) = stage.try_push(batch) {
                             drop(stage_rx);
                             abort_and_drain(&mut stage_tasks).await;
-                            drop(batches);
-                            drop(reservation);
+                            drop(stage);
                             return Err(err);
                         }
-                        batches.push(batch);
                     }
                 }
             } else {
@@ -499,18 +593,14 @@ pub(super) fn ensure_stage<'a>(
                         }
                         if cancel_tx.is_closed() {
                             drop(stage_rx);
-                            drop(batches);
-                            drop(reservation);
+                            drop(stage);
                             return Ok(None);
                         }
-                        let delta = tracker.count_batch(&batch);
-                        if let Err(err) = reservation.try_grow(delta) {
+                        if let Err(err) = stage.try_push(batch) {
                             drop(stage_rx);
-                            drop(batches);
-                            drop(reservation);
+                            drop(stage);
                             return Err(err);
                         }
-                        batches.push(batch);
                     }
                     None => break,
                 }
@@ -522,18 +612,15 @@ pub(super) fn ensure_stage<'a>(
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        drop(batches);
-                        drop(reservation);
+                        drop(stage);
                         return Err(err);
                     }
                     Err(err) if err.is_panic() => {
-                        drop(batches);
-                        drop(reservation);
+                        drop(stage);
                         std::panic::resume_unwind(err.into_panic())
                     }
                     Err(err) => {
-                        drop(batches);
-                        drop(reservation);
+                        drop(stage);
                         return Err(exec_datafusion_err!(
                             "Morsel stage task failed: {err}"
                         ));
@@ -543,15 +630,11 @@ pub(super) fn ensure_stage<'a>(
         }
 
         if cancel_tx.is_closed() {
-            drop(batches);
-            drop(reservation);
+            drop(stage);
             return Ok(None);
         }
 
-        let artifact = Arc::new(MaterializedStage {
-            batches,
-            _reservation: reservation,
-        });
+        let artifact = Arc::new(stage);
         dag.outputs[stage_id.0] = Some(Arc::clone(&artifact));
         Ok(Some(artifact))
     })
