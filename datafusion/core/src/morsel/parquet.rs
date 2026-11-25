@@ -413,6 +413,10 @@ impl ParquetScan {
         Ok(())
     }
 
+    pub(super) fn pushdown_filters(&self) -> bool {
+        self.pushdown_filters
+    }
+
     pub(super) fn pushed_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.config.as_ref()?.file_source().exact_filter()
     }

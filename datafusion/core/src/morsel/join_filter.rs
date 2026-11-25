@@ -68,6 +68,10 @@ const MAX_BLOOM_KEYS: usize = 5_000_000;
 pub(super) struct DynamicJoinFilterConfig {
     pub(super) max_inlist_values: usize,
     pub(super) max_inlist_bytes: usize,
+    /// Build a split-block Bloom filter only when the probe Parquet scan runs
+    /// row-level `RowFilter` (`pushdown_filters = true`); when false, only
+    /// min/max bounds and small `InList` are needed for file-open pruning.
+    pub(super) build_bloom: bool,
 }
 
 /// Cache-line-friendly 256-bit (8 x `u32`) split-block Bloom filter.

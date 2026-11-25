@@ -790,12 +790,12 @@ impl HashJoinBuildSink {
                 return Ok(None);
             };
             drop(key_batches);
-            drop(hash_chunks);
-            drop(valid_masks);
             let dynamic_filter = match (self.dynamic_filter, key_summary) {
                 (Some(cfg), Some(summary)) => {
                     let membership = Self::build_flat_int_membership(
                         &keys,
+                        &hash_chunks,
+                        &valid_masks,
                         distinct_count,
                         cfg,
                         &reservation,
@@ -810,6 +810,8 @@ impl HashJoinBuildSink {
                 }
                 _ => None,
             };
+            drop(hash_chunks);
+            drop(valid_masks);
             (keys, Vec::new(), Vec::new(), dynamic_filter)
         } else {
             let small_inlist = if let Some(cfg) = self.dynamic_filter
@@ -857,7 +859,7 @@ impl HashJoinBuildSink {
                 }
             }
             let dynamic_filter = match (self.dynamic_filter, key_summary) {
-                (Some(_), Some(summary)) => {
+                (Some(cfg), Some(summary)) => {
                     let membership = if let Some(arr) = small_inlist {
                         let bytes = arr.get_array_memory_size();
                         if reservation.try_grow(bytes).is_ok() {
@@ -865,11 +867,12 @@ impl HashJoinBuildSink {
                         } else {
                             JoinMembershipFilter::None
                         }
-                    } else if hash_entries > 1
-                        || self.key_types.len() > 1
-                        || self.has_floats
+                    } else if cfg.build_bloom
+                        && (hash_entries > 1
+                            || self.key_types.len() > 1
+                            || self.has_floats)
                     {
-                        Self::build_chained_bloom_membership(
+                        Self::build_bloom_membership(
                             &hash_chunks,
                             &valid_masks,
                             hash_entries,
@@ -920,6 +923,8 @@ impl HashJoinBuildSink {
 
     fn build_flat_int_membership(
         keys: &BuildKeys,
+        hash_chunks: &[Vec<u64>],
+        valid_masks: &[Option<BooleanBuffer>],
         distinct_count: usize,
         cfg: DynamicJoinFilterConfig,
         reservation: &MemoryReservation,
@@ -927,8 +932,8 @@ impl HashJoinBuildSink {
         if distinct_count <= 1 {
             return JoinMembershipFilter::None;
         }
-        macro_rules! build_int_membership {
-            ($table:expr, $Arr:ty, $K:ty, $to_u64:expr) => {{
+        macro_rules! try_int_inlist {
+            ($table:expr, $Arr:ty, $K:ty) => {{
                 let inlist_bytes = distinct_count.saturating_mul(size_of::<$K>());
                 if distinct_count <= cfg.max_inlist_values
                     && inlist_bytes <= cfg.max_inlist_bytes
@@ -947,50 +952,34 @@ impl HashJoinBuildSink {
                     }
                     return JoinMembershipFilter::None;
                 }
-                let Some(num_blocks) =
-                    SplitBlockBloomFilter::num_blocks_for_entries(distinct_count)
-                else {
-                    return JoinMembershipFilter::None;
-                };
-                let est_bytes = SplitBlockBloomFilter::estimated_bytes(num_blocks);
-                if reservation.try_grow(est_bytes).is_err() {
-                    return JoinMembershipFilter::None;
-                }
-                let mut bloom = SplitBlockBloomFilter::with_blocks(num_blocks);
-                let to_u64: fn($K) -> u64 = $to_u64;
-                for slot in &$table.slots {
-                    if slot.first_row != 0 {
-                        bloom.insert(mix_u64(to_u64(slot.key)));
-                    }
-                }
-                JoinMembershipFilter::Bloom(Arc::new(bloom))
             }};
         }
         match keys {
-            BuildKeys::Int32(t) => {
-                build_int_membership!(t, Int32Array, i32, |v: i32| v as u32 as u64)
-            }
-            BuildKeys::Int64(t) => {
-                build_int_membership!(t, Int64Array, i64, |v: i64| v as u64)
-            }
-            BuildKeys::UInt32(t) => {
-                build_int_membership!(t, UInt32Array, u32, |v: u32| v as u64)
-            }
-            BuildKeys::UInt64(t) => {
-                build_int_membership!(t, UInt64Array, u64, |v: u64| v)
-            }
-            _ => JoinMembershipFilter::None,
+            BuildKeys::Int32(t) => try_int_inlist!(t, Int32Array, i32),
+            BuildKeys::Int64(t) => try_int_inlist!(t, Int64Array, i64),
+            BuildKeys::UInt32(t) => try_int_inlist!(t, UInt32Array, u32),
+            BuildKeys::UInt64(t) => try_int_inlist!(t, UInt64Array, u64),
+            _ => return JoinMembershipFilter::None,
         }
+        if !cfg.build_bloom {
+            return JoinMembershipFilter::None;
+        }
+        Self::build_bloom_membership(
+            hash_chunks,
+            valid_masks,
+            distinct_count,
+            reservation,
+        )
     }
 
-    fn build_chained_bloom_membership(
+    fn build_bloom_membership(
         hash_chunks: &[Vec<u64>],
         valid_masks: &[Option<BooleanBuffer>],
-        hash_entries: usize,
+        distinct_entries: usize,
         reservation: &MemoryReservation,
     ) -> JoinMembershipFilter {
         let Some(num_blocks) =
-            SplitBlockBloomFilter::num_blocks_for_entries(hash_entries)
+            SplitBlockBloomFilter::num_blocks_for_entries(distinct_entries)
         else {
             return JoinMembershipFilter::None;
         };

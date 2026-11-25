@@ -1926,13 +1926,14 @@ impl DagBuilder<'_> {
             );
             if opt.enable_dynamic_filter_pushdown
                 && opt.enable_join_dynamic_filter_pushdown
-                && matches!(probe_source, Source::Parquet(_))
+                && let Source::Parquet(ref probe_parquet) = probe_source
                 && kind.allows_dynamic_filter_pushdown()
                 && !blocked_by_intervening_build_emit
             {
                 Some(DynamicJoinFilterConfig {
                     max_inlist_values: opt.hash_join_inlist_pushdown_max_distinct_values,
                     max_inlist_bytes: opt.hash_join_inlist_pushdown_max_size,
+                    build_bloom: probe_parquet.pushdown_filters(),
                 })
             } else {
                 None
