@@ -927,7 +927,7 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
         .with_can_spill(false)
         .register(memory_pool);
     let mut headroom_target = 0usize;
-    for target in [256 * 1024usize, 128 * 1024, 64 * 1024] {
+    for target in [64 * 1024usize, 32 * 1024] {
         if headroom_res.try_grow(target).is_ok() {
             headroom_target = target;
             break;

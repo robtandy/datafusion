@@ -8,18 +8,23 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{
-    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewBuilder,
+    ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StringViewBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::config::MorselMode;
+use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
+use datafusion::execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::morsel::MorselQueryPlanner;
 use datafusion::physical_plan::{ExecutionPlan, collect, execute_stream};
@@ -658,7 +663,7 @@ async fn sort_spills_under_tight_greedy_pool_with_exact_parity() -> Result<()> {
             );
         }
         drop(plan);
-        assert_zero_leaks(&runtime, label);
+        wait_zero_leaks(&runtime, label).await;
     }
     Ok(())
 }
@@ -936,5 +941,356 @@ async fn spill_cleanup_on_early_drop_worker_error_disk_quota_and_fair_pool() -> 
         }
     }
 
+    Ok(())
+}
+
+/// Fault-injecting MemoryPool that allows the first `MorselSpillViability`
+/// probe to succeed and rejects any subsequent viability probes (simulating a
+/// pool transiently filled by a concurrent query at sort/TopN finalize time).
+#[derive(Debug)]
+struct RejectSecondViabilityPool {
+    inner: GreedyMemoryPool,
+    viability_calls: AtomicUsize,
+}
+
+impl RejectSecondViabilityPool {
+    fn new(pool_size: usize) -> Self {
+        Self {
+            inner: GreedyMemoryPool::new(pool_size),
+            viability_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl std::fmt::Display for RejectSecondViabilityPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RejectSecondViabilityPool({})", self.inner)
+    }
+}
+
+impl MemoryPool for RejectSecondViabilityPool {
+    fn name(&self) -> &str {
+        "RejectSecondViabilityPool"
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        if reservation.consumer().name() == "MorselSpillViability" {
+            let n = self.viability_calls.fetch_add(1, Ordering::SeqCst);
+            if n >= 1 {
+                return Err(DataFusionError::ResourcesExhausted(
+                    "injected transient pool exhaustion during second viability probe"
+                        .into(),
+                ));
+            }
+        }
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sort_and_topn_spilled_finalize_reuses_spill_context_under_transient_pool_pressure()
+-> Result<()> {
+    let table = large_sort_table(48, 1024);
+    let stock = stock_context(4, 512);
+    stock.register_table("s", table.clone())?;
+
+    for (label, sql) in [
+        (
+            "sort_transient_viability_reject",
+            "SELECT id, sort_key, payload FROM s ORDER BY sort_key ASC NULLS LAST, id ASC",
+        ),
+        (
+            "topn_large_limit_transient_viability_reject",
+            "SELECT id, sort_key, payload FROM s ORDER BY sort_key DESC NULLS FIRST, id ASC LIMIT 30000",
+        ),
+    ] {
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(RejectSecondViabilityPool::new(1536 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("s", table.clone())?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec", "{label}");
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+
+        assert_exact_order(expected, actual, label)?;
+        assert!(
+            spilled_bytes(plan.as_ref()) > 0,
+            "{label}: expected spilled_bytes > 0"
+        );
+        drop(plan);
+        wait_zero_leaks(&runtime, label).await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fair_spill_pool_radix_join_into_group_by_and_sort_does_not_starve_downstream()
+-> Result<()> {
+    // 20,000 build rows (> RADIX_JOIN_THRESHOLD_ROWS = 16,384) guarantees a
+    // 64-way radix HashJoin feeding downstream spillable sinks under FairSpillPool.
+    let (build_tbl, probe_tbl) = large_join_tables(20_000, 24_000, 1024);
+    let stock = stock_context(4, 512);
+    stock.register_table("b", build_tbl.clone())?;
+    stock.register_table("p", probe_tbl.clone())?;
+
+    // 1. Join -> GROUP BY at generous 32 MiB FairSpillPool must NOT spill
+    //    (proves resident radix partitions do not register 64 spillable consumers).
+    {
+        let sql = "SELECT b.bk, COUNT(*) AS cnt, MIN(p.pval) AS lo FROM b INNER JOIN p ON b.bk = p.pk GROUP BY b.bk";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(32 * 1024 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("b", build_tbl.clone())?;
+        ctx.register_table("p", probe_tbl.clone())?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "FairSpillPool 32 MiB Join -> GROUP BY parity mismatch"
+        );
+        assert_eq!(
+            spilled_bytes(plan.as_ref()),
+            0,
+            "FairSpillPool 32 MiB Join -> GROUP BY should not spill when resident partitions use one non-spillable consumer"
+        );
+        drop(plan);
+        assert_zero_leaks(&runtime, "fair_32mb_join_group_by");
+    }
+
+    // 2. Join -> ORDER BY at tight 4 MiB FairSpillPool succeeds cleanly via
+    //    spilling without starving downstream Sort.
+    {
+        let sql = "SELECT b.bk, p.pk, p.pval FROM b INNER JOIN p ON b.bk = p.pk ORDER BY b.bk ASC, p.pval ASC";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("b", build_tbl.clone())?;
+        ctx.register_table("p", probe_tbl.clone())?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_exact_order(expected, actual, "fair_4mb_join_order_by")?;
+        drop(plan);
+        assert_zero_leaks(&runtime, "fair_4mb_join_order_by");
+    }
+    Ok(())
+}
+
+/// Exact inverse of `hash_join::mix_u64` (SplitMix64 finalizer) used to craft
+/// deterministic `Int64` keys that collide on chosen radix hash bit windows.
+fn unmix_u64(mut x: u64) -> u64 {
+    x ^= (x >> 31) ^ (x >> 62);
+    x = x.wrapping_mul(0x3196_42b2_d24d_8ec3);
+    x ^= (x >> 27) ^ (x >> 54);
+    x = x.wrapping_mul(0x96de_1b17_3f11_9089);
+    x ^= (x >> 30) ^ (x >> 60);
+    x
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_by_recursive_radix_split_and_sorted_spill_fallback_parity() -> Result<()> {
+    // 1. Int64 keys colliding on L0 [51..57) (varied L1 [47..51) -> triggers
+    //    recursive radix split) AND keys colliding on all radix levels [43..57)
+    //    (non-progressing skew -> triggers `finalize_sorted_spill_fallback` and
+    //    `rows_equal_on_keys` across duplicate boundary rows!).
+    let int_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+
+    let make_colliding_int_table = |mask_all_levels: bool| -> Arc<MemTable> {
+        let num_keys = 16_000usize;
+        let mut keys_pool = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let desired_hash = if mask_all_levels {
+                // Zero bits [43..57) so L0, L1, and L2 all map to bucket 0.
+                ((i as u64) & ((1u64 << 43) - 1)) | (((i as u64) & 0x7f) << 57)
+            } else {
+                // Zero L0 bits [51..57), spread L1 bits [47..51) uniformly.
+                let l1 = ((i as u64) & 0xf) << 47;
+                l1 | ((i as u64) & ((1u64 << 43) - 1)) | (((i as u64) & 0x7f) << 57)
+            };
+            keys_pool.push(unmix_u64(desired_hash) as i64);
+        }
+
+        let mut parts: Vec<Vec<RecordBatch>> = vec![Vec::new(); 4];
+        for rep in 0..2usize {
+            for (chunk_idx, chunk) in keys_pool.chunks(1024).enumerate() {
+                let mut ks: Vec<Option<i64>> = Vec::with_capacity(chunk.len() + 2);
+                let mut vs: Vec<Option<i64>> = Vec::with_capacity(chunk.len() + 2);
+                ks.push(None);
+                vs.push(Some(7));
+                for (j, &k) in chunk.iter().enumerate() {
+                    ks.push(Some(k));
+                    vs.push(Some(((j + rep * 13) % 97) as i64));
+                }
+                parts[(rep * 16 + chunk_idx) % 4].push(
+                    RecordBatch::try_new(
+                        Arc::clone(&int_schema),
+                        vec![
+                            Arc::new(Int64Array::from(ks)),
+                            Arc::new(Int64Array::from(vs)),
+                        ],
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        Arc::new(MemTable::try_new(Arc::clone(&int_schema), parts).unwrap())
+    };
+
+    for (mode_label, mask_all_levels) in [
+        ("int_recursive_l1_split", false),
+        ("int_sorted_spill_fallback", true),
+    ] {
+        let tbl = make_colliding_int_table(mask_all_levels);
+        let stock = stock_context(4, 256);
+        stock.register_table("t", tbl.clone())?;
+
+        for (q_label, sql) in [
+            ("group_count", "SELECT k, COUNT(*) AS n FROM t GROUP BY k"),
+            (
+                "direct_grouped",
+                "SELECT k, COUNT(*) AS n, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi, AVG(CAST(v AS DOUBLE)) AS a FROM t GROUP BY k",
+            ),
+        ] {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+            let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+            let ctx = morsel_context(4, 256, Arc::clone(&runtime))?;
+            ctx.register_table("t", tbl.clone())?;
+
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            assert_eq!(plan.name(), "MorselExec");
+            let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "{mode_label}/{q_label}: parity mismatch"
+            );
+            assert!(
+                spilled_bytes(plan.as_ref()) > 0,
+                "{mode_label}/{q_label}: expected spilled_bytes > 0"
+            );
+            drop(plan);
+            assert_zero_leaks(&runtime, &format!("{mode_label}_{q_label}"));
+        }
+    }
+
+    // 2. Multi-column `Grouped` keys colliding on `GROUP_HASH_SEED` bits [47..57)
+    //    (L0 + L1 identical -> forces non-progressing split -> `finalize_sorted_spill_fallback`
+    //    and multi-column `rows_equal_on_keys` including NULLs and duplicate rows!).
+    const GROUP_HASH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+    let rs = RandomState::with_seed(GROUP_HASH_SEED);
+    let target_keys = 3_500usize;
+    let mut colliding_ints: Vec<i64> = Vec::with_capacity(target_keys);
+    let mut colliding_strs: Vec<String> = Vec::with_capacity(target_keys);
+    let pad = "p".repeat(120);
+    let mut base = 0i64;
+    let mut hashes = vec![0u64; 8192];
+    while colliding_ints.len() < target_keys {
+        let cand_ints: Vec<i64> = (base..base + 8192).collect();
+        let cand_strs: Vec<String> = cand_ints
+            .iter()
+            .map(|k| format!("ck-{k:08}-{pad}"))
+            .collect();
+        let a0: ArrayRef = Arc::new(Int64Array::from(cand_ints.clone()));
+        let a1: ArrayRef = Arc::new(StringArray::from(cand_strs.clone()));
+        hashes.fill(0);
+        create_hashes(&[a0, a1], &rs, &mut hashes)?;
+        for (i, &h) in hashes.iter().enumerate() {
+            // Collide on bits [47..57) (both L0 [51..57) and L1 [47..51) == 0).
+            if ((h >> 47) & 0x3ff) == 0 {
+                colliding_ints.push(cand_ints[i]);
+                colliding_strs.push(cand_strs[i].clone());
+                if colliding_ints.len() >= target_keys {
+                    break;
+                }
+            }
+        }
+        base += 8192;
+    }
+
+    let grp_schema = Arc::new(Schema::new(vec![
+        Field::new("k_int", DataType::Int64, true),
+        Field::new("k_str", DataType::Utf8, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let mut parts: Vec<Vec<RecordBatch>> = vec![Vec::new(); 4];
+    for rep in 0..2usize {
+        for (chunk_idx, start) in (0..colliding_ints.len()).step_by(512).enumerate() {
+            let end = (start + 512).min(colliding_ints.len());
+            let mut ki: Vec<Option<i64>> = Vec::with_capacity(end - start + 1);
+            let mut ks: Vec<Option<&str>> = Vec::with_capacity(end - start + 1);
+            let mut vs: Vec<Option<i64>> = Vec::with_capacity(end - start + 1);
+            ki.push(None);
+            ks.push(None);
+            vs.push(Some(3));
+            for i in start..end {
+                ki.push(Some(colliding_ints[i]));
+                ks.push(Some(colliding_strs[i].as_str()));
+                vs.push(Some(((i + rep * 11) % 53) as i64));
+            }
+            parts[(rep * 8 + chunk_idx) % 4].push(RecordBatch::try_new(
+                Arc::clone(&grp_schema),
+                vec![
+                    Arc::new(Int64Array::from(ki)),
+                    Arc::new(StringArray::from(ks)),
+                    Arc::new(Int64Array::from(vs)),
+                ],
+            )?);
+        }
+    }
+    let grp_tbl = Arc::new(MemTable::try_new(grp_schema, parts)?);
+    let stock = stock_context(4, 128);
+    stock.register_table("g", grp_tbl.clone())?;
+    let sql =
+        "SELECT k_int, k_str, COUNT(*) AS n, SUM(v) AS s FROM g GROUP BY k_int, k_str";
+    let expected = stock.sql(sql).await?.collect().await?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+    let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+    let ctx = morsel_context(4, 128, Arc::clone(&runtime))?;
+    ctx.register_table("g", grp_tbl)?;
+
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    assert_eq!(plan.name(), "MorselExec");
+    let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected),
+        "grouped multi-column sorted fallback parity mismatch"
+    );
+    assert!(
+        spilled_bytes(plan.as_ref()) > 0,
+        "grouped multi-column sorted fallback: expected spilled_bytes > 0"
+    );
+    drop(plan);
+    assert_zero_leaks(&runtime, "grouped_sorted_fallback");
     Ok(())
 }

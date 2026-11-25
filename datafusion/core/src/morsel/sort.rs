@@ -1199,6 +1199,10 @@ async fn emit_sorted_runs(
             break;
         }
     }
+    drop(merged);
+    if any_spilled {
+        tokio::task::yield_now().await;
+    }
     Ok(())
 }
 

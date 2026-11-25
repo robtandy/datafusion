@@ -3712,17 +3712,12 @@ impl Pipeline {
         MetricBuilder::new(fin.metrics)
             .counter("sort_finalizations", 0)
             .add(1);
-        let sort_spill = SpillContext::try_new(
-            fin.context,
-            fin.metrics,
-            Arc::clone(sink.input_schema()),
-        );
         sink.finalize_and_emit(
             sorted_runs,
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
-            sort_spill,
+            fin.spill,
             tx,
             fin.measurement,
         )
@@ -3758,17 +3753,12 @@ impl Pipeline {
         MetricBuilder::new(fin.metrics)
             .counter("topn_finalizations", 0)
             .add(1);
-        let topn_spill = SpillContext::try_new(
-            fin.context,
-            fin.metrics,
-            Arc::clone(sink.input_schema()),
-        );
         sink.finalize_and_emit(
             sorted_runs,
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
-            topn_spill,
+            fin.spill,
             tx,
             fin.measurement,
         )
@@ -4004,6 +3994,7 @@ impl Pipeline {
             batch_size,
             context,
             metrics,
+            spill: post_sort_spill,
             measurement: measurement.map(Arc::as_ref),
         };
         match post_sort {
@@ -4817,6 +4808,7 @@ impl Pipeline {
                         batch_size: output.batch_size,
                         context,
                         metrics,
+                        spill: sink_spill,
                         measurement: measurement.map(Arc::as_ref),
                     },
                     tx,
@@ -4835,6 +4827,7 @@ impl Pipeline {
                         batch_size: output.batch_size,
                         context,
                         metrics,
+                        spill: sort_spill,
                         measurement: measurement.map(Arc::as_ref),
                     },
                     tx,
@@ -4956,6 +4949,7 @@ struct SortFinalizeCtx<'a> {
     batch_size: usize,
     context: &'a Arc<TaskContext>,
     metrics: &'a ExecutionPlanMetricsSet,
+    spill: Option<SpillContext>,
     measurement: Option<&'a RunMetrics>,
 }
 
