@@ -22,7 +22,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::{Expr, Limit, LogicalPlan, SortExpr, col};
+use datafusion::logical_expr::{Expr, Limit, LogicalPlan};
 use datafusion::morsel::{MorselMetrics, MorselQueryPlanner};
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
@@ -866,16 +866,13 @@ async fn morsel_mode_required_and_prefer_for_unsupported_sort_limit_shapes() -> 
     }
 
     for (sql, expected_substr) in [
-        ("SELECT id FROM t LIMIT 3", "limit"),
-        ("SELECT id FROM t OFFSET 2", "offset"),
-        ("SELECT grp, COUNT(*) FROM t GROUP BY grp LIMIT 2", "limit"),
         (
-            "SELECT * FROM (SELECT id, k FROM t ORDER BY id LIMIT 5) sub WHERE k > 0",
-            "unsupported",
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t ORDER BY id",
+            "window",
         ),
         (
-            "SELECT a.id FROM (SELECT id, grp FROM t ORDER BY id LIMIT 5) a JOIN t b ON a.grp = b.grp",
-            "unsupported",
+            "SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id",
+            "union",
         ),
         ("SELECT id FROM mt ORDER BY m", "unsupported sort key"),
     ] {
@@ -939,23 +936,6 @@ async fn morsel_mode_required_and_prefer_for_unsupported_sort_limit_shapes() -> 
         .to_string();
     assert!(
         err.contains("morsel_mode=required") && err.contains("non-literal OFFSET"),
-        "{err}"
-    );
-
-    // Nested Sort must fail cleanly in required mode.
-    let nested_sort = LogicalPlan::Sort(datafusion::logical_expr::Sort {
-        expr: vec![SortExpr::new(col("id"), false, false)],
-        input: Arc::new(base_sort),
-        fetch: None,
-    });
-    let err = required
-        .state()
-        .create_physical_plan(&nested_sort)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("morsel_mode=required") && err.contains("nested Sort"),
         "{err}"
     );
     Ok(())

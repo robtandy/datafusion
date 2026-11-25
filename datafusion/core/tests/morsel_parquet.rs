@@ -406,8 +406,11 @@ async fn unsupported_parquet_queries_delegate_only_in_prefer_mode() -> Result<()
         .await?;
     }
     for (sql, reason) in [
-        ("SELECT id FROM t LIMIT 3", "LIMIT"),
-        ("SELECT id FROM t OFFSET 1", "OFFSET"),
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t",
+            "Window",
+        ),
+        ("SELECT id FROM t UNION ALL SELECT id FROM t", "Union"),
         ("SELECT id, year FROM partitioned", "partition columns"),
         ("SELECT input_file_name() FROM t", "projection expression"),
     ] {
@@ -2585,7 +2588,7 @@ async fn parquet_group_count_high_cardinality_concurrent_oom_error_and_cancellat
     let prefer = context(&dir, "prefer", false).await?;
     let required = context(&dir, "required", false).await?;
     for bad_sql in [
-        "SELECT k, COUNT(DISTINCT gate) FROM t GROUP BY k",
+        "SELECT k, COUNT(DISTINCT gate), SUM(DISTINCT gate) FROM t GROUP BY k",
         "SELECT k, COUNT(*) FILTER (WHERE gate > 0) FROM t GROUP BY k",
         "SELECT k, MEDIAN(gate) FROM t GROUP BY k",
         "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",
