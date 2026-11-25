@@ -119,10 +119,10 @@ _STANDARD_TPCH_SPECS: tuple[
         2,
         ("part", "supplier", "partsupp", "nation", "region"),
         True,
+        True,
+        True,
         False,
-        False,
-        False,
-        False,
+        True,
         "Standard TPC-H Q2 (5-way join + correlated MIN subquery + TopN)",
     ),
     (
@@ -139,9 +139,9 @@ _STANDARD_TPCH_SPECS: tuple[
         4,
         ("orders", "lineitem"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q4 (EXISTS semi-join + GROUP BY + ORDER BY)",
     ),
@@ -169,9 +169,9 @@ _STANDARD_TPCH_SPECS: tuple[
         7,
         ("supplier", "lineitem", "orders", "customer", "nation"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q7 (6-way join with self-joined nation + EXTRACT + GROUP BY + ORDER BY)",
     ),
@@ -179,9 +179,9 @@ _STANDARD_TPCH_SPECS: tuple[
         8,
         ("part", "supplier", "lineitem", "orders", "customer", "nation", "region"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q8 (8-way join + CASE ratio aggregate + ORDER BY)",
     ),
@@ -189,9 +189,9 @@ _STANDARD_TPCH_SPECS: tuple[
         9,
         ("part", "supplier", "lineitem", "partsupp", "orders", "nation"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q9 (6-way join + LIKE filter + GROUP BY + ORDER BY)",
     ),
@@ -209,9 +209,9 @@ _STANDARD_TPCH_SPECS: tuple[
         11,
         ("partsupp", "supplier", "nation"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q11 (3-way join + HAVING scalar subquery + ORDER BY)",
     ),
@@ -229,9 +229,9 @@ _STANDARD_TPCH_SPECS: tuple[
         13,
         ("customer", "orders"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q13 (LEFT OUTER JOIN + 2-stage GROUP BY + ORDER BY)",
     ),
@@ -249,9 +249,9 @@ _STANDARD_TPCH_SPECS: tuple[
         15,
         ("lineitem", "supplier"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q15 (CTE revenue0 + MAX subquery + join + ORDER BY)",
     ),
@@ -259,9 +259,9 @@ _STANDARD_TPCH_SPECS: tuple[
         16,
         ("partsupp", "part", "supplier"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q16 (NOT IN anti-join + COUNT DISTINCT + GROUP BY + ORDER BY)",
     ),
@@ -269,8 +269,8 @@ _STANDARD_TPCH_SPECS: tuple[
         17,
         ("lineitem", "part"),
         True,
-        False,
-        False,
+        True,
+        True,
         False,
         False,
         "Standard TPC-H Q17 (2-way join + correlated AVG subquery + ungrouped SUM)",
@@ -279,10 +279,10 @@ _STANDARD_TPCH_SPECS: tuple[
         18,
         ("customer", "orders", "lineitem"),
         True,
+        True,
+        True,
         False,
-        False,
-        False,
-        False,
+        True,
         "Standard TPC-H Q18 (3-way join + IN HAVING semi-join + GROUP BY + TopN 100)",
     ),
     (
@@ -299,9 +299,9 @@ _STANDARD_TPCH_SPECS: tuple[
         20,
         ("supplier", "nation", "partsupp", "part", "lineitem"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q20 (nested IN semi-joins + correlated SUM subquery + ORDER BY)",
     ),
@@ -309,19 +309,19 @@ _STANDARD_TPCH_SPECS: tuple[
         21,
         ("supplier", "lineitem", "orders", "nation"),
         True,
+        True,
+        True,
         False,
-        False,
-        False,
-        False,
+        True,
         "Standard TPC-H Q21 (4-way join + EXISTS semi-join + NOT EXISTS anti-join + TopN 100)",
     ),
     (
         22,
         ("customer", "orders"),
         True,
-        False,
-        False,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q22 (SUBSTRING + scalar AVG subquery + NOT EXISTS anti-join + GROUP BY + ORDER BY)",
     ),
@@ -927,8 +927,11 @@ def _duckdb_exec(
                     "plan": plan,
                     "parquet_morsels_claimed": None,
                     "count_finalizations": None,
+                    "group_count_finalizations": None,
                     "aggregate_finalizations": None,
                     "join_build_finalizations": None,
+                    "join_empty_build_short_circuits": None,
+                    "join_null_aware_short_circuits": None,
                     "sort_finalizations": None,
                     "topn_finalizations": None,
                     "bytes_scanned": None,
@@ -1064,6 +1067,9 @@ def compare_tables(
                 )
 
 
+_NATIVE_PARQUET_RE = re.compile(r"NativeParquet\[([^\], ]+)")
+
+
 def validate_plan(
     evidence: dict, arm: Arm, workload: Workload, table_row_groups: dict[str, int]
 ):
@@ -1084,15 +1090,19 @@ def validate_plan(
         raise ValueError(
             f"{arm.name}/{workload.name}: expected MorselExec plan, got:\n{plan}"
         )
-    missing_tables = [t for t in workload.tables if f"NativeParquet[{t}" not in plan]
+    scans = _NATIVE_PARQUET_RE.findall(plan)
+    missing_tables = [t for t in workload.tables if t not in scans]
     if missing_tables:
         raise ValueError(
             f"{arm.name}/{workload.name}: expected NativeParquet for {workload.tables} "
             f"(missing {missing_tables}), got:\n{plan}"
         )
-    expected_rgs = sum(table_row_groups[t] for t in workload.tables)
+    expected_rgs = sum(table_row_groups[t] for t in scans)
     claimed = evidence["parquet_morsels_claimed"]
-    if arm.profile == "no_pushdown":
+    short_circuits = (evidence.get("join_empty_build_short_circuits") or 0) + (
+        evidence.get("join_null_aware_short_circuits") or 0
+    )
+    if arm.profile == "no_pushdown" and short_circuits == 0:
         if claimed != expected_rgs:
             raise ValueError(
                 f"{arm.name}/{workload.name}: expected to claim all {expected_rgs} "
@@ -1104,44 +1114,81 @@ def validate_plan(
                 f"{arm.name}/{workload.name}: expected 1..={expected_rgs} row groups "
                 f"claimed under {arm.profile}, got {claimed}"
             )
-    if ("CountSink" in plan) != workload.is_count or evidence[
+    expected_counts = len(re.findall(r"\bCountSink\b", plan))
+    if (expected_counts > 0) != workload.is_count or evidence[
         "count_finalizations"
-    ] != int(workload.is_count):
+    ] != expected_counts:
         raise ValueError(
             f"{arm.name}/{workload.name}: unexpected CountSink or count_finalizations "
             f"(is_count={workload.is_count}, count_finalizations={evidence['count_finalizations']})"
         )
-    agg_finalizations = evidence.get("aggregate_finalizations", 0)
-    if ("AggregateSink" in plan) != workload.is_aggregate or agg_finalizations != int(
-        workload.is_aggregate
+    expected_group_counts = plan.count("GroupCountSink")
+    group_count_finalizations = evidence.get("group_count_finalizations")
+    if (
+        group_count_finalizations is not None
+        and short_circuits == 0
+        and group_count_finalizations != expected_group_counts
     ):
+        raise ValueError(
+            f"{arm.name}/{workload.name}: expected {expected_group_counts} "
+            f"group_count_finalizations, got {group_count_finalizations}"
+        )
+    expected_aggs = plan.count("AggregateSink")
+    agg_finalizations = evidence.get("aggregate_finalizations", 0)
+    agg_ok = (
+        agg_finalizations == expected_aggs
+        if short_circuits == 0
+        else 0 <= agg_finalizations <= expected_aggs
+    )
+    if (expected_aggs > 0) != workload.is_aggregate or not agg_ok:
         raise ValueError(
             f"{arm.name}/{workload.name}: unexpected AggregateSink or aggregate_finalizations "
-            f"(is_aggregate={workload.is_aggregate}, aggregate_finalizations={agg_finalizations})"
+            f"(is_aggregate={workload.is_aggregate}, expected={expected_aggs}, "
+            f"aggregate_finalizations={agg_finalizations})"
         )
+    expected_sorts = plan.count("SortSink")
     sort_finalizations = evidence.get("sort_finalizations", 0)
-    if ("SortSink" in plan) != workload.is_sort or sort_finalizations != int(
-        workload.is_sort
-    ):
+    sort_ok = (
+        sort_finalizations == expected_sorts
+        if short_circuits == 0
+        else 0 <= sort_finalizations <= expected_sorts
+    )
+    if (expected_sorts > 0) != workload.is_sort or not sort_ok:
         raise ValueError(
             f"{arm.name}/{workload.name}: unexpected SortSink or sort_finalizations "
-            f"(is_sort={workload.is_sort}, sort_finalizations={sort_finalizations})"
+            f"(is_sort={workload.is_sort}, expected={expected_sorts}, "
+            f"sort_finalizations={sort_finalizations})"
         )
+    expected_topns = plan.count("TopNSink")
     topn_finalizations = evidence.get("topn_finalizations", 0)
-    if ("TopNSink" in plan) != workload.is_topn or topn_finalizations != int(
-        workload.is_topn
-    ):
+    topn_ok = (
+        topn_finalizations == expected_topns
+        if short_circuits == 0
+        else 0 <= topn_finalizations <= expected_topns
+    )
+    if (expected_topns > 0) != workload.is_topn or not topn_ok:
         raise ValueError(
             f"{arm.name}/{workload.name}: unexpected TopNSink or topn_finalizations "
-            f"(is_topn={workload.is_topn}, topn_finalizations={topn_finalizations})"
+            f"(is_topn={workload.is_topn}, expected={expected_topns}, "
+            f"topn_finalizations={topn_finalizations})"
         )
     expected_join_builds = plan.count("HashJoinBuildSink")
     join_builds = evidence.get("join_build_finalizations")
-    if join_builds is not None and join_builds != expected_join_builds:
-        raise ValueError(
-            f"{arm.name}/{workload.name}: expected {expected_join_builds} "
-            f"join_build_finalizations, got {join_builds}"
+    if join_builds is not None:
+        jb_ok = (
+            join_builds == expected_join_builds
+            if short_circuits == 0
+            else (
+                join_builds == 0
+                if expected_join_builds == 0
+                else 1 <= join_builds <= expected_join_builds
+            )
         )
+        if not jb_ok:
+            raise ValueError(
+                f"{arm.name}/{workload.name}: expected {expected_join_builds} "
+                f"join_build_finalizations, got {join_builds}"
+            )
 
 
 def make_runner(arm: Arm, runner_bin: Path, data_dir: Path, threads: int, timeout: int):
@@ -1211,8 +1258,17 @@ def verify_suite(
                     "output_rows": sample["output_rows"],
                     "parquet_morsels_claimed": sample["parquet_morsels_claimed"],
                     "count_finalizations": sample["count_finalizations"],
+                    "group_count_finalizations": sample.get(
+                        "group_count_finalizations"
+                    ),
                     "aggregate_finalizations": sample["aggregate_finalizations"],
                     "join_build_finalizations": sample.get("join_build_finalizations"),
+                    "join_empty_build_short_circuits": sample.get(
+                        "join_empty_build_short_circuits"
+                    ),
+                    "join_null_aware_short_circuits": sample.get(
+                        "join_null_aware_short_circuits"
+                    ),
                     "sort_finalizations": sample.get("sort_finalizations"),
                     "topn_finalizations": sample.get("topn_finalizations"),
                     "bytes_scanned": sample["bytes_scanned"],
@@ -1553,6 +1609,91 @@ def summarize_jsonl(path: Path):
             f"geomean ratio={ratio_gmean:.2f}x "
             f"(sum of medians: {stock_sum:.1f} ms vs {duck_sum:.1f} ms, {stock_sum / duck_sum:.2f}x)"
         )
+
+    # 3-way Standard TPC-H Scorecard (Morsel vs Stock vs DuckDB) across all standard
+    # queries present with stock_default, duckdb_default, and >= 1 Morsel arm.
+    morsel_arm_order = [
+        arm_name
+        for arm_name in ("morsel_no_pushdown", "morsel_pruning", "morsel_pushdown")
+        if any((c, arm_name) in medians for c in STANDARD_TPCH_QUERIES)
+    ]
+    shared_3way = [
+        c
+        for c in STANDARD_TPCH_QUERIES
+        if (c, "stock_default") in medians
+        and (c, "duckdb_default") in medians
+        and any((c, m) in medians for m in morsel_arm_order)
+    ]
+    if shared_3way and morsel_arm_order:
+        print()
+        morsel_cols = " | ".join(f"`{m}` ms" for m in morsel_arm_order)
+        morsel_align = " | ".join("---:" for _ in morsel_arm_order)
+        print(
+            f"| Query | `stock_default` ms | {morsel_cols} | Best Morsel ms (arm) | "
+            f"`duckdb_default` ms | Best Morsel / Stock | Best Morsel / DuckDB |"
+        )
+        print(f"| --- | ---: | {morsel_align} | ---: | ---: | ---: | ---: |")
+        best_morsel_vals: list[float] = []
+        stock_vals: list[float] = []
+        duck_vals: list[float] = []
+        for c in shared_3way:
+            s_ms = medians[(c, "stock_default")]
+            d_ms = medians[(c, "duckdb_default")]
+            avail = [
+                (medians[(c, m)], m) for m in morsel_arm_order if (c, m) in medians
+            ]
+            best_ms, best_arm = min(avail, key=lambda item: item[0])
+            stock_vals.append(s_ms)
+            duck_vals.append(d_ms)
+            best_morsel_vals.append(best_ms)
+            m_cells = " | ".join(
+                f"{medians[(c, m)]:.1f}" if (c, m) in medians else "—"
+                for m in morsel_arm_order
+            )
+            print(
+                f"| `{c}` | {s_ms:.1f} | {m_cells} | "
+                f"{best_ms:.1f} (`{best_arm}`) | {d_ms:.1f} | "
+                f"{best_ms / s_ms:.2f}x | {best_ms / d_ms:.2f}x |"
+            )
+
+        n_q = len(shared_3way)
+        s_gm = statistics.geometric_mean(stock_vals)
+        d_gm = statistics.geometric_mean(duck_vals)
+        b_gm = statistics.geometric_mean(best_morsel_vals)
+        m_gm_cells = []
+        m_sum_cells = []
+        for m in morsel_arm_order:
+            if all((c, m) in medians for c in shared_3way):
+                vals = [medians[(c, m)] for c in shared_3way]
+                m_gm_cells.append(f"**{statistics.geometric_mean(vals):.1f}**")
+                m_sum_cells.append(f"**{sum(vals):.1f}**")
+            else:
+                m_gm_cells.append("—")
+                m_sum_cells.append("—")
+        print(
+            f"| **GeoMean ({n_q}/{len(STANDARD_TPCH_QUERIES)})** | **{s_gm:.1f}** | "
+            f"{' | '.join(m_gm_cells)} | **{b_gm:.1f}** | **{d_gm:.1f}** | "
+            f"**{b_gm / s_gm:.2f}x** | **{b_gm / d_gm:.2f}x** |"
+        )
+        s_sum = sum(stock_vals)
+        d_sum = sum(duck_vals)
+        b_sum = sum(best_morsel_vals)
+        print(
+            f"| **Sum ({n_q}/{len(STANDARD_TPCH_QUERIES)})** | **{s_sum:.1f}** | "
+            f"{' | '.join(m_sum_cells)} | **{b_sum:.1f}** | **{d_sum:.1f}** | "
+            f"**{b_sum / s_sum:.2f}x** | **{b_sum / d_sum:.2f}x** |"
+        )
+        print()
+        for m in morsel_arm_order:
+            if all((c, m) in medians for c in shared_3way):
+                m_vals = [medians[(c, m)] for c in shared_3way]
+                m_gm = statistics.geometric_mean(m_vals)
+                print(
+                    f"Geometric mean ({n_q}/{len(STANDARD_TPCH_QUERIES)} standard queries) "
+                    f"`{m}`: {m_gm:.1f} ms "
+                    f"({m_gm / s_gm:.2f}x vs `stock_default`, {m_gm / d_gm:.2f}x vs `duckdb_default`; "
+                    f"sum={sum(m_vals):.1f} ms)"
+                )
 
     rejections = header.get("morsel_rejections") or {}
     if rejections:
