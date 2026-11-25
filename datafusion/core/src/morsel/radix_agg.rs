@@ -922,6 +922,20 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
         return Ok(());
     }
 
+    // Hold dedicated replay headroom across every `merged.next().await` call
+    // so `StreamingMergeBuilder` / `MultiLevelMergeBuilder` can never consume
+    // the entire pool and starve `cur_table`.
+    let headroom_res = MemoryConsumer::new(consumer_name)
+        .with_can_spill(false)
+        .register(memory_pool);
+    let mut headroom_target = 0usize;
+    for target in [256 * 1024usize, 128 * 1024, 64 * 1024] {
+        if headroom_res.try_grow(target).is_ok() {
+            headroom_target = target;
+            break;
+        }
+    }
+
     let merge_metrics = ExecutionPlanMetricsSet::new();
     let merge_res = MemoryConsumer::new(consumer_name)
         .with_can_spill(true)
@@ -947,11 +961,15 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
     let mut last_key_batch: Option<RecordBatch> = None;
 
     while let Some(batch_res) = merged.next().await {
+        // Temporarily release headroom while `cur_table` ingests/emits this
+        // batch, then re-acquire before the next `merged.next().await`.
+        headroom_res.resize(0);
         if tx.is_closed() {
             return Ok(());
         }
         let batch = batch_res?;
         if batch.num_rows() == 0 {
+            let _ = headroom_res.try_resize(headroom_target);
             continue;
         }
         // Find the run boundary at the start of `batch` that matches the last
@@ -996,7 +1014,9 @@ async fn finalize_sorted_spill_fallback<M: RadixGroupMerger>(
             last_key_batch = Some(tail.slice(last_row, 1));
             merger.merge_partial_batch(&mut cur_table, &tail)?;
         }
+        let _ = headroom_res.try_resize(headroom_target);
     }
+    drop(headroom_res);
 
     if !tx.is_closed() && !merger.table_is_empty(&cur_table) {
         merger

@@ -1137,15 +1137,6 @@ enum WorkerSinkMemory {
 }
 
 impl WorkerSinkMemory {
-    fn into_reservation(self) -> MemoryReservation {
-        match self {
-            Self::Reservation(r)
-            | Self::SpillableReservation(r, _)
-            | Self::HashJoinBuild(r, ..) => r,
-            Self::SharedSort(..) => panic!("expected MemoryReservation"),
-        }
-    }
-
     fn into_spillable_reservation(self) -> (MemoryReservation, Option<SpillContext>) {
         match self {
             Self::SpillableReservation(r, spill) => (r, spill),
@@ -1606,9 +1597,10 @@ impl Pipeline {
                 WorkerSink::Aggregate(sink.new_state_with_spill(res, spill)?)
             }
             Sink::TopN { sink, .. } => {
-                WorkerSink::TopN(sink.new_state(
-                    sink_memory.expect("topn reservation").into_reservation(),
-                )?)
+                let (res, spill) = sink_memory
+                    .expect("topn reservation")
+                    .into_spillable_reservation();
+                WorkerSink::TopN(sink.new_state_with_spill(res, spill, batch_size)?)
             }
             Sink::Sort { sink, .. } => {
                 let (shared, spill) =
@@ -1932,10 +1924,12 @@ impl Pipeline {
                     .await?;
                 Ok(true)
             }
-            WorkerSink::TopN(local) => worker.process(|| {
-                local.add_view(&view)?;
+            WorkerSink::TopN(local) => {
+                worker
+                    .process_async(local.add_view_async(&view, tx))
+                    .await?;
                 Ok(true)
-            }),
+            }
             WorkerSink::Sort(local) => {
                 worker
                     .process_async(local.add_view_async(view, tx))
@@ -2118,13 +2112,17 @@ impl Pipeline {
                 }
                 Ok(true)
             }
-            WorkerSink::TopN(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+            WorkerSink::TopN(local) => {
+                let view = worker.process(|| {
+                    apply_operators_view(&self.operators, BatchView::all(batch))
+                })?;
                 if !view.is_empty() {
-                    local.add_view(&view)?;
+                    worker
+                        .process_async(local.add_view_async(&view, tx))
+                        .await?;
                 }
                 Ok(true)
-            }),
+            }
             WorkerSink::Sort(local) => {
                 let view = worker.process(|| {
                     apply_operators_view(&self.operators, BatchView::all(batch))
@@ -2177,8 +2175,10 @@ impl Pipeline {
                 if output.tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
-                let run = worker.process(|| local.finish(output.batch_size))?;
-                return Ok(WorkerState::SortedRuns(run.into_iter().collect()));
+                let runs = worker
+                    .process_async(local.finish_async(output.batch_size, &output.tx))
+                    .await?;
+                return Ok(WorkerState::SortedRuns(runs));
             }
             WorkerSink::Sort(local) => {
                 if output.tx.is_closed() {
@@ -2443,9 +2443,13 @@ impl Pipeline {
                 Arc::clone(shared),
                 targets.sort_spill.cloned(),
             ))
-        } else if matches!(self.sink, Sink::Aggregate { .. } | Sink::GroupCount { .. }) {
+        } else if matches!(
+            self.sink,
+            Sink::Aggregate { .. } | Sink::GroupCount { .. } | Sink::TopN { .. }
+        ) {
             let consumer_name = match self.sink {
                 Sink::GroupCount { .. } => "MorselGroupCount",
+                Sink::TopN { .. } => "MorselTopN",
                 _ => "MorselAggregate",
             };
             let res = MemoryConsumer::new(consumer_name)
@@ -3773,11 +3777,17 @@ impl Pipeline {
         MetricBuilder::new(fin.metrics)
             .counter("topn_finalizations", 0)
             .add(1);
+        let topn_spill = SpillContext::try_new(
+            fin.context,
+            fin.metrics,
+            Arc::clone(sink.input_schema()),
+        );
         sink.finalize_and_emit(
             sorted_runs,
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
+            topn_spill,
             tx,
             fin.measurement,
         )
@@ -3811,10 +3821,19 @@ impl Pipeline {
             PostSort::TopN { .. } => ("MorselTopN", "topn"),
             PostSort::Sort { .. } => ("MorselSort", "sort"),
         };
+        let agg_spilled = match &finalized_agg {
+            FinalizedAggOutput::Count(_) => false,
+            FinalizedAggOutput::GroupCount(f) => f.has_spilled(),
+            FinalizedAggOutput::Aggregate(f) => f.has_spilled(),
+        };
         let sort_workers = match &finalized_agg {
             FinalizedAggOutput::Count(_) => 1,
             FinalizedAggOutput::GroupCount(_) | FinalizedAggOutput::Aggregate(_) => {
-                self.workers.get()
+                if agg_spilled {
+                    1
+                } else {
+                    self.workers.get()
+                }
             }
         };
 
@@ -3870,21 +3889,30 @@ impl Pipeline {
 
         // Consumer tasks: dynamically claim finalized aggregate batches and feed local TopN / Sort.
         let stage_reservation = MemoryConsumer::new(consumer_name)
-            .with_can_spill(matches!(post_sort, PostSort::Sort { .. }))
+            .with_can_spill(true)
             .register(context.memory_pool());
-        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. })
-            .then(|| SharedSortMemory::new(stage_reservation.new_empty()));
+        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. }).then(|| {
+            let s = SharedSortMemory::new(stage_reservation.new_empty());
+            if agg_spilled {
+                s.mark_spilled();
+            }
+            s
+        });
         let post_sort_spill = match post_sort {
             PostSort::Sort { sink, .. } => {
                 SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
             }
-            PostSort::TopN { .. } => None,
+            PostSort::TopN { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
         };
         for id in 0..sort_workers {
             let pipeline = Arc::clone(self);
             let agg_rx = Arc::clone(&agg_rx);
             let output_tx = tx.clone();
-            let reservation = stage_reservation.new_empty();
+            let reservation = MemoryConsumer::new(consumer_name)
+                .with_can_spill(post_sort_spill.is_some())
+                .register(context.memory_pool());
             let shared_sort = shared_sort_memory.as_ref().map(Arc::clone);
             let spill_ctx = post_sort_spill.clone();
             let mut worker =
@@ -3898,9 +3926,9 @@ impl Pipeline {
                     Sort(SortState),
                 }
                 let mut local = match ps {
-                    PostSort::TopN { sink, .. } => {
-                        LocalPostState::TopN(sink.new_state(reservation)?)
-                    }
+                    PostSort::TopN { sink, .. } => LocalPostState::TopN(
+                        sink.new_state_with_spill(reservation, spill_ctx, batch_size)?,
+                    ),
                     PostSort::Sort { sink, .. } => {
                         LocalPostState::Sort(sink.new_state_with_spill(
                             shared_sort.expect("shared sort memory"),
@@ -3924,7 +3952,11 @@ impl Pipeline {
                     worker.claim();
                     match &mut local {
                         LocalPostState::TopN(s) => {
-                            worker.process(|| s.add_view(&BatchView::all(batch)))?;
+                            worker
+                                .process_async(
+                                    s.add_view_async(&BatchView::all(batch), &output_tx),
+                                )
+                                .await?;
                         }
                         LocalPostState::Sort(s) => {
                             worker
@@ -3942,8 +3974,9 @@ impl Pipeline {
                 }
                 let runs = match local {
                     LocalPostState::TopN(s) => {
-                        let run = worker.process(|| s.finish(batch_size))?;
-                        run.into_iter().collect()
+                        worker
+                            .process_async(s.finish_async(batch_size, &output_tx))
+                            .await?
                     }
                     LocalPostState::Sort(s) => {
                         worker.process_async(s.finish_async(&output_tx)).await?
@@ -4261,6 +4294,9 @@ impl Pipeline {
             Sink::Aggregate { sink, .. } => sink
                 .partial_schema()
                 .and_then(|s| SpillContext::try_new(context, metrics, Arc::clone(s))),
+            Sink::TopN { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
             _ => None,
         };
         let sink_reservation = match &self.sink {
@@ -4274,9 +4310,11 @@ impl Pipeline {
                     .with_can_spill(sink_spill.is_some())
                     .register(context.memory_pool()),
             ),
-            Sink::TopN { .. } => {
-                Some(MemoryConsumer::new("MorselTopN").register(context.memory_pool()))
-            }
+            Sink::TopN { .. } => Some(
+                MemoryConsumer::new("MorselTopN")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool()),
+            ),
             Sink::Sort { .. } => None,
             Sink::Result
             | Sink::Count { .. }
@@ -4358,10 +4396,13 @@ impl Pipeline {
                     ))
                 } else if matches!(
                     self.sink,
-                    Sink::Aggregate { .. } | Sink::GroupCount { .. }
+                    Sink::Aggregate { .. }
+                        | Sink::GroupCount { .. }
+                        | Sink::TopN { .. }
                 ) {
                     let consumer_name = match self.sink {
                         Sink::GroupCount { .. } => "MorselGroupCount",
+                        Sink::TopN { .. } => "MorselTopN",
                         _ => "MorselAggregate",
                     };
                     let res = MemoryConsumer::new(consumer_name)

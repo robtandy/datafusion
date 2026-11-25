@@ -3159,13 +3159,9 @@ impl RadixGroupMerger for GroupedRadixMerger {
                 columns.push(acc.evaluate(EmitTo::All)?);
             }
             let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
-            let batch_bytes = batch.get_array_memory_size();
-            let batch_res = table.reservation.new_empty();
             drop(table);
-            batch_res.try_grow(batch_bytes)?;
             emit_finalized_batch(batch, result_operators, batch_size, tx, measurement)
                 .await?;
-            drop(batch_res);
             Ok(())
         })
     }
@@ -3239,6 +3235,16 @@ pub(super) struct FinalizedAggregate {
 }
 
 impl FinalizedAggregate {
+    pub(super) fn has_spilled(&self) -> bool {
+        match &self.state {
+            AggregateState::Ungrouped(_) => false,
+            AggregateState::Grouped(s) => s.radix.as_ref().is_some_and(|r| r.spilled),
+            AggregateState::DirectGrouped(s) => {
+                s.radix.as_ref().is_some_and(|r| r.spilled)
+            }
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(super) async fn emit(
         self,

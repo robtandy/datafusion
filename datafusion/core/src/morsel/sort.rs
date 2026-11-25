@@ -66,7 +66,7 @@ use super::{Operator, apply_operators};
 const MAX_LOCAL_SORT_RUN_BYTES: usize = 64 * 1024 * 1024;
 /// Smaller flush threshold once any sort worker has transitioned into spill mode
 /// so workers stream sorted runs to disk instead of competing for tight RAM.
-const MAX_SPILLED_LOCAL_SORT_RUN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SPILLED_LOCAL_SORT_RUN_BYTES: usize = 256 * 1024;
 const MAX_INLINE_VIEW_LEN: u32 = 12;
 
 pub(super) fn is_supported_sort_key_type(dt: &DataType) -> bool {
@@ -490,7 +490,7 @@ impl SharedSortMemory {
         })
     }
 
-    fn mark_spilled(&self) {
+    pub(super) fn mark_spilled(&self) {
         self.spilled.store(true, AtomicOrdering::Release);
     }
 
@@ -1328,10 +1328,21 @@ impl TopNSink {
         write!(f, "]")
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new_state(&self, reservation: MemoryReservation) -> Result<TopNState> {
+        self.new_state_with_spill(reservation, None, 8192)
+    }
+
+    pub(super) fn new_state_with_spill(
+        &self,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+        batch_size: usize,
+    ) -> Result<TopNState> {
         let row_converter = RowConverter::new(self.sort_fields.clone())?;
         let first_col_fast = FirstColFastPath::try_new(&self.ordering, &self.schema);
         Ok(TopNState {
+            schema: Arc::clone(&self.schema),
             ordering: self.ordering.clone(),
             row_converter,
             limit: self.heap_limit,
@@ -1342,6 +1353,9 @@ impl TopNSink {
             row_map_bytes: 0,
             key_bytes: 0,
             first_col_fast,
+            spilled_runs: Vec::new(),
+            spill,
+            batch_size: batch_size.max(1),
             reservation,
             #[cfg(test)]
             peak_retained_rows: Arc::clone(&self.peak_retained_rows),
@@ -1352,12 +1366,14 @@ impl TopNSink {
         })
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn finalize_and_emit(
         &self,
         runs: Vec<SortedRun>,
         result_operators: &[Operator],
         batch_size: usize,
         memory_pool: &Arc<dyn MemoryPool>,
+        spill: Option<SpillContext>,
         tx: mpsc::Sender<RecordBatch>,
         measurement: Option<&RunMetrics>,
     ) -> Result<()> {
@@ -1372,7 +1388,7 @@ impl TopNSink {
                 batch_size,
                 memory_pool,
                 consumer_name: "MorselTopNMerge",
-                spill: None,
+                spill,
             },
             tx,
             measurement,
@@ -2049,6 +2065,7 @@ impl RetainedBatch {
 }
 
 pub(super) struct TopNState {
+    schema: SchemaRef,
     ordering: LexOrdering,
     row_converter: RowConverter,
     limit: usize,
@@ -2059,6 +2076,9 @@ pub(super) struct TopNState {
     row_map_bytes: usize,
     key_bytes: usize,
     first_col_fast: Option<FirstColFastPath>,
+    spilled_runs: Vec<SortedRun>,
+    spill: Option<SpillContext>,
+    batch_size: usize,
     reservation: MemoryReservation,
     #[cfg(test)]
     peak_retained_rows: Arc<AtomicUsize>,
@@ -2119,6 +2139,203 @@ impl TopNState {
             let materialized = view.clone().materialize()?;
             self.ingest_dense_batch(&materialized)
         }
+    }
+
+    async fn spill_heap_to_disk(
+        &mut self,
+        spill_manager: &SpillManager,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.heap.is_empty() {
+            for old in &self.batches {
+                self.batch_memory.uncount_batch(&old.batch);
+            }
+            self.batches.clear();
+            self.retained_rows = 0;
+            self.row_map_bytes = 0;
+            self.key_bytes = 0;
+            self.reservation.resize(0);
+            return Ok(());
+        }
+        let sorted_entries = std::mem::take(&mut self.heap).into_sorted_vec();
+        let indices: Vec<(usize, usize)> = sorted_entries
+            .iter()
+            .map(|e| {
+                let b_idx = e.batch_idx as usize;
+                let dense_row = self.batches[b_idx].resolve_row(e.row_idx);
+                (b_idx, dense_row)
+            })
+            .collect();
+        drop(sorted_entries);
+        let batch_refs: Vec<&RecordBatch> =
+            self.batches.iter().map(|r| &r.batch).collect();
+        let chunk_size = self.batch_size.max(1);
+        let mut file = spill_manager.create_in_progress_file("MorselTopNSpill")?;
+        let mut max_record_batch_memory = 0usize;
+        let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> = async {
+            for slab in indices.chunks(chunk_size) {
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let out = interleave_record_batch(&batch_refs, slab)?;
+                let mem = file.append_batch_async(&out).await?;
+                max_record_batch_memory = max_record_batch_memory.max(mem);
+            }
+            if tx.is_closed() {
+                return Ok(None);
+            }
+            file.finish_async().await
+        }
+        .await;
+
+        for old in &self.batches {
+            self.batch_memory.uncount_batch(&old.batch);
+        }
+        self.batches.clear();
+        self.retained_rows = 0;
+        self.row_map_bytes = 0;
+        self.key_bytes = 0;
+        self.reservation.resize(0);
+        if let Some(fast) = &mut self.first_col_fast {
+            fast.threshold = None;
+        }
+
+        match res {
+            Ok(Some(finished)) => {
+                self.spilled_runs.push(SortedRun::Spilled(SortedSpillFile {
+                    file: finished,
+                    max_record_batch_memory,
+                }));
+                Ok(())
+            }
+            Ok(None) => {
+                let _ = file.abort_async().await;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = file.abort_async().await;
+                Err(err)
+            }
+        }
+    }
+
+    pub(super) async fn add_view_async(
+        &mut self,
+        view: &BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.limit == 0 || view.is_empty() {
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            return self.add_view(view);
+        }
+        let spill_ctx = self.spill.clone().unwrap();
+        let batch = if view.is_all() {
+            view.batch().clone()
+        } else {
+            view.clone().materialize()?
+        };
+        if spill_ctx.is_spilled() {
+            self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+            if let Some(sf) = spill_batches_sorted(
+                &self.schema,
+                &self.ordering,
+                std::slice::from_ref(&batch),
+                self.batch_size,
+                &spill_ctx.manager,
+                tx,
+            )
+            .await?
+            {
+                self.spilled_runs.push(SortedRun::Spilled(sf));
+            }
+            return Ok(());
+        }
+
+        // Pre-check headroom BEFORE mutating `self.heap` so `self.heap` and
+        // `self.batches` remain 100% consistent if we transition to spill mode.
+        let est = datafusion_common::utils::memory::get_record_batch_memory_size(&batch)
+            .saturating_mul(2)
+            .saturating_add(batch.num_rows().saturating_mul(64));
+        let probe = self.reservation.new_empty();
+        let fits = probe.try_grow(est).is_ok();
+        drop(probe);
+        if !fits {
+            spill_ctx.mark_spilled();
+            self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+            if let Some(sf) = spill_batches_sorted(
+                &self.schema,
+                &self.ordering,
+                std::slice::from_ref(&batch),
+                self.batch_size,
+                &spill_ctx.manager,
+                tx,
+            )
+            .await?
+            {
+                self.spilled_runs.push(SortedRun::Spilled(sf));
+            }
+            return Ok(());
+        }
+
+        if let Err(err) = self.add_view(&BatchView::all(batch.clone())) {
+            if matches!(err, DataFusionError::ResourcesExhausted(_)) {
+                spill_ctx.mark_spilled();
+                // If `ingest_dense_batch` failed during `compact()` (after
+                // pushing `retained`), `self.heap` already includes `batch`!
+                // If it failed on `retained` before push, skip out-of-range
+                // batch_idx entries and spill `batch` directly.
+                let pending_pushed = self
+                    .heap
+                    .iter()
+                    .all(|e| (e.batch_idx as usize) < self.batches.len());
+                if pending_pushed {
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                } else {
+                    // Retain only entries pointing to valid earlier batches,
+                    // spill them, then spill `batch` in full.
+                    let max_idx = self.batches.len() as u32;
+                    let valid: Vec<TopNHeapEntry> = std::mem::take(&mut self.heap)
+                        .into_vec()
+                        .into_iter()
+                        .filter(|e| e.batch_idx < max_idx)
+                        .collect();
+                    self.heap = BinaryHeap::from(valid);
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                    if let Some(sf) = spill_batches_sorted(
+                        &self.schema,
+                        &self.ordering,
+                        std::slice::from_ref(&batch),
+                        self.batch_size,
+                        &spill_ctx.manager,
+                        tx,
+                    )
+                    .await?
+                    {
+                        self.spilled_runs.push(SortedRun::Spilled(sf));
+                    }
+                }
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finish_async(
+        mut self,
+        batch_size: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<Vec<SortedRun>> {
+        if self.spilled_runs.is_empty() {
+            let run = self.finish(batch_size)?;
+            return Ok(run.into_iter().collect());
+        }
+        if let Some(spill_ctx) = self.spill.clone() {
+            self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+        }
+        Ok(std::mem::take(&mut self.spilled_runs))
     }
 
     fn ingest_dense_batch(&mut self, batch: &RecordBatch) -> Result<()> {

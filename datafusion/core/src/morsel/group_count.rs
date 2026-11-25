@@ -1529,6 +1529,10 @@ pub(super) struct FinalizedGroupCounts {
 }
 
 impl FinalizedGroupCounts {
+    pub(super) fn has_spilled(&self) -> bool {
+        self.state.radix.as_ref().is_some_and(|r| r.spilled)
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(super) async fn emit(
         mut self,
