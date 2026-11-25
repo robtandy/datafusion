@@ -2080,6 +2080,331 @@ async fn hash_join_memory_limit_failure_during_build_and_finalize_frees_all_memo
     Ok(())
 }
 
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn outer_and_anti_build_emission_child_pipeline_waits_for_probe_completion()
+-> Result<()> {
+    // 4 build rows (keys 1, 2, 3, NULL) vs 10 probe batches (20 rows, keys 1 and 2 only).
+    // Keys 3 and NULL on build are unmatched and MUST be emitted by the child pipeline
+    // strictly AFTER all 10 probe batches complete.
+    let build_batches = join_test_batches(
+        "bv",
+        &[vec![Some(1)], vec![Some(2)], vec![Some(3)], vec![None]],
+    )?;
+    let probe_keys: Vec<Vec<Option<i32>>> =
+        (0..10).map(|i| vec![Some((i % 2) + 1), Some(99)]).collect();
+    let probe_batches = join_test_batches("pv", &probe_keys)?;
+
+    let cases = [
+        (
+            "right_outer",
+            "SELECT probe_t.k, build_t.bv, probe_t.pv \
+             FROM (SELECT k, pv FROM probe_t WHERE observe_probe(pv)) probe_t \
+             RIGHT OUTER JOIN build_t ON probe_t.k = build_t.k",
+            12usize, // 10 matched + 2 unmatched build (key 3, NULL)
+        ),
+        (
+            "full_outer",
+            "SELECT probe_t.k, build_t.bv, probe_t.pv \
+             FROM (SELECT k, pv FROM probe_t WHERE observe_probe(pv)) probe_t \
+             FULL OUTER JOIN build_t ON probe_t.k = build_t.k",
+            22usize, // 10 matched + 10 unmatched probe (key 99) + 2 unmatched build
+        ),
+        (
+            "build_anti",
+            "SELECT build_t.k, build_t.bv \
+             FROM build_t \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM (SELECT k, pv FROM probe_t WHERE observe_probe(pv)) probe_t \
+                 WHERE probe_t.k = build_t.k \
+             )",
+            2usize, // unmatched build rows (key 3, NULL)
+        ),
+        (
+            "build_semi",
+            "SELECT build_t.k, build_t.bv \
+             FROM build_t \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM (SELECT k, pv FROM probe_t WHERE observe_probe(pv)) probe_t \
+                 WHERE probe_t.k = build_t.k \
+             )",
+            2usize, // matched build rows (key 1, key 2)
+        ),
+    ];
+
+    for (label, sql, expected_rows) in cases {
+        let ObservedJoin {
+            mut plan,
+            mut probe_scans,
+            ..
+        } = observed_hash_join(
+            build_batches.clone(),
+            probe_batches.clone(),
+            sql,
+            None,
+            None,
+            false,
+        )
+        .await?;
+
+        let (entered, mut emit_entered) = mpsc::unbounded_channel();
+        let resume = Arc::new(Semaphore::new(0));
+        {
+            let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+            let probe = pipeline
+                .operators
+                .iter_mut()
+                .find_map(|op| match op {
+                    Operator::HashProbe(p) => Some(Arc::get_mut(p).unwrap()),
+                    _ => None,
+                })
+                .expect("expected HashProbe operator");
+            assert!(
+                probe.needs_build_emission(),
+                "{label}: expected build-emission child pipeline"
+            );
+            probe.build_emit_gate = Some(FinalizeGate {
+                entered,
+                resume: Arc::clone(&resume),
+            });
+        }
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+
+        // Drain probe output concurrently until the build-emission child pipeline reaches its gate.
+        let mut rows = 0usize;
+        timeout(DEADLINE, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    sig = emit_entered.recv() => {
+                        assert_eq!(sig, Some(()), "{label}: gate closed early");
+                        break;
+                    }
+                    item = stream.next() => {
+                        let batch = item
+                            .expect("stream ended before build emission gate")?;
+                        rows += batch.num_rows();
+                    }
+                }
+            }
+            Ok::<(), datafusion_common::DataFusionError>(())
+        })
+        .await
+        .unwrap()?;
+
+        // Every probe batch MUST have been observed before build emission starts!
+        let mut probe_observed = 0usize;
+        while probe_scans.try_recv().is_ok() {
+            probe_observed += 1;
+        }
+        assert_eq!(
+            probe_observed, 10,
+            "{label}: build-emission child pipeline started before all probe batches finished"
+        );
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_emission_pipelines"))
+                .map_or(0, |v| v.as_usize()),
+            0,
+            "{label}: build emission metric incremented while gated"
+        );
+
+        // Release child pipeline gate and collect remaining unmatched/matched build rows.
+        resume.add_permits(1);
+        while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+            rows += batch?.num_rows();
+        }
+        assert_eq!(rows, expected_rows, "{label}: total output rows mismatch");
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_emission_pipelines"))
+                .map_or(0, |v| v.as_usize()),
+            1,
+            "{label}: expected exactly 1 build-emission child pipeline"
+        );
+
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0, "{label}: memory leaked");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn outer_join_drop_at_build_emit_gate_and_mid_probe_error_clean_up() -> Result<()> {
+    let build_batches = join_test_batches(
+        "bv",
+        &[vec![Some(1)], vec![Some(2)], vec![Some(3)], vec![None]],
+    )?;
+    let probe_keys: Vec<Vec<Option<i32>>> =
+        (0..8).map(|i| vec![Some((i % 2) + 1), Some(99)]).collect();
+    let probe_batches = join_test_batches("pv", &probe_keys)?;
+    let sql = "SELECT probe_t.k, build_t.bv, probe_t.pv \
+               FROM (SELECT k, pv FROM probe_t WHERE observe_probe(pv)) probe_t \
+               RIGHT OUTER JOIN build_t ON probe_t.k = build_t.k";
+
+    // 1. Drop stream while paused at build_emit_gate: child pipeline never runs and memory frees.
+    {
+        let ObservedJoin { mut plan, .. } = observed_hash_join(
+            build_batches.clone(),
+            probe_batches.clone(),
+            sql,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let (entered, mut emit_entered) = mpsc::unbounded_channel();
+        let resume = Arc::new(Semaphore::new(0));
+        {
+            let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+            let probe = pipeline
+                .operators
+                .iter_mut()
+                .find_map(|op| match op {
+                    Operator::HashProbe(p) => Some(Arc::get_mut(p).unwrap()),
+                    _ => None,
+                })
+                .unwrap();
+            probe.build_emit_gate = Some(FinalizeGate {
+                entered,
+                resume: Arc::clone(&resume),
+            });
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+
+        timeout(DEADLINE, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    sig = emit_entered.recv() => {
+                        assert_eq!(sig, Some(()));
+                        break;
+                    }
+                    item = stream.next() => {
+                        let _ = item.expect("stream ended before gate")?;
+                    }
+                }
+            }
+            Ok::<(), datafusion_common::DataFusionError>(())
+        })
+        .await
+        .unwrap()?;
+
+        drop(stream);
+        resume.add_permits(1);
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_emission_pipelines"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // 2. Mid-probe error aborts peers, never starts build-emission child pipeline, and frees memory.
+    {
+        let ObservedJoin { plan, .. } =
+            observed_hash_join(build_batches, probe_batches, sql, None, Some(3), false)
+                .await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 4)?;
+        let pipeline = Arc::downgrade(&plan.pipeline);
+        let mut stream = plan.execute(0, ctx)?;
+        let mut saw_err = false;
+        while let Some(item) = timeout(DEADLINE, stream.next()).await.unwrap() {
+            if let Err(err) = item {
+                assert!(
+                    err.to_string().contains("test join worker failure"),
+                    "unexpected error: {err}"
+                );
+                saw_err = true;
+                break;
+            }
+        }
+        assert!(saw_err, "expected probe error");
+        assert_eq!(
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("join_build_emission_pipelines"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(stream);
+        drop(plan);
+        assert_workers_stopped(&pipeline).await;
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn cross_join_and_outer_join_oom_clean_up_all_reservations() -> Result<()> {
+    let build_keys: Vec<Vec<Option<i32>>> = (0..16)
+        .map(|i| (0..256).map(|j| Some(i * 256 + j)).collect())
+        .collect();
+    let build_batches = join_test_batches("bv", &build_keys)?;
+    let probe_keys: Vec<Vec<Option<i32>>> = (0..32)
+        .map(|i| (0..256).map(|j| Some(i * 256 + j)).collect())
+        .collect();
+    let probe_batches = join_test_batches("pv", &probe_keys)?;
+
+    for sql in [
+        "SELECT probe_t.k, build_t.bv, probe_t.pv FROM probe_t CROSS JOIN build_t",
+        "SELECT probe_t.k, build_t.bv, probe_t.pv FROM probe_t RIGHT OUTER JOIN build_t ON probe_t.k = build_t.k",
+        "SELECT probe_t.k, build_t.bv, probe_t.pv FROM probe_t FULL OUTER JOIN build_t ON probe_t.k = build_t.k",
+    ] {
+        for limit_bytes in [256usize, 8192] {
+            let ObservedJoin { plan, .. } = observed_hash_join(
+                build_batches.clone(),
+                probe_batches.clone(),
+                sql,
+                None,
+                None,
+                false,
+            )
+            .await?;
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit_bytes));
+            let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 64)?;
+            let pipeline = Arc::downgrade(&plan.pipeline);
+            let mut stream = plan.execute(0, ctx)?;
+            let err = timeout(DEADLINE, stream.next())
+                .await
+                .unwrap()
+                .expect("expected OOM error")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    datafusion_common::DataFusionError::ResourcesExhausted(_)
+                ),
+                "sql={sql}, limit={limit_bytes}: expected ResourcesExhausted, got {err}"
+            );
+            drop(stream);
+            drop(plan);
+            assert_workers_stopped(&pipeline).await;
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "sql={sql}, limit={limit_bytes}: memory leaked after OOM"
+            );
+        }
+    }
+    Ok(())
+}
+
 struct ObservedSortPlan {
     plan: MorselExec,
     scans: Observations,
