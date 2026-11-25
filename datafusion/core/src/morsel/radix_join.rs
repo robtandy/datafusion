@@ -49,7 +49,11 @@ pub(super) fn build_join_spill_schema(
     for (idx, dt) in key_types.iter().enumerate() {
         fields.push(Arc::new(Field::new(format!("__k_{idx}"), dt.clone(), true)));
     }
-    fields.push(Arc::new(Field::new("__morsel_hash", DataType::UInt64, false)));
+    fields.push(Arc::new(Field::new(
+        "__morsel_hash",
+        DataType::UInt64,
+        false,
+    )));
     Arc::new(Schema::new(fields))
 }
 
@@ -95,7 +99,8 @@ pub(super) fn unpack_build_spill_batch(
             &opts,
         )?)
     };
-    let keys = batch.columns()[num_payload_cols..num_payload_cols + num_key_cols].to_vec();
+    let keys =
+        batch.columns()[num_payload_cols..num_payload_cols + num_key_cols].to_vec();
     let hash_col = batch
         .column(num_payload_cols + num_key_cols)
         .as_any()
@@ -195,8 +200,7 @@ impl RadixBuildStore {
                     to_spill.push(permuted.slice(offset, len));
                     self.part_rows[p] = self.part_rows[p].saturating_add(len);
                     let share = batch_bytes.saturating_mul(len) / total_rows;
-                    self.part_est_bytes[p] =
-                        self.part_est_bytes[p].saturating_add(share);
+                    self.part_est_bytes[p] = self.part_est_bytes[p].saturating_add(share);
                 }
                 self.mem_part_bytes[p] = 0;
                 if !to_spill.is_empty()

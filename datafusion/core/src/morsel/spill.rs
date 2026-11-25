@@ -55,9 +55,8 @@ impl SpillContext {
                 return None;
             }
         }
-        let manager =
-            SpillManager::new(env, SpillMetrics::new(plan_metrics, 0), schema)
-                .with_compression_type(opts.spill_compression);
+        let manager = SpillManager::new(env, SpillMetrics::new(plan_metrics, 0), schema)
+            .with_compression_type(opts.spill_compression);
         Some(Self {
             manager,
             min_headroom_bytes,

@@ -10,9 +10,9 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 
 use arrow::array::{
@@ -34,11 +34,11 @@ use arrow::datatypes::{
     UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::row::{RowConverter, SortField};
-use datafusion_common::{DataFusionError, Result};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::{
     RecordBatchMemoryCounter, RecordBatchMemoryTracker,
 };
+use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_expr::ColumnarValue;
@@ -407,7 +407,7 @@ fn concat_view_arrays<T: ByteViewType>(
     }
 }
 
-fn concat_batches_compact_views(
+pub(super) fn concat_batches_compact_views(
     schema: &SchemaRef,
     batches: &[RecordBatch],
 ) -> Result<RecordBatch> {
@@ -685,28 +685,29 @@ async fn spill_sorted_indexed_run(
     let chunk_size = chunk_size.max(1);
     let mut file = spill_manager.create_in_progress_file("MorselSortSpill")?;
     let mut max_record_batch_memory = 0usize;
-    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> = async {
-        let mut offset = 0usize;
-        while offset < indices.len() {
+    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+        async {
+            let mut offset = 0usize;
+            while offset < indices.len() {
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let take_len = (indices.len() - offset).min(chunk_size);
+                let slice = indices.slice(offset, take_len);
+                offset += take_len;
+                let columns = take_arrays(batch.columns(), &slice, None)?;
+                let options = RecordBatchOptions::new().with_row_count(Some(take_len));
+                let chunk =
+                    RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+                let mem = file.append_batch_async(&chunk).await?;
+                max_record_batch_memory = max_record_batch_memory.max(mem);
+            }
             if tx.is_closed() {
                 return Ok(None);
             }
-            let take_len = (indices.len() - offset).min(chunk_size);
-            let slice = indices.slice(offset, take_len);
-            offset += take_len;
-            let columns = take_arrays(batch.columns(), &slice, None)?;
-            let options = RecordBatchOptions::new().with_row_count(Some(take_len));
-            let chunk =
-                RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
-            let mem = file.append_batch_async(&chunk).await?;
-            max_record_batch_memory = max_record_batch_memory.max(mem);
+            file.finish_async().await
         }
-        if tx.is_closed() {
-            return Ok(None);
-        }
-        file.finish_async().await
-    }
-    .await;
+        .await;
 
     match res {
         Ok(Some(finished)) => Ok(Some(SortedSpillFile {
@@ -731,23 +732,24 @@ async fn spill_batched_run(
 ) -> Result<Option<SortedSpillFile>> {
     let mut file = spill_manager.create_in_progress_file("MorselSortSpill")?;
     let mut max_record_batch_memory = 0usize;
-    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> = async {
-        while let Some(batch) = run.pop_front() {
-            if batch.num_rows() == 0 {
-                continue;
+    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+        async {
+            while let Some(batch) = run.pop_front() {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let mem = file.append_batch_async(&batch).await?;
+                max_record_batch_memory = max_record_batch_memory.max(mem);
             }
             if tx.is_closed() {
                 return Ok(None);
             }
-            let mem = file.append_batch_async(&batch).await?;
-            max_record_batch_memory = max_record_batch_memory.max(mem);
+            file.finish_async().await
         }
-        if tx.is_closed() {
-            return Ok(None);
-        }
-        file.finish_async().await
-    }
-    .await;
+        .await;
     run.release();
 
     match res {
@@ -1057,12 +1059,10 @@ async fn emit_sorted_runs(
                         "Spilled sorted run requires SpillContext"
                     );
                 };
-                let mut stream = spill_ctx
-                    .manager
-                    .read_spill_as_stream_unbuffered(
-                        sf.file,
-                        Some(sf.max_record_batch_memory),
-                    )?;
+                let mut stream = spill_ctx.manager.read_spill_as_stream_unbuffered(
+                    sf.file,
+                    Some(sf.max_record_batch_memory),
+                )?;
                 let mut remaining_skip = skip;
                 let mut remaining_fetch = fetch;
                 while let Some(batch) = stream.next().await {
@@ -2172,21 +2172,22 @@ impl TopNState {
         let chunk_size = self.batch_size.max(1);
         let mut file = spill_manager.create_in_progress_file("MorselTopNSpill")?;
         let mut max_record_batch_memory = 0usize;
-        let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> = async {
-            for slab in indices.chunks(chunk_size) {
+        let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+            async {
+                for slab in indices.chunks(chunk_size) {
+                    if tx.is_closed() {
+                        return Ok(None);
+                    }
+                    let out = interleave_record_batch(&batch_refs, slab)?;
+                    let mem = file.append_batch_async(&out).await?;
+                    max_record_batch_memory = max_record_batch_memory.max(mem);
+                }
                 if tx.is_closed() {
                     return Ok(None);
                 }
-                let out = interleave_record_batch(&batch_refs, slab)?;
-                let mem = file.append_batch_async(&out).await?;
-                max_record_batch_memory = max_record_batch_memory.max(mem);
+                file.finish_async().await
             }
-            if tx.is_closed() {
-                return Ok(None);
-            }
-            file.finish_async().await
-        }
-        .await;
+            .await;
 
         for old in &self.batches {
             self.batch_memory.uncount_batch(&old.batch);
@@ -2878,7 +2879,9 @@ impl SortState {
                 return Ok(());
             }
             match run {
-                SortedRun::Spilled(sf) => self.completed_runs.push(SortedRun::Spilled(sf)),
+                SortedRun::Spilled(sf) => {
+                    self.completed_runs.push(SortedRun::Spilled(sf))
+                }
                 SortedRun::Indexed(mut ir) => {
                     let sf = if let Some(backing) = ir.batch.as_ref() {
                         spill_sorted_indexed_run(
@@ -3005,10 +3008,7 @@ impl SortState {
         }
     }
 
-    fn try_flush_tracked_in_memory(
-        &self,
-        tracked: &TrackedBatches,
-    ) -> Result<SortedRun> {
+    fn try_flush_tracked_in_memory(&self, tracked: &TrackedBatches) -> Result<SortedRun> {
         let merged_guard = if tracked.batches.len() == 1 {
             let single = tracked.batches[0].clone();
             self.shared_memory.count_batch(&single)?;

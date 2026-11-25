@@ -14,9 +14,7 @@ use arrow::compute::{SortOptions, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::utils::memory::get_record_batch_memory_size;
-use datafusion_common::{
-    DataFusionError, Result, exec_datafusion_err, float_semantics,
-};
+use datafusion_common::{DataFusionError, Result, exec_datafusion_err, float_semantics};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::spill_file::SpillFile;
@@ -757,11 +755,8 @@ fn finalize_spilled_partition<'a, M: RadixGroupMerger>(
                         continue;
                     }
                     merger.hash_partial_batch(&batch, &mut hashes)?;
-                    let (perm, ranges) = radix_permute_indices(
-                        &hashes,
-                        next_shift,
-                        RECURSIVE_RADIX_BITS,
-                    );
+                    let (perm, ranges) =
+                        radix_permute_indices(&hashes, next_shift, RECURSIVE_RADIX_BITS);
                     let permuted = take_record_batch(&batch, &perm)?;
                     drop(batch);
                     for (sp, &(offset, len)) in ranges.iter().enumerate() {
@@ -816,8 +811,7 @@ fn finalize_spilled_partition<'a, M: RadixGroupMerger>(
             }
 
             // Non-progressing hash collision skew: merge all sub-files via sorted fallback.
-            let flat: Vec<Arc<dyn SpillFile>> =
-                sub_files.into_iter().flatten().collect();
+            let flat: Vec<Arc<dyn SpillFile>> = sub_files.into_iter().flatten().collect();
             return finalize_sorted_spill_fallback(
                 merger,
                 flat,

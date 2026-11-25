@@ -1931,9 +1931,7 @@ impl Pipeline {
                 Ok(true)
             }
             WorkerSink::Sort(local) => {
-                worker
-                    .process_async(local.add_view_async(view, tx))
-                    .await?;
+                worker.process_async(local.add_view_async(view, tx)).await?;
                 Ok(true)
             }
             WorkerSink::HashJoinBuild(local) => {
@@ -2128,9 +2126,7 @@ impl Pipeline {
                     apply_operators_view(&self.operators, BatchView::all(batch))
                 })?;
                 if !view.is_empty() {
-                    worker
-                        .process_async(local.add_view_async(view, tx))
-                        .await?;
+                    worker.process_async(local.add_view_async(view, tx)).await?;
                 }
                 Ok(true)
             }
@@ -2184,9 +2180,7 @@ impl Pipeline {
                 if output.tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
-                let runs = worker
-                    .process_async(local.finish_async(&output.tx))
-                    .await?;
+                let runs = worker.process_async(local.finish_async(&output.tx)).await?;
                 return Ok(WorkerState::SortedRuns(runs));
             }
             WorkerSink::HashJoinBuild(local) => {
@@ -2326,19 +2320,14 @@ impl Pipeline {
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
-        let mut join_state = JoinWorkerState::new(
-            tables,
-            probe_reservation,
-            probe_spill_env,
-        );
+        let mut join_state =
+            JoinWorkerState::new(tables, probe_reservation, probe_spill_env);
         let Operator::HashProbe(probe) = &self.operators[op_idx] else {
             unreachable!()
         };
         let table = Arc::clone(&join_state.tables[build_id]);
         let FinalizedHashTableKind::Single(single) = &table.kind else {
-            return internal_err!(
-                "run_build_emission_worker expected SingleHashTable"
-            );
+            return internal_err!("run_build_emission_worker expected SingleHashTable");
         };
         let num_rows = single.num_rows();
         let chunk_rows = output.batch_size.max(1);
@@ -2362,9 +2351,9 @@ impl Pipeline {
                 if indices.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(
-                        probe.materialize_single_build_emission_batch(single, &indices)?,
-                    ))
+                    Ok(Some(probe.materialize_single_build_emission_batch(
+                        single, &indices,
+                    )?))
                 }
             })?;
             if let Some(batch) = batch_opt {
@@ -2625,9 +2614,8 @@ impl Pipeline {
                     // Release build spill files immediately before streaming probe!
                     drop(build_files);
                     let mut local_scratch = ProbeScratch::default();
-                    let local_probe_res =
-                        MemoryConsumer::new("MorselHashJoinSpillProbe")
-                            .register(context.memory_pool());
+                    let local_probe_res = MemoryConsumer::new("MorselHashJoinSpillProbe")
+                        .register(context.memory_pool());
                     for pf in probe_files {
                         if output.tx.is_closed() {
                             return Ok(false);
@@ -2745,8 +2733,8 @@ impl Pipeline {
                     if sub_b.is_empty() {
                         if probe.kind.emits_unmatched_probe() {
                             for pf in sub_p {
-                                let mut stream =
-                                    probe_mgr.read_spill_as_stream_unbuffered(pf, None)?;
+                                let mut stream = probe_mgr
+                                    .read_spill_as_stream_unbuffered(pf, None)?;
                                 while let Some(batch_res) = stream.next().await {
                                     let batch = batch_res?;
                                     if batch.num_rows() == 0 {
@@ -2811,11 +2799,11 @@ impl Pipeline {
             let mut local_scratch = ProbeScratch::default();
 
             let run_slice = async |slice_batches: Vec<RecordBatch>,
-                                       probe_matched: &mut Vec<u64>,
-                                       sink: &mut WorkerSink,
-                                       join_state: &mut JoinWorkerState,
-                                       worker: &mut WorkerMetrics,
-                                       local_scratch: &mut ProbeScratch|
+                                   probe_matched: &mut Vec<u64>,
+                                   sink: &mut WorkerSink,
+                                   join_state: &mut JoinWorkerState,
+                                   worker: &mut WorkerMetrics,
+                                   local_scratch: &mut ProbeScratch|
                    -> Result<bool> {
                 if slice_batches.is_empty() {
                     return Ok(true);
@@ -3043,8 +3031,7 @@ impl Pipeline {
             if table.is_empty() {
                 continue;
             }
-            let needs_p2 =
-                probe.needs_build_emission() || table.has_spilled_partitions();
+            let needs_p2 = probe.needs_build_emission() || table.has_spilled_partitions();
             if !needs_p2 {
                 continue;
             }
@@ -3133,9 +3120,7 @@ impl Pipeline {
                             }
                         };
                         if !Self::merge_worker_state_into_targets(
-                            local,
-                            targets,
-                            &output.tx,
+                            local, targets, &output.tx,
                         )
                         .await?
                         {
@@ -3159,11 +3144,8 @@ impl Pipeline {
                         probe_spill_env.clone(),
                     );
                     join_state.resident_tables[probe.build_id] = None;
-                    let mut worker = WorkerMetrics::for_pipeline(
-                        measurement.cloned(),
-                        0,
-                        &emit_label,
-                    );
+                    let mut worker =
+                        WorkerMetrics::for_pipeline(measurement.cloned(), 0, &emit_label);
 
                     // Step 2a: Resident M build emission + NULL-key build rows,
                     // then drop M immediately to free 100% of M's RAM before S!
@@ -3265,10 +3247,7 @@ impl Pipeline {
                     if radix.spilled_build_mask != 0 {
                         let (probe_mgr, mut probe_files_by_part) = {
                             let mut m = radix.probe_spill_manifest.lock();
-                            (
-                                m.manager.take(),
-                                std::mem::take(&mut m.files_by_part),
-                            )
+                            (m.manager.take(), std::mem::take(&mut m.files_by_part))
                         };
                         let build_mgr = radix
                             .build_spill_manager
@@ -3315,12 +3294,8 @@ impl Pipeline {
                     join_state.finish_probe_spills()?;
                     drop(join_state);
                     let local = self.finish_worker(sink, output, worker).await?;
-                    if !Self::merge_worker_state_into_targets(
-                        local,
-                        targets,
-                        &output.tx,
-                    )
-                    .await?
+                    if !Self::merge_worker_state_into_targets(local, targets, &output.tx)
+                        .await?
                     {
                         return Ok(false);
                     }
@@ -3366,7 +3341,8 @@ impl Pipeline {
                 BuildRunOutcome::ShortCircuitAll => {
                     let empty_res = MemoryConsumer::new("MorselHashJoinBuild")
                         .register(context.memory_pool());
-                    let empty_state = build_sink.new_state_with_spill(empty_res, None, None);
+                    let empty_state =
+                        build_sink.new_state_with_spill(empty_res, None, None);
                     let finalized = build_sink
                         .finalize_with_spill(
                             empty_state,
@@ -4396,9 +4372,7 @@ impl Pipeline {
                     ))
                 } else if matches!(
                     self.sink,
-                    Sink::Aggregate { .. }
-                        | Sink::GroupCount { .. }
-                        | Sink::TopN { .. }
+                    Sink::Aggregate { .. } | Sink::GroupCount { .. } | Sink::TopN { .. }
                 ) {
                     let consumer_name = match self.sink {
                         Sink::GroupCount { .. } => "MorselGroupCount",
@@ -4744,9 +4718,7 @@ impl Pipeline {
                 }
             }
             Sink::GroupCount {
-                sink,
-                post_sort,
-                ..
+                sink, post_sort, ..
             } => {
                 if !tx.is_closed() && !cancel_tx.is_closed() {
                     #[cfg(test)]
@@ -4787,9 +4759,7 @@ impl Pipeline {
                 }
             }
             Sink::Aggregate {
-                sink,
-                post_sort,
-                ..
+                sink, post_sort, ..
             } => {
                 if !tx.is_closed() && !cancel_tx.is_closed() {
                     #[cfg(test)]

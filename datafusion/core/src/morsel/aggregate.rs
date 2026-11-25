@@ -946,7 +946,8 @@ impl GroupedState {
     fn update_reservation(&mut self) -> Result<()> {
         let bytes = self.tracked_bytes();
         if bytes > self.table_tracked_bytes {
-            self.reservation.try_grow(bytes - self.table_tracked_bytes)?;
+            self.reservation
+                .try_grow(bytes - self.table_tracked_bytes)?;
         } else if bytes < self.table_tracked_bytes {
             self.reservation.shrink(self.table_tracked_bytes - bytes);
         }
@@ -1043,7 +1044,11 @@ impl GroupedState {
         Ok(())
     }
 
-    fn ingest_dense_unchecked(&mut self, batch: &RecordBatch, rebound: bool) -> Result<()> {
+    fn ingest_dense_unchecked(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+    ) -> Result<()> {
         let group_arrays = if rebound {
             self.rebound_group_exprs
                 .iter_mut()
@@ -1255,7 +1260,8 @@ impl GroupedState {
         let batch_reservation = self.reservation.new_empty();
         drop(self);
         batch_reservation.try_grow(batch_bytes)?;
-        emit_finalized_batch(batch, result_operators, batch_size, tx, measurement).await?;
+        emit_finalized_batch(batch, result_operators, batch_size, tx, measurement)
+            .await?;
         drop(batch_reservation);
         Ok(())
     }
@@ -2282,10 +2288,7 @@ fn build_direct_raw_partial_batch(
                         )
                     })?;
                 let vals: Vec<i64> = arr.values().iter().map(|&v| v as i64).collect();
-                cols.push(Arc::new(Int64Array::new(
-                    vals.into(),
-                    arr.nulls().cloned(),
-                )));
+                cols.push(Arc::new(Int64Array::new(vals.into(), arr.nulls().cloned())));
             }
             DirectAggSpec::AvgFloat64(col) => {
                 let arr = batch
@@ -2385,7 +2388,8 @@ where
     fn update_reservation(&mut self) -> Result<()> {
         let bytes = self.tracked_bytes();
         if bytes > self.table_tracked_bytes {
-            self.reservation.try_grow(bytes - self.table_tracked_bytes)?;
+            self.reservation
+                .try_grow(bytes - self.table_tracked_bytes)?;
         } else if bytes < self.table_tracked_bytes {
             self.reservation.shrink(self.table_tracked_bytes - bytes);
         }
@@ -2773,30 +2777,46 @@ macro_rules! dispatch_direct_kind {
 impl DirectGroupedKind {
     fn new(spec: &DirectGroupedSpec, reservation: MemoryReservation) -> Self {
         match spec.key_type {
-            IntKeyType::Int8 => {
-                Self::Int8(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::Int16 => {
-                Self::Int16(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::Int32 => {
-                Self::Int32(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::Int64 => {
-                Self::Int64(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::UInt8 => {
-                Self::UInt8(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::UInt16 => {
-                Self::UInt16(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::UInt32 => {
-                Self::UInt32(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
-            IntKeyType::UInt64 => {
-                Self::UInt64(DirectIntGroupMap::new(spec.key_index, &spec.aggs, reservation))
-            }
+            IntKeyType::Int8 => Self::Int8(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::Int16 => Self::Int16(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::Int32 => Self::Int32(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::Int64 => Self::Int64(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::UInt8 => Self::UInt8(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::UInt16 => Self::UInt16(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::UInt32 => Self::UInt32(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
+            IntKeyType::UInt64 => Self::UInt64(DirectIntGroupMap::new(
+                spec.key_index,
+                &spec.aggs,
+                reservation,
+            )),
         }
     }
 
@@ -2935,7 +2955,11 @@ impl DirectGroupedState {
         if self.direct_scatter {
             let partial =
                 build_direct_raw_partial_batch(view, &self.spec, &self.partial_schema)?;
-            hash_int_key_array(partial.column(0), self.spec.key_type, &mut self.hash_buf)?;
+            hash_int_key_array(
+                partial.column(0),
+                self.spec.key_type,
+                &mut self.hash_buf,
+            )?;
             let radix = self
                 .radix
                 .get_or_insert_with(RadixPartitionStore::new_default);
@@ -3327,9 +3351,7 @@ impl FinalizedAggregate {
                     let merger = Arc::new(DirectGroupedRadixMerger {
                         schema: self.schema,
                         partial_schema,
-                        spec: self
-                            .direct_grouped
-                            .expect("direct grouped spec"),
+                        spec: self.direct_grouped.expect("direct grouped spec"),
                     });
                     return finalize_and_emit_radix(
                         merger,

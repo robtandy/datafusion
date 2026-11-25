@@ -19,9 +19,7 @@ use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::{
-    FairSpillPool, GreedyMemoryPool, MemoryPool,
-};
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::morsel::MorselQueryPlanner;
 use datafusion::physical_plan::{ExecutionPlan, collect, execute_stream};
@@ -73,8 +71,7 @@ fn runtime_with_pool(
     pool: Arc<dyn MemoryPool>,
     max_temp_bytes: Option<u64>,
 ) -> Result<Arc<RuntimeEnv>> {
-    let mut dm =
-        DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory);
+    let mut dm = DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory);
     if let Some(limit) = max_temp_bytes {
         dm = dm.with_max_temp_directory_size(limit);
     }
@@ -85,15 +82,11 @@ fn runtime_with_pool(
 }
 
 fn spilled_bytes(plan: &dyn ExecutionPlan) -> usize {
-    plan.metrics()
-        .and_then(|m| m.spilled_bytes())
-        .unwrap_or(0)
+    plan.metrics().and_then(|m| m.spilled_bytes()).unwrap_or(0)
 }
 
 fn spill_count(plan: &dyn ExecutionPlan) -> usize {
-    plan.metrics()
-        .and_then(|m| m.spill_count())
-        .unwrap_or(0)
+    plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0)
 }
 
 fn assert_zero_leaks(runtime: &RuntimeEnv, label: &str) {
@@ -343,7 +336,8 @@ fn write_parquet_table(
     for (idx, chunk) in batches.chunks(4).enumerate() {
         let path = subdir.join(format!("part_{idx}.parquet"));
         let file = std::fs::File::create(&path)?;
-        let mut writer = ArrowWriter::try_new(file, chunk[0].schema(), Some(props.clone()))?;
+        let mut writer =
+            ArrowWriter::try_new(file, chunk[0].schema(), Some(props.clone()))?;
         for b in chunk {
             writer.write(b)?;
         }
@@ -352,9 +346,15 @@ fn write_parquet_table(
     Ok(subdir.to_str().unwrap().to_owned())
 }
 
-fn assert_exact_order(expected: Vec<RecordBatch>, actual: Vec<RecordBatch>, label: &str) -> Result<()> {
-    let exp_rows: Vec<RecordBatch> = expected.into_iter().filter(|b| b.num_rows() > 0).collect();
-    let act_rows: Vec<RecordBatch> = actual.into_iter().filter(|b| b.num_rows() > 0).collect();
+fn assert_exact_order(
+    expected: Vec<RecordBatch>,
+    actual: Vec<RecordBatch>,
+    label: &str,
+) -> Result<()> {
+    let exp_rows: Vec<RecordBatch> =
+        expected.into_iter().filter(|b| b.num_rows() > 0).collect();
+    let act_rows: Vec<RecordBatch> =
+        actual.into_iter().filter(|b| b.num_rows() > 0).collect();
     if exp_rows.is_empty() {
         assert!(act_rows.is_empty(), "{label}: expected empty result");
         return Ok(());
@@ -389,7 +389,9 @@ async fn group_by_spills_under_tight_greedy_pool_with_exact_parity() -> Result<(
         assert_eq!(plan.name(), "MorselExec");
         let actual = collect(Arc::clone(&plan), ctx.task_ctx())
             .await
-            .map_err(|e| DataFusionError::Execution(format!("sql=`{sql}` failed: {e}")))?;
+            .map_err(|e| {
+                DataFusionError::Execution(format!("sql=`{sql}` failed: {e}"))
+            })?;
 
         if sql.contains("ORDER BY") {
             assert_exact_order(expected, actual, sql)?;
@@ -737,7 +739,8 @@ async fn parquet_spilled_join_group_by_and_float_nan_parity() -> Result<()> {
         .register_parquet("p", &p_path, ParquetReadOptions::default())
         .await?;
 
-    let sql = "SELECT b.bk, COUNT(*) AS cnt FROM b INNER JOIN p ON b.bk = p.pk GROUP BY b.bk";
+    let sql =
+        "SELECT b.bk, COUNT(*) AS cnt FROM b INNER JOIN p ON b.bk = p.pk GROUP BY b.bk";
     let expected = stock.sql(sql).await?.collect().await?;
 
     for pushdown in [false, true] {
@@ -917,8 +920,7 @@ async fn spill_cleanup_on_early_drop_worker_error_disk_quota_and_fair_pool() -> 
             ),
         ] {
             let expected = stock.sql(sql).await?.collect().await?;
-            let pool: Arc<dyn MemoryPool> =
-                Arc::new(FairSpillPool::new(2 * 1024 * 1024));
+            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(2 * 1024 * 1024));
             let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
             let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
             ctx.register_table("g", group_tbl.clone())?;

@@ -568,6 +568,10 @@ impl HashJoinBuildSink {
             valid_masks: Vec::new(),
             r0_mem_bytes: 0,
             radix: None,
+            pending_radix_batches: Vec::new(),
+            pending_radix_hashes: Vec::new(),
+            pending_radix_rows: 0,
+            pending_radix_bytes: 0,
             null_key_payloads: Vec::new(),
             null_key_spill_files: Vec::new(),
             null_key_rows: 0,
@@ -634,8 +638,9 @@ impl HashJoinBuildSink {
         null_key_spill: Option<SpillContext>,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<Option<Arc<FinalizedHashTable>>> {
-        if combined.radix.is_some() {
+        if combined.radix.is_some() || !combined.pending_radix_batches.is_empty() {
             combined.flush_r0_to_radix(tx).await?;
+            combined.flush_pending_radix(tx).await?;
             return self
                 .finalize_radix(
                     combined,
@@ -652,6 +657,7 @@ impl HashJoinBuildSink {
         // parallel radix finalize for L2 cache locality!
         if self.can_radix_spill() && combined.num_rows > RADIX_JOIN_THRESHOLD_ROWS {
             combined.flush_r0_to_radix(tx).await?;
+            combined.flush_pending_radix(tx).await?;
             return self
                 .finalize_radix(
                     combined,
@@ -1212,7 +1218,8 @@ impl HashJoinBuildSink {
                     } else {
                         None
                     };
-                    let spilled_build = (0..num_parts).map(|_| Mutex::new(None)).collect();
+                    let spilled_build =
+                        (0..num_parts).map(|_| Mutex::new(None)).collect();
                     let radix_table = RadixHashTable {
                         shift,
                         radix_bits,
@@ -1429,8 +1436,8 @@ impl HashJoinBuildSink {
 
         // Optional parallel lock-free split-block Bloom filter populated across
         // all finalize workers.
-        let bloom_reservation = MemoryConsumer::new("MorselHashJoinBloom")
-            .register(memory_pool);
+        let bloom_reservation =
+            MemoryConsumer::new("MorselHashJoinBloom").register(memory_pool);
         let atomic_bloom = if let Some(cfg) = self.dynamic_filter
             && cfg.build_bloom
             && (total_hash_entries > 1 || self.key_types.len() > 1 || self.has_floats)
@@ -1854,6 +1861,10 @@ pub(super) struct HashJoinBuildState {
     valid_masks: Vec<Option<BooleanBuffer>>,
     r0_mem_bytes: usize,
     radix: Option<RadixBuildStore>,
+    pending_radix_batches: Vec<RecordBatch>,
+    pending_radix_hashes: Vec<u64>,
+    pending_radix_rows: usize,
+    pending_radix_bytes: usize,
     null_key_payloads: Vec<RecordBatch>,
     null_key_spill_files: Vec<Arc<dyn SpillFile>>,
     null_key_rows: usize,
@@ -1921,10 +1932,8 @@ impl HashJoinBuildState {
                         Some(p) => Some(filter_record_batch(p, &v_mask)?),
                         None => None,
                     };
-                    let v_hashes: Vec<u64> = bits
-                        .set_indices()
-                        .map(|i| hashes[i])
-                        .collect();
+                    let v_hashes: Vec<u64> =
+                        bits.set_indices().map(|i| hashes[i]).collect();
                     let packed = pack_build_spill_batch(
                         &self.build_spill_schema,
                         v_payload.as_ref(),
@@ -1932,9 +1941,8 @@ impl HashJoinBuildState {
                         v_hashes.clone(),
                     )?;
                     let extra = self.null_key_mem_bytes;
-                    let radix = self
-                        .radix
-                        .get_or_insert_with(RadixBuildStore::new_default);
+                    let radix =
+                        self.radix.get_or_insert_with(RadixBuildStore::new_default);
                     radix
                         .push_packed_batch(
                             packed,
@@ -1954,9 +1962,7 @@ impl HashJoinBuildState {
                     hashes.clone(),
                 )?;
                 let extra = self.null_key_mem_bytes;
-                let radix = self
-                    .radix
-                    .get_or_insert_with(RadixBuildStore::new_default);
+                let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
                 radix
                     .push_packed_batch(
                         packed,
@@ -2017,6 +2023,101 @@ impl HashJoinBuildState {
         self.reservation.try_grow(bytes)?;
         self.null_key_payloads.push(nk_batch);
         self.null_key_mem_bytes = self.null_key_mem_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    async fn flush_pending_radix(
+        &mut self,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.pending_radix_batches.is_empty() {
+            return Ok(());
+        }
+        let batches = std::mem::take(&mut self.pending_radix_batches);
+        let hashes = std::mem::take(&mut self.pending_radix_hashes);
+        self.pending_radix_rows = 0;
+        if self.pending_radix_bytes > 0 {
+            let shrink = self.pending_radix_bytes.min(self.reservation.size());
+            self.reservation.shrink(shrink);
+            self.pending_radix_bytes = 0;
+        }
+        let merged = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            super::sort::concat_batches_compact_views(&self.build_spill_schema, &batches)?
+        };
+        let extra = self.null_key_mem_bytes;
+        let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
+        radix
+            .push_packed_batch(
+                merged,
+                &hashes,
+                extra,
+                &self.reservation,
+                self.build_spill.as_ref(),
+                tx,
+            )
+            .await
+    }
+
+    async fn push_radix_packed(
+        &mut self,
+        packed: RecordBatch,
+        hashes: Vec<u64>,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        const RADIX_COALESCE_TARGET_ROWS: usize = 8_192;
+        let rows = packed.num_rows();
+        if rows == 0 {
+            return Ok(());
+        }
+        let spilled = self.radix.as_ref().is_some_and(|r| r.spilled)
+            || self
+                .build_spill
+                .as_ref()
+                .is_some_and(SpillContext::is_spilled);
+        // Fast path: full-sized batch with nothing pending goes straight into
+        // radix permutation without an extra concat copy.
+        if !spilled
+            && self.pending_radix_batches.is_empty()
+            && rows >= RADIX_COALESCE_TARGET_ROWS
+        {
+            let extra = self.null_key_mem_bytes;
+            let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
+            return radix
+                .push_packed_batch(
+                    packed,
+                    &hashes,
+                    extra,
+                    &self.reservation,
+                    self.build_spill.as_ref(),
+                    tx,
+                )
+                .await;
+        }
+        let bytes = get_record_batch_memory_size(&packed);
+        if spilled || self.reservation.try_grow(bytes).is_err() {
+            self.flush_pending_radix(tx).await?;
+            let extra = self.null_key_mem_bytes;
+            let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
+            return radix
+                .push_packed_batch(
+                    packed,
+                    &hashes,
+                    extra,
+                    &self.reservation,
+                    self.build_spill.as_ref(),
+                    tx,
+                )
+                .await;
+        }
+        self.pending_radix_bytes = self.pending_radix_bytes.saturating_add(bytes);
+        self.pending_radix_rows = self.pending_radix_rows.saturating_add(rows);
+        self.pending_radix_batches.push(packed);
+        self.pending_radix_hashes.extend_from_slice(&hashes);
+        if self.pending_radix_rows >= RADIX_COALESCE_TARGET_ROWS {
+            self.flush_pending_radix(tx).await?;
+        }
         Ok(())
     }
 
@@ -2098,8 +2199,7 @@ impl HashJoinBuildState {
                         RecordBatch::try_new_with_options(
                             Arc::clone(&self.payload_schema),
                             vec![],
-                            &RecordBatchOptions::new()
-                                .with_row_count(Some(invalid_rows)),
+                            &RecordBatchOptions::new().with_row_count(Some(invalid_rows)),
                         )?
                     } else if view.is_all() {
                         let proj = batch.project(&self.payload_columns)?;
@@ -2115,11 +2215,12 @@ impl HashJoinBuildState {
                         nv.materialize()?
                     };
                     self.push_null_key_batch(nk_batch, tx).await?;
-                    self.num_rows = self.num_rows.checked_add(invalid_rows).ok_or_else(|| {
-                        datafusion_common::exec_datafusion_err!(
-                            "Morsel HashJoin build row count overflow"
-                        )
-                    })?;
+                    self.num_rows =
+                        self.num_rows.checked_add(invalid_rows).ok_or_else(|| {
+                            datafusion_common::exec_datafusion_err!(
+                                "Morsel HashJoin build row count overflow"
+                            )
+                        })?;
                 }
                 if valid_rows == 0 {
                     return Ok(());
@@ -2169,20 +2270,7 @@ impl HashJoinBuildState {
             &normalized_keys,
             hashes.clone(),
         )?;
-        let extra = self.null_key_mem_bytes;
-        let radix = self
-            .radix
-            .get_or_insert_with(RadixBuildStore::new_default);
-        radix
-            .push_packed_batch(
-                packed,
-                &hashes,
-                extra,
-                &self.reservation,
-                self.build_spill.as_ref(),
-                tx,
-            )
-            .await?;
+        self.push_radix_packed(packed, hashes, tx).await?;
         self.num_rows = self.num_rows.checked_add(valid_rows).ok_or_else(|| {
             datafusion_common::exec_datafusion_err!(
                 "Morsel HashJoin build row count overflow"
@@ -2208,6 +2296,8 @@ impl HashJoinBuildState {
         }
         let use_radix = self.radix.is_some()
             || other.radix.is_some()
+            || !self.pending_radix_batches.is_empty()
+            || !other.pending_radix_batches.is_empty()
             || (self.can_radix
                 && self.num_rows.saturating_add(other.num_rows)
                     > RADIX_JOIN_THRESHOLD_ROWS);
@@ -2216,22 +2306,23 @@ impl HashJoinBuildState {
             return Ok(());
         }
         self.flush_r0_to_radix(tx).await?;
+        self.flush_pending_radix(tx).await?;
         other.flush_r0_to_radix(tx).await?;
+        other.flush_pending_radix(tx).await?;
         if let (Some(mine), Some(theirs)) = (&mut self.key_summary, &other.key_summary) {
             mine.merge(theirs);
         }
         if let Some(other_radix) = other.radix.take() {
-            let radix = self
-                .radix
-                .get_or_insert_with(RadixBuildStore::new_default);
+            let radix = self.radix.get_or_insert_with(RadixBuildStore::new_default);
             radix.combine_from(other_radix);
         }
         self.null_key_payloads.append(&mut other.null_key_payloads);
         self.null_key_spill_files
             .append(&mut other.null_key_spill_files);
         self.null_key_rows = self.null_key_rows.saturating_add(other.null_key_rows);
-        self.null_key_mem_bytes =
-            self.null_key_mem_bytes.saturating_add(other.null_key_mem_bytes);
+        self.null_key_mem_bytes = self
+            .null_key_mem_bytes
+            .saturating_add(other.null_key_mem_bytes);
         self.num_rows = self.num_rows.saturating_add(other.num_rows);
         let transferred = other.reservation.free();
         self.reservation.grow(transferred);
@@ -2853,9 +2944,7 @@ pub(super) fn build_single_table_from_packed_batches(
         ));
     }
     if num_rows >= u32::MAX as usize {
-        return exec_err!(
-            "Morsel HashJoin partition exceeds u32::MAX rows ({num_rows})"
-        );
+        return exec_err!("Morsel HashJoin partition exceeds u32::MAX rows ({num_rows})");
     }
 
     let num_key_cols = meta.key_types.len();
@@ -2959,9 +3048,9 @@ pub(super) fn build_single_table_from_packed_batches(
             &RecordBatchOptions::new().with_row_count(Some(num_rows)),
         )?
     } else if payload_batches.len() == 1 {
-        payload_batches.pop().unwrap()
+        super::sort::gc_view_batch(&payload_batches.pop().unwrap())?
     } else {
-        concat_batches(&meta.payload_schema, &payload_batches)?
+        super::sort::concat_batches_compact_views(&meta.payload_schema, &payload_batches)?
     };
     drop(payload_batches);
 
@@ -3121,8 +3210,7 @@ pub(super) fn build_single_table_from_packed_batches(
     };
     drop(hash_chunks);
 
-    let matched: Vec<AtomicU64> =
-        (0..matched_words).map(|_| AtomicU64::new(0)).collect();
+    let matched: Vec<AtomicU64> = (0..matched_words).map(|_| AtomicU64::new(0)).collect();
     let final_bytes = get_record_batch_memory_size(&payload)
         .saturating_add(build_keys.memory_bytes())
         .saturating_add(dir_bytes)
@@ -3317,24 +3405,42 @@ impl SingleProbeCursor {
 pub(super) struct RadixProbeCursor {
     batch: RecordBatch,
     keys: ProbeKeys,
+    valid_mask: Option<BooleanBuffer>,
+    rows: ProbeRows,
     resident: Arc<ResidentRadixPartitions>,
-    resident_buckets: Vec<Vec<u32>>,
-    immediate_unmatched: Vec<u32>,
-    unmatched_pos: usize,
-    cur_part: usize,
-    cur_bucket_pos: usize,
+    shift: u32,
+    radix_bits: u32,
+    resident_mask: u64,
+    spilled_build_mask: u64,
+    pos: usize,
     next_entry: u32,
     row_matched: bool,
-    /// Used when `probe.filter.is_some()` to step through one partition at a time.
+    /// Populated only when `probe.filter.is_some()` to reuse `SingleProbeCursor`.
+    filtered_buckets: Option<Vec<Vec<u32>>>,
+    filtered_unmatched: Vec<u32>,
+    filtered_unmatched_pos: usize,
+    filtered_part: usize,
     filtered_part_cursor: Option<SingleProbeCursor>,
     _reservation: MemoryReservation,
 }
 
 impl RadixProbeCursor {
     fn is_exhausted(&self) -> bool {
-        self.unmatched_pos >= self.immediate_unmatched.len()
-            && self.cur_part >= self.resident_buckets.len()
-            && self.filtered_part_cursor.is_none()
+        if let Some(buckets) = &self.filtered_buckets {
+            self.filtered_unmatched_pos >= self.filtered_unmatched.len()
+                && self.filtered_part >= buckets.len()
+                && self.filtered_part_cursor.is_none()
+        } else {
+            match &self.rows {
+                ProbeRows::All { num_rows } | ProbeRows::Mask { num_rows, .. } => {
+                    self.pos >= *num_rows
+                }
+                ProbeRows::BackingIndices(indices) => self.pos >= indices.len(),
+                ProbeRows::CompactedKeys { backing_rows } => {
+                    self.pos >= backing_rows.len()
+                }
+            }
+        }
     }
 }
 
@@ -3796,31 +3902,7 @@ impl HashJoinProbe {
         probe_spill_env: Option<&ProbeSpillEnv>,
         probe_reservation: &MemoryReservation,
     ) -> Result<Option<RadixProbeCursor>> {
-        let cursor_reservation = probe_reservation.new_empty();
-        let batch = if view.is_all() {
-            view.into_parts().0
-        } else {
-            let mat = view.materialize()?;
-            let bytes = get_record_batch_memory_size(&mat);
-            let _ = cursor_reservation.try_grow(bytes);
-            mat
-        };
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok(None);
-        }
-
-        let mut key_arrays = Vec::with_capacity(self.probe_key_exprs.len());
-        for expr in &self.probe_key_exprs {
-            key_arrays.push(expr.evaluate(&batch)?.into_array(num_rows)?);
-        }
-        let valid_mask = if self.null_equality == NullEquality::NullEqualsNull {
-            None
-        } else {
-            valid_key_mask(&key_arrays)
-        };
-        let keys = self.build_probe_keys_for_meta(&key_arrays, num_rows, &radix.meta)?;
-
+        let mut cursor_reservation = probe_reservation.new_empty();
         let num_parts = 1usize << radix.radix_bits;
         let shift = radix.shift;
         let radix_bits = radix.radix_bits;
@@ -3829,65 +3911,211 @@ impl HashJoinProbe {
         let keep_null_probe = self.kind.keeps_null_probe_keys();
         let emit_unmatched_probe = self.kind.emits_unmatched_probe();
 
-        let mut resident_buckets: Vec<Vec<u32>> = vec![Vec::new(); num_parts];
-        let mut spill_buckets: Vec<Vec<u32>> = if spilled_build_mask != 0 {
-            vec![Vec::new(); num_parts]
-        } else {
-            Vec::new()
-        };
-        let mut immediate_unmatched: Vec<u32> = Vec::new();
-
-        for i in 0..num_rows {
-            if valid_mask.as_ref().is_some_and(|v| !v.value(i)) {
-                if keep_null_probe {
-                    immediate_unmatched.push(i as u32);
+        // Build zero-copy `(batch, keys, valid_mask, rows)` matching `SingleProbeCursor`.
+        let is_flat_int = matches!(
+            self.key_kind,
+            KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+        );
+        let (batch, keys, valid_mask, rows) = if view.is_all() {
+            let batch = view.into_parts().0;
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                return Ok(None);
+            }
+            let mut key_arrays = Vec::with_capacity(self.probe_key_exprs.len());
+            for expr in &self.probe_key_exprs {
+                key_arrays.push(expr.evaluate(&batch)?.into_array(num_rows)?);
+            }
+            let valid_mask = if self.null_equality == NullEquality::NullEqualsNull {
+                None
+            } else {
+                valid_key_mask(&key_arrays)
+            };
+            let keys =
+                self.build_probe_keys_for_meta(&key_arrays, num_rows, &radix.meta)?;
+            (batch, keys, valid_mask, ProbeRows::All { num_rows })
+        } else if is_flat_int && let Some(key_col) = self.plain_single_key_col {
+            let view = view.into_reserved_for_retention(&mut cursor_reservation)?;
+            let (batch, selection) = view.into_parts();
+            let num_rows = batch.num_rows();
+            let key_arr = batch.column(key_col);
+            let keys = self.build_probe_keys_for_meta(
+                std::slice::from_ref(key_arr),
+                num_rows,
+                &radix.meta,
+            )?;
+            let (rows, valid_mask) = match selection {
+                Selection::All => unreachable!(),
+                Selection::Mask { bits, .. } => {
+                    if key_arr.null_count() > 0 {
+                        let nulls = key_arr.nulls().unwrap().inner();
+                        if keep_null_probe {
+                            (ProbeRows::Mask { bits, num_rows }, Some(nulls.clone()))
+                        } else {
+                            let combined = &bits & nulls;
+                            if combined.count_set_bits() == 0 {
+                                return Ok(None);
+                            }
+                            (
+                                ProbeRows::Mask {
+                                    bits: combined,
+                                    num_rows,
+                                },
+                                None,
+                            )
+                        }
+                    } else {
+                        (ProbeRows::Mask { bits, num_rows }, None)
+                    }
                 }
-                continue;
+                Selection::Indices(indices) => {
+                    let valid_mask = if key_arr.null_count() > 0 {
+                        Some(key_arr.nulls().unwrap().inner().clone())
+                    } else {
+                        None
+                    };
+                    (ProbeRows::BackingIndices(indices), valid_mask)
+                }
+            };
+            (batch, keys, valid_mask, rows)
+        } else {
+            let mat = view.materialize()?;
+            let num_rows = mat.num_rows();
+            if num_rows == 0 {
+                return Ok(None);
             }
-            let h = keys.hash_at(i);
-            let p = radix_partition(h, shift, radix_bits);
-            if ((resident_mask >> p) & 1) != 0 {
-                resident_buckets[p].push(i as u32);
-            } else if ((spilled_build_mask >> p) & 1) != 0 {
-                spill_buckets[p].push(i as u32);
-            } else if emit_unmatched_probe {
-                immediate_unmatched.push(i as u32);
+            let bytes = get_record_batch_memory_size(&mat);
+            let _ = cursor_reservation.try_grow(bytes);
+            let mut key_arrays = Vec::with_capacity(self.probe_key_exprs.len());
+            for expr in &self.probe_key_exprs {
+                key_arrays.push(expr.evaluate(&mat)?.into_array(num_rows)?);
             }
-        }
+            let valid_mask = if self.null_equality == NullEquality::NullEqualsNull {
+                None
+            } else {
+                valid_key_mask(&key_arrays)
+            };
+            let keys =
+                self.build_probe_keys_for_meta(&key_arrays, num_rows, &radix.meta)?;
+            (mat, keys, valid_mask, ProbeRows::All { num_rows })
+        };
 
         // Route probe rows belonging to spilled build partitions `p ∈ S` into
         // worker-local synchronous `LocalProbeSpill`.
         if spilled_build_mask != 0 {
+            let mut spill_buckets: Vec<Vec<u32>> = vec![Vec::new(); num_parts];
+            let mut pos = 0usize;
+            let row_len = match &rows {
+                ProbeRows::All { num_rows } | ProbeRows::Mask { num_rows, .. } => {
+                    *num_rows
+                }
+                ProbeRows::BackingIndices(idx) => idx.len(),
+                ProbeRows::CompactedKeys { backing_rows } => backing_rows.len(),
+            };
+            while pos < row_len {
+                if let Some((key_idx, backing_row)) = probe_row_at(&rows, pos)
+                    && valid_mask.as_ref().is_none_or(|v| v.value(key_idx))
+                {
+                    let h = keys.hash_at(key_idx);
+                    let p = radix_partition(h, shift, radix_bits);
+                    if ((spilled_build_mask >> p) & 1) != 0 {
+                        spill_buckets[p].push(backing_row);
+                    }
+                }
+                pos += 1;
+            }
             let env = probe_spill_env.expect("probe spill env for spilled join");
             let lps = local_probe_spill
                 .as_deref_mut()
                 .expect("local probe spill for spilled join");
-            for (p, rows) in spill_buckets.into_iter().enumerate() {
-                if rows.is_empty() {
+            for (p, p_rows) in spill_buckets.into_iter().enumerate() {
+                if p_rows.is_empty() {
                     continue;
                 }
-                let idx_arr = UInt32Array::from(rows);
+                let idx_arr = UInt32Array::from(p_rows);
                 let sub = take_record_batch(&batch, &idx_arr)?;
                 lps.push_batch(p, sub, env, probe_reservation)?;
             }
         }
 
-        let has_resident_work = resident_buckets.iter().any(|b| !b.is_empty());
-        if !has_resident_work && immediate_unmatched.is_empty() {
+        // Fast path: equi-joins without residual filter probe directly over
+        // `rows` with ZERO 64-bucket Vec allocations!
+        if self.filter.is_none() {
+            if resident_mask == 0 && !emit_unmatched_probe {
+                return Ok(None);
+            }
+            return Ok(Some(RadixProbeCursor {
+                batch,
+                keys,
+                valid_mask,
+                rows,
+                resident: Arc::clone(resident),
+                shift,
+                radix_bits,
+                resident_mask,
+                spilled_build_mask,
+                pos: 0,
+                next_entry: 0,
+                row_matched: false,
+                filtered_buckets: None,
+                filtered_unmatched: Vec::new(),
+                filtered_unmatched_pos: 0,
+                filtered_part: 0,
+                filtered_part_cursor: None,
+                _reservation: cursor_reservation,
+            }));
+        }
+
+        // Residual non-equi filter path: bucket resident rows by partition so
+        // `SingleProbeCursor::next_chunk_filtered` handles arbitrary filters.
+        let mut filtered_buckets: Vec<Vec<u32>> = vec![Vec::new(); num_parts];
+        let mut filtered_unmatched: Vec<u32> = Vec::new();
+        let row_len = match &rows {
+            ProbeRows::All { num_rows } | ProbeRows::Mask { num_rows, .. } => *num_rows,
+            ProbeRows::BackingIndices(idx) => idx.len(),
+            ProbeRows::CompactedKeys { backing_rows } => backing_rows.len(),
+        };
+        for pos in 0..row_len {
+            let Some((key_idx, backing_row)) = probe_row_at(&rows, pos) else {
+                continue;
+            };
+            if valid_mask.as_ref().is_some_and(|v| !v.value(key_idx)) {
+                if keep_null_probe {
+                    filtered_unmatched.push(backing_row);
+                }
+                continue;
+            }
+            let h = keys.hash_at(key_idx);
+            let p = radix_partition(h, shift, radix_bits);
+            if ((resident_mask >> p) & 1) != 0 {
+                filtered_buckets[p].push(backing_row);
+            } else if ((spilled_build_mask >> p) & 1) == 0 && emit_unmatched_probe {
+                filtered_unmatched.push(backing_row);
+            }
+        }
+        let has_work = filtered_buckets.iter().any(|b| !b.is_empty())
+            || !filtered_unmatched.is_empty();
+        if !has_work {
             return Ok(None);
         }
 
         Ok(Some(RadixProbeCursor {
             batch,
             keys,
+            valid_mask,
+            rows,
             resident: Arc::clone(resident),
-            resident_buckets,
-            immediate_unmatched,
-            unmatched_pos: 0,
-            cur_part: 0,
-            cur_bucket_pos: 0,
+            shift,
+            radix_bits,
+            resident_mask,
+            spilled_build_mask,
+            pos: 0,
             next_entry: 0,
             row_matched: false,
+            filtered_buckets: Some(filtered_buckets),
+            filtered_unmatched,
+            filtered_unmatched_pos: 0,
+            filtered_part: 0,
             filtered_part_cursor: None,
             _reservation: cursor_reservation,
         }))
@@ -4220,7 +4448,7 @@ impl HashJoinProbe {
         scratch: &mut ProbeScratch,
     ) -> Result<OperatorStep> {
         let limit = batch_size.max(1);
-        let num_parts = cursor.resident_buckets.len();
+        let num_parts = cursor.resident.partitions.len();
 
         // Residual non-equi filter path: step through each non-empty resident
         // partition using SingleProbeCursor and coalesce up to `limit` rows.
@@ -4228,27 +4456,44 @@ impl HashJoinProbe {
             return self.next_chunk_radix_filtered(cursor, limit, scratch);
         }
 
-        // BuildSemi / BuildAnti: only mark build-side matched bits across all
-        // resident partitions; emit zero rows during P1.
-        if matches!(self.kind, ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti) {
-            while cursor.cur_part < num_parts {
-                let p = cursor.cur_part;
-                cursor.cur_part += 1;
-                let rows = &cursor.resident_buckets[p];
-                if rows.is_empty() {
-                    continue;
-                }
-                let Some(part_table) = cursor.resident.partitions[p].as_ref() else {
+        let shift = cursor.shift;
+        let radix_bits = cursor.radix_bits;
+        let resident_mask = cursor.resident_mask;
+        let spilled_build_mask = cursor.spilled_build_mask;
+        let keep_null_probe = self.kind.keeps_null_probe_keys();
+        let emit_unmatched_probe = self.kind.emits_unmatched_probe();
+
+        // BuildSemi / BuildAnti: mark build-side matched bits directly with
+        // ZERO bucket allocations and ZERO output during P1.
+        if matches!(
+            self.kind,
+            ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti
+        ) {
+            while !cursor.is_exhausted() {
+                let Some((key_idx, _)) = probe_row_at(&cursor.rows, cursor.pos) else {
+                    cursor.pos += 1;
                     continue;
                 };
-                for &r in rows {
-                    probe_mark_all_matches(&cursor.keys, part_table, r as usize)?;
+                cursor.pos += 1;
+                if cursor
+                    .valid_mask
+                    .as_ref()
+                    .is_some_and(|v| !v.value(key_idx))
+                {
+                    continue;
+                }
+                let h = cursor.keys.hash_at(key_idx);
+                let p = radix_partition(h, shift, radix_bits);
+                if ((resident_mask >> p) & 1) != 0
+                    && let Some(part_table) = cursor.resident.partitions[p].as_ref()
+                {
+                    probe_mark_all_matches(&cursor.keys, part_table, key_idx)?;
                 }
             }
             return Ok(OperatorStep::NeedMoreInput(None));
         }
 
-        // ProbeSemi / ProbeAnti: probe-only output (no build columns).
+        // ProbeSemi / ProbeAnti: direct radix lookup, probe-only output.
         if matches!(
             self.kind,
             ProbeJoinKind::ProbeSemi | ProbeJoinKind::ProbeAnti { .. }
@@ -4257,42 +4502,37 @@ impl HashJoinProbe {
             scratch.probe_indices.clear();
             reserve_indices(&mut scratch.probe_indices, limit)?;
 
-            while cursor.unmatched_pos < cursor.immediate_unmatched.len()
-                && scratch.probe_indices.len() < limit
-            {
-                scratch
-                    .probe_indices
-                    .push(cursor.immediate_unmatched[cursor.unmatched_pos]);
-                cursor.unmatched_pos += 1;
-            }
-
-            while cursor.cur_part < num_parts && scratch.probe_indices.len() < limit {
-                let p = cursor.cur_part;
-                let rows = &cursor.resident_buckets[p];
-                if cursor.cur_bucket_pos >= rows.len() {
-                    cursor.cur_part += 1;
-                    cursor.cur_bucket_pos = 0;
-                    continue;
-                }
-                let Some(part_table) = cursor.resident.partitions[p].as_ref() else {
-                    cursor.cur_part += 1;
-                    cursor.cur_bucket_pos = 0;
+            while !cursor.is_exhausted() && scratch.probe_indices.len() < limit {
+                let Some((key_idx, backing_row)) = probe_row_at(&cursor.rows, cursor.pos)
+                else {
+                    cursor.pos += 1;
                     continue;
                 };
-                while cursor.cur_bucket_pos < rows.len()
-                    && scratch.probe_indices.len() < limit
+                cursor.pos += 1;
+                if cursor
+                    .valid_mask
+                    .as_ref()
+                    .is_some_and(|v| !v.value(key_idx))
                 {
-                    let r = rows[cursor.cur_bucket_pos];
-                    cursor.cur_bucket_pos += 1;
-                    let matched =
-                        probe_has_any_match(&cursor.keys, part_table, r as usize)?;
-                    if matched == is_semi {
-                        scratch.probe_indices.push(r);
+                    if keep_null_probe {
+                        scratch.probe_indices.push(backing_row);
                     }
+                    continue;
                 }
-                if cursor.cur_bucket_pos >= rows.len() {
-                    cursor.cur_part += 1;
-                    cursor.cur_bucket_pos = 0;
+                let h = cursor.keys.hash_at(key_idx);
+                let p = radix_partition(h, shift, radix_bits);
+                if ((spilled_build_mask >> p) & 1) != 0 {
+                    continue;
+                }
+                let matched = if ((resident_mask >> p) & 1) != 0
+                    && let Some(part_table) = cursor.resident.partitions[p].as_ref()
+                {
+                    probe_has_any_match(&cursor.keys, part_table, key_idx)?
+                } else {
+                    false
+                };
+                if matched == is_semi {
+                    scratch.probe_indices.push(backing_row);
                 }
             }
 
@@ -4319,7 +4559,11 @@ impl HashJoinProbe {
                             "ProbeSemi/ProbeAnti cannot project build columns"
                         );
                     };
-                    cols.push(take(cursor.batch.column(*idx).as_ref(), &probe_idx, None)?);
+                    cols.push(take(
+                        cursor.batch.column(*idx).as_ref(),
+                        &probe_idx,
+                        None,
+                    )?);
                 }
                 if let Ok(mut v) = probe_idx.into_parts().1.into_inner().into_vec::<u32>()
                 {
@@ -4336,118 +4580,105 @@ impl HashJoinProbe {
         }
 
         // Inner / BuildOuter / ProbeOuter / FullOuter equi-join fast path:
-        // Probe L2-locally partition-by-partition and emit ONE coalesced batch
-        // via single `interleave` (build cols) + `take` (probe cols)!
+        // Direct radix probe with ZERO bucket allocations!
         let mark_build = matches!(
             self.kind,
             ProbeJoinKind::BuildOuter | ProbeJoinKind::FullOuter
-        );
-        let emit_unmatched_probe = matches!(
-            self.kind,
-            ProbeJoinKind::ProbeOuter | ProbeJoinKind::FullOuter
         );
         scratch.interleave_build.clear();
         scratch.probe_indices.clear();
         scratch.interleave_build.reserve(limit);
         reserve_indices(&mut scratch.probe_indices, limit)?;
         let mut has_null_build = false;
-
-        if emit_unmatched_probe {
-            while cursor.unmatched_pos < cursor.immediate_unmatched.len()
-                && scratch.probe_indices.len() < limit
-            {
-                scratch.interleave_build.push((num_parts, 0));
-                scratch
-                    .probe_indices
-                    .push(cursor.immediate_unmatched[cursor.unmatched_pos]);
-                cursor.unmatched_pos += 1;
-                has_null_build = true;
-            }
-        } else {
-            cursor.unmatched_pos = cursor.immediate_unmatched.len();
-        }
-
         let mut single_part_hit: Option<usize> = None;
         let mut multi_part_hit = false;
 
-        while cursor.cur_part < num_parts && scratch.probe_indices.len() < limit {
-            let p = cursor.cur_part;
-            let rows = &cursor.resident_buckets[p];
-            if cursor.cur_bucket_pos >= rows.len() {
-                cursor.cur_part += 1;
-                cursor.cur_bucket_pos = 0;
-                cursor.next_entry = 0;
-                cursor.row_matched = false;
-                continue;
-            }
-            let Some(part_table) = cursor.resident.partitions[p].as_ref() else {
-                cursor.cur_part += 1;
-                cursor.cur_bucket_pos = 0;
-                cursor.next_entry = 0;
-                cursor.row_matched = false;
+        while !cursor.is_exhausted() && scratch.probe_indices.len() < limit {
+            let Some((key_idx, backing_row)) = probe_row_at(&cursor.rows, cursor.pos)
+            else {
+                cursor.pos += 1;
                 continue;
             };
-
-            let before_part = scratch.probe_indices.len();
-            while cursor.cur_bucket_pos < rows.len()
-                && scratch.probe_indices.len() < limit
+            if cursor.next_entry == 0
+                && cursor
+                    .valid_mask
+                    .as_ref()
+                    .is_some_and(|v| !v.value(key_idx))
             {
-                let r = rows[cursor.cur_bucket_pos];
-                let rem = limit - scratch.probe_indices.len();
-                let continued = cursor.next_entry != 0;
-                scratch.build_indices.clear();
-                scratch.cand_probe.clear();
-                let chain_done = probe_step_key_candidates(
-                    &cursor.keys,
-                    part_table,
-                    r as usize,
-                    r,
-                    &mut cursor.next_entry,
-                    rem,
-                    false,
-                    &mut scratch.build_indices,
-                    &mut scratch.cand_probe,
-                )?;
-                let added = scratch.build_indices.len();
-                if added > 0 {
-                    for &b in &scratch.build_indices {
-                        if mark_build {
-                            part_table.mark_matched(b);
-                        }
-                        scratch.interleave_build.push((p, b as usize));
-                        scratch.probe_indices.push(r);
-                    }
-                    if chain_done {
-                        cursor.cur_bucket_pos += 1;
-                        cursor.next_entry = 0;
-                        cursor.row_matched = false;
-                    } else {
-                        cursor.row_matched = true;
-                        break;
-                    }
-                } else {
-                    if emit_unmatched_probe && (!continued || !cursor.row_matched) {
-                        scratch.interleave_build.push((num_parts, 0));
-                        scratch.probe_indices.push(r);
-                        has_null_build = true;
-                    }
-                    cursor.cur_bucket_pos += 1;
-                    cursor.next_entry = 0;
-                    cursor.row_matched = false;
+                if keep_null_probe {
+                    scratch.interleave_build.push((num_parts, 0));
+                    scratch.probe_indices.push(backing_row);
+                    has_null_build = true;
                 }
+                cursor.pos += 1;
+                continue;
             }
-
-            if scratch.probe_indices.len() > before_part {
+            let h = cursor.keys.hash_at(key_idx);
+            let p = radix_partition(h, shift, radix_bits);
+            if ((spilled_build_mask >> p) & 1) != 0 {
+                cursor.pos += 1;
+                cursor.next_entry = 0;
+                cursor.row_matched = false;
+                continue;
+            }
+            if ((resident_mask >> p) & 1) == 0 {
+                if emit_unmatched_probe {
+                    scratch.interleave_build.push((num_parts, 0));
+                    scratch.probe_indices.push(backing_row);
+                    has_null_build = true;
+                }
+                cursor.pos += 1;
+                cursor.next_entry = 0;
+                cursor.row_matched = false;
+                continue;
+            }
+            let part_table = cursor.resident.partitions[p]
+                .as_ref()
+                .expect("resident partition present");
+            let rem = limit - scratch.probe_indices.len();
+            let continued = cursor.next_entry != 0;
+            scratch.build_indices.clear();
+            scratch.cand_probe.clear();
+            let chain_done = probe_step_key_candidates(
+                &cursor.keys,
+                part_table,
+                key_idx,
+                backing_row,
+                &mut cursor.next_entry,
+                rem,
+                false,
+                &mut scratch.build_indices,
+                &mut scratch.cand_probe,
+            )?;
+            let added = scratch.build_indices.len();
+            if added > 0 {
                 match single_part_hit {
                     None => single_part_hit = Some(p),
                     Some(prev) if prev != p => multi_part_hit = true,
                     _ => {}
                 }
-            }
-
-            if cursor.cur_bucket_pos >= rows.len() {
-                cursor.cur_part += 1;
-                cursor.cur_bucket_pos = 0;
+                for &b in &scratch.build_indices {
+                    if mark_build {
+                        part_table.mark_matched(b);
+                    }
+                    scratch.interleave_build.push((p, b as usize));
+                    scratch.probe_indices.push(backing_row);
+                }
+                if chain_done {
+                    cursor.pos += 1;
+                    cursor.next_entry = 0;
+                    cursor.row_matched = false;
+                } else {
+                    cursor.row_matched = true;
+                    break;
+                }
+            } else {
+                if emit_unmatched_probe && (!continued || !cursor.row_matched) {
+                    scratch.interleave_build.push((num_parts, 0));
+                    scratch.probe_indices.push(backing_row);
+                    has_null_build = true;
+                }
+                cursor.pos += 1;
                 cursor.next_entry = 0;
                 cursor.row_matched = false;
             }
@@ -4506,7 +4737,32 @@ impl HashJoinProbe {
                                 }
                             }
                             arr_refs.push(null_holder.as_ref());
-                            interleave(&arr_refs, &scratch.interleave_build)?
+                            let raw = interleave(&arr_refs, &scratch.interleave_build)?;
+                            match raw.data_type() {
+                                DataType::Utf8View => {
+                                    let sv = raw
+                                        .as_any()
+                                        .downcast_ref::<StringViewArray>()
+                                        .unwrap();
+                                    if sv.data_buffers().len() > 2 {
+                                        Arc::new(sv.gc()) as ArrayRef
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                DataType::BinaryView => {
+                                    let bv = raw
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::BinaryViewArray>()
+                                        .unwrap();
+                                    if bv.data_buffers().len() > 2 {
+                                        Arc::new(bv.gc()) as ArrayRef
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                _ => raw,
+                            }
                         }
                     }
                 };
@@ -4533,28 +4789,30 @@ impl HashJoinProbe {
         limit: usize,
         scratch: &mut ProbeScratch,
     ) -> Result<OperatorStep> {
-        let num_parts = cursor.resident_buckets.len();
+        let num_parts = cursor.resident.partitions.len();
         let mut chunks: Vec<RecordBatch> = Vec::new();
         let mut total_rows = 0usize;
 
-        if cursor.unmatched_pos < cursor.immediate_unmatched.len()
+        if cursor.filtered_unmatched_pos < cursor.filtered_unmatched.len()
             && self.kind.emits_unmatched_probe()
         {
-            let take_n = (cursor.immediate_unmatched.len() - cursor.unmatched_pos)
+            let take_n = (cursor.filtered_unmatched.len()
+                - cursor.filtered_unmatched_pos)
                 .min(limit - total_rows);
-            let slice = &cursor.immediate_unmatched
-                [cursor.unmatched_pos..cursor.unmatched_pos + take_n];
-            cursor.unmatched_pos += take_n;
-            let b = self.materialize_unmatched_probe_indices_batch(&cursor.batch, slice)?;
+            let slice = &cursor.filtered_unmatched
+                [cursor.filtered_unmatched_pos..cursor.filtered_unmatched_pos + take_n];
+            cursor.filtered_unmatched_pos += take_n;
+            let b =
+                self.materialize_unmatched_probe_indices_batch(&cursor.batch, slice)?;
             total_rows += b.num_rows();
             chunks.push(b);
         } else {
-            cursor.unmatched_pos = cursor.immediate_unmatched.len();
+            cursor.filtered_unmatched_pos = cursor.filtered_unmatched.len();
         }
 
         while total_rows < limit {
             if let Some(mut sc) = cursor.filtered_part_cursor.take() {
-                let p = cursor.cur_part;
+                let p = cursor.filtered_part;
                 let part_table = cursor.resident.partitions[p]
                     .as_ref()
                     .expect("active filtered partition exists");
@@ -4572,7 +4830,7 @@ impl HashJoinProbe {
                             total_rows += b.num_rows();
                             chunks.push(b);
                         }
-                        cursor.cur_part += 1;
+                        cursor.filtered_part += 1;
                     }
                     OperatorStep::HaveMoreOutput(b) => {
                         if b.num_rows() > 0 {
@@ -4584,17 +4842,21 @@ impl HashJoinProbe {
                 }
                 continue;
             }
-            if cursor.cur_part >= num_parts {
+            if cursor.filtered_part >= num_parts {
                 break;
             }
-            let p = cursor.cur_part;
-            let rows = &cursor.resident_buckets[p];
+            let p = cursor.filtered_part;
+            let rows = cursor
+                .filtered_buckets
+                .as_ref()
+                .map(|b| b[p].as_slice())
+                .unwrap_or(&[]);
             if rows.is_empty() || cursor.resident.partitions[p].is_none() {
-                cursor.cur_part += 1;
+                cursor.filtered_part += 1;
                 continue;
             }
             let part_table = cursor.resident.partitions[p].as_ref().unwrap();
-            let idx_arr = UInt32Array::from(rows.clone());
+            let idx_arr = UInt32Array::from(rows.to_vec());
             let sub_keys = match &cursor.keys {
                 ProbeKeys::Rows { .. } => {
                     let sub_batch = take_record_batch(&cursor.batch, &idx_arr)?;
@@ -4643,7 +4905,7 @@ impl HashJoinProbe {
         let out = if chunks.len() == 1 {
             chunks.pop().unwrap()
         } else {
-            concat_batches(&self.output_schema, &chunks)?
+            super::sort::concat_batches_compact_views(&self.output_schema, &chunks)?
         };
         Ok(if cursor.is_exhausted() {
             OperatorStep::NeedMoreInput(Some(out))
@@ -4667,7 +4929,8 @@ impl HashJoinProbe {
         shift: u32,
         depth: usize,
         tx: &mpsc::Sender<RecordBatch>,
-    ) -> Result<Option<(u32, Vec<(Vec<Arc<dyn SpillFile>>, Vec<Arc<dyn SpillFile>>)>)>> {
+    ) -> Result<Option<(u32, Vec<(Vec<Arc<dyn SpillFile>>, Vec<Arc<dyn SpillFile>>)>)>>
+    {
         if depth >= MAX_RADIX_DEPTH {
             return Ok(None);
         }
@@ -4838,7 +5101,10 @@ impl HashJoinProbe {
         let mut out_batches = Vec::new();
 
         // BuildSemi / BuildAnti: mark build-side matched bits only.
-        if matches!(self.kind, ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti) {
+        if matches!(
+            self.kind,
+            ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti
+        ) {
             if let Some(mut sc) = self.start_single_table_probe(
                 BatchView::all(probe_batch.clone()),
                 slice_table,
@@ -4922,10 +5188,8 @@ impl HashJoinProbe {
                     };
                     cols.push(take(probe_batch.column(*idx).as_ref(), &idx_arr, None)?);
                 }
-                out_batches.push(RecordBatch::try_new(
-                    Arc::clone(&self.output_schema),
-                    cols,
-                )?);
+                out_batches
+                    .push(RecordBatch::try_new(Arc::clone(&self.output_schema), cols)?);
             }
             return Ok(out_batches);
         }
