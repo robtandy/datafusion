@@ -407,9 +407,10 @@ impl DagBuilder<'_> {
                     }))))
                 }
                 LogicalPlan::MaterializedCte(MaterializedCtePlan::Cte(cte)) => {
+                    let cont_count_only = count_only && post_nodes.is_empty();
                     if cte.scans()?.is_empty() {
                         let inner = match self
-                            .lower_node(cte.continuation(), count_only)
+                            .lower_node(cte.continuation(), cont_count_only)
                             .await?
                         {
                             Ok(n) => n,
@@ -433,7 +434,7 @@ impl DagBuilder<'_> {
                         },
                     );
                     let cont_res =
-                        self.lower_node(cte.continuation(), count_only).await?;
+                        self.lower_node(cte.continuation(), cont_count_only).await?;
                     match prev {
                         Some(old) => {
                             self.cte_stages.insert(cte.id, old);

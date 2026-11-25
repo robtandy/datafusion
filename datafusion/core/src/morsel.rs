@@ -4,7 +4,7 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -70,7 +70,8 @@ use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
 use dag::{
     DagRuntime, MaterializedStage, ScalarSubqueryState, StageId, StageSource, StageSpec,
-    bind_stage_dependencies, collect_pipeline_stage_deps, validate_dag,
+    bind_stage_dependencies, collect_pipeline_stage_deps, collect_stage_seed_buffers,
+    validate_dag,
 };
 #[cfg(test)]
 use group_count::IntKeyType;
@@ -3741,16 +3742,19 @@ impl Pipeline {
             Arc::new(Vec::new()),
             Vec::new(),
             None,
+            None,
             context,
             metrics,
             measurement,
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn start_dag(
         self: Arc<Self>,
         stages: Arc<Vec<StageSpec>>,
         consumer_counts: Vec<usize>,
+        stage_seed_buffers: Option<Arc<HashSet<usize>>>,
         scalar_subqueries: Option<Arc<ScalarSubqueryState>>,
         context: Arc<TaskContext>,
         metrics: ExecutionPlanMetricsSet,
@@ -3760,11 +3764,30 @@ impl Pipeline {
         let worker_measurement = measurement.clone();
         let supervisor = SpawnedTask::spawn(async move {
             let measurement = worker_measurement;
+            if stages.is_empty() && scalar_subqueries.is_none() {
+                let empty_deps = Arc::new(HashMap::new());
+                let cancel_tx = tx.clone();
+                return self
+                    .run_pipeline_to_tx(
+                        None,
+                        &empty_deps,
+                        &context,
+                        &metrics,
+                        measurement.as_ref(),
+                        tx,
+                        cancel_tx,
+                    )
+                    .await;
+            }
             let _sq_guard = scalar_subqueries
                 .as_ref()
                 .map(ScalarSubqueryState::acquire_run);
-            let mut dag =
-                DagRuntime::new(stages, consumer_counts, &self, context.memory_pool());
+            let mut dag = DagRuntime::new(
+                stages,
+                consumer_counts,
+                stage_seed_buffers,
+                context.memory_pool(),
+            );
 
             if let Some(sq_state) = &scalar_subqueries {
                 let cont = sq_state
@@ -3855,6 +3878,7 @@ impl PipelineRun {
 struct MorselExec {
     stages: Arc<Vec<StageSpec>>,
     consumer_counts: Vec<usize>,
+    stage_seed_buffers: Option<Arc<HashSet<usize>>>,
     scalar_subqueries: Option<Arc<ScalarSubqueryState>>,
     pipeline: Arc<Pipeline>,
     properties: Arc<PlanProperties>,
@@ -3881,6 +3905,7 @@ impl MorselExec {
     ) -> Result<Self> {
         let consumer_counts =
             validate_dag(&stages, scalar_subqueries.as_deref(), &pipeline)?;
+        let stage_seed_buffers = collect_stage_seed_buffers(&stages);
         let has_blocking_prefix = !stages.is_empty() || scalar_subqueries.is_some();
         let emission = if has_blocking_prefix {
             EmissionType::Final
@@ -3923,6 +3948,7 @@ impl MorselExec {
         Ok(Self {
             stages: Arc::new(stages),
             consumer_counts,
+            stage_seed_buffers,
             scalar_subqueries,
             metrics,
             pipeline: Arc::new(pipeline),
@@ -4219,6 +4245,7 @@ impl ExecutionPlan for MorselExec {
         }
         let stages = Arc::clone(&self.stages);
         let consumer_counts = self.consumer_counts.clone();
+        let stage_seed_buffers = self.stage_seed_buffers.clone();
         let scalar_subqueries = self.scalar_subqueries.clone();
         let metrics = self.metrics.clone();
         let stream = stream::once(async move {
@@ -4227,6 +4254,7 @@ impl ExecutionPlan for MorselExec {
                 pipeline.start_dag(
                     stages,
                     consumer_counts,
+                    stage_seed_buffers,
                     scalar_subqueries,
                     context,
                     metrics,

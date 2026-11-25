@@ -5,13 +5,12 @@
 //! Multi-stage pipeline DAG representation, validation, and runtime scheduler
 //! for the experimental morsel engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayData, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{
     Result, ScalarValue, exec_datafusion_err, exec_err, internal_err,
 };
@@ -165,48 +164,138 @@ fn extract_scalar_value(
     }
 }
 
+/// Collect all pre-existing `MemTable` source buffer addresses across `stages`
+/// once at plan construction time. Returns `None` when `stages` is empty or
+/// contains no pre-existing `MemTable` buffers.
+pub(super) fn collect_stage_seed_buffers(
+    stages: &[StageSpec],
+) -> Option<Arc<HashSet<usize>>> {
+    if stages.is_empty() {
+        return None;
+    }
+    let mut seeds = HashSet::new();
+    for stage in stages {
+        collect_memory_source_buffers(&stage.pipeline, &mut seeds);
+    }
+    (!seeds.is_empty()).then(|| Arc::new(seeds))
+}
+
+fn collect_memory_source_buffers(pipeline: &Pipeline, out: &mut HashSet<usize>) {
+    if let Source::Memory(mem) = &pipeline.source {
+        for batch in &mem.batches {
+            for col in batch.columns() {
+                collect_array_data_buffers(&col.to_data(), out);
+            }
+        }
+    }
+    for op in &pipeline.operators {
+        if let Operator::HashProbe(probe) = op {
+            collect_memory_source_buffers(&probe.build_pipeline, out);
+        }
+    }
+}
+
+fn collect_array_data_buffers(data: &ArrayData, out: &mut HashSet<usize>) {
+    if let Some(nulls) = data.nulls() {
+        out.insert(nulls.buffer().data_ptr().addr().get());
+    }
+    for buf in data.buffers() {
+        out.insert(buf.data_ptr().addr().get());
+    }
+    for child in data.child_data() {
+        collect_array_data_buffers(child, out);
+    }
+}
+
+fn visit_batch_buffers(batch: &RecordBatch, f: &mut impl FnMut(usize, usize)) {
+    fn visit_data(data: &ArrayData, f: &mut impl FnMut(usize, usize)) {
+        if let Some(nulls) = data.nulls() {
+            let buf = nulls.buffer();
+            if buf.capacity() > 0 {
+                f(buf.data_ptr().addr().get(), buf.capacity());
+            }
+        }
+        for buf in data.buffers() {
+            if buf.capacity() > 0 {
+                f(buf.data_ptr().addr().get(), buf.capacity());
+            }
+        }
+        for child in data.child_data() {
+            visit_data(child, f);
+        }
+    }
+    for col in batch.columns() {
+        visit_data(&col.to_data(), f);
+    }
+}
+
 /// Run-wide buffer-deduplicating memory accounting for materialized intermediate
-/// stages. Pre-existing `MemTable` source buffers are seeded without charging
-/// the pool, and execution-allocated buffers shared across stages are charged
-/// once and released when the last referencing stage drops.
+/// stages. Pre-existing `MemTable` source buffers (computed once at planning
+/// time) are skipped without charging the pool, and execution-allocated buffers
+/// shared across stages are charged once and released when the last referencing
+/// stage drops.
 #[derive(Debug)]
 pub(super) struct SharedStageMemory {
+    seed_buffers: Option<Arc<HashSet<usize>>>,
     inner: Mutex<SharedStageMemoryInner>,
 }
 
 #[derive(Debug)]
 struct SharedStageMemoryInner {
-    tracker: RecordBatchMemoryTracker,
+    /// Active execution-allocated buffers: `addr -> (capacity, refcount)`.
+    counted_buffers: HashMap<usize, (usize, usize)>,
     reservation: MemoryReservation,
 }
 
 impl SharedStageMemory {
     pub(super) fn new(
-        stages: &[StageSpec],
-        root_pipeline: &Pipeline,
+        seed_buffers: Option<Arc<HashSet<usize>>>,
         pool: &Arc<dyn MemoryPool>,
     ) -> Arc<Self> {
-        let mut tracker = RecordBatchMemoryTracker::new();
-        for stage in stages {
-            seed_memory_source_buffers(&stage.pipeline, &mut tracker);
-        }
-        seed_memory_source_buffers(root_pipeline, &mut tracker);
         let reservation = MemoryConsumer::new("MorselStageOutput").register(pool);
         Arc::new(Self {
+            seed_buffers,
             inner: Mutex::new(SharedStageMemoryInner {
-                tracker,
+                counted_buffers: HashMap::new(),
                 reservation,
             }),
         })
     }
 
+    fn is_seeded(&self, addr: usize) -> bool {
+        self.seed_buffers
+            .as_ref()
+            .is_some_and(|seeds| seeds.contains(&addr))
+    }
+
     fn try_add_batch(&self, batch: &RecordBatch) -> Result<()> {
         let mut inner = self.inner.lock();
-        let delta = inner.tracker.count_batch(batch);
+        let mut delta = 0usize;
+        visit_batch_buffers(batch, &mut |addr, cap| {
+            if self.is_seeded(addr) {
+                return;
+            }
+            let entry = inner.counted_buffers.entry(addr).or_insert((cap, 0));
+            if entry.1 == 0 {
+                delta = delta.saturating_add(entry.0);
+            }
+            entry.1 += 1;
+        });
         if delta > 0
             && let Err(err) = inner.reservation.try_grow(delta)
         {
-            inner.tracker.uncount_batch(batch);
+            visit_batch_buffers(batch, &mut |addr, _| {
+                if self.is_seeded(addr) {
+                    return;
+                }
+                if let Some((_, count)) = inner.counted_buffers.get_mut(&addr) {
+                    if *count <= 1 {
+                        inner.counted_buffers.remove(&addr);
+                    } else {
+                        *count -= 1;
+                    }
+                }
+            });
             return Err(err);
         }
         Ok(())
@@ -216,26 +305,23 @@ impl SharedStageMemory {
         let mut inner = self.inner.lock();
         let mut freed = 0usize;
         for batch in batches {
-            freed = freed.saturating_add(inner.tracker.uncount_batch(batch));
+            visit_batch_buffers(batch, &mut |addr, _| {
+                if self.is_seeded(addr) {
+                    return;
+                }
+                if let Some((cap, count)) = inner.counted_buffers.get_mut(&addr) {
+                    if *count <= 1 {
+                        let cap = *cap;
+                        inner.counted_buffers.remove(&addr);
+                        freed = freed.saturating_add(cap);
+                    } else {
+                        *count -= 1;
+                    }
+                }
+            });
         }
         if freed > 0 {
             inner.reservation.shrink(freed);
-        }
-    }
-}
-
-fn seed_memory_source_buffers(
-    pipeline: &Pipeline,
-    tracker: &mut RecordBatchMemoryTracker,
-) {
-    if let Source::Memory(mem) = &pipeline.source {
-        for batch in &mem.batches {
-            tracker.count_batch(batch);
-        }
-    }
-    for op in &pipeline.operators {
-        if let Operator::HashProbe(probe) = op {
-            seed_memory_source_buffers(&probe.build_pipeline, tracker);
         }
     }
 }
@@ -273,18 +359,18 @@ pub(super) struct DagRuntime {
     stages: Arc<Vec<StageSpec>>,
     outputs: Vec<Option<Arc<MaterializedStage>>>,
     remaining_consumers: Vec<usize>,
-    memory: Arc<SharedStageMemory>,
+    memory: Option<Arc<SharedStageMemory>>,
 }
 
 impl DagRuntime {
     pub(super) fn new(
         stages: Arc<Vec<StageSpec>>,
         consumer_counts: Vec<usize>,
-        root_pipeline: &Pipeline,
+        seed_buffers: Option<Arc<HashSet<usize>>>,
         pool: &Arc<dyn MemoryPool>,
     ) -> Self {
         let n = stages.len();
-        let memory = SharedStageMemory::new(&stages, root_pipeline, pool);
+        let memory = (n > 0).then(|| SharedStageMemory::new(seed_buffers, pool));
         Self {
             stages,
             outputs: vec![None; n],
@@ -534,7 +620,12 @@ pub(super) fn ensure_stage<'a>(
             });
         }
 
-        let mut stage = MaterializedStage::new(Arc::clone(&dag.memory));
+        let memory = Arc::clone(
+            dag.memory
+                .as_ref()
+                .expect("SharedStageMemory present when stages are non-empty"),
+        );
+        let mut stage = MaterializedStage::new(memory);
         let mut task_done = false;
 
         loop {
