@@ -364,6 +364,85 @@ class TpchHarnessTest(unittest.TestCase):
                     rgs,
                 )
 
+    def test_validate_plan_handles_multistage_repeated_scans_and_short_circuit(self):
+        # Q13: GroupCountSink + AggregateSink + SortSink + HashJoinBuildSink.
+        q13_rgs = {"customer": 2, "orders": 8}
+        q13_ev = {
+            "plan": (
+                "MorselExec: workers=4, [Stage stage_0: [Build: NativeParquet[customer] -> HashJoinBuildSink]; "
+                "NativeParquet[orders] -> HashJoinProbe -> AggregateSink; FinalizedAggregateSource]; "
+                "StageSource[stage_0] -> GroupCountSink[key=c_count@0]; FinalizedGroupCountSource -> "
+                "SortSink; FinalizedSortSource"
+            ),
+            "parquet_morsels_claimed": 10,
+            "count_finalizations": 0,
+            "group_count_finalizations": 1,
+            "aggregate_finalizations": 1,
+            "join_build_finalizations": 1,
+            "join_empty_build_short_circuits": 0,
+            "join_null_aware_short_circuits": 0,
+            "sort_finalizations": 1,
+            "topn_finalizations": 0,
+        }
+        validate_plan(q13_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q13"], q13_rgs)
+        with self.assertRaisesRegex(ValueError, "group_count_finalizations"):
+            validate_plan(
+                dict(q13_ev, group_count_finalizations=0),
+                ARMS["morsel_no_pushdown"],
+                WORKLOADS["q13"],
+                q13_rgs,
+            )
+
+        # Q16: part vs partsupp disambiguation (must not double-count `part` inside `partsupp`).
+        q16_rgs = {"partsupp": 4, "part": 2, "supplier": 1}
+        q16_ev = {
+            "plan": (
+                "MorselExec: workers=4, [Stage stage_0: [Build: NativeParquet[part] -> HashJoinBuildSink]; "
+                "[Build: NativeParquet[supplier] -> HashJoinBuildSink]; "
+                "NativeParquet[partsupp] -> HashJoinProbe -> HashJoinProbe -> AggregateSink; FinalizedAggregateSource]; "
+                "StageSource[stage_0] -> AggregateSink; FinalizedAggregateSource -> SortSink; FinalizedSortSource"
+            ),
+            "parquet_morsels_claimed": 7,
+            "count_finalizations": 0,
+            "group_count_finalizations": 0,
+            "aggregate_finalizations": 2,
+            "join_build_finalizations": 2,
+            "join_empty_build_short_circuits": 0,
+            "join_null_aware_short_circuits": 0,
+            "sort_finalizations": 1,
+            "topn_finalizations": 0,
+        }
+        validate_plan(q16_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q16"], q16_rgs)
+
+        # Q17 with empty-build short-circuit (e.g. SF=0.01 where filtered `part` is empty).
+        q17_rgs = {"lineitem": 16, "part": 2}
+        q17_ev = {
+            "plan": (
+                "MorselExec: workers=4, [Stage stage_0: NativeParquet[lineitem] -> AggregateSink; "
+                "FinalizedAggregateSource]; [Build: NativeParquet[part] -> Filter -> HashJoinBuildSink]; "
+                "[Build: StageSource[stage_0] -> HashJoinBuildSink]; "
+                "NativeParquet[lineitem] -> HashJoinProbe -> HashJoinProbe -> AggregateSink; FinalizedAggregateSource"
+            ),
+            "parquet_morsels_claimed": 18,
+            "count_finalizations": 0,
+            "group_count_finalizations": 0,
+            "aggregate_finalizations": 2,
+            "join_build_finalizations": 1,
+            "join_empty_build_short_circuits": 1,
+            "join_null_aware_short_circuits": 0,
+            "sort_finalizations": 0,
+            "topn_finalizations": 0,
+        }
+        validate_plan(q17_ev, ARMS["morsel_no_pushdown"], WORKLOADS["q17"], q17_rgs)
+        # Without short-circuit flag, partial claims (18 != 34) must fail under no_pushdown.
+        with self.assertRaisesRegex(ValueError, "expected to claim all 34"):
+            validate_plan(
+                dict(q17_ev, join_empty_build_short_circuits=0),
+                ARMS["morsel_no_pushdown"],
+                WORKLOADS["q17"],
+                q17_rgs,
+            )
+
     def test_compare_tables_handles_decimal_and_order_semantics(self):
         oracle = pa.table(
             {
@@ -651,6 +730,123 @@ class TpchHarnessTest(unittest.TestCase):
             self.assertIn("0.5/1.5", out)
             self.assertIn("| `q3` | `morsel_no_pushdown` | `topn` |", out)
 
+    def test_summarize_jsonl_reports_3way_scorecard_and_morsel_geomeans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "three_way.jsonl"
+            records = [
+                {
+                    "record_type": "header",
+                    "host": "test-host",
+                    "arch": "aarch64",
+                    "kernel": "7.0",
+                    "threads": 8,
+                    "cache_regime": "warm",
+                    "warmups": 1,
+                    "repeats": 1,
+                    "build_revision": "deadbeef",
+                    "duckdb_version": "2.0.1",
+                    "pyarrow_version": "26.0.1",
+                    "morsel_rejections": {},
+                },
+                # q1: stock=200ms, morsel_no_pd=100ms, morsel_pd=80ms (best=80), duck=100ms
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "stock_default",
+                    "seconds": 0.2,
+                    "exec_seconds": 0.19,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "morsel_no_pushdown",
+                    "seconds": 0.1,
+                    "exec_seconds": 0.09,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 16,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "morsel_pushdown",
+                    "seconds": 0.08,
+                    "exec_seconds": 0.07,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 16,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q1",
+                    "arm": "duckdb_default",
+                    "seconds": 0.1,
+                    "exec_seconds": None,
+                    "output_rows": 4,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+                # q6: stock=800ms, morsel_no_pd=400ms (best=400), morsel_pd=500ms, duck=200ms
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "stock_default",
+                    "seconds": 0.8,
+                    "exec_seconds": 0.78,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 0,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "morsel_no_pushdown",
+                    "seconds": 0.4,
+                    "exec_seconds": 0.39,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 16,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "morsel_pushdown",
+                    "seconds": 0.5,
+                    "exec_seconds": 0.49,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": 16,
+                },
+                {
+                    "record_type": "trial",
+                    "case": "q6",
+                    "arm": "duckdb_default",
+                    "seconds": 0.2,
+                    "exec_seconds": None,
+                    "output_rows": 1,
+                    "output_batches": 1,
+                    "parquet_morsels_claimed": None,
+                },
+            ]
+            jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                summarize_jsonl(jsonl)
+            out = buf.getvalue()
+            self.assertIn("Best Morsel ms (arm)", out)
+            self.assertIn("80.0 (`morsel_pushdown`)", out)
+            self.assertIn("400.0 (`morsel_no_pushdown`)", out)
+            # GeoMean(2/22): stock=400.0, morsel_no_pd=200.0, morsel_pd=200.0, best=sqrt(80*400)=178.9, duck=141.4
+            self.assertIn("**GeoMean (2/22)**", out)
+            self.assertIn("**Sum (2/22)**", out)
+            self.assertIn(
+                "`morsel_no_pushdown`: 200.0 ms (0.50x vs `stock_default`", out
+            )
+            self.assertIn("`morsel_pushdown`: 200.0 ms (0.50x vs `stock_default`", out)
+
     def test_require_warm_cache_rejects_partial_residency(self):
         with patch("harness.cache_pages", return_value={"resident": 1, "total": 2}):
             with self.assertRaisesRegex(ValueError, "cannot verify warm"):
@@ -839,10 +1035,9 @@ class TpchHarnessTest(unittest.TestCase):
             expected_rejected = set(STANDARD_TPCH_QUERIES) - set(
                 MORSEL_ADMITTED_QUERIES
             )
-            self.assertEqual(len(expected_rejected), 14)
-            self.assertEqual(set(report["morsel_rejections"].keys()), expected_rejected)
-            for qname, err in report["morsel_rejections"].items():
-                self.assertIn("morsel_mode=required", err, msg=qname)
+            self.assertEqual(len(expected_rejected), 0)
+            self.assertEqual(report["morsel_rejections"], {})
+            self.assertEqual(len(MORSEL_ADMITTED_QUERIES), 25)
 
             morsel_ev = {
                 (e["case"], e["arm"]): e
@@ -861,6 +1056,9 @@ class TpchHarnessTest(unittest.TestCase):
             )
             self.assertEqual(
                 morsel_ev[("q1", "morsel_no_pushdown")]["sort_finalizations"], 1
+            )
+            self.assertEqual(
+                morsel_ev[("q2", "morsel_no_pushdown")]["topn_finalizations"], 1
             )
             self.assertEqual(
                 morsel_ev[("q3", "morsel_no_pushdown")]["parquet_morsels_claimed"], 26
@@ -883,6 +1081,18 @@ class TpchHarnessTest(unittest.TestCase):
             )
             self.assertEqual(
                 morsel_ev[("q12", "morsel_no_pushdown")]["sort_finalizations"], 1
+            )
+            self.assertEqual(
+                morsel_ev[("q13", "morsel_no_pushdown")]["group_count_finalizations"], 1
+            )
+            self.assertEqual(
+                morsel_ev[("q15", "morsel_no_pushdown")]["aggregate_finalizations"], 3
+            )
+            self.assertEqual(
+                morsel_ev[("q21", "morsel_no_pushdown")]["parquet_morsels_claimed"], 58
+            )
+            self.assertEqual(
+                morsel_ev[("q22", "morsel_no_pushdown")]["aggregate_finalizations"], 2
             )
             for join_q in ("q14", "q19"):
                 self.assertEqual(
@@ -988,9 +1198,9 @@ class TpchHarnessTest(unittest.TestCase):
             header, trials = records[0], records[1:]
             self.assertEqual(header["record_type"], "header")
             self.assertEqual(header["cache_regime"], "warm")
-            self.assertIn("q2", header["morsel_rejections"])
-            # 2 arms * 2 reps for q2 + 4 arms * 2 reps for (q1, q3, q6, q12, q6_count, q6_scan) = 52
-            self.assertEqual(len(trials), 52)
+            self.assertEqual(header["morsel_rejections"], {})
+            # 4 arms * 2 reps for all 7 Morsel-admitted queries (q2, q1, q3, q6, q12, q6_count, q6_scan) = 56
+            self.assertEqual(len(trials), 56)
             for trial in trials:
                 self.assertGreater(trial["seconds"], 0)
                 if sys.platform == "linux" and sys.maxsize > 2**32:
@@ -1027,17 +1237,30 @@ class TpchHarnessTest(unittest.TestCase):
                     pipelines = trial["morsel_pipelines"]
                     self.assertIsInstance(pipelines, dict)
                     self.assertGreater(len(pipelines), 0)
-                    parquet_pipe_claims = sum(
-                        sum(p["worker_claims"])
-                        for name, p in pipelines.items()
-                        if name not in ("sort", "topn")
-                    )
                     all_pipe_claims = sum(
                         sum(p["worker_claims"]) for p in pipelines.values()
                     )
-                    self.assertEqual(
-                        parquet_pipe_claims, trial["parquet_morsels_claimed"]
-                    )
+                    if trial["case"] in (
+                        "q1",
+                        "q3",
+                        "q6",
+                        "q12",
+                        "q6_count",
+                        "q6_scan",
+                    ):
+                        parquet_pipe_claims = sum(
+                            sum(p["worker_claims"])
+                            for name, p in pipelines.items()
+                            if name not in ("sort", "topn")
+                        )
+                        self.assertEqual(
+                            parquet_pipe_claims, trial["parquet_morsels_claimed"]
+                        )
+                    else:
+                        # Multi-stage queries (e.g. q2) also include StageSource claims.
+                        self.assertGreaterEqual(
+                            all_pipe_claims, trial["parquet_morsels_claimed"]
+                        )
                     self.assertEqual(all_pipe_claims, sum(trial["worker_claims"]))
                     self.assertEqual(
                         sum(trial["worker_completions"]),
