@@ -194,6 +194,7 @@ impl ControlledScan {
                 Sink::Count {
                     sink: CountSink::new(Arc::clone(&output_schema)),
                     result_operators: vec![],
+                    post_sort: None,
                 },
                 output_schema,
             )
@@ -665,6 +666,7 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
                 Sink::Count {
                     sink: CountSink::new(Arc::clone(&output_schema)),
                     result_operators: vec![],
+                    post_sort: None,
                 },
                 output_schema,
             )
