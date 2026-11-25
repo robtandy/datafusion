@@ -14,7 +14,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 use datafusion_physical_plan::spill::SpillManager;
@@ -273,21 +273,6 @@ impl SpillContext {
             None => Ok(None),
         }
     }
-}
-
-/// Verify that `reservation` can temporarily admit `min_headroom_bytes` when no
-/// other consumers hold memory.
-pub(super) fn check_spill_headroom(
-    reservation: &MemoryReservation,
-    min_headroom_bytes: usize,
-) -> Result<()> {
-    if min_headroom_bytes == 0 {
-        return Ok(());
-    }
-    let probe = reservation.new_empty();
-    probe.try_grow(min_headroom_bytes)?;
-    drop(probe);
-    Ok(())
 }
 
 /// Spill non-empty `batches` asynchronously into a single finished `SpillFile`,

@@ -39,7 +39,9 @@ use datafusion_common::utils::memory::{
     RecordBatchMemoryCounter, RecordBatchMemoryTracker,
 };
 use datafusion_common::{DataFusionError, Result};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::expressions::Column;
@@ -56,7 +58,7 @@ use tokio::sync::mpsc;
 
 use super::batch::{BatchView, Selection};
 use super::metrics::{self, RunMetrics};
-use super::spill::{SpillContext, SyncSpillWriter, check_spill_headroom};
+use super::spill::{SpillContext, SyncSpillWriter};
 use super::{Operator, apply_operators};
 
 /// Maximum incremental buffered bytes (after the first batch's shared buffers)
@@ -499,15 +501,6 @@ impl SharedSortMemory {
 
     fn is_spilled(&self) -> bool {
         self.spilled.load(AtomicOrdering::Acquire)
-    }
-
-    fn total_reserved(&self) -> usize {
-        self.inner.lock().reservation.size()
-    }
-
-    fn check_spill_headroom(&self, min_headroom_bytes: usize) -> Result<()> {
-        let probe = self.inner.lock().reservation.new_empty();
-        check_spill_headroom(&probe, min_headroom_bytes)
     }
 
     fn count_batch(&self, batch: &RecordBatch) -> Result<()> {
@@ -2454,8 +2447,18 @@ impl TopNState {
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<Vec<SortedRun>> {
         if self.spilled_runs.is_empty() {
-            let run = self.finish(batch_size)?;
-            return Ok(run.into_iter().collect());
+            match self.finish_in_memory(batch_size) {
+                Ok(run) => return Ok(run.into_iter().collect()),
+                Err(err)
+                    if matches!(err, DataFusionError::ResourcesExhausted(_))
+                        && let Some(spill_ctx) = self.spill.clone() =>
+                {
+                    spill_ctx.mark_spilled();
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                    return Ok(std::mem::take(&mut self.spilled_runs));
+                }
+                Err(err) => return Err(err),
+            }
         }
         if let Some(spill_ctx) = self.spill.clone() {
             self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
@@ -2649,13 +2652,18 @@ impl TopNState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish(mut self, batch_size: usize) -> Result<Option<SortedRun>> {
+        self.finish_in_memory(batch_size)
+    }
+
+    fn finish_in_memory(&mut self, batch_size: usize) -> Result<Option<SortedRun>> {
         if self.heap.is_empty() {
             self.reservation.free();
             return Ok(None);
         }
         // `BinaryHeap::into_sorted_vec` produces ascending order = exact SQL sort order.
-        let sorted_entries = self.heap.into_sorted_vec();
+        let sorted_entries = std::mem::take(&mut self.heap).into_sorted_vec();
         let indices: Vec<(usize, usize)> = sorted_entries
             .iter()
             .map(|e| {
@@ -2664,9 +2672,6 @@ impl TopNState {
                 (b_idx, dense_row)
             })
             .collect();
-        drop(sorted_entries);
-        self.key_bytes = 0;
-        self.row_map_bytes = 0;
 
         let batch_refs: Vec<&RecordBatch> =
             self.batches.iter().map(|r| &r.batch).collect();
@@ -2712,20 +2717,34 @@ impl TopNState {
                         self.batch_memory.uncount_batch(b);
                         out_tracker.uncount_batch(b);
                     }
+                    drop(out_batches);
+                    self.heap = BinaryHeap::from(sorted_entries);
+                    let prev_bytes = self
+                        .batch_memory
+                        .memory_usage()
+                        .saturating_add(self.key_bytes)
+                        .saturating_add(self.row_map_bytes);
+                    self.reservation.resize(prev_bytes);
                     return Err(err);
                 }
                 out_batches.push_back(out);
             }
         }
+        drop(sorted_entries);
         for old in &self.batches {
             self.batch_memory.uncount_batch(&old.batch);
         }
-        drop(self.batches);
-        self.reservation.resize(out_tracker.memory_usage());
+        self.batches.clear();
+        self.retained_rows = 0;
+        self.key_bytes = 0;
+        self.row_map_bytes = 0;
+        let empty_res = self.reservation.new_empty();
+        let run_res = std::mem::replace(&mut self.reservation, empty_res);
+        run_res.resize(out_tracker.memory_usage());
         Ok(Some(SortedRun::Batches(Box::new(BatchedRun {
             batches: out_batches,
             tracker: out_tracker,
-            reservation: self.reservation,
+            reservation: run_res,
         }))))
     }
 }
@@ -2957,14 +2976,14 @@ impl SortState {
                     self.batches.push(batch);
                     return Ok(());
                 }
-                // If no sort memory is reserved at all and even the minimum spill
-                // headroom doesn't fit in the pool, fail fast with ResourcesExhausted.
-                if self.shared_memory.total_reserved() == 0
-                    && let Err(headroom_err) = self
-                        .shared_memory
-                        .check_spill_headroom(spill_ctx.min_headroom_bytes)
+                // Only fail fast when the pool's own finite limit is below
+                // `min_headroom_bytes`; transient pressure from sibling workers
+                // (e.g. concurrent `MorselSortCompact` merges or Parquet readers)
+                // must fall through to sorting and spilling this batch directly.
+                if let MemoryLimit::Finite(limit) = spill_ctx.memory_pool.memory_limit()
+                    && limit < spill_ctx.min_headroom_bytes
                 {
-                    return Err(headroom_err);
+                    return Err(err);
                 }
                 // Otherwise another worker currently holds memory or this single batch
                 // exceeds remaining RAM: sort and spill this batch directly.
@@ -3801,6 +3820,109 @@ mod tests {
             drop(run);
             assert_eq!(pool.reserved(), 0);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topn_finish_async_falls_back_to_spill_on_oom() -> Result<()> {
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("k", 0)),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        let sink = TopNSink::try_new(Arc::clone(&schema), ordering, 0, 128)?.unwrap();
+
+        let pool = test_pool(Some(512 * 1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+            )
+            .build_arc()?;
+        let task_ctx = TaskContext::default().with_runtime(runtime);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let spill_ctx = SpillContext::try_new(&task_ctx, &metrics, Arc::clone(&schema))
+            .expect("spill context viable under 512 KiB pool");
+
+        let mut state = sink.new_state_with_spill(
+            MemoryConsumer::new("test_topn_finish_oom")
+                .with_can_spill(true)
+                .register(&pool),
+            Some(spill_ctx.clone()),
+            128,
+        )?;
+
+        let ks: Vec<i32> = (0..512).rev().collect();
+        let vs: Vec<String> = ks
+            .iter()
+            .map(|&x| format!("val-{x:06}-padding-0123456789abcdef0123456789abcdef"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ks)),
+                Arc::new(StringArray::from(vs)),
+            ],
+        )?;
+        let (tx, _rx) = mpsc::channel(4);
+        state.add_view_async(&BatchView::all(batch), &tx).await?;
+        assert!(
+            state.spilled_runs.is_empty(),
+            "heap should still be in memory before finish_async"
+        );
+
+        // Simulate a sibling worker temporarily filling the remaining pool right
+        // before `finish_async`, forcing `finish_in_memory`'s `try_resize(peak)`
+        // to fail with `ResourcesExhausted`.
+        let sibling = MemoryConsumer::new("sibling").register(&pool);
+        let remaining = (512 * 1024usize).saturating_sub(pool.reserved());
+        sibling.grow(remaining);
+
+        let runs = state.finish_async(128, &tx).await?;
+        assert_eq!(runs.len(), 1);
+        let SortedRun::Spilled(sf) = &runs[0] else {
+            panic!("expected TopN finish_async to spill on OOM");
+        };
+
+        let mut stream = spill_ctx
+            .manager
+            .read_spill_as_stream(Arc::clone(&sf.file), Some(64))?;
+        let mut got_k = Vec::new();
+        let mut got_v = Vec::new();
+        while let Some(b) = stream.next().await {
+            let b = b?;
+            got_k.extend_from_slice(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+            );
+            let sv = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..sv.len() {
+                got_v.push(sv.value(i).to_string());
+            }
+        }
+        assert_eq!(got_k, (0..128).collect::<Vec<i32>>());
+        assert_eq!(
+            got_v,
+            (0..128)
+                .map(|x| format!("val-{x:06}-padding-0123456789abcdef0123456789abcdef"))
+                .collect::<Vec<_>>()
+        );
+
+        drop(stream);
+        drop(runs);
+        drop(sibling);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 }

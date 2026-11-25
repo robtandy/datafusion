@@ -1045,24 +1045,32 @@ impl GroupedState {
         Ok(())
     }
 
-    fn ingest_dense_unchecked(
+    fn eval_group_exprs(
         &mut self,
         batch: &RecordBatch,
         rebound: bool,
-    ) -> Result<()> {
-        let group_arrays = if rebound {
+    ) -> Result<Vec<ArrayRef>> {
+        if rebound {
             self.rebound_group_exprs
                 .iter_mut()
                 .map(|expr| expr.evaluate(batch))
-                .collect::<Result<Vec<_>>>()?
+                .collect()
         } else {
             self.group_exprs
                 .iter_mut()
                 .map(|expr| expr.evaluate(batch))
-                .collect::<Result<Vec<_>>>()?
-        };
+                .collect()
+        }
+    }
+
+    fn ingest_dense_with_group_arrays(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+        group_arrays: &[ArrayRef],
+    ) -> Result<()> {
         self.group_values
-            .intern(&group_arrays, &mut self.group_indices)?;
+            .intern(group_arrays, &mut self.group_indices)?;
         let total_num_groups = self.group_values.len();
 
         let args_iter = if rebound {
@@ -1078,6 +1086,16 @@ impl GroupedState {
             acc.update_batch(&arrays, &self.group_indices, None, total_num_groups)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn ingest_dense_unchecked(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+    ) -> Result<()> {
+        let group_arrays = self.eval_group_exprs(batch, rebound)?;
+        self.ingest_dense_with_group_arrays(batch, rebound, &group_arrays)
     }
 
     #[cfg(test)]
@@ -1110,28 +1128,19 @@ impl GroupedState {
             return Ok(());
         }
 
+        let group_arrays = self.eval_group_exprs(&batch, rebound)?;
+
         // If spilling is enabled and we already hold groups, pre-check whether
         // this batch might exceed the pool; flush consistent state first so we
         // stay well within budget.
         if self.spill.is_some() && !self.group_values.is_empty() {
-            let key_arrays = if rebound {
-                self.rebound_group_exprs
-                    .iter_mut()
-                    .map(|expr| expr.evaluate(&batch))
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                self.group_exprs
-                    .iter_mut()
-                    .map(|expr| expr.evaluate(&batch))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let est = self.estimate_batch_delta(batch.num_rows(), &key_arrays);
+            let est = self.estimate_batch_delta(batch.num_rows(), &group_arrays);
             if !self.check_batch_headroom(est) {
                 self.spill_on_oom(tx)?;
             }
         }
 
-        self.ingest_dense_unchecked(&batch, rebound)?;
+        self.ingest_dense_with_group_arrays(&batch, rebound, &group_arrays)?;
         if let Err(err) = self.update_reservation() {
             if matches!(err, DataFusionError::ResourcesExhausted(_))
                 && self.spill.is_some()
