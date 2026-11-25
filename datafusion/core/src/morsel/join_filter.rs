@@ -155,17 +155,12 @@ impl SplitBlockBloomFilter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum SmallDistinctValues {
+    #[default]
     Disabled,
     Open(Vec<ScalarValue>),
     Overflow,
-}
-
-impl Default for SmallDistinctValues {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl SmallDistinctValues {
