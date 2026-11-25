@@ -1100,13 +1100,14 @@ async fn unsupported_aggregates_reject_in_required_and_fallback_in_prefer() -> R
     }
 
     for (sql, expected_reason) in [
-        ("SELECT COUNT(DISTINCT v) FROM t", "DISTINCT"),
         (
             "SELECT COUNT(DISTINCT k), SUM(DISTINCT v) FROM t",
             "DISTINCT",
         ),
-        ("SELECT k, SUM(DISTINCT v) FROM t GROUP BY k", "DISTINCT"),
-        ("SELECT k, AVG(DISTINCT v) FROM t GROUP BY k", "DISTINCT"),
+        (
+            "SELECT k, COUNT(DISTINCT v), SUM(DISTINCT v + 1) FROM t GROUP BY k",
+            "DISTINCT",
+        ),
         ("SELECT SUM(v) FILTER (WHERE v > 10) FROM t", "FILTER"),
         (
             "SELECT k, COUNT(*) FILTER (WHERE v > 10) FROM t GROUP BY k",
@@ -1121,11 +1122,6 @@ async fn unsupported_aggregates_reject_in_required_and_fallback_in_prefer() -> R
             "GROUPING SETS",
         ),
         ("SELECT k, SUM(v) FROM t GROUP BY CUBE(k)", "GROUPING SETS"),
-        (
-            "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 10",
-            "only projection",
-        ),
-        ("SELECT k, SUM(v) FROM t GROUP BY k LIMIT 1", "LIMIT"),
         ("SELECT MEDIAN(v) FROM t", "median"),
         ("SELECT k, ARRAY_AGG(v) FROM t GROUP BY k", "array_agg"),
         ("SELECT k, STDDEV(v) FROM t GROUP BY k", "stddev"),

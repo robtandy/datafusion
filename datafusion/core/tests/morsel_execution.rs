@@ -91,7 +91,7 @@ async fn sql_mode_selects_the_planner_for_new_queries() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_table("items", items(false)?)?;
     let scan = "SELECT id FROM items";
-    let unsupported = "SELECT id FROM items LIMIT 3";
+    let unsupported = "SELECT id, ROW_NUMBER() OVER () FROM items";
     let before_set = ctx.sql(scan).await?;
     assert_ne!(physical(&ctx, scan).await?.name(), "MorselExec");
 
@@ -119,7 +119,7 @@ async fn sql_mode_selects_the_planner_for_new_queries() -> Result<()> {
     assert_eq!(physical(&ctx, count).await?.name(), "MorselExec");
     let err = physical(&ctx, unsupported).await.unwrap_err().to_string();
     assert!(
-        err.contains("morsel_mode=required") && err.contains("LIMIT"),
+        err.contains("morsel_mode=required") && err.contains("Window"),
         "{err}"
     );
     assert!(
@@ -143,14 +143,14 @@ async fn explain_and_views_do_not_bypass_required_mode() -> Result<()> {
     ctx.register_table("items", items(false)?)?;
     ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
         .await?;
-    ctx.sql("CREATE VIEW totals AS SELECT SUM(id) AS total FROM items")
+    ctx.sql("CREATE VIEW totals AS SELECT MEDIAN(id) AS total FROM items")
         .await?
         .collect()
         .await?;
     for query in [
         "SELECT * FROM totals",
-        "SELECT 1",
-        "EXPLAIN SELECT id FROM items LIMIT 3",
+        "SELECT id, ROW_NUMBER() OVER () FROM items",
+        "EXPLAIN SELECT id, ROW_NUMBER() OVER () FROM items",
         "EXPLAIN FORMAT PGJSON SELECT * FROM totals",
         "EXPLAIN ANALYZE SELECT * FROM totals",
     ] {
@@ -253,7 +253,7 @@ async fn required_mode_checks_explicit_planners() -> Result<()> {
         .collect()
         .await?;
     assert_eq!(physical(&explicit, scan).await?.name(), "MorselExec");
-    let err = physical(&explicit, "SELECT id FROM items LIMIT 3")
+    let err = physical(&explicit, "SELECT id, ROW_NUMBER() OVER () FROM items")
         .await
         .unwrap_err()
         .to_string();
@@ -520,13 +520,12 @@ async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
         )?;
     }
     for sql in [
-        "SELECT id FROM items LIMIT 3",
+        "SELECT id, ROW_NUMBER() OVER () FROM items",
+        "SELECT id FROM items UNION ALL SELECT id FROM items",
         "SELECT MEDIAN(id) FROM items WHERE threshold > 0",
-        "SELECT COUNT(DISTINCT id) FROM items WHERE threshold > 0",
         "SELECT COUNT(*) FILTER (WHERE id > 0) FROM items WHERE threshold > 0",
-        "SELECT label, COUNT(DISTINCT id) FROM items WHERE threshold > 0 GROUP BY label",
+        "SELECT COUNT(DISTINCT id), SUM(DISTINCT threshold) FROM items WHERE threshold > 0",
         "SELECT id + 1 FROM unknown WHERE id > 0",
-        "SELECT id, (SELECT MAX(id) FROM items) FROM items",
     ] {
         let fallback = physical(&morsel, sql).await?;
         let expected = physical(&default, sql).await?;
@@ -1055,14 +1054,12 @@ async fn unsupported_group_by_shapes_reject_in_required_and_fallback_in_prefer()
     }
 
     for sql in [
-        "SELECT id, COUNT(DISTINCT threshold) FROM t GROUP BY id",
+        "SELECT id, COUNT(DISTINCT threshold), SUM(DISTINCT threshold) FROM t GROUP BY id",
         "SELECT id, COUNT(*) FILTER (WHERE threshold > 0) FROM t GROUP BY id",
         "SELECT id, MEDIAN(threshold) FROM t GROUP BY id",
         "SELECT id, COUNT(*) FROM t GROUP BY GROUPING SETS ((id), ())",
         "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)",
         "SELECT id, COUNT(*) FROM t GROUP BY CUBE(id)",
-        "SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 1",
-        "SELECT id, COUNT(*) FROM t GROUP BY id LIMIT 2",
     ] {
         let err = physical(&required, sql).await.unwrap_err().to_string();
         assert!(err.contains("morsel_mode=required"), "{sql}: {err}");

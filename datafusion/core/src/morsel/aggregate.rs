@@ -86,9 +86,21 @@ pub(super) fn validate_aggregate(
             order_by,
             null_treatment,
         } = &function.params;
-        if *distinct {
+        let inner = function.func.inner();
+        let supported_func = inner.is::<Count>()
+            || inner.is::<Sum>()
+            || inner.is::<Min>()
+            || inner.is::<Max>()
+            || inner.is::<Avg>();
+        if !supported_func {
             return Ok(Err(format!(
-                "DISTINCT aggregates are not supported in native morsel aggregates: {expr}"
+                "unsupported aggregate function '{}' in native morsel aggregates",
+                function.func.name()
+            )));
+        }
+        if *distinct && !(inner.is::<Count>() && args.len() == 1) {
+            return Ok(Err(format!(
+                "DISTINCT aggregates are only supported for single-argument COUNT(DISTINCT expr) in native morsel aggregates: {expr}"
             )));
         }
         if filter.is_some() {
@@ -104,18 +116,6 @@ pub(super) fn validate_aggregate(
         if null_treatment.is_some() {
             return Ok(Err(format!(
                 "null treatment in aggregate functions is not supported in native morsel aggregates: {expr}"
-            )));
-        }
-        let inner = function.func.inner();
-        let supported_func = inner.is::<Count>()
-            || inner.is::<Sum>()
-            || inner.is::<Min>()
-            || inner.is::<Max>()
-            || inner.is::<Avg>();
-        if !supported_func {
-            return Ok(Err(format!(
-                "unsupported aggregate function '{}' in native morsel aggregates",
-                function.func.name()
             )));
         }
         for arg in args {
@@ -239,6 +239,9 @@ fn try_build_direct_grouped_spec(
 
     let mut aggs = Vec::with_capacity(aggr_exprs.len());
     for aggr in aggr_exprs {
+        if aggr.is_distinct() {
+            return None;
+        }
         let inner = aggr.fun().inner();
         let args = aggr.expressions();
         let out_dt = aggr.field().data_type().clone();
@@ -323,14 +326,28 @@ pub(super) struct AggregateSink {
 }
 
 impl AggregateSink {
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn try_new(
         aggregate: &Aggregate,
         input_schema: &SchemaRef,
         session: &dyn Session,
     ) -> Result<std::result::Result<Self, String>> {
+        Self::try_new_with_context(
+            aggregate,
+            input_schema,
+            session,
+            &PhysicalPlanningContext::default(),
+        )
+    }
+
+    pub(super) fn try_new_with_context(
+        aggregate: &Aggregate,
+        input_schema: &SchemaRef,
+        session: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
+    ) -> Result<std::result::Result<Self, String>> {
         let logical_input_schema = aggregate.input.schema();
         let props = session.execution_props();
-        let planning_ctx = PhysicalPlanningContext::default();
 
         let (group_schema, group_exprs, group_names, mut output_fields) =
             if aggregate.group_expr.is_empty() {
@@ -344,7 +361,7 @@ impl AggregateSink {
                         expr,
                         logical_input_schema,
                         props,
-                        &planning_ctx,
+                        planning_ctx,
                     )?;
                     let name = physical_name(expr)?;
                     exprs.push(Arc::clone(&phys));
@@ -369,12 +386,15 @@ impl AggregateSink {
                 logical_input_schema,
                 input_schema,
                 props,
-                &planning_ctx,
+                planning_ctx,
             )
             .build()?;
+            let distinct_ok = lowered.aggregate.is_distinct()
+                && lowered.aggregate.fun().inner().is::<Count>()
+                && lowered.aggregate.expressions().len() == 1;
             if lowered.filter.is_some()
                 || !lowered.order_bys.is_empty()
-                || lowered.aggregate.is_distinct()
+                || (lowered.aggregate.is_distinct() && !distinct_ok)
                 || lowered.aggregate.ignore_nulls()
             {
                 return Ok(Err(format!(
@@ -438,6 +458,50 @@ impl AggregateSink {
             #[cfg(test)]
             finalize_gate: None,
         }))
+    }
+
+    pub(super) fn try_new_distinct(
+        input_schema: &SchemaRef,
+    ) -> Result<std::result::Result<Self, String>> {
+        if input_schema.fields().is_empty() {
+            return Ok(Err(
+                "DISTINCT on zero-column schema is not supported in native morsels"
+                    .into(),
+            ));
+        }
+        let mut group_exprs: Vec<Arc<dyn PhysicalExpr>> =
+            Vec::with_capacity(input_schema.fields().len());
+        let mut group_names = Vec::with_capacity(input_schema.fields().len());
+        for (idx, field) in input_schema.fields().iter().enumerate() {
+            group_exprs.push(Arc::new(Column::new(field.name(), idx)));
+            group_names.push(field.name().clone());
+        }
+        if let Err(err) =
+            new_group_values(Arc::clone(input_schema), &GroupClustering::None)
+        {
+            return Ok(Err(format!("unsupported DISTINCT key type: {err}")));
+        }
+        let needed_columns: Vec<usize> = (0..input_schema.fields().len()).collect();
+        let rebound_group_exprs = group_exprs.clone();
+        let direct_grouped =
+            try_build_direct_grouped_spec(&group_exprs, &[], input_schema);
+        Ok(Ok(Self {
+            schema: Arc::clone(input_schema),
+            group_schema: Some(Arc::clone(input_schema)),
+            group_exprs,
+            group_names,
+            aggr_exprs: Vec::new(),
+            needed_columns,
+            rebound_group_exprs,
+            rebound_aggr_args: Vec::new(),
+            direct_grouped,
+            #[cfg(test)]
+            finalize_gate: None,
+        }))
+    }
+
+    pub(super) fn is_grouped(&self) -> bool {
+        self.group_schema.is_some()
     }
 
     pub(super) fn schema(&self) -> &SchemaRef {

@@ -3030,3 +3030,261 @@ async fn sort_with_shared_utf8view_slices_keeps_one_run_per_worker_and_bounded_p
     assert_eq!(pool.reserved(), 0);
     Ok(())
 }
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn multi_stage_dag_topological_barrier_mid_dag_drop_and_validator() -> Result<()> {
+    use arrow::array::Int64Array;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("grp", DataType::Int32, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 2, 2, 3, 4, 4, 5])),
+            Arc::new(Int32Array::from(vec![10, 10, 10, 20, 20, 20, 30, 30])),
+            Arc::new(Int64Array::from(vec![5, 15, 20, 25, 30, 35, 40, 45])),
+        ],
+    )?;
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int32, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(Int64Array::from(vec![2, 3, 4, 5, 6])),
+        ],
+    )?;
+    let ctx = crate::prelude::SessionContext::new();
+    ctx.register_table("f", Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
+    ctx.register_table(
+        "d",
+        Arc::new(MemTable::try_new(dim_schema, vec![vec![dim_batch]])?),
+    )?;
+
+    // 3+ dependent stages:
+    // Stage 0: Aggregate(GROUP BY k, grp, SUM(v))
+    // Root: Join(Stage 0, d) -> Aggregate(GROUP BY grp, SUM(sv * weight)) -> TopN(LIMIT 2)
+    let sql = "
+        SELECT s.grp, SUM(s.sv * d.weight) AS total
+        FROM (
+            SELECT k, grp, SUM(v) AS sv
+            FROM f
+            GROUP BY k, grp
+            HAVING SUM(v) > 10
+        ) s
+        JOIN d ON s.k = d.dk
+        GROUP BY s.grp
+        ORDER BY total DESC, s.grp ASC
+        LIMIT 2
+    ";
+    let logical = ctx.sql(sql).await?.into_optimized_plan()?;
+    let planner = MorselQueryPlanner::new(NonZeroUsize::new(2).unwrap());
+
+    // 1. Strict topological barrier: pause at Stage 0's Aggregate finalize_gate and verify
+    //    Stage 0 has not finalized and neither join build nor root TopN has finalized yet.
+    let Lowering::Native(mut plan) = planner.try_lower(&logical, &ctx.state()).await?
+    else {
+        panic!("expected native multi-stage DAG plan");
+    };
+    assert!(
+        !plan.stages.is_empty(),
+        "expected at least one upstream DAG stage"
+    );
+    let (stage0_entered, mut stage0_finalizing) = mpsc::unbounded_channel();
+    let stage0_resume = Arc::new(Semaphore::new(0));
+    {
+        let stages_mut = Arc::get_mut(&mut plan.stages).unwrap();
+        let stage0_pipeline = Arc::get_mut(&mut stages_mut[0].pipeline).unwrap();
+        let Sink::Aggregate { sink, .. } = &mut stage0_pipeline.sink else {
+            panic!("expected Stage 0 to be Aggregate sink");
+        };
+        sink.finalize_gate = Some(FinalizeGate {
+            entered: stage0_entered,
+            resume: Arc::clone(&stage0_resume),
+        });
+    }
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024));
+    let task_ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 8)?;
+    let weak = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, Arc::clone(&task_ctx))?;
+    assert!(futures::poll!(stream.next()).is_pending());
+    timeout(DEADLINE, stage0_finalizing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // While paused at Stage 0's finalize_gate, 0 finalizations anywhere in the DAG!
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("topn_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+
+    // Release Stage 0 -> full DAG completes cleanly.
+    stage0_resume.add_permits(1);
+    let mut out_rows = 0usize;
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        out_rows += batch?.num_rows();
+    }
+    assert_eq!(out_rows, 2);
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        2
+    );
+    assert_eq!(
+        plan.metrics()
+            .and_then(|m| m.sum_by_name("topn_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        1
+    );
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&weak).await;
+    assert_eq!(pool.reserved(), 0);
+
+    // 2. Drop stream while paused at Stage 0's finalize_gate: Stage 0 never finalizes,
+    //    downstream join/agg/TopN never start, all tasks exit and pool returns to 0.
+    let Lowering::Native(mut cancel_plan) =
+        planner.try_lower(&logical, &ctx.state()).await?
+    else {
+        panic!("expected native multi-stage DAG plan");
+    };
+    let (cancel_entered, mut cancel_finalizing) = mpsc::unbounded_channel();
+    let cancel_resume = Arc::new(Semaphore::new(0));
+    {
+        let stages_mut = Arc::get_mut(&mut cancel_plan.stages).unwrap();
+        let stage0_pipeline = Arc::get_mut(&mut stages_mut[0].pipeline).unwrap();
+        let Sink::Aggregate { sink, .. } = &mut stage0_pipeline.sink else {
+            panic!("expected Stage 0 to be Aggregate sink");
+        };
+        sink.finalize_gate = Some(FinalizeGate {
+            entered: cancel_entered,
+            resume: Arc::clone(&cancel_resume),
+        });
+    }
+    let cancel_weak = Arc::downgrade(&cancel_plan.pipeline);
+    let mut cancel_stream = cancel_plan.execute(0, task_ctx)?;
+    assert!(futures::poll!(cancel_stream.next()).is_pending());
+    timeout(DEADLINE, cancel_finalizing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(cancel_stream);
+    assert_eq!(
+        cancel_plan
+            .metrics()
+            .and_then(|m| m.sum_by_name("aggregate_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    assert_eq!(
+        cancel_plan
+            .metrics()
+            .and_then(|m| m.sum_by_name("topn_finalizations"))
+            .map_or(0, |v| v.as_usize()),
+        0
+    );
+    drop(cancel_plan);
+    assert_workers_stopped(&cancel_weak).await;
+    assert_eq!(pool.reserved(), 0);
+
+    // 3. DAG validator rejects cyclic / out-of-order stage references and schema mismatches.
+    let s1 = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let s2 = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)]));
+    let cyclic_stage = StageSpec {
+        id: StageId(0),
+        label: "bad_cycle".into(),
+        pipeline: Arc::new(Pipeline {
+            source: Source::Stage(StageSource {
+                stage_id: StageId(0),
+                schema: Arc::clone(&s1),
+                ordered: false,
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(1).unwrap(),
+            sink: Sink::Result,
+            sink_capacity: 2,
+        }),
+        output_schema: Arc::clone(&s1),
+        estimate: SideEstimate {
+            is_empty: true,
+            mem_rows: Some(0),
+            approx_bytes: 0,
+        },
+        dependencies: vec![StageId(0)],
+    };
+    let root_dummy = Pipeline {
+        source: Source::Stage(StageSource {
+            stage_id: StageId(0),
+            schema: Arc::clone(&s1),
+            ordered: false,
+        }),
+        operators: vec![],
+        workers: NonZeroUsize::new(1).unwrap(),
+        sink: Sink::Result,
+        sink_capacity: 2,
+    };
+    let err = validate_dag(&[cyclic_stage], None, &root_dummy).unwrap_err();
+    assert!(
+        err.to_string().contains("cycle or out-of-order dependency"),
+        "expected cycle rejection, got: {err}"
+    );
+
+    let ok_stage = StageSpec {
+        id: StageId(0),
+        label: "stage_0".into(),
+        pipeline: Arc::new(Pipeline {
+            source: Source::Memory(MemorySource {
+                table: "empty".into(),
+                batches: vec![],
+                projection: None,
+                schema: Arc::clone(&s1),
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(1).unwrap(),
+            sink: Sink::Result,
+            sink_capacity: 2,
+        }),
+        output_schema: Arc::clone(&s1),
+        estimate: SideEstimate {
+            is_empty: true,
+            mem_rows: Some(0),
+            approx_bytes: 0,
+        },
+        dependencies: vec![],
+    };
+    let mismatched_root = Pipeline {
+        source: Source::Stage(StageSource {
+            stage_id: StageId(0),
+            schema: s2,
+            ordered: false,
+        }),
+        operators: vec![],
+        workers: NonZeroUsize::new(1).unwrap(),
+        sink: Sink::Result,
+        sink_capacity: 2,
+    };
+    let err = validate_dag(&[ok_stage], None, &mismatched_root).unwrap_err();
+    assert!(
+        err.to_string().contains("schema mismatch"),
+        "expected schema mismatch rejection, got: {err}"
+    );
+
+    Ok(())
+}

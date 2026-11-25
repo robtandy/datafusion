@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_catalog::{ScanArgs, TableProvider};
-use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{DFSchema, Result, internal_datafusion_err, internal_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::PartitionedFile;
@@ -23,6 +23,7 @@ use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, TableScan};
 use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
 use datafusion_physical_expr::{PhysicalExpr, conjunction, create_physical_expr};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
@@ -185,6 +186,9 @@ impl ParquetScan {
             .iter()
             .filter(|expr| {
                 !expr.is_volatile()
+                    && !expr
+                        .exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_))))
+                        .unwrap_or(true)
                     && expr
                         .column_refs()
                         .iter()
@@ -280,7 +284,9 @@ impl ParquetScan {
                 unreachable!();
             };
             for expr in split_conjunction(&predicate) {
-                if is_volatile(expr) {
+                let has_scalar_subquery =
+                    expr.exists(|e| Ok(e.is::<ScalarSubqueryExpr>()))?;
+                if is_volatile(expr) || has_scalar_subquery {
                     residual.push(Arc::clone(expr));
                 } else {
                     candidates.push(Arc::clone(expr));
