@@ -35,7 +35,7 @@ implemented in `#193`:
 - **Revisions compared (same `tpch_runner.rs`, `--profile release-nonlto`,
   `rustc 1.99.1 (58cf8f9c3 2026-10-13)`):**
   - **Before (`morsel-execution` base):** `3ba7893d9`
-  - **After (`agent/morsel-issue-193`):** `e58bd78d6`
+  - **After (`agent/morsel-issue-193`):** `e58bd78d6` (Q3/Q5/Q6/Q12 5-round paired table) and `87755b449` (full 22-query SF=5 verification after fixing guarded `RowFilter` staging, `pruning=false` gating, and Q7/Q20 build-side estimates)
 - **Dataset:** Standard deterministic SF=5 TPC-H Parquet tables generated via
   `benchmarks/morsel_tpch/harness.py generate ... --sf 5 --row-group-size 131072`
   (35 files, 353 row groups, 43.3M total rows, 1.34 GiB Zstd level 3, pre-read
@@ -76,6 +76,39 @@ pushdown.
 | **TPC-H `q6_count`** | 183.6 ms | 186.1 ms | 0.99× | 82,528,403 → 82,528,403 | 198.7 ms |
 | **TPC-H Q12** | 847.1 ms | **211.5 ms** | **4.01×** (−635.6 ms) | 221,292,133 → 221,292,133 | 207.2 ms |
 | **SF=5 dynamic range join** | 310.7 ms | **68.9 ms** | **4.51×** (−241.8 ms) | **237,374,364 → 25,625,691 (−89.2%)** | 109.8 ms |
+
+### Full 22-Query SF=5 Regression & Speedup Check (`3ba7893d9` vs `87755b449`)
+
+Paired quiet-host check (`vmstat` 98–99% idle before, 95–99% idle after; 1 warmup + 3 counterbalanced measured rounds per profile on 8 pinned CPUs, `taskset -c 0-7`):
+
+| Query | `pruning` Before | `pruning` After | `pruning` Speedup | `pushdown` Before | `pushdown` After | `pushdown` Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `q1` | 703.1 ms | 704.7 ms | 1.00× | 707.1 ms | 705.3 ms | 1.00× |
+| `q2` | 272.4 ms | 272.1 ms | 1.00× | 278.6 ms | 246.9 ms | **1.13×** |
+| `q3` | 525.9 ms | 526.1 ms | 1.00× | 554.6 ms | 393.3 ms | **1.41×** |
+| `q4` | 262.3 ms | 263.7 ms | 0.99× | 248.9 ms | 224.3 ms | **1.11×** |
+| `q5` | 743.0 ms | 760.5 ms | 0.98× | 743.9 ms | 410.0 ms | **1.81×** |
+| `q6` | 338.1 ms | 335.8 ms | 1.01× | 491.7 ms | 466.3 ms | **1.05×** |
+| `q7` | 1,338.0 ms | 1,355.3 ms | 0.99× | 1,355.0 ms | 438.3 ms | **3.09×** |
+| `q8` | 867.6 ms | 879.1 ms | 0.99× | 884.4 ms | 570.4 ms | **1.55×** |
+| `q9` | 1,887.4 ms | 1,893.1 ms | 1.00× | 1,875.5 ms | 1,939.3 ms | 0.97× |
+| `q10` | 798.5 ms | 799.3 ms | 1.00× | 769.6 ms | 662.5 ms | **1.16×** |
+| `q11` | 151.0 ms | 151.0 ms | 1.00× | 153.6 ms | 140.4 ms | **1.09×** |
+| `q12` | 858.5 ms | 215.6 ms | **3.98×** | 902.4 ms | 258.9 ms | **3.49×** |
+| `q13` | 890.5 ms | 895.1 ms | 0.99× | 864.2 ms | 892.3 ms | 0.97× |
+| `q14` | 450.9 ms | 450.8 ms | 1.00× | 346.2 ms | 372.1 ms | 0.93× |
+| `q15` | 695.3 ms | 696.3 ms | 1.00× | 903.9 ms | 896.4 ms | 1.01× |
+| `q16` | 209.2 ms | 206.0 ms | 1.02× | 216.5 ms | 210.1 ms | 1.03× |
+| `q17` | 2,399.2 ms | 2,433.9 ms | 0.99× | 2,413.3 ms | 2,307.5 ms | **1.05×** |
+| `q18` | 2,799.7 ms | 2,845.3 ms | 0.98× | 2,808.2 ms | 1,586.4 ms | **1.77×** |
+| `q19` | 512.2 ms | 507.8 ms | 1.01× | 671.8 ms | 401.5 ms | **1.67×** |
+| `q20` | 1,038.0 ms | 1,038.9 ms | 1.00× | 1,061.3 ms | 1,041.9 ms | **1.02×** |
+| `q21` | 4,473.6 ms | 2,763.4 ms | **1.62×** | 4,508.8 ms | 2,649.6 ms | **1.70×** |
+| `q22` | 132.8 ms | 135.1 ms | 0.98× | 138.3 ms | 118.1 ms | **1.17×** |
+| **22-Q Geomean** | **676.8 ms** | **624.2 ms** | **1.08×** | **702.3 ms** | **534.3 ms** | **1.31×** |
+| **22-Q Sum** | **22,347.0 ms** | **20,128.8 ms** | **1.11×** | **22,897.5 ms** | **16,931.9 ms** | **1.35×** |
+| `q6_count` | 190.2 ms | 184.6 ms | 1.03× | 249.0 ms | 219.3 ms | **1.14×** |
+| `sf5_dyn_orderkey_range` | 313.7 ms | 69.7 ms | **4.50×** | 316.6 ms | 70.6 ms | **4.48×** |
 
 ## Key Takeaways
 
