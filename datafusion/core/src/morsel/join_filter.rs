@@ -5,32 +5,40 @@
 //! Dynamic join filter collection (per-key min/max bounds, small `InList`,
 //! and cache-resident split-block Bloom filters) for native morsel hash joins.
 
+#[cfg(any(feature = "parquet", test))]
 use std::fmt::{self, Display, Formatter};
+#[cfg(any(feature = "parquet", test))]
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
 
+#[cfg(any(feature = "parquet", test))]
+use arrow::array::RecordBatch;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
     Date64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray,
     DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::{
     filter, max, max_binary, max_binary_view, max_boolean, max_string, max_string_view,
     min, min_binary, min_binary_view, min_boolean, min_string, min_string_view,
 };
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+#[cfg(any(feature = "parquet", test))]
+use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, TimeUnit};
+#[cfg(any(feature = "parquet", test))]
 use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{
-    NullEquality, Result, ScalarValue, float_semantics, internal_datafusion_err,
-};
+use datafusion_common::{NullEquality, Result, ScalarValue};
+#[cfg(any(feature = "parquet", test))]
+use datafusion_common::{float_semantics, internal_datafusion_err};
+#[cfg(any(feature = "parquet", test))]
 use datafusion_expr::{ColumnarValue, Operator as ExprOperator};
 #[cfg(any(feature = "parquet", test))]
 use datafusion_physical_expr::PhysicalExpr;
@@ -39,7 +47,9 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, InListExpr, IsNullExpr, Literal,
 };
 
-use super::hash_join::{KeyKind, join_random_state, mix_u64, valid_key_mask};
+use super::hash_join::KeyKind;
+#[cfg(any(feature = "parquet", test))]
+use super::hash_join::{join_random_state, mix_u64, valid_key_mask};
 
 // Putze et al. / Parquet split-block Bloom filter odd multiplicative salts.
 const SBBF_SALTS: [u32; 8] = [
@@ -143,6 +153,7 @@ impl SplitBlockBloomFilter {
         }
     }
 
+    #[cfg(any(feature = "parquet", test))]
     #[inline]
     pub(super) fn might_contain(&self, h: u64) -> bool {
         let block = &self.blocks[(h as usize) & self.block_mask];
@@ -403,6 +414,7 @@ impl JoinMembershipFilter {
 /// Immutable dynamic join filter summary produced during build `finalize` and
 /// consumed by probe-side `ParquetScan::start` before any probe row group is fetched.
 #[derive(Debug)]
+#[cfg_attr(not(any(feature = "parquet", test)), expect(dead_code))]
 pub(super) struct DynamicJoinFilterData {
     pub(super) key_kind: KeyKind,
     pub(super) null_equality: NullEquality,

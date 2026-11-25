@@ -199,6 +199,7 @@ impl ProbeJoinKind {
         matches!(self, Self::ProbeAnti { null_aware: true })
     }
 
+    #[cfg(any(feature = "parquet", test))]
     pub(super) fn allows_dynamic_filter_pushdown(self) -> bool {
         matches!(
             self,
@@ -1617,6 +1618,7 @@ pub(super) struct FinalizedHashTable {
     mask: usize,
     next: Vec<u32>,
     matched: Vec<AtomicU64>,
+    #[cfg_attr(not(any(feature = "parquet", test)), expect(dead_code))]
     dynamic_filter: Option<Arc<DynamicJoinFilterData>>,
     _reservation: MemoryReservation,
 }
