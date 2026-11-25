@@ -65,7 +65,9 @@ mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod planner;
+mod radix;
 mod sort;
+mod spill;
 
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
@@ -88,6 +90,7 @@ use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
 use parquet::{ClaimedWork, ParquetScan, ReadyReaders};
 use sort::{SharedSortMemory, SortSink, SortState, SortedRun, TopNSink, TopNState};
+use spill::SpillContext;
 #[cfg(test)]
 mod tests;
 
@@ -1117,20 +1120,20 @@ impl Sink {
 
 enum WorkerSinkMemory {
     Reservation(MemoryReservation),
-    SharedSort(Arc<SharedSortMemory>),
+    SharedSort(Arc<SharedSortMemory>, Option<SpillContext>),
 }
 
 impl WorkerSinkMemory {
     fn into_reservation(self) -> MemoryReservation {
         match self {
             Self::Reservation(r) => r,
-            Self::SharedSort(_) => panic!("expected MemoryReservation"),
+            Self::SharedSort(..) => panic!("expected MemoryReservation"),
         }
     }
 
-    fn into_shared_sort(self) -> Arc<SharedSortMemory> {
+    fn into_shared_sort(self) -> (Arc<SharedSortMemory>, Option<SpillContext>) {
         match self {
-            Self::SharedSort(s) => s,
+            Self::SharedSort(s, spill) => (s, spill),
             Self::Reservation(_) => panic!("expected SharedSortMemory"),
         }
     }
@@ -1178,6 +1181,7 @@ struct BuildEmissionTargets<'a> {
     combined_build: Option<&'a mut HashJoinBuildState>,
     sink_reservation: Option<&'a MemoryReservation>,
     shared_sort_memory: Option<&'a Arc<SharedSortMemory>>,
+    sort_spill: Option<&'a SpillContext>,
 }
 
 type WorkerTail = (Vec<RecordBatch>, WorkerMetrics);
@@ -1514,9 +1518,9 @@ impl Pipeline {
                 )?)
             }
             Sink::Sort { sink, .. } => {
-                WorkerSink::Sort(sink.new_state(
-                    sink_memory.expect("sort shared memory").into_shared_sort(),
-                ))
+                let (shared, spill) =
+                    sink_memory.expect("sort shared memory").into_shared_sort();
+                WorkerSink::Sort(sink.new_state_with_spill(shared, spill, batch_size))
             }
             Sink::HashJoinBuild(sink) => WorkerSink::HashJoinBuild(
                 sink.new_state(
@@ -1579,7 +1583,7 @@ impl Pipeline {
                 tokio::task::yield_now().await;
             }
         }
-        self.finish_worker(sink, &output, worker)
+        self.finish_worker(sink, &output, worker).await
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1640,7 +1644,7 @@ impl Pipeline {
                 tokio::task::yield_now().await;
             }
         }
-        self.finish_worker(sink, &output, worker)
+        self.finish_worker(sink, &output, worker).await
     }
 
     #[cfg(feature = "parquet")]
@@ -1733,7 +1737,7 @@ impl Pipeline {
             worker.complete();
             tokio::task::yield_now().await;
         }
-        self.finish_worker(sink, &output, worker)
+        self.finish_worker(sink, &output, worker).await
     }
 
     fn advance_join_chain(
@@ -1828,10 +1832,12 @@ impl Pipeline {
                 local.add_view(&view)?;
                 Ok(true)
             }),
-            WorkerSink::Sort(local) => worker.process(|| {
-                local.add_view(view)?;
+            WorkerSink::Sort(local) => {
+                worker
+                    .process_async(local.add_view_async(view, tx))
+                    .await?;
                 Ok(true)
-            }),
+            }
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
                 local.add_view(&view)?;
                 Ok(true)
@@ -2002,13 +2008,17 @@ impl Pipeline {
                 }
                 Ok(true)
             }),
-            WorkerSink::Sort(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+            WorkerSink::Sort(local) => {
+                let view = worker.process(|| {
+                    apply_operators_view(&self.operators, BatchView::all(batch))
+                })?;
                 if !view.is_empty() {
-                    local.add_view(view)?;
+                    worker
+                        .process_async(local.add_view_async(view, tx))
+                        .await?;
                 }
                 Ok(true)
-            }),
+            }
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
                 let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
@@ -2032,7 +2042,7 @@ impl Pipeline {
         }
     }
 
-    fn finish_worker(
+    async fn finish_worker(
         &self,
         sink: WorkerSink,
         output: &WorkerOutput,
@@ -2053,7 +2063,9 @@ impl Pipeline {
                 if output.tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
-                let runs = worker.process(|| local.finish())?;
+                let runs = worker
+                    .process_async(local.finish_async(&output.tx))
+                    .await?;
                 return Ok(WorkerState::SortedRuns(runs));
             }
             WorkerSink::HashJoinBuild(local) => {
@@ -2247,7 +2259,7 @@ impl Pipeline {
             worker.complete();
             tokio::task::yield_now().await;
         }
-        self.finish_worker(sink, &output, worker)
+        self.finish_worker(sink, &output, worker).await
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -2315,7 +2327,10 @@ impl Pipeline {
                 let tables = Arc::clone(finalized_tables);
                 let probe_res = probe_reservation.new_empty();
                 let sink_memory = if let Some(shared) = targets.shared_sort_memory {
-                    Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                    Some(WorkerSinkMemory::SharedSort(
+                        Arc::clone(shared),
+                        targets.sort_spill.cloned(),
+                    ))
                 } else {
                     targets
                         .sink_reservation
@@ -2686,6 +2701,7 @@ impl Pipeline {
                 combined_build: Some(&mut combined_build),
                 sink_reservation: Some(&build_reservation),
                 shared_sort_memory: None,
+                sort_spill: None,
             };
             let cont = build_pipeline
                 .run_build_emission_pipelines(
@@ -2787,11 +2803,17 @@ impl Pipeline {
         MetricBuilder::new(fin.metrics)
             .counter("sort_finalizations", 0)
             .add(1);
+        let sort_spill = SpillContext::try_new(
+            fin.context,
+            fin.metrics,
+            Arc::clone(sink.input_schema()),
+        );
         sink.finalize_and_emit(
             sorted_runs,
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
+            sort_spill,
             tx,
             fin.measurement,
         )
@@ -2919,16 +2941,24 @@ impl Pipeline {
         }
 
         // Consumer tasks: dynamically claim finalized aggregate batches and feed local TopN / Sort.
-        let stage_reservation =
-            MemoryConsumer::new(consumer_name).register(context.memory_pool());
+        let stage_reservation = MemoryConsumer::new(consumer_name)
+            .with_can_spill(matches!(post_sort, PostSort::Sort { .. }))
+            .register(context.memory_pool());
         let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. })
             .then(|| SharedSortMemory::new(stage_reservation.new_empty()));
+        let post_sort_spill = match post_sort {
+            PostSort::Sort { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
+            PostSort::TopN { .. } => None,
+        };
         for id in 0..sort_workers {
             let pipeline = Arc::clone(self);
             let agg_rx = Arc::clone(&agg_rx);
             let output_tx = tx.clone();
             let reservation = stage_reservation.new_empty();
             let shared_sort = shared_sort_memory.as_ref().map(Arc::clone);
+            let spill_ctx = post_sort_spill.clone();
             let mut worker =
                 WorkerMetrics::for_pipeline(measurement.cloned(), id, stage_label);
             tasks.spawn(async move {
@@ -2943,9 +2973,13 @@ impl Pipeline {
                     PostSort::TopN { sink, .. } => {
                         LocalPostState::TopN(sink.new_state(reservation)?)
                     }
-                    PostSort::Sort { sink, .. } => LocalPostState::Sort(
-                        sink.new_state(shared_sort.expect("shared sort memory")),
-                    ),
+                    PostSort::Sort { sink, .. } => {
+                        LocalPostState::Sort(sink.new_state_with_spill(
+                            shared_sort.expect("shared sort memory"),
+                            spill_ctx,
+                            batch_size,
+                        ))
+                    }
                 };
                 loop {
                     let maybe_batch = tokio::select! {
@@ -2960,22 +2994,33 @@ impl Pipeline {
                         return Ok(Vec::new());
                     }
                     worker.claim();
-                    worker.process(|| match &mut local {
-                        LocalPostState::TopN(s) => s.add_view(&BatchView::all(batch)),
-                        LocalPostState::Sort(s) => s.add_view(BatchView::all(batch)),
-                    })?;
+                    match &mut local {
+                        LocalPostState::TopN(s) => {
+                            worker.process(|| s.add_view(&BatchView::all(batch)))?;
+                        }
+                        LocalPostState::Sort(s) => {
+                            worker
+                                .process_async(
+                                    s.add_view_async(BatchView::all(batch), &output_tx),
+                                )
+                                .await?;
+                        }
+                    }
                     worker.complete();
                     tokio::task::yield_now().await;
                 }
                 if output_tx.is_closed() {
                     return Ok(Vec::new());
                 }
-                let runs = worker.process(|| match local {
+                let runs = match local {
                     LocalPostState::TopN(s) => {
-                        Ok(s.finish(batch_size)?.into_iter().collect())
+                        let run = worker.process(|| s.finish(batch_size))?;
+                        run.into_iter().collect()
                     }
-                    LocalPostState::Sort(s) => s.finish(),
-                })?;
+                    LocalPostState::Sort(s) => {
+                        worker.process_async(s.finish_async(&output_tx)).await?
+                    }
+                };
                 Ok(runs)
             });
         }
@@ -3299,9 +3344,17 @@ impl Pipeline {
         };
         let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
             SharedSortMemory::new(
-                MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+                MemoryConsumer::new("MorselSort")
+                    .with_can_spill(true)
+                    .register(context.memory_pool()),
             )
         });
+        let sort_spill = match &self.sink {
+            Sink::Sort { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
+            _ => None,
+        };
         let mut combined_group = match (&self.sink, &sink_reservation) {
             (Sink::GroupCount { sink, .. }, Some(reservation)) => {
                 Some(sink.new_state(reservation.new_empty()))
@@ -3347,7 +3400,10 @@ impl Pipeline {
                         let (pipeline, next, output) =
                             (Arc::clone(&self), Arc::clone(&next), output.clone());
                         let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            Some(WorkerSinkMemory::SharedSort(
+                                Arc::clone(shared),
+                                sort_spill.clone(),
+                            ))
                         } else {
                             sink_reservation
                                 .as_ref()
@@ -3407,7 +3463,10 @@ impl Pipeline {
                             output.clone(),
                         );
                         let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            Some(WorkerSinkMemory::SharedSort(
+                                Arc::clone(shared),
+                                sort_spill.clone(),
+                            ))
                         } else {
                             sink_reservation
                                 .as_ref()
@@ -3451,7 +3510,10 @@ impl Pipeline {
                         let (pipeline, ready, output) =
                             (Arc::clone(&self), ready.clone(), output.clone());
                         let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            Some(WorkerSinkMemory::SharedSort(
+                                Arc::clone(shared),
+                                sort_spill.clone(),
+                            ))
                         } else {
                             sink_reservation
                                 .as_ref()
@@ -3611,6 +3673,7 @@ impl Pipeline {
                 combined_build: None,
                 sink_reservation: sink_reservation.as_ref(),
                 shared_sort_memory: shared_sort_memory.as_ref(),
+                sort_spill: sort_spill.as_ref(),
             };
             match self
                 .run_build_emission_pipelines(
