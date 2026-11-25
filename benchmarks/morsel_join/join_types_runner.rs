@@ -178,29 +178,24 @@ async fn run_one(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let sf: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let workers: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let warmups: usize = std::env::args()
-        .nth(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let repeats: usize = std::env::args()
-        .nth(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let inner_only = args.iter().any(|a| a == "--inner-only");
+    let positional: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .collect();
+    let sf: usize = positional.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let workers: usize = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let warmups: usize = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let repeats: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .max_blocking_threads(workers)
         .enable_all()
         .build()?;
-    rt.block_on(run_bench(sf, workers, warmups, repeats))
+    rt.block_on(run_bench(sf, workers, warmups, repeats, inner_only))
 }
 
 async fn run_bench(
@@ -208,6 +203,7 @@ async fn run_bench(
     workers: usize,
     warmups: usize,
     repeats: usize,
+    inner_only: bool,
 ) -> Result<(), Box<dyn Error>> {
     // TPC-H proportional sizes:
     // SF=1: customer=150K, orders=1.5M, supplier=10K, threshold=1
@@ -392,12 +388,37 @@ async fn run_bench(
         .await?;
     }
 
-    let workloads = [
+    let all_workloads: Vec<(&str, &str, bool)> = vec![
         (
             "inner_baseline",
             "SELECT c.c_mktsegment, COUNT(*) AS n, SUM(o.o_totalprice) AS total \
              FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey \
              GROUP BY c.c_mktsegment",
+            true,
+        ),
+        (
+            "inner_filter_q19_or",
+            "SELECT COUNT(*) AS n, SUM(o.o_totalprice) AS total \
+             FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey \
+             WHERE (c.c_mktsegment = 0 AND o.o_totalprice >= 20000 AND o.o_totalprice <= 50000 AND c.c_acctbal > 1000) \
+                OR (c.c_mktsegment = 1 AND o.o_totalprice >= 60000 AND o.o_totalprice <= 85000 AND c.c_acctbal < 6000) \
+                OR (c.c_mktsegment = 2 AND o.o_totalprice >= 10000 AND o.o_totalprice <= 30000 AND c.c_acctbal >= 3000)",
+            true,
+        ),
+        (
+            "inner_filter_50pct",
+            "SELECT c.c_mktsegment, COUNT(*) AS n, SUM(o.o_totalprice + c.c_acctbal) AS total \
+             FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey \
+             WHERE o.o_totalprice + c.c_acctbal > 54000 \
+             GROUP BY c.c_mktsegment",
+            true,
+        ),
+        (
+            "inner_filter_sparse_count",
+            "SELECT COUNT(*) AS n \
+             FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey \
+             WHERE o.o_totalprice + c.c_acctbal > 107000",
+            true,
         ),
         (
             "left_semi_exists",
@@ -407,6 +428,7 @@ async fn run_bench(
                  SELECT 1 FROM customer c \
                  WHERE c.c_custkey = o.o_custkey AND c.c_mktsegment = 0 \
              )",
+            false,
         ),
         (
             "left_anti_not_exists",
@@ -416,6 +438,7 @@ async fn run_bench(
                  SELECT 1 FROM orders o WHERE o.o_custkey = c.c_custkey \
              ) \
              GROUP BY c.c_mktsegment",
+            false,
         ),
         (
             "not_in_null_aware",
@@ -424,6 +447,7 @@ async fn run_bench(
              WHERE o.o_suppkey NOT IN ( \
                  SELECT s.s_suppkey FROM supplier s WHERE s.s_flag = 1 \
              )",
+            false,
         ),
         (
             "not_in_null_short_circuit",
@@ -432,6 +456,7 @@ async fn run_bench(
              WHERE o.o_suppkey NOT IN ( \
                  SELECT s.s_suppkey FROM supplier_null s WHERE s.s_flag = 1 \
              )",
+            false,
         ),
         (
             "left_outer_q13_filter",
@@ -439,24 +464,33 @@ async fn run_bench(
              FROM customer c LEFT OUTER JOIN orders o \
                ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' \
              GROUP BY c.c_mktsegment",
+            false,
         ),
         (
             "right_outer_child_emit",
             "SELECT COUNT(*) AS n, COUNT(o.o_orderkey) AS matched_o \
              FROM orders o RIGHT OUTER JOIN customer c ON o.o_custkey = c.c_custkey",
+            false,
         ),
         (
             "full_outer_child_emit",
             "SELECT COUNT(*) AS n, COUNT(o.o_orderkey) AS matched_o, COUNT(c.c_custkey) AS matched_c \
              FROM orders o FULL OUTER JOIN customer c ON o.o_custkey = c.c_custkey",
+            false,
         ),
         (
             "cross_join_scalar",
             "SELECT COUNT(*) AS n, SUM(o.o_totalprice) AS total \
              FROM orders o CROSS JOIN threshold t \
              WHERE o.o_totalprice > t.min_price",
+            false,
         ),
     ];
+    let workloads: Vec<(&str, &str)> = all_workloads
+        .into_iter()
+        .filter(|(_, _, is_inner)| !inner_only || *is_inner)
+        .map(|(n, s, _)| (n, s))
+        .collect();
 
     println!(
         "SF={sf} workers={workers} batch_size={BATCH_SIZE} warmups={warmups} repeats={repeats}"
