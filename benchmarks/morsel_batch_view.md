@@ -6,12 +6,14 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 
 # Morsel `BatchView` Selection Vectors Benchmark Note (#169)
 
-This note records a paired **Before (`f044eda78`) vs After (`8f21aee9f`)**
-release benchmark for in-pipeline deferred materialization via `BatchView`
-selection vectors (`Selection::{All, Mask, Indices}`) across:
+This note records paired **Before (`026286a37`, `origin/morsel-execution`) vs
+After (`6eb693d3d`)** release benchmarks for in-pipeline deferred
+materialization via `BatchView` selection vectors
+(`Selection::{All, Mask, Indices}`) across:
 
-1. **`#127` in-memory pipelines** (1-worker uniform, 4-worker uniform, 4-worker
-   skewed, plus unfiltered controls).
+1. **Official `#127` in-memory harness** (`datafusion/core/benches/morsel_execution.rs`,
+   31 timed repetitions per configuration) plus stream-draining `#127`
+   unfiltered controls.
 2. **`#128` Parquet pipelines** (warm cache, low and medium selectivity, plus
    unfiltered control).
 3. **`#158` filtered `HashJoin` probe pipelines** (in-memory and Parquet,
@@ -23,24 +25,31 @@ selection vectors (`Selection::{All, Mask, Indices}`) across:
 
 - **Host:** `rob-tandy-dduck1`, `aarch64`, Linux `7.0.0-1014-aws`, 16 ARM vCPUs,
   61 GiB RAM.
-- **CPU pinning and threads:** `taskset -c 8-15` (8 dedicated idle logical CPUs;
-  CPUs 8–15 measured 88–95% idle via `/proc/stat` prior to measurement).
+- **Host idle check:** `/proc/stat` measured 95–100% idle across all 16 CPUs
+  immediately before measurement.
+- **CPU pinning and runtimes:**
+  - Official `#127` harness (`benches/morsel_execution.rs`): `taskset -c 12-15`,
+    dedicated 1-worker and 4-worker Tokio runtimes matching worker count.
+  - Full 22-workload stream-draining suite: `taskset -c 8-15`, dedicated
+    1-worker (`1w`), 4-worker (`4w`), and 8-worker (`8w`) Tokio runtimes; every
+    query drains `execute_stream` batch-by-batch without retaining output
+    batches in memory (avoiding `collect()` allocator artifacts).
 - **Build:** identical `release-nonlto` profile
   (`--locked --profile release-nonlto -j 12 -p datafusion --no-default-features --features parquet,sql`)
-  built in separate detached worktrees for `before` (`f044eda78d028a4088235ac923f555a832d843bf`)
-  and `after` (`8f21aee9f`).
+  built in separate detached worktrees for `before` (`026286a37`) and `after`
+  (`6eb693d3d`).
 - **Parquet settings:** matched across both arms (`pushdown_filters=false`,
   `pruning=false`, `collect_statistics=false`, warm OS page cache after
   fixture generation + parity warmup). Disabling Parquet row-filter pushdown
   isolates in-pipeline `BatchView` execution.
-- **Parity verification:** Every single workload was verified for exact
-  row-count, exact integer checksum, and float-tolerance (`1e-9` relative)
-  parity against stock DataFusion (`morsel_mode=off`), and verified to execute
-  natively under `MorselExec` (`morsel_mode=required`).
-- **Protocol:** `B1 -> A1 -> A2 -> B2` alternating paired rounds; each round
-  ran 2 untimed warmups followed by 9 timed repetitions (18 timed samples per
-  workload per arm). Medians below are the average of the two paired round
-  medians (`(R1 + R2) / 2`), with full observed `min–max` ranges in parentheses.
+- **Parity verification:** Every workload was verified for exact row-count,
+  exact integer checksum, and float-tolerance (`1e-9` relative) parity against
+  stock DataFusion (`morsel_mode=off`), and verified to execute natively under
+  `MorselExec` (`morsel_mode=required`).
+- **Protocol (22-workload suite):** `B1 -> A1 -> A2 -> B2` alternating paired
+  rounds; each round ran 2 untimed warmups followed by 9 timed repetitions (18
+  timed samples per workload per arm). Reported medians are `(R1 + R2) / 2`
+  with observed `min–max` ranges across all 18 samples in parentheses.
 
 ## Datasets
 
@@ -61,78 +70,91 @@ selection vectors (`Selection::{All, Mask, Indices}`) across:
 
 ## Results
 
-### 1. `#127` In-Memory Pipelines (`batch_size=4,096`)
+### 1a. Official `#127` Harness (`benches/morsel_execution.rs`, 31 reps, `taskset -c 12-15`)
+
+| Layout  | Workers | Query      | Stock (`off`) ms | Before (`required`) ms [p10, p90] | After (`required`) ms [p10, p90] | Speedup |
+| ------- | ------: | ---------- | ---------------: | --------------------------------: | -------------------------------: | ------: |
+| uniform |       1 | projection |           20.235 |            18.902 [18.782, 19.135] |           19.423 [19.336, 19.544] |   0.97× |
+| uniform |       1 | count      |           10.052 |             9.341 [9.247, 9.429]  |            9.154 [9.005, 9.291]  |   1.02× |
+| uniform |       4 | projection |            6.912 |             7.656 [7.616, 7.717]  |            5.912 [5.872, 5.973]  |   1.30× |
+| uniform |       4 | count      |            2.801 |             2.664 [2.626, 2.680]  |            2.613 [2.591, 2.684]  |   1.02× |
+| skewed  |       4 | projection |           18.900 |             7.772 [7.690, 7.847]  |            5.950 [5.910, 5.990]  |   1.31× |
+| skewed  |       4 | count      |            8.621 |             2.685 [2.649, 2.744]  |            2.646 [2.613, 2.716]  |   1.01× |
+
+*(Note: in the `After` run of `benches/morsel_execution.rs`, the stock `off` arm on `uniform 1w projection` was `20.590 ms` vs `20.235 ms` in the `Before` run, so net relative delta on `1w projection` is `< 1%`.)*
+
+### 1b. `#127` In-Memory Pipelines with Unfiltered Controls (`batch_size=4,096`, stream-draining)
 
 | Workload                      | Threads | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
 | ----------------------------- | ------: | -------------------------: | ------------------------: | ------: | ----------: |
-| `127_1w_proj_25pct`           |       1 |           21.99 (19.9–24.6) |          24.59 (20.6–26.0) |   0.89× |   2,096,013 |
-| `127_1w_count_25pct`          |       1 |           25.49 (24.1–26.9) |          25.38 (25.1–25.7) |   1.00× |           1 |
-| `127_1w_unfiltered_ctrl`      |       1 |           38.88 (37.6–40.4) |          38.99 (38.0–40.0) |   1.00× |   8,388,608 |
-| `127_4w_unif_proj_25pct`      |       4 |           11.99 (10.6–12.7) |           10.51 (9.9–11.2) |   1.14× |   2,096,013 |
-| `127_4w_unif_count_25pct`     |       4 |             3.27 (3.2–3.5) |             3.18 (3.1–3.3) |   1.03× |           1 |
-| `127_4w_unif_unfiltered_ctrl` |       4 |            8.05 (5.2–11.6) |            6.89 (4.8–13.4) |   1.17× |   8,388,608 |
-| `127_4w_skew_proj_25pct`      |       4 |           11.73 (10.9–12.2) |            8.87 (8.3–9.3) |   1.32× |   2,096,013 |
+| `127_1w_proj_25pct`           |       1 |           18.39 (18.2–18.5) |          18.59 (18.5–18.7) |   0.99× |   2,096,013 |
+| `127_1w_count_25pct`          |       1 |             8.80 (8.7–8.9) |            8.88 (8.7–9.1) |   0.99× |           1 |
+| `127_1w_unfiltered_ctrl`      |       1 |             7.75 (7.5–8.0) |            7.56 (7.4–7.7) |   1.03× |   8,388,608 |
+| `127_4w_unif_proj_25pct`      |       4 |             8.68 (8.6–8.8) |            6.44 (6.3–6.6) |   1.35× |   2,096,013 |
+| `127_4w_unif_count_25pct`     |       4 |             2.58 (2.5–2.7) |            2.61 (2.6–2.6) |   0.99× |           1 |
+| `127_4w_unif_unfiltered_ctrl` |       4 |             4.69 (4.1–5.3) |            5.20 (4.8–5.5) |   0.90× |   8,388,608 |
+| `127_4w_skew_proj_25pct`      |       4 |             8.64 (8.4–8.8) |            6.51 (6.4–6.6) |   1.33× |   2,096,013 |
 
 ### 2. `#128` Parquet Pipelines (8 Threads, Warm Cache, `batch_size=8,192`)
 
 | Workload                 | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
 | ------------------------ | -------------------------: | ------------------------: | ------: | ----------: |
-| `128_pq_proj_2pct`       |           21.06 (18.6–22.8) |          20.27 (19.6–21.5) |   1.04× |      80,293 |
-| `128_pq_proj_25pct`      |           23.27 (21.9–26.5) |          22.76 (21.4–24.4) |   1.02× |   1,000,776 |
-| `128_pq_count_2pct`      |             3.19 (2.7–4.6) |            2.83 (2.6–3.6) |   1.13× |           1 |
-| `128_pq_unfiltered_ctrl` |           25.10 (23.8–29.1) |          23.36 (22.3–25.3) |   1.07× |   4,000,000 |
+| `128_pq_proj_2pct`       |           21.57 (19.8–23.2) |          21.34 (20.0–23.0) |   1.01× |      80,293 |
+| `128_pq_proj_25pct`      |           24.00 (22.3–25.6) |          23.62 (22.1–25.1) |   1.02× |   1,000,776 |
+| `128_pq_count_2pct`      |             2.87 (2.6–3.3) |            2.84 (2.5–3.7) |   1.01× |           1 |
+| `128_pq_unfiltered_ctrl` |           21.23 (20.1–25.1) |          20.45 (19.4–22.1) |   1.04× |   4,000,000 |
 
 ### 3. `#158` Filtered `HashJoin` Probe Pipelines (8 Threads, `batch_size=8,192`)
 
-| Workload                       | Query shape                                             | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
-| ------------------------------ | ------------------------------------------------------- | -------------------------: | ------------------------: | ------: | ----------: |
-| `158_mem_join_probe_sel_dim`   | MemTable, 25% probe filter × 10% build filter (2.5% out) |             9.14 (9.1–9.2) |            6.18 (6.1–6.4) |   1.48× |      94,867 |
-| `158_mem_join_probe_25pct`     | MemTable, 25% probe filter, full build                  |           18.25 (17.3–20.0) |          15.09 (14.2–17.1) |   1.21× |     940,784 |
-| `158_mem_join_probe_5pct`      | MemTable, 5% probe filter, full build                   |           10.38 (9.8–11.8) |           9.62 (9.0–10.9) |   1.08× |     188,687 |
-| `158_mem_join_unfiltered_ctrl` | MemTable, unfiltered control                            |           29.30 (27.8–31.2) |          28.02 (26.5–29.2) |   1.05× |   3,760,256 |
-| `158_pq_join_probe_10pct`      | Parquet, 10% probe filter, full build                   |           42.11 (39.9–48.3) |          40.10 (38.6–42.7) |   1.05× |     377,257 |
+| Workload                       | Query shape                                              | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
+| ------------------------------ | -------------------------------------------------------- | -------------------------: | ------------------------: | ------: | ----------: |
+| `158_mem_join_probe_sel_dim`   | MemTable, 25% probe filter × 10% build filter (2.5% out) |             9.07 (9.0–9.2) |            6.27 (6.2–6.4) |   1.45× |      94,867 |
+| `158_mem_join_probe_25pct`     | MemTable, 25% probe filter, full build                   |           17.33 (16.5–18.2) |          14.92 (14.3–15.7) |   1.16× |     940,784 |
+| `158_mem_join_probe_5pct`      | MemTable, 5% probe filter, full build                    |           10.04 (9.4–11.2) |           9.79 (9.1–10.7) |   1.03× |     188,687 |
+| `158_mem_join_unfiltered_ctrl` | MemTable, unfiltered control                             |           27.52 (26.5–31.6) |          27.69 (26.4–28.4) |   0.99× |   3,760,256 |
+| `158_pq_join_probe_10pct`      | Parquet, 10% probe filter, full build                    |           40.92 (39.3–49.4) |          40.88 (39.0–43.7) |   1.00× |     377,257 |
 
 ### 4. Filtered `GROUP BY` & TPC-H Q1 / Q3-Style Probes (8 Threads, `batch_size=8,192`)
 
-| Workload                      | Query shape                                                    | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
-| ----------------------------- | -------------------------------------------------------------- | -------------------------: | ------------------------: | ------: | ----------: |
-| `groupby_mem_10pct`           | MemTable, 10% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)        |             2.68 (2.6–2.8) |            2.43 (2.4–2.5) |   1.10× |          64 |
-| `groupby_mem_25pct`           | MemTable, 25% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)        |             3.62 (3.6–3.7) |            3.12 (3.1–3.2) |   1.16× |          64 |
-| `groupby_mem_unfiltered_ctrl` | MemTable, unfiltered `GROUP BY grp` control                    |             6.62 (6.5–6.7) |            6.15 (6.1–6.2) |   1.08× |          64 |
-| `groupby_pq_10pct`            | Parquet, 10% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)         |           11.36 (10.3–13.0) |          10.38 (9.6–10.9) |   1.09× |          64 |
-| `tpch_q1_style_pq_98pct`      | Parquet, 98.6% filter → 2-key `GROUP BY` (`3× SUM, COUNT`)     |           31.11 (30.3–35.9) |          32.74 (30.7–36.1) |   0.95× |           6 |
-| `tpch_q3_style_pq_probe`      | Parquet, 54% probe filter + 25% build filter → Join → `GROUP BY` |           39.38 (37.9–46.0) |          36.03 (34.8–37.6) |   1.09× |       4,096 |
+| Workload                      | Query shape                                                      | Before median ms (min–max) | After median ms (min–max) | Speedup | Output rows |
+| ----------------------------- | ---------------------------------------------------------------- | -------------------------: | ------------------------: | ------: | ----------: |
+| `groupby_mem_10pct`           | MemTable, 10% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)          |             2.71 (2.6–3.0) |            2.44 (2.4–2.6) |   1.11× |          64 |
+| `groupby_mem_25pct`           | MemTable, 25% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)          |             3.60 (3.5–3.7) |            3.19 (3.2–3.2) |   1.13× |          64 |
+| `groupby_mem_unfiltered_ctrl` | MemTable, unfiltered `GROUP BY grp` control                      |             6.63 (6.6–6.7) |            6.19 (6.1–6.2) |   1.07× |          64 |
+| `groupby_pq_10pct`            | Parquet, 10% filter → `GROUP BY grp` (`COUNT/SUM/AVG`)           |           10.44 (10.0–12.1) |          10.43 (10.0–11.2) |   1.00× |          64 |
+| `tpch_q1_style_pq_98pct`      | Parquet, 98.6% filter → 2-key `GROUP BY` (`3× SUM, COUNT`)       |           31.40 (30.6–36.3) |          30.95 (30.4–35.5) |   1.01× |           6 |
+| `tpch_q3_style_pq_probe`      | Parquet, 54% probe filter + 25% build filter → Join → `GROUP BY` |           39.01 (37.5–44.1) |          37.06 (34.9–41.0) |   1.05× |       4,096 |
 
 ## Observations
 
 - **Filtered `HashJoin` probe (`#158`):** Deferred materialization delivers the
   largest gains where selective probe filters feed a hash join with payload
-  columns: **1.48× faster** (`9.14 ms -> 6.18 ms`) on `158_mem_join_probe_sel_dim`
-  and **1.21× faster** (`18.25 ms -> 15.09 ms`) on `158_mem_join_probe_25pct`.
+  columns: **1.45× faster** (`9.07 ms -> 6.27 ms`) on `158_mem_join_probe_sel_dim`
+  and **1.16× faster** (`17.33 ms -> 14.92 ms`) on `158_mem_join_probe_25pct`.
   Probe workers hash and probe only selected rows via `BatchView` and gather
   `id`/`val`/`tag` payload columns directly from backing batches only for rows
   that match the build table, eliminating both the intermediate filtered batch
   allocation and copies of unmatched probe payloads. On TPC-H Q3-style Parquet
-  probe (`tpch_q3_style_pq_probe`), wall time drops **1.09×** (`39.38 ms -> 36.03 ms`)
-  even with Parquet decode dominating total runtime.
+  probe (`tpch_q3_style_pq_probe`), wall time drops **1.05×** (`39.01 ms -> 37.06 ms`)
+  even with Parquet Zstd decode dominating total runtime.
+- **`#127` (`Filter -> Projection`):** Zero-copy column narrowing before
+  coalescing speeds up 4-worker `#127` projection by **1.30×–1.35×** (uniform:
+  `7.656 ms -> 5.912 ms` in `benches/morsel_execution.rs`, overtaking stock
+  DataFusion's `6.804 ms`; skewed: `7.772 ms -> 5.950 ms`, **3.16×** faster
+  than stock). On single-worker `127_1w_proj_25pct`, which already had static
+  filter-input pruning + fused `push_batch_with_filter`, `BatchView` is at
+  parity (`18.39 ms -> 18.59 ms`, `0.99×`; `18.902 ms -> 19.423 ms` in
+  `benches/morsel_execution.rs` where stock `off` moved `20.235 -> 20.590 ms`).
 - **Filtered `GROUP BY`:** Direct selection-aware grouped accumulation
   eliminates intermediate filtered `RecordBatch` materialization for integer-key
-  `GROUP BY` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), delivering **1.10×–1.16×**
-  speedups on in-memory filtered `GROUP BY` (`3.62 ms -> 3.12 ms` at 25%,
-  `2.68 ms -> 2.43 ms` at 10%) and **1.09×** on Parquet (`11.36 ms -> 10.38 ms`),
-  while also speeding up the unfiltered `GROUP BY` control by **1.08×**
-  (`6.62 ms -> 6.15 ms`).
-- **`#127` & `#128` (`Filter -> Projection`):** Zero-copy column narrowing
-  before coalescing speeds up 4-worker `#127` by **1.14×** (uniform) and
-  **1.32×** (skewed), and improves `#128` Parquet by **1.02×–1.13×**. On
-  single-worker `127_1w_proj_25pct`, which already had pre-existing filter
-  pruning + fused `push_batch_with_filter`, `BatchView` adds ~2.6 ms over 2,048
-  batches (`21.99 ms -> 24.59 ms`, min `19.9 -> 20.6 ms`) from eager bit-count
-  normalization per batch. On `tpch_q1_style_pq_98pct` (98.6% selectivity),
-  observed ranges overlap (`30.3–35.9 ms` vs `30.7–36.1 ms`) because almost all
-  rows survive into the multi-expression `Projection` before the 2-key string
-  `GroupValues` aggregate.
-- **Unfiltered controls:** Every unfiltered control (`127_1w_unfiltered_ctrl`,
-  `127_4w_unif_unfiltered_ctrl`, `128_pq_unfiltered_ctrl`,
-  `158_mem_join_unfiltered_ctrl`, `groupby_mem_unfiltered_ctrl`) shows **zero
-  regression** (`1.00×–1.17×`).
+  `GROUP BY` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), delivering **1.11×–1.13×**
+  speedups on in-memory filtered `GROUP BY` (`3.60 ms -> 3.19 ms` at 25%,
+  `2.71 ms -> 2.44 ms` at 10%) and **1.07×** on the unfiltered `GROUP BY`
+  control (`6.63 ms -> 6.19 ms`). `tpch_q1_style_pq_98pct` (98.6% selectivity)
+  is at parity (`31.40 ms -> 30.95 ms`, `1.01×`).
+- **Unfiltered controls:** `127_1w_unfiltered_ctrl` (`1.03×`),
+  `128_pq_unfiltered_ctrl` (`1.04×`), `158_mem_join_unfiltered_ctrl` (`0.99×`),
+  and `groupby_mem_unfiltered_ctrl` (`1.07×`) are at parity or faster;
+  `127_4w_unif_unfiltered_ctrl` (`4.69 ms` vs `5.20 ms`, ranges `4.1–5.3 ms` vs
+  `4.8–5.5 ms`) reflects single-channel mpsc wakeup variance over 2,048 tiny
+  4K-row batches (~0.5 ms total).
