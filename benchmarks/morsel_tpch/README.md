@@ -76,53 +76,56 @@ as `--queries q1,q3,q6,q12` or `--queries q6_count q6_scan q1_unordered`.
 
 ### Roadmap TPC-H Queries (Stock DataFusion vs DuckDB; Morsel Not Yet Admitted)
 
-19 of the 22 standard TPC-H queries (`q1`–`q5`, `q7`–`q13`, `q15`–`q18`,
-`q20`–`q22`) are currently rejected at planning time under `morsel_mode=required`
-(see
+14 of the 22 standard TPC-H queries (`q2`, `q4`, `q7`–`q9`, `q11`, `q13`,
+`q15`–`q18`, `q20`–`q22`) are currently rejected at planning time under
+`morsel_mode=required` (see
 [sf5_baseline_22q.md](sf5_baseline_22q.md#3-live-22-query-morsel-admission--operator-capability-checklist)
-for the complete 22-query rejection and operator-capability checklist). The
-original SF1 roadmap subset (`q1`, `q3`, `q12`) remains directly runnable via
-`--queries q1,q3,q6,q12`:
-
-- **`q1`**: Filtered grouped multi-aggregate (`SUM`, `AVG`, `COUNT`) + `ORDER BY`
-  over `lineitem`.
-- **`q3`**: 3-way join (`customer`, `orders`, `lineitem`) + filter + `GROUP BY` +
-  `ORDER BY ... LIMIT 10`.
-- **`q12`**: 2-way join (`lineitem`, `orders`) + filter + conditional `SUM` +
-  `GROUP BY` + `ORDER BY`.
-
-`harness.py verify` checks that `morsel_mode=required` explicitly rejects these
-three queries at planning time (until `HashJoin` and `Sort`/`TopN` land in the
-morsel planner):
-
-- `q1`: `unsupported logical operator: Sort: lineitem.l_returnflag ASC NULLS LAST, lineitem.l_linestatus ASC NULLS LAST`
-- `q3`: `unsupported logical operator: Sort: revenue DESC NULLS FIRST, orders.o_orderdate ASC NULLS LAST, fetch=10`
-- `q12`: `unsupported logical operator: Sort: lineitem.l_shipmode ASC NULLS LAST`
+for the 22-query operator-capability checklist and
+[checkpoint_b_results.md](checkpoint_b_results.md#5-live-22-query-admission-status-post-159)
+for the post-`#159` update). `harness.py verify` checks that
+`morsel_mode=required` explicitly rejects these 14 queries at planning time.
 
 ### Currently-Admitted Morsel-Native Queries (Live 3-Way Comparison)
 
-Six workloads (`q6`, `q14`, `q19`, `q1_unordered`, `q6_count`, `q6_scan`) run
-directly over the real TPC-H Parquet schemas (`l_quantity`, `l_extendedprice`,
-`l_discount`, `l_tax` as `DECIMAL(15,2)`, `l_shipdate` as `DATE32`,
-`l_orderkey` / `p_partkey` as `INT64`, string columns as `Utf8View`) — no casts
-or schema workarounds are needed; `morsel_mode=required` admits all six natively
-under `MorselExec` (see [sf5_baseline_22q.md](sf5_baseline_22q.md) for the
-post-`#188` SF5 5-arm comparison including `q14` and `q19`,
-[checkpoint_a_results.md](checkpoint_a_results.md) for the idle-`dduck2`
-Checkpoint A SF1 3-way scorecard, and [morsel_aggregate.md](morsel_aggregate.md)
-for the `#168` `dduck1` aggregate note):
+Eleven workloads — **8 standard TPC-H queries** (`q1`, `q3`, `q5`, `q6`, `q10`,
+`q12`, `q14`, `q19`) plus 3 single-table slices (`q1_unordered`, `q6_count`,
+`q6_scan`) — run directly over the real TPC-H Parquet schemas (`l_quantity`,
+`l_extendedprice`, `l_discount`, `l_tax` as `DECIMAL(15,2)`, `l_shipdate` as
+`DATE32`, `l_orderkey` / `p_partkey` as `INT64`, string columns as `Utf8View`)
+with zero casts or schema workarounds; `morsel_mode=required` admits all eleven
+natively under `MorselExec`:
 
-- **`q6`**: Standard TPC-H Q6 (matching `benchmarks/queries/q6.sql`) — filtered
-  ungrouped `SUM(l_extendedprice * l_discount)` over `lineitem`.
-- **`q14`**: Standard TPC-H Q14 (matching `benchmarks/queries/q14.sql`) —
-  two-pipeline native Inner `HashJoin` (`part` build, filtered `lineitem` probe)
-  - conditional `SUM` ratio (`#188`).
-- **`q19`**: Standard TPC-H Q19 (matching `benchmarks/queries/q19.sql`) —
-  two-pipeline native Inner `HashJoin` (`part` build, `lineitem` probe) with
-  disjunctive 3-branch `OR` join filter + ungrouped `SUM` (`#188`).
-- **`q1_unordered`**: TPC-H Q1 without `ORDER BY` — filtered grouped
-  multi-aggregate (`4× SUM`, `3× AVG`, `COUNT(*)`) over
-  `(l_returnflag, l_linestatus)` on `lineitem`.
+- See [checkpoint_b_results.md](checkpoint_b_results.md) for the idle-`dduck2`
+  **Checkpoint B** SF1 3-way warm + cold scorecard across `q1`, `q3`, `q6`, and
+  `q12` with `#138` per-pipeline wait/work breakdowns (`#174`).
+- See [sf5_baseline_22q.md](sf5_baseline_22q.md) for the post-`#188` SF5
+  22-query Stock vs. DuckDB baseline and 5-arm Morsel comparison (`#189`).
+- See [checkpoint_a_results.md](checkpoint_a_results.md) for the idle-`dduck2`
+  Checkpoint A SF1 3-way scorecard (`#173`).
+- See [morsel_aggregate.md](morsel_aggregate.md) for the `#168` `dduck1`
+  aggregate note.
+
+Checkpoint B standard queries (`--queries q1,q3,q6,q12`):
+
+- **`q1`**: Filtered grouped 8-aggregate (`SUM`, `AVG`, `COUNT`) + `ORDER BY`
+  (`SortSink`) over `lineitem`.
+- **`q3`**: 3-way Inner `HashJoin` (`customer ⋈ orders ⋈ lineitem`) + filter +
+  `GROUP BY` + `ORDER BY ... LIMIT 10` (`TopNSink`).
+- **`q6`**: Filtered ungrouped `SUM(l_extendedprice * l_discount)` over
+  `lineitem`.
+- **`q12`**: 2-way Inner `HashJoin` (`orders ⋈ lineitem`) + filter +
+  conditional `SUM` + `GROUP BY` + `ORDER BY` (`SortSink`).
+
+Additional admitted standard queries (`q5`, `q10`, `q14`, `q19`) and slices:
+
+- **`q5`**: 6-way Inner `HashJoin` + `GROUP BY` + `ORDER BY` (`SortSink`).
+- **`q10`**: 4-way Inner `HashJoin` + `GROUP BY` + `ORDER BY ... LIMIT 20`
+  (`TopNSink`).
+- **`q14`**: Two-pipeline native Inner `HashJoin` (`part` build, filtered
+  `lineitem` probe) + conditional `SUM` ratio (`#188`).
+- **`q19`**: Two-pipeline native Inner `HashJoin` (`part` build, `lineitem`
+  probe) with disjunctive 3-branch `OR` join filter + ungrouped `SUM` (`#188`).
+- **`q1_unordered`**: TPC-H Q1 without `ORDER BY`.
 - **`q6_count`**:
 
   ```sql
@@ -184,8 +187,9 @@ defaults.
   `seconds`, Stock `operator_compute_ms`, and (when `MORSEL_METRICS=1`, the
   default on `measure`) `MorselMetrics` wait/work breakdowns
   (`morsel_decode_work_ms`, `morsel_process_work_ms`, `morsel_ready_wait_ms`,
-  `morsel_output_wait_ms`, `morsel_pending_io_ms`, peak queue depths, and
-  per-worker `worker_claims` / `worker_completions`).
+  `morsel_output_wait_ms`, `morsel_pending_io_ms`, coordinator join/sort/topn
+  combine/finalize times, peak queue depths, per-worker `worker_claims` /
+  `worker_completions`, and per-pipeline `morsel_pipelines` breakdowns).
 - **DuckDB (`harness.py _duckdb-exec`)**: Opens a fresh in-memory connection,
   sets `threads`, preloads `LOAD parquet`, warms the Arrow C-stream bridge with
   `SELECT 1` (so one-time dynamic extension loading does not penalize DuckDB vs
@@ -196,6 +200,11 @@ FROM read_parquet(...)` views for the queried tables, and starts the clock
   the Linux page cache once before timing and checks via `mincore` that 100% of
   4 KiB pages of the queried tables are resident **before and after** every
   timed trial. Any residency drop aborts the run.
+- **Cold page cache (`--cache cold`)**: Evicts all queried Parquet files from
+  the Linux page cache via `fsync` + `posix_fadvise(POSIX_FADV_DONTNEED)`
+  before each trial (no `sudo` required; requires disk-backed storage, not
+  `tmpfs`) and verifies via `mincore` that `0 / total` 4 KiB pages are resident
+  before each timed trial.
 
 ### Result Parity Against DuckDB Oracle
 
