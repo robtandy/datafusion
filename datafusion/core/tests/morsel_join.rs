@@ -255,6 +255,8 @@ async fn inner_join_parity_cardinality_nulls_duplicates_and_blowup() -> Result<(
         "SELECT l.k, l.s, l.v, r.v AS rv FROM l JOIN r ON l.k = r.k AND l.s = r.s",
         // Post-join cross-table Filter (pushed to join.filter) + Projection
         "SELECT l.k, l.v + r.v AS total FROM l JOIN r ON l.k = r.k WHERE l.v + r.v > 500 AND l.v > 0 AND r.v < 3010",
+        // Q19-style OR residual join filter
+        "SELECT l.k, l.v, r.v AS rv FROM l JOIN r ON l.k = r.k WHERE (l.s = 'one' AND r.v > 20) OR (l.s = 'mm' AND l.v + r.v > 5010)",
         // Volatile post-join Filter (stays above Join)
         "SELECT l.k, l.v, r.v AS rv FROM l JOIN r ON l.k = r.k WHERE random() >= 0.0",
         // Post-join COUNT(*)
@@ -321,6 +323,11 @@ async fn inner_join_parity_cardinality_nulls_duplicates_and_blowup() -> Result<(
 
         for sql in queries {
             let (plan, actual) = assert_native_parity(&stock, &native, sql).await?;
+            let display = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(
+                !display.contains(", filter="),
+                "{source_kind}: INNER join residual filter must lower as post-probe Filter, not in-probe filter:\n{display}"
+            );
             assert!(
                 metric(plan.as_ref(), "join_build_finalizations") >= 1,
                 "{source_kind}: `{sql}`"

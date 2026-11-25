@@ -987,8 +987,27 @@ impl MorselQueryPlanner {
         let join_output_schema =
             Arc::new(build_join_schema(&left_schema, &right_schema, &join.join_type).0);
 
-        let (mut post_ops, mut final_schema) =
+        // For INNER hash joins, keep residual `join.filter` as a post-probe
+        // `Operator::Filter` so probing uses the specialized no-filter fast loops
+        // and downstream operators benefit from lazy `BatchView` filtering.
+        let inner_post_filter = !is_cross && join.join_type == JoinType::Inner;
+        let mut post_ops = Vec::new();
+        if inner_post_filter && let Some(filter_expr) = &join.filter {
+            let predicate =
+                create_physical_expr(filter_expr, &join.schema, props, &planning_ctx)?;
+            if predicate.data_type(&join_output_schema)? != DataType::Boolean {
+                return plan_err!(
+                    "Morsel join filter predicate must return Boolean: {predicate}"
+                );
+            }
+            post_ops.push(Operator::Filter {
+                predicate,
+                projection: None,
+            });
+        }
+        let (extra_post_ops, mut final_schema) =
             Self::lower_operators(post_nodes, Arc::clone(&join_output_schema), session)?;
+        post_ops.extend(extra_post_ops);
 
         let build_side = if join.null_aware {
             match join.join_type {
@@ -1142,7 +1161,9 @@ impl MorselQueryPlanner {
                 (payload_cols, output_proj, Arc::clone(&join_output_schema))
             };
 
-        let compiled_filter = if let Some(filter_expr) = &join.filter {
+        let compiled_filter = if !inner_post_filter
+            && let Some(filter_expr) = &join.filter
+        {
             let left_df_schema = join.left.schema();
             let right_df_schema = join.right.schema();
             let cols = filter_expr.column_refs();
