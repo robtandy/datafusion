@@ -97,14 +97,21 @@ class Workload:
     is_count: bool
     description: str
     is_aggregate: bool = False
+    is_sort: bool = False
+    is_topn: bool = False
 
 
-_STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], ...] = (
+# (qnum, tables, ordered, morsel_admitted, is_aggregate, is_sort, is_topn, description)
+_STANDARD_TPCH_SPECS: tuple[
+    tuple[int, tuple[str, ...], bool, bool, bool, bool, bool, str], ...
+] = (
     (
         1,
         ("lineitem",),
         True,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q1 (grouped multi-aggregate + ORDER BY over lineitem)",
     ),
@@ -114,14 +121,18 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q2 (5-way join + correlated MIN subquery + TopN)",
     ),
     (
         3,
         ("customer", "orders", "lineitem"),
         True,
+        True,
+        True,
         False,
-        False,
+        True,
         "Standard TPC-H Q3 (3-way join + filter + GROUP BY + ORDER BY LIMIT 10)",
     ),
     (
@@ -130,13 +141,17 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q4 (EXISTS semi-join + GROUP BY + ORDER BY)",
     ),
     (
         5,
         ("customer", "orders", "lineitem", "supplier", "nation", "region"),
         True,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q5 (6-way join + GROUP BY + ORDER BY)",
     ),
@@ -146,12 +161,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         True,
         True,
+        False,
+        False,
         "Standard TPC-H Q6 (filtered SUM over lineitem)",
     ),
     (
         7,
         ("supplier", "lineitem", "orders", "customer", "nation"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q7 (6-way join with self-joined nation + EXTRACT + GROUP BY + ORDER BY)",
@@ -162,6 +181,8 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q8 (8-way join + CASE ratio aggregate + ORDER BY)",
     ),
     (
@@ -170,14 +191,18 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q9 (6-way join + LIKE filter + GROUP BY + ORDER BY)",
     ),
     (
         10,
         ("customer", "orders", "lineitem", "nation"),
         True,
+        True,
+        True,
         False,
-        False,
+        True,
         "Standard TPC-H Q10 (4-way join + GROUP BY + TopN 20)",
     ),
     (
@@ -186,13 +211,17 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q11 (3-way join + HAVING scalar subquery + ORDER BY)",
     ),
     (
         12,
         ("lineitem", "orders"),
         True,
-        False,
+        True,
+        True,
+        True,
         False,
         "Standard TPC-H Q12 (join + filter + conditional SUM + GROUP BY + ORDER BY)",
     ),
@@ -200,6 +229,8 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         13,
         ("customer", "orders"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q13 (LEFT OUTER JOIN + 2-stage GROUP BY + ORDER BY)",
@@ -210,12 +241,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         True,
         True,
+        False,
+        False,
         "Standard TPC-H Q14 (2-way join + conditional SUM ratio)",
     ),
     (
         15,
         ("lineitem", "supplier"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q15 (CTE revenue0 + MAX subquery + join + ORDER BY)",
@@ -226,12 +261,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q16 (NOT IN anti-join + COUNT DISTINCT + GROUP BY + ORDER BY)",
     ),
     (
         17,
         ("lineitem", "part"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q17 (2-way join + correlated AVG subquery + ungrouped SUM)",
@@ -242,6 +281,8 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q18 (3-way join + IN HAVING semi-join + GROUP BY + TopN 100)",
     ),
     (
@@ -250,12 +291,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         True,
         True,
+        False,
+        False,
         "Standard TPC-H Q19 (2-way join with disjunctive OR predicates + SUM)",
     ),
     (
         20,
         ("supplier", "nation", "partsupp", "part", "lineitem"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q20 (nested IN semi-joins + correlated SUM subquery + ORDER BY)",
@@ -266,12 +311,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
         True,
         False,
         False,
+        False,
+        False,
         "Standard TPC-H Q21 (4-way join + EXISTS semi-join + NOT EXISTS anti-join + TopN 100)",
     ),
     (
         22,
         ("customer", "orders"),
         True,
+        False,
+        False,
         False,
         False,
         "Standard TPC-H Q22 (SUBSTRING + scalar AVG subquery + NOT EXISTS anti-join + GROUP BY + ORDER BY)",
@@ -281,7 +330,16 @@ _STANDARD_TPCH_SPECS: tuple[tuple[int, tuple[str, ...], bool, bool, bool, str], 
 
 def _build_workloads() -> dict[str, Workload]:
     workloads: dict[str, Workload] = {}
-    for qnum, tables, ordered, admitted, is_agg, desc in _STANDARD_TPCH_SPECS:
+    for (
+        qnum,
+        tables,
+        ordered,
+        admitted,
+        is_agg,
+        is_sort,
+        is_topn,
+        desc,
+    ) in _STANDARD_TPCH_SPECS:
         name = f"q{qnum}"
         workloads[name] = Workload(
             name=name,
@@ -291,6 +349,8 @@ def _build_workloads() -> dict[str, Workload]:
             morsel_admitted=admitted,
             is_count=False,
             is_aggregate=is_agg,
+            is_sort=is_sort,
+            is_topn=is_topn,
             description=desc,
         )
     workloads["q1_unordered"] = Workload(
@@ -679,6 +739,28 @@ def require_warm_cache(files: list[Path]) -> dict[str, int]:
     return pages
 
 
+def evict_files(files: list[Path]):
+    """Drop clean file pages from the Linux page cache without root privileges."""
+    if platform.system() != "Linux" or not hasattr(os, "posix_fadvise"):
+        raise ValueError("cold cache eviction requires Linux posix_fadvise")
+    for path in files:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
+def require_cold_cache(files: list[Path]) -> dict[str, int]:
+    pages = cache_pages(files)
+    if pages is None:
+        raise ValueError("cold cache verification requires Linux mincore")
+    if pages["resident"] != 0:
+        raise ValueError(f"cannot verify cold file page cache: {pages}")
+    return pages
+
+
 class DataFusionRunner:
     def __init__(
         self,
@@ -846,6 +928,9 @@ def _duckdb_exec(
                     "parquet_morsels_claimed": None,
                     "count_finalizations": None,
                     "aggregate_finalizations": None,
+                    "join_build_finalizations": None,
+                    "sort_finalizations": None,
+                    "topn_finalizations": None,
                     "bytes_scanned": None,
                     "worker_claims": None,
                     "worker_completions": None,
@@ -854,8 +939,13 @@ def _duckdb_exec(
                     "morsel_ready_wait_ms": None,
                     "morsel_output_wait_ms": None,
                     "morsel_pending_io_ms": None,
+                    "morsel_join_combine_work_ms": None,
+                    "morsel_join_finalize_work_ms": None,
+                    "morsel_sort_finalize_work_ms": None,
+                    "morsel_topn_finalize_work_ms": None,
                     "morsel_peak_ready_depth": None,
                     "morsel_peak_output_depth": None,
+                    "morsel_pipelines": None,
                     "operator_compute_ms": None,
                 }
             )
@@ -1029,6 +1119,29 @@ def validate_plan(
             f"{arm.name}/{workload.name}: unexpected AggregateSink or aggregate_finalizations "
             f"(is_aggregate={workload.is_aggregate}, aggregate_finalizations={agg_finalizations})"
         )
+    sort_finalizations = evidence.get("sort_finalizations", 0)
+    if ("SortSink" in plan) != workload.is_sort or sort_finalizations != int(
+        workload.is_sort
+    ):
+        raise ValueError(
+            f"{arm.name}/{workload.name}: unexpected SortSink or sort_finalizations "
+            f"(is_sort={workload.is_sort}, sort_finalizations={sort_finalizations})"
+        )
+    topn_finalizations = evidence.get("topn_finalizations", 0)
+    if ("TopNSink" in plan) != workload.is_topn or topn_finalizations != int(
+        workload.is_topn
+    ):
+        raise ValueError(
+            f"{arm.name}/{workload.name}: unexpected TopNSink or topn_finalizations "
+            f"(is_topn={workload.is_topn}, topn_finalizations={topn_finalizations})"
+        )
+    expected_join_builds = plan.count("HashJoinBuildSink")
+    join_builds = evidence.get("join_build_finalizations")
+    if join_builds is not None and join_builds != expected_join_builds:
+        raise ValueError(
+            f"{arm.name}/{workload.name}: expected {expected_join_builds} "
+            f"join_build_finalizations, got {join_builds}"
+        )
 
 
 def make_runner(arm: Arm, runner_bin: Path, data_dir: Path, threads: int, timeout: int):
@@ -1099,6 +1212,9 @@ def verify_suite(
                     "parquet_morsels_claimed": sample["parquet_morsels_claimed"],
                     "count_finalizations": sample["count_finalizations"],
                     "aggregate_finalizations": sample["aggregate_finalizations"],
+                    "join_build_finalizations": sample.get("join_build_finalizations"),
+                    "sort_finalizations": sample.get("sort_finalizations"),
+                    "topn_finalizations": sample.get("topn_finalizations"),
                     "bytes_scanned": sample["bytes_scanned"],
                     "plan": sample["plan"],
                 }
@@ -1133,8 +1249,10 @@ def run_bench(args):
     morsel_arms = resolve_arms(args.morsel_arms, DEFAULT_MORSEL_ARMS)
     roadmap_arms = resolve_arms(args.roadmap_arms, DEFAULT_ROADMAP_ARMS)
 
-    if args.cache == "warm" and platform.system() != "Linux":
-        raise ValueError("--cache warm requires Linux mincore page-cache verification")
+    if args.cache in ("warm", "cold") and platform.system() != "Linux":
+        raise ValueError(
+            f"--cache {args.cache} requires Linux mincore page-cache verification"
+        )
 
     verification = verify_suite(
         data_dir,
@@ -1210,7 +1328,10 @@ def run_bench(args):
             for arm_name in order:
                 arm = ARMS[arm_name]
                 before = None
-                if rep > 0:
+                if args.cache == "cold":
+                    evict_files(q_files)
+                    before = require_cold_cache(q_files)
+                elif rep > 0:
                     if args.cache == "warm":
                         before = require_warm_cache(q_files)
                     else:
@@ -1354,6 +1475,51 @@ def summarize_jsonl(path: Path):
                 f"{peak_ready}/{peak_out} |"
             )
 
+    pipeline_groups = [
+        ((case, arm), rows)
+        for (case, arm), rows in grouped.items()
+        if any(r.get("morsel_pipelines") for r in rows)
+    ]
+    if pipeline_groups:
+        print()
+        print(
+            "| Query | Arm | Pipeline | Decode ms | Process ms | Ready wait ms | "
+            "Output wait ms | Join comb/fin ms | Sort/TopN fin ms | Claims (min..max) |"
+        )
+        print("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for (case, arm), rows in pipeline_groups:
+            pipe_names = sorted(
+                {
+                    p
+                    for r in rows
+                    if r.get("morsel_pipelines")
+                    for p in r["morsel_pipelines"]
+                }
+            )
+            for pname in pipe_names:
+                p_samples = [
+                    r["morsel_pipelines"][pname]
+                    for r in rows
+                    if r.get("morsel_pipelines") and pname in r["morsel_pipelines"]
+                ]
+                decode = statistics.median(s["decode_work_ms"] for s in p_samples)
+                process = statistics.median(s["process_work_ms"] for s in p_samples)
+                ready = statistics.median(s["ready_wait_ms"] for s in p_samples)
+                output = statistics.median(s["output_wait_ms"] for s in p_samples)
+                jcomb = statistics.median(s["join_combine_work_ms"] for s in p_samples)
+                jfin = statistics.median(s["join_finalize_work_ms"] for s in p_samples)
+                stfin = statistics.median(
+                    s["sort_finalize_work_ms"] + s["topn_finalize_work_ms"]
+                    for s in p_samples
+                )
+                med_claims = p_samples[len(p_samples) // 2]["worker_claims"]
+                claims_str = f"{min(med_claims)}..{max(med_claims)}"
+                print(
+                    f"| `{case}` | `{arm}` | `{pname}` | {decode:.1f} | {process:.1f} | "
+                    f"{ready:.1f} | {output:.1f} | {jcomb:.1f}/{jfin:.1f} | "
+                    f"{stfin:.1f} | {claims_str} |"
+                )
+
     # Pairwise geometric mean for Stock DataFusion vs DuckDB on standard TPC-H queries
     # only (excludes non-standard slices such as q1_unordered, q6_count, q6_scan so
     # queries are never double-counted).
@@ -1401,8 +1567,10 @@ def run_duckdb_profile(args):
     data_dir = args.path.resolve(strict=True)
     scale_factor = infer_scale_factor(dataset_summary(data_dir))
     query_names = resolve_queries(args.queries, MORSEL_ADMITTED_QUERIES)
-    if args.cache == "warm" and platform.system() != "Linux":
-        raise ValueError("--cache warm requires Linux mincore page-cache verification")
+    if args.cache in ("warm", "cold") and platform.system() != "Linux":
+        raise ValueError(
+            f"--cache {args.cache} requires Linux mincore page-cache verification"
+        )
 
     referenced_tables = sorted({t for q in query_names for t in WORKLOADS[q].tables})
     all_referenced_files = [
@@ -1419,7 +1587,10 @@ def run_duckdb_profile(args):
         q_files = [f for t in workload.tables for f in table_files(data_dir, t)]
         samples = []
         for rep in range(1 - args.warmups, args.repeats + 1):
-            if rep > 0 and args.cache == "warm":
+            if args.cache == "cold":
+                evict_files(q_files)
+                require_cold_cache(q_files)
+            elif rep > 0 and args.cache == "warm":
                 require_warm_cache(q_files)
             sample = runner.profile(workload)
             if rep > 0:
@@ -1554,7 +1725,7 @@ def main():
     bench.add_argument("--timeout", type=positive_int, default=120)
     bench.add_argument(
         "--cache",
-        choices=("warm", "none"),
+        choices=("warm", "cold", "none"),
         default="warm" if platform.system() == "Linux" else "none",
     )
     bench.add_argument("--warmups", type=int, default=1)
@@ -1581,7 +1752,7 @@ def main():
     dprof.add_argument("--timeout", type=positive_int, default=120)
     dprof.add_argument(
         "--cache",
-        choices=("warm", "none"),
+        choices=("warm", "cold", "none"),
         default="warm" if platform.system() == "Linux" else "none",
     )
     dprof.add_argument("--warmups", type=int, default=1)
