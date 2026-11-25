@@ -13,7 +13,6 @@ use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::MorselMode;
 use datafusion_common::instant::Instant;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
@@ -57,6 +56,7 @@ use crate::datasource::{MemTable, source_as_provider};
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
 mod aggregate;
+mod batch;
 mod count;
 mod fallback;
 mod group_count;
@@ -66,6 +66,7 @@ mod metrics;
 mod parquet;
 
 use aggregate::{AggregateSink, AggregateState};
+use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
 use group_count::{GroupCountSink, GroupCountState, IntKeyType};
 use hash_join::{
@@ -1248,18 +1249,6 @@ fn prune_filter_input(operators: &mut [Operator], schema: &Schema) {
     }
 }
 
-fn with_filter_mask<T>(
-    batch: RecordBatch,
-    predicate: &Arc<dyn PhysicalExpr>,
-    apply: impl FnOnce(RecordBatch, &BooleanArray) -> Result<T>,
-) -> Result<T> {
-    let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
-    let Ok(mask) = as_boolean_array(&mask) else {
-        return internal_err!("Cannot create filter_array from non-boolean predicates");
-    };
-    apply(batch, mask)
-}
-
 fn filter_batch(
     batch: &RecordBatch,
     mask: &BooleanArray,
@@ -1294,30 +1283,71 @@ fn filter_batch(
     }
 }
 
-fn apply_operators(
+fn apply_operators_view(
     operators: &[Operator],
-    mut batch: RecordBatch,
-) -> Result<RecordBatch> {
+    mut view: BatchView,
+) -> Result<BatchView> {
     for operator in operators {
-        batch = match operator {
+        view = match operator {
             Operator::Filter {
                 predicate,
                 projection,
-            } => with_filter_mask(batch, predicate, |batch, mask| {
-                filter_batch(&batch, mask, projection.as_deref())
-            })?,
-            Operator::Projection(projector) => projector.project_batch(&batch)?,
+            } => {
+                let filtered = view.filter(predicate)?;
+                match projection {
+                    Some(columns) => filtered.project_columns(columns)?,
+                    None => filtered,
+                }
+            }
+            Operator::Projection(projector) => view.apply_projection(projector)?,
             Operator::HashProbe(_) => {
                 return internal_err!(
                     "HashProbe must execute through join continuation driver"
                 );
             }
         };
-        if batch.num_rows() == 0 {
+        if view.is_empty() {
             break;
         }
     }
-    Ok(batch)
+    Ok(view)
+}
+
+fn apply_operators(operators: &[Operator], batch: RecordBatch) -> Result<RecordBatch> {
+    apply_operators_view(operators, BatchView::all(batch))?.materialize()
+}
+
+fn push_view_into_coalescer(
+    coalescer: &mut LimitedBatchCoalescer,
+    view: BatchView,
+) -> Result<()> {
+    if view.is_empty() {
+        return Ok(());
+    }
+    match view.into_parts() {
+        (batch, Selection::All) => {
+            coalescer.push_batch(batch)?;
+        }
+        (batch, Selection::Mask { bits, .. }) => {
+            let mask = BooleanArray::new(bits, None);
+            coalescer.push_batch_with_filter(batch, &mask)?;
+        }
+        (batch, selection @ Selection::Indices(_)) => {
+            let materialized = BatchView::try_new(batch, selection)?.materialize()?;
+            coalescer.push_batch(materialized)?;
+        }
+    }
+    Ok(())
+}
+
+enum NarrowProjectorCache {
+    Uninitialized,
+    Identity,
+    Narrowed {
+        columns: Vec<usize>,
+        schema: SchemaRef,
+        projector: Projector,
+    },
 }
 
 struct ResultBuffer {
@@ -1325,24 +1355,47 @@ struct ResultBuffer {
     coalesce_source: bool,
     source_coalescer: Option<LimitedBatchCoalescer>,
     source_finished: bool,
-    filters: Vec<Option<LimitedBatchCoalescer>>,
+    /// Slot `i < operators.len()` coalesces filtered input just before a non-pure
+    /// `Operator::Projection` at index `i`. Slot `operators.len()` is the terminal
+    /// coalescer for filtered batches reaching the `Result` sink.
+    coalescers: Vec<Option<LimitedBatchCoalescer>>,
+    is_pure_projection: Vec<bool>,
+    filter_schemas: Vec<Option<SchemaRef>>,
+    narrow_projectors: Vec<NarrowProjectorCache>,
     output: Option<RecordBatch>,
     next_to_finish: usize,
 }
 
 impl ResultBuffer {
     fn new(operators: &[Operator], batch_size: usize, coalesce_source: bool) -> Self {
-        let slots = operators
+        let has_filter = operators
             .iter()
-            .rposition(|op| matches!(op, Operator::Filter { .. }));
+            .any(|op| matches!(op, Operator::Filter { .. }));
+        let slot_count = if has_filter { operators.len() + 1 } else { 0 };
+        let op_cache_len = if has_filter { operators.len() } else { 0 };
+        let is_pure_projection = if has_filter {
+            operators
+                .iter()
+                .map(|op| {
+                    matches!(op, Operator::Projection(p) if is_pure_column_projection(p))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             batch_size,
             coalesce_source,
             source_coalescer: None,
             source_finished: !coalesce_source,
-            filters: std::iter::repeat_with(|| None)
-                .take(slots.map_or(0, |i| i + 1))
-                .collect(),
+            coalescers: std::iter::repeat_with(|| None).take(slot_count).collect(),
+            is_pure_projection,
+            filter_schemas: std::iter::repeat_with(|| None).take(op_cache_len).collect(),
+            narrow_projectors: std::iter::repeat_with(|| {
+                NarrowProjectorCache::Uninitialized
+            })
+            .take(op_cache_len)
+            .collect(),
             output: None,
             next_to_finish: 0,
         }
@@ -1362,11 +1415,96 @@ impl ResultBuffer {
         Ok(())
     }
 
+    fn push_view(&mut self, operators: &[Operator], view: BatchView) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        if !self.coalesce_source {
+            let saw_filter = !view.is_all();
+            return self.push_view_from(operators, 0, view, saw_filter);
+        }
+        let schema = view.schema();
+        let coalescer = self.source_coalescer.get_or_insert_with(|| {
+            LimitedBatchCoalescer::new(schema, self.batch_size, None)
+        });
+        push_view_into_coalescer(coalescer, view)
+    }
+
     fn push_from(
         &mut self,
         operators: &[Operator],
         start: usize,
         mut batch: RecordBatch,
+    ) -> Result<()> {
+        if self.coalescers.is_empty() {
+            for op in operators.iter().skip(start) {
+                match op {
+                    Operator::Projection(projector) => {
+                        batch = projector.project_batch(&batch)?;
+                    }
+                    Operator::Filter { .. } => unreachable!(),
+                    Operator::HashProbe(_) => {
+                        return internal_err!(
+                            "HashProbe must execute through join continuation driver"
+                        );
+                    }
+                }
+                if batch.num_rows() == 0 {
+                    return Ok(());
+                }
+            }
+            if batch.num_rows() != 0 {
+                debug_assert!(self.output.is_none());
+                self.output = Some(batch);
+            }
+            return Ok(());
+        }
+        self.push_view_from(operators, start, BatchView::all(batch), false)
+    }
+
+    fn ensure_narrow_projector(
+        cache: &mut NarrowProjectorCache,
+        projector: &Projector,
+        input_schema: &Schema,
+    ) {
+        if !matches!(cache, NarrowProjectorCache::Uninitialized) {
+            return;
+        }
+        let needed = projector.projection().column_indices();
+        if needed.len() < input_schema.fields().len() {
+            let remap = || -> Result<(SchemaRef, Projector)> {
+                let narrow = ProjectionExprs::from_indices(&needed, input_schema);
+                let narrow_schema = Arc::new(input_schema.project(&needed)?);
+                let remapped = projector
+                    .projection()
+                    .clone()
+                    .try_map_exprs(|expr| narrow.project_expr(&expr))?
+                    .make_projector_with_schema_metadata(
+                        &narrow_schema,
+                        projector.output_schema(),
+                    )?;
+                Ok((narrow_schema, remapped))
+            };
+            if let Ok((schema, remapped)) = remap()
+                && remapped.output_schema() == projector.output_schema()
+            {
+                *cache = NarrowProjectorCache::Narrowed {
+                    columns: needed,
+                    schema,
+                    projector: remapped,
+                };
+                return;
+            }
+        }
+        *cache = NarrowProjectorCache::Identity;
+    }
+
+    fn push_view_from(
+        &mut self,
+        operators: &[Operator],
+        start: usize,
+        mut view: BatchView,
+        mut saw_filter: bool,
     ) -> Result<()> {
         for (index, op) in operators.iter().enumerate().skip(start) {
             match op {
@@ -1374,33 +1512,54 @@ impl ResultBuffer {
                     predicate,
                     projection,
                 } => {
-                    return with_filter_mask(batch, predicate, |batch, mask| {
-                        let (batch, mask) = if mask.len() == batch.num_rows() {
-                            let batch = match projection {
-                                Some(columns) => batch.project(columns)?,
-                                None => batch,
-                            };
-                            (batch, Some(mask))
-                        } else {
-                            (filter_batch(&batch, mask, projection.as_deref())?, None)
+                    view = view.filter(predicate)?;
+                    if let Some(columns) = projection {
+                        let schema = match &self.filter_schemas[index] {
+                            Some(s) => Arc::clone(s),
+                            None => {
+                                let s = Arc::new(view.batch().schema().project(columns)?);
+                                self.filter_schemas[index] = Some(Arc::clone(&s));
+                                s
+                            }
                         };
-                        let coalescer = self.filters[index].get_or_insert_with(|| {
-                            LimitedBatchCoalescer::new(
-                                batch.schema(),
-                                self.batch_size,
-                                None,
-                            )
-                        });
-                        if let Some(mask) = mask {
-                            coalescer.push_batch_with_filter(batch, mask)?;
-                        } else {
-                            coalescer.push_batch(batch)?;
-                        }
-                        Ok(())
-                    });
+                        view = view.project_columns_with_schema(columns, schema)?;
+                    }
+                    saw_filter = true;
                 }
                 Operator::Projection(projector) => {
-                    batch = projector.project_batch(&batch)?
+                    if self.is_pure_projection.get(index).copied().unwrap_or(false) {
+                        view = view.apply_projection(projector)?;
+                    } else if !self.coalescers.is_empty()
+                        && (saw_filter || self.coalescers[index].is_some())
+                    {
+                        // Narrow away filter-only columns zero-copy before coalescing,
+                        // then evaluate expressions on full coalesced batches.
+                        Self::ensure_narrow_projector(
+                            &mut self.narrow_projectors[index],
+                            projector,
+                            view.batch().schema().as_ref(),
+                        );
+                        if let NarrowProjectorCache::Narrowed {
+                            columns, schema, ..
+                        } = &self.narrow_projectors[index]
+                        {
+                            view = view.project_columns_with_schema(
+                                columns,
+                                Arc::clone(schema),
+                            )?;
+                        }
+                        if view.is_empty() {
+                            return Ok(());
+                        }
+                        let schema = view.schema();
+                        let coalescer = self.coalescers[index].get_or_insert_with(|| {
+                            LimitedBatchCoalescer::new(schema, self.batch_size, None)
+                        });
+                        push_view_into_coalescer(coalescer, view)?;
+                        return Ok(());
+                    } else {
+                        view = view.apply_projection(projector)?;
+                    }
                 }
                 Operator::HashProbe(_) => {
                     return internal_err!(
@@ -1408,10 +1567,24 @@ impl ResultBuffer {
                     );
                 }
             }
-            if batch.num_rows() == 0 {
+            if view.is_empty() {
                 return Ok(());
             }
         }
+
+        if view.is_empty() {
+            return Ok(());
+        }
+        let terminal = operators.len();
+        if (saw_filter || !view.is_all()) && terminal < self.coalescers.len() {
+            let schema = view.schema();
+            let coalescer = self.coalescers[terminal].get_or_insert_with(|| {
+                LimitedBatchCoalescer::new(schema, self.batch_size, None)
+            });
+            push_view_into_coalescer(coalescer, view)?;
+            return Ok(());
+        }
+        let batch = view.materialize()?;
         if batch.num_rows() != 0 {
             debug_assert!(self.output.is_none());
             self.output = Some(batch);
@@ -1427,7 +1600,7 @@ impl ResultBuffer {
             // Drain downstream before feeding it again, so completed batches cannot pile up
             // behind a blocked send. At EOF finish upstream first to feed downstream tails.
             let completed =
-                self.filters
+                self.coalescers
                     .iter_mut()
                     .enumerate()
                     .rev()
@@ -1435,7 +1608,33 @@ impl ResultBuffer {
                         Some((index, slot.as_mut()?.next_completed_batch()?))
                     });
             if let Some((index, batch)) = completed {
-                self.push_from(operators, index + 1, batch)?;
+                if index == operators.len() {
+                    return Ok(Some(batch));
+                }
+                let projected = match &self.narrow_projectors[index] {
+                    NarrowProjectorCache::Narrowed { projector, .. } => {
+                        projector.project_batch(&batch)?
+                    }
+                    NarrowProjectorCache::Identity
+                    | NarrowProjectorCache::Uninitialized => {
+                        let Operator::Projection(projector) = &operators[index] else {
+                            unreachable!()
+                        };
+                        projector.project_batch(&batch)?
+                    }
+                };
+                if index + 1 == operators.len() {
+                    if projected.num_rows() != 0 {
+                        return Ok(Some(projected));
+                    }
+                } else {
+                    self.push_view_from(
+                        operators,
+                        index + 1,
+                        BatchView::all(projected),
+                        false,
+                    )?;
+                }
             } else if let Some(batch) = self
                 .source_coalescer
                 .as_mut()
@@ -1447,8 +1646,8 @@ impl ResultBuffer {
                     coalescer.finish()?;
                 }
                 self.source_finished = true;
-            } else if eof && self.next_to_finish < self.filters.len() {
-                if let Some(coalescer) = &mut self.filters[self.next_to_finish] {
+            } else if eof && self.next_to_finish < self.coalescers.len() {
+                if let Some(coalescer) = &mut self.coalescers[self.next_to_finish] {
                     coalescer.finish()?;
                 }
                 self.next_to_finish += 1;
@@ -1496,6 +1695,7 @@ enum WorkerState {
 struct JoinWorkerState {
     tables: Arc<Vec<Arc<FinalizedHashTable>>>,
     scratch: ProbeScratch,
+    probe_reservation: MemoryReservation,
 }
 
 enum BuildRunOutcome {
@@ -1644,7 +1844,7 @@ impl Pipeline {
         batch_size: usize,
         worker: WorkerMetrics,
     ) -> impl Stream<Item = Result<RecordBatch>> {
-        let buffer = ResultBuffer::new(&self.operators, batch_size, false);
+        let buffer = Box::new(ResultBuffer::new(&self.operators, batch_size, false));
         stream::try_unfold(
             (self, 0usize, worker, buffer),
             |(pipeline, mut next, mut worker, mut buffer)| async move {
@@ -1790,14 +1990,16 @@ impl Pipeline {
         next: &AtomicUsize,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
-        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
-        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
-            tables,
-            scratch: ProbeScratch::default(),
-        });
+        let mut join_state =
+            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
+                tables,
+                scratch: ProbeScratch::default(),
+                probe_reservation,
+            });
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -1842,14 +2044,16 @@ impl Pipeline {
         ready: ReadyReaders,
         output: WorkerOutput,
         reservation: Option<MemoryReservation>,
-        finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, reservation)?;
-        let mut join_state = finalized_tables.map(|tables| JoinWorkerState {
-            tables,
-            scratch: ProbeScratch::default(),
-        });
+        let mut join_state =
+            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
+                tables,
+                scratch: ProbeScratch::default(),
+                probe_reservation,
+            });
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
             if tx.is_closed() {
@@ -1930,33 +2134,39 @@ impl Pipeline {
     fn advance_join_chain(
         &self,
         start_op: usize,
-        mut batch: RecordBatch,
+        mut view: BatchView,
         join_state: &mut JoinWorkerState,
         frames: &mut Vec<(usize, ProbeCursor)>,
         batch_size: usize,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Option<BatchView>> {
         for (idx, operator) in self.operators.iter().enumerate().skip(start_op) {
             match operator {
                 Operator::Filter {
                     predicate,
                     projection,
                 } => {
-                    batch = with_filter_mask(batch, predicate, |batch, mask| {
-                        filter_batch(&batch, mask, projection.as_deref())
-                    })?;
-                    if batch.num_rows() == 0 {
+                    view = view.filter(predicate)?;
+                    if let Some(columns) = projection {
+                        view = view.project_columns(columns)?;
+                    }
+                    if view.is_empty() {
                         return Ok(None);
                     }
                 }
                 Operator::Projection(projector) => {
-                    batch = projector.project_batch(&batch)?;
-                    if batch.num_rows() == 0 {
+                    view = view.apply_projection(projector)?;
+                    if view.is_empty() {
                         return Ok(None);
                     }
                 }
                 Operator::HashProbe(probe) => {
                     let table = &join_state.tables[probe.build_id];
-                    let Some(mut cursor) = probe.start_probe(batch, table)? else {
+                    let Some(mut cursor) = probe.start_probe_view(
+                        view,
+                        table,
+                        &join_state.probe_reservation,
+                    )?
+                    else {
                         return Ok(None);
                     };
                     match probe.next_chunk(
@@ -1967,33 +2177,33 @@ impl Pipeline {
                     )? {
                         OperatorStep::NeedMoreInput(None) => return Ok(None),
                         OperatorStep::NeedMoreInput(Some(out)) => {
-                            batch = out;
+                            view = BatchView::all(out);
                         }
                         OperatorStep::HaveMoreOutput(out) => {
                             frames.push((idx, cursor));
-                            batch = out;
+                            view = BatchView::all(out);
                         }
                     }
                 }
             }
         }
-        if batch.num_rows() == 0 {
+        if view.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(batch))
+            Ok(Some(view))
         }
     }
 
     async fn deliver_join_output(
         &self,
-        batch: RecordBatch,
+        view: BatchView,
         tx: &mpsc::Sender<RecordBatch>,
         sink: &mut WorkerSink,
         worker: &mut WorkerMetrics,
     ) -> Result<bool> {
         match sink {
             WorkerSink::Count(local) => worker.process(|| {
-                local.add_rows(batch.num_rows())?;
+                local.add_rows(view.num_rows())?;
                 Ok(true)
             }),
             WorkerSink::GroupCount(local) => {
@@ -2001,26 +2211,26 @@ impl Pipeline {
                     unreachable!()
                 };
                 worker.process(|| {
-                    local.add_column(batch.column(sink.key_index))?;
+                    local.add_view(&view, sink.key_index)?;
                     Ok(true)
                 })
             }
             WorkerSink::Aggregate(local) => worker.process(|| {
-                local.add_batch(&batch)?;
+                local.add_view(&view)?;
                 Ok(true)
             }),
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
-                local.add_batch(&batch)?;
+                local.add_view(&view)?;
                 Ok(true)
             }),
             WorkerSink::Result(buffer) => {
-                // Avoid copying already-large join output batches through the coalescer;
-                // only coalesce sparse/small batches while keeping output unordered.
-                if batch.num_rows() >= (buffer.batch_size / 2).max(1) {
-                    return Ok(worker.send(tx, batch).await);
+                // Avoid copying already-large dense join output batches through the
+                // coalescer; only coalesce sparse/small or filtered batches.
+                if view.is_all() && view.num_rows() >= (buffer.batch_size / 2).max(1) {
+                    return Ok(worker.send(tx, view.into_parts().0).await);
                 }
                 let mut output = worker.process(|| {
-                    buffer.push_input(&[], batch)?;
+                    buffer.push_view(&[], view)?;
                     buffer.next(&[], false)
                 })?;
                 while let Some(out) = output {
@@ -2045,7 +2255,13 @@ impl Pipeline {
     ) -> Result<bool> {
         let mut frames: Vec<(usize, ProbeCursor)> = Vec::new();
         let mut produced = worker.process(|| {
-            self.advance_join_chain(0, batch, join_state, &mut frames, batch_size)
+            self.advance_join_chain(
+                0,
+                BatchView::all(batch),
+                join_state,
+                &mut frames,
+                batch_size,
+            )
         })?;
         loop {
             if let Some(out) = produced
@@ -2074,7 +2290,7 @@ impl Pipeline {
                     OperatorStep::NeedMoreInput(None) => Ok(None),
                     OperatorStep::NeedMoreInput(Some(chunk)) => self.advance_join_chain(
                         op_idx + 1,
-                        chunk,
+                        BatchView::all(chunk),
                         join_state,
                         &mut frames,
                         batch_size,
@@ -2083,7 +2299,7 @@ impl Pipeline {
                         frames.push((op_idx, cursor));
                         self.advance_join_chain(
                             op_idx + 1,
-                            chunk,
+                            BatchView::all(chunk),
                             join_state,
                             &mut frames,
                             batch_size,
@@ -2109,7 +2325,8 @@ impl Pipeline {
                         count::count_filtered_rows(&batch, predicate)?
                     }
                     CountStrategy::General => {
-                        apply_operators(&self.operators, batch)?.num_rows()
+                        apply_operators_view(&self.operators, BatchView::all(batch))?
+                            .num_rows()
                     }
                 };
                 local.add_rows(rows)?;
@@ -2131,9 +2348,12 @@ impl Pipeline {
                             local.add_filtered_batch(&batch, predicate, key_index)?;
                         }
                         GroupCountStrategy::General(col_index) => {
-                            let batch = apply_operators(&self.operators, batch)?;
-                            if batch.num_rows() > 0 {
-                                local.add_column(batch.column(col_index))?;
+                            let view = apply_operators_view(
+                                &self.operators,
+                                BatchView::all(batch),
+                            )?;
+                            if !view.is_empty() {
+                                local.add_view(&view, col_index)?;
                             }
                         }
                     }
@@ -2141,16 +2361,16 @@ impl Pipeline {
                 })
             }
             WorkerSink::Aggregate(local) => worker.process(|| {
-                let batch = apply_operators(&self.operators, batch)?;
-                if batch.num_rows() > 0 {
-                    local.add_batch(&batch)?;
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                if !view.is_empty() {
+                    local.add_view(&view)?;
                 }
                 Ok(true)
             }),
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
-                let batch = apply_operators(&self.operators, batch)?;
-                if batch.num_rows() > 0 {
-                    local.add_batch(&batch)?;
+                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                if !view.is_empty() {
+                    local.add_view(&view)?;
                 }
                 Ok(true)
             }),
@@ -2306,6 +2526,9 @@ impl Pipeline {
 
         let build_reservation =
             MemoryConsumer::new("MorselHashJoinBuild").register(context.memory_pool());
+        let nested_probe_reservation = nested_tables.as_ref().map(|_| {
+            MemoryConsumer::new("MorselHashJoinProbe").register(context.memory_pool())
+        });
         let mut combined_build = build_sink.new_state(build_reservation.new_empty());
         let build_output = WorkerOutput {
             tx: tx.clone(),
@@ -2325,7 +2548,15 @@ impl Pipeline {
                         build_output.clone(),
                     );
                     let reservation = Some(build_reservation.new_empty());
-                    let tables = nested_tables.clone();
+                    let join_ctx = nested_tables.as_ref().map(|t| {
+                        (
+                            Arc::clone(t),
+                            nested_probe_reservation
+                                .as_ref()
+                                .expect("nested probe reservation")
+                                .new_empty(),
+                        )
+                    });
                     let worker = WorkerMetrics::for_pipeline(
                         measurement.cloned(),
                         id,
@@ -2343,7 +2574,7 @@ impl Pipeline {
                                 &next,
                                 output,
                                 reservation,
-                                tables,
+                                join_ctx,
                                 worker,
                             )
                             .await
@@ -2365,7 +2596,15 @@ impl Pipeline {
                         build_output.clone(),
                     );
                     let reservation = Some(build_reservation.new_empty());
-                    let tables = nested_tables.clone();
+                    let join_ctx = nested_tables.as_ref().map(|t| {
+                        (
+                            Arc::clone(t),
+                            nested_probe_reservation
+                                .as_ref()
+                                .expect("nested probe reservation")
+                                .new_empty(),
+                        )
+                    });
                     let worker = WorkerMetrics::for_pipeline(
                         measurement.cloned(),
                         id,
@@ -2377,7 +2616,7 @@ impl Pipeline {
                                 ready,
                                 output,
                                 reservation,
-                                tables,
+                                join_ctx,
                                 worker,
                             )
                             .await
@@ -2386,6 +2625,7 @@ impl Pipeline {
             }
         }
         drop(build_reservation);
+        drop(nested_probe_reservation);
 
         let mut combine_duration = std::time::Duration::ZERO;
         while let Some(result) = tasks.join_next().await {
@@ -2546,6 +2786,10 @@ impl Pipeline {
             // Phase 2: execute probe/scan pipeline unless short-circuited by an
             // empty INNER JOIN build table (DuckDB's EmptyResultIfRHSIsEmpty).
             if !skip_probe {
+                let probe_reservation = finalized_tables.as_ref().map(|_| {
+                    MemoryConsumer::new("MorselHashJoinProbe")
+                        .register(context.memory_pool())
+                });
                 let mut tasks = JoinSet::new();
                 match &self.source {
                     Source::Memory(source) => {
@@ -2557,7 +2801,15 @@ impl Pipeline {
                             let reservation = sink_reservation
                                 .as_ref()
                                 .map(MemoryReservation::new_empty);
-                            let tables = finalized_tables.clone();
+                            let join_ctx = finalized_tables.as_ref().map(|t| {
+                                (
+                                    Arc::clone(t),
+                                    probe_reservation
+                                        .as_ref()
+                                        .expect("probe reservation")
+                                        .new_empty(),
+                                )
+                            });
                             let worker = if has_join {
                                 WorkerMetrics::for_pipeline(
                                     measurement.clone(),
@@ -2579,7 +2831,7 @@ impl Pipeline {
                                         &next,
                                         output,
                                         reservation,
-                                        tables,
+                                        join_ctx,
                                         worker,
                                     )
                                     .await
@@ -2600,7 +2852,15 @@ impl Pipeline {
                             let reservation = sink_reservation
                                 .as_ref()
                                 .map(MemoryReservation::new_empty);
-                            let tables = finalized_tables.clone();
+                            let join_ctx = finalized_tables.as_ref().map(|t| {
+                                (
+                                    Arc::clone(t),
+                                    probe_reservation
+                                        .as_ref()
+                                        .expect("probe reservation")
+                                        .new_empty(),
+                                )
+                            });
                             let worker = if has_join {
                                 WorkerMetrics::for_pipeline(
                                     measurement.clone(),
@@ -2616,7 +2876,7 @@ impl Pipeline {
                                         ready,
                                         output,
                                         reservation,
-                                        tables,
+                                        join_ctx,
                                         worker,
                                     )
                                     .await
@@ -2625,6 +2885,7 @@ impl Pipeline {
                     }
                 }
                 drop(sink_reservation);
+                drop(probe_reservation);
                 while let Some(result) = tasks.join_next().await {
                     let local = match result {
                         Ok(Ok(local)) => local,

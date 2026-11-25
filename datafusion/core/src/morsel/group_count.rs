@@ -11,7 +11,7 @@ use arrow::array::types::{
 };
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, Int64Array, NullBufferBuilder,
-    PrimitiveArray, RecordBatch,
+    PrimitiveArray, RecordBatch, UInt32Array,
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -23,6 +23,7 @@ use datafusion_expr::{ColumnarValue, Expr};
 use datafusion_physical_expr::PhysicalExpr;
 use tokio::sync::mpsc;
 
+use super::batch::{BatchView, Selection};
 use super::count::count_overflow;
 use super::metrics::{self, RunMetrics};
 use super::{Operator, apply_operators, filter_batch};
@@ -219,6 +220,39 @@ where
         let nulls = array.nulls().unwrap();
         let mut null_rows: i64 = 0;
         for i in selected.set_indices() {
+            if nulls.is_valid(i) {
+                self.add_key(values[i], 1)?;
+            } else {
+                null_rows = null_rows.checked_add(1).ok_or_else(count_overflow)?;
+            }
+        }
+        self.add_null(null_rows)
+    }
+
+    fn add_array_indices(
+        &mut self,
+        array: &PrimitiveArray<T>,
+        indices: &UInt32Array,
+    ) -> Result<()> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let null_count = array.null_count();
+        if null_count == array.len() {
+            let rows = i64::try_from(indices.len()).map_err(|_| count_overflow())?;
+            return self.add_null(rows);
+        }
+        let values = array.values();
+        if null_count == 0 {
+            for &idx in indices.values() {
+                self.add_key(values[idx as usize], 1)?;
+            }
+            return Ok(());
+        }
+        let nulls = array.nulls().unwrap();
+        let mut null_rows: i64 = 0;
+        for &idx in indices.values() {
+            let i = idx as usize;
             if nulls.is_valid(i) {
                 self.add_key(values[i], 1)?;
             } else {
@@ -450,6 +484,90 @@ impl GroupCountState {
             GroupCountMapKind::UInt64(m) => {
                 m.add_array(downcast_primitive!(array, UInt64Type))
             }
+        }
+    }
+
+    fn add_column_selected(
+        &mut self,
+        array: &ArrayRef,
+        bits: &BooleanBuffer,
+    ) -> Result<()> {
+        match &mut self.0 {
+            GroupCountMapKind::Int8(m) => {
+                m.add_array_selected(downcast_primitive!(array, Int8Type), bits)
+            }
+            GroupCountMapKind::Int16(m) => {
+                m.add_array_selected(downcast_primitive!(array, Int16Type), bits)
+            }
+            GroupCountMapKind::Int32(m) => {
+                m.add_array_selected(downcast_primitive!(array, Int32Type), bits)
+            }
+            GroupCountMapKind::Int64(m) => {
+                m.add_array_selected(downcast_primitive!(array, Int64Type), bits)
+            }
+            GroupCountMapKind::UInt8(m) => {
+                m.add_array_selected(downcast_primitive!(array, UInt8Type), bits)
+            }
+            GroupCountMapKind::UInt16(m) => {
+                m.add_array_selected(downcast_primitive!(array, UInt16Type), bits)
+            }
+            GroupCountMapKind::UInt32(m) => {
+                m.add_array_selected(downcast_primitive!(array, UInt32Type), bits)
+            }
+            GroupCountMapKind::UInt64(m) => {
+                m.add_array_selected(downcast_primitive!(array, UInt64Type), bits)
+            }
+        }
+    }
+
+    fn add_column_indices(
+        &mut self,
+        array: &ArrayRef,
+        indices: &UInt32Array,
+    ) -> Result<()> {
+        match &mut self.0 {
+            GroupCountMapKind::Int8(m) => {
+                m.add_array_indices(downcast_primitive!(array, Int8Type), indices)
+            }
+            GroupCountMapKind::Int16(m) => {
+                m.add_array_indices(downcast_primitive!(array, Int16Type), indices)
+            }
+            GroupCountMapKind::Int32(m) => {
+                m.add_array_indices(downcast_primitive!(array, Int32Type), indices)
+            }
+            GroupCountMapKind::Int64(m) => {
+                m.add_array_indices(downcast_primitive!(array, Int64Type), indices)
+            }
+            GroupCountMapKind::UInt8(m) => {
+                m.add_array_indices(downcast_primitive!(array, UInt8Type), indices)
+            }
+            GroupCountMapKind::UInt16(m) => {
+                m.add_array_indices(downcast_primitive!(array, UInt16Type), indices)
+            }
+            GroupCountMapKind::UInt32(m) => {
+                m.add_array_indices(downcast_primitive!(array, UInt32Type), indices)
+            }
+            GroupCountMapKind::UInt64(m) => {
+                m.add_array_indices(downcast_primitive!(array, UInt64Type), indices)
+            }
+        }
+    }
+
+    pub(super) fn add_view(&mut self, view: &BatchView, key_index: usize) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        let col = view.batch().column(key_index);
+        match view.selection() {
+            Selection::All => self.add_column(col),
+            Selection::Mask { bits, selected } => {
+                if *selected == view.batch().num_rows() {
+                    self.add_column(col)
+                } else {
+                    self.add_column_selected(col, bits)
+                }
+            }
+            Selection::Indices(indices) => self.add_column_indices(col, indices),
         }
     }
 
@@ -923,6 +1041,50 @@ mod tests {
             assert_eq!(total_count, 8, "type={dt}");
             assert_eq!(pool.reserved(), 0, "type={dt}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn group_count_add_view_all_mask_and_indices_on_sliced_batch() -> Result<()> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+        let base = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![
+                Some(99),
+                Some(10),
+                None,
+                Some(10),
+                Some(20),
+                None,
+                Some(88),
+            ]))],
+        )?;
+        let sliced = base.slice(1, 5); // [10, NULL, 10, 20, NULL]
+        let mask = BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+        ]);
+        let view_mask = BatchView::from_boolean_array(sliced.clone(), &mask)?;
+        let view_idx = view_mask.clone().with_indices_selection();
+
+        let mut s_mask = GroupCountState::new(IntKeyType::Int32, test_reservation(&pool));
+        let mut s_idx = GroupCountState::new(IntKeyType::Int32, test_reservation(&pool));
+        s_mask.add_view(&view_mask, 0)?;
+        s_idx.add_view(&view_idx, 0)?;
+        let GroupCountMapKind::Int32(m1) = &s_mask.0 else {
+            unreachable!()
+        };
+        let GroupCountMapKind::Int32(m2) = &s_idx.0 else {
+            unreachable!()
+        };
+        assert_eq!(m1.counts, m2.counts);
+        assert_eq!(m1.null_count, m2.null_count);
+        assert_eq!(m1.counts.get(&10), Some(&1));
+        assert_eq!(m1.null_count, Some(2));
         Ok(())
     }
 }
