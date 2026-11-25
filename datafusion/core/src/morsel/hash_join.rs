@@ -1111,7 +1111,7 @@ impl HashJoinBuildSink {
             mut null_key_payloads,
             mut null_key_spill_files,
             null_key_rows,
-            null_key_mem_bytes,
+            mut null_key_mem_bytes,
             key_summary,
             num_rows,
             has_null_key,
@@ -1279,10 +1279,24 @@ impl HashJoinBuildSink {
                 nk_spill
                     .append_single("MorselHashJoinNullKeySpill", &null_key_payloads)?;
                 null_key_payloads.clear();
+                let shrink = null_key_mem_bytes.min(reservation.size());
+                if shrink > 0 {
+                    reservation.shrink(shrink);
+                }
+                null_key_mem_bytes = 0;
             }
             if let Some(sf) = nk_spill.finish_single()? {
                 null_key_spill_files.push(sf);
             }
+        }
+
+        // Preserve accounting for any in-memory NULL-key rows when `null_key_spill`
+        // is `None` before `store.spill_all_mem(0, ...)` zeroes `reservation`.
+        let nk_res = MemoryConsumer::new("MorselHashJoinNullKey").register(memory_pool);
+        let nk_mem = null_key_mem_bytes.min(reservation.size());
+        if nk_mem > 0 {
+            reservation.shrink(nk_mem);
+            nk_res.grow(nk_mem);
         }
 
         // Spill all in-memory chunks in `store` into the stage-shared partition
@@ -1386,8 +1400,7 @@ impl HashJoinBuildSink {
             Some(NullKeyBuildRows {
                 mem_batches: null_key_payloads,
                 spill_files: null_key_spill_files,
-                _reservation: MemoryConsumer::new("MorselHashJoinNullKey")
-                    .register(memory_pool),
+                _reservation: nk_res,
             })
         } else {
             None

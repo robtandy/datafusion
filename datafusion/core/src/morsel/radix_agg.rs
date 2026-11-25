@@ -174,15 +174,20 @@ impl RadixPartitionStore {
         // write large coalesced partition files instead of 64 tiny files/batch.
         const SPILLED_FLUSH_CAP_BYTES: usize = 16 * 1024 * 1024;
         let in_spill_mode = self.spilled || spill.is_some_and(SpillContext::is_spilled);
-        let should_spill = (in_spill_mode
+        let mut should_spill = in_spill_mode
             && self.total_mem_bytes.saturating_add(batch_bytes)
-                >= SPILLED_FLUSH_CAP_BYTES)
-            || reservation.try_resize(target_bytes).is_err();
+                >= SPILLED_FLUSH_CAP_BYTES;
+        if !should_spill && let Err(err) = reservation.try_resize(target_bytes) {
+            if spill.is_none() {
+                return Err(err);
+            }
+            should_spill = true;
+        }
         if should_spill {
             let Some(spill_ctx) = spill else {
-                // Propagate the exact DataFusion ResourcesExhausted error.
-                reservation.try_resize(target_bytes)?;
-                unreachable!()
+                return Err(datafusion_common::resources_datafusion_err!(
+                    "Morsel radix GROUP BY spill requested without an active SpillContext"
+                ));
             };
             self.spilled = true;
             spill_ctx.mark_spilled();
@@ -1139,4 +1144,101 @@ pub(super) async fn emit_finalized_batch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_execution::memory_pool::{
+        MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+    };
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct FailFirstTryGrowPool {
+        failed_once: AtomicBool,
+        reserved: AtomicUsize,
+    }
+
+    impl FailFirstTryGrowPool {
+        fn new() -> Self {
+            Self {
+                failed_once: AtomicBool::new(false),
+                reserved: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl fmt::Display for FailFirstTryGrowPool {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "FailFirstTryGrowPool")
+        }
+    }
+
+    impl MemoryPool for FailFirstTryGrowPool {
+        fn name(&self) -> &str {
+            "FailFirstTryGrowPool"
+        }
+
+        fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+            self.reserved.fetch_add(additional, Ordering::Relaxed);
+        }
+
+        fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
+            self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+        }
+
+        fn try_grow(
+            &self,
+            _reservation: &MemoryReservation,
+            additional: usize,
+        ) -> Result<()> {
+            if !self.failed_once.swap(true, Ordering::SeqCst) {
+                return Err(datafusion_common::resources_datafusion_err!(
+                    "injected first try_grow OOM"
+                ));
+            }
+            self.reserved.fetch_add(additional, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.reserved.load(Ordering::Relaxed)
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            MemoryLimit::Finite(usize::MAX)
+        }
+    }
+
+    #[test]
+    fn push_partial_batch_without_spill_returns_oom_without_panicking_when_retry_would_succeed()
+     {
+        let pool: Arc<dyn MemoryPool> = Arc::new(FailFirstTryGrowPool::new());
+        let reservation = MemoryConsumer::new("TestRadixAgg")
+            .with_can_spill(true)
+            .register(&pool);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let hashes = vec![10u64, 20, 30, 40];
+        let (tx, _rx) = mpsc::channel(1);
+        let mut store = RadixPartitionStore::new_default();
+
+        let err = store
+            .push_partial_batch(batch, &hashes, 0, &reservation, None, &tx)
+            .expect_err("expected ResourcesExhausted without panicking");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
 }
