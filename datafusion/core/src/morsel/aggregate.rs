@@ -675,6 +675,7 @@ impl AggregateSink {
                 );
                 Ok(AggregateState::Grouped(GroupedState {
                     group_values,
+                    group_schema: Arc::clone(group_schema),
                     group_exprs,
                     rebound_group_exprs,
                     accumulators,
@@ -910,6 +911,7 @@ impl UngroupedState {
 
 pub(super) struct GroupedState {
     group_values: Box<dyn GroupValues>,
+    group_schema: SchemaRef,
     group_exprs: Vec<ArgEvaluator>,
     rebound_group_exprs: Vec<ArgEvaluator>,
     accumulators: Vec<Box<dyn GroupsAccumulator>>,
@@ -981,6 +983,11 @@ impl GroupedState {
             return Ok(());
         }
         let group_arrays = self.group_values.emit(EmitTo::All)?;
+        // Reset `group_values` cleanly after `EmitTo::All`: `GroupValuesColumn`
+        // (multi-column GROUP BY) replaces its value vectors without clearing
+        // its internal hash table unless rebuilt/cleared.
+        self.group_values =
+            new_group_values(Arc::clone(&self.group_schema), &GroupClustering::None)?;
         hash_group_columns(&group_arrays, self.has_float_keys, &mut self.hash_buf)?;
         let mut cols = group_arrays;
         for acc in &mut self.accumulators {
