@@ -38,33 +38,36 @@ with Stock DataFusion, and full `#138` per-pipeline wait/work breakdowns).
 | **Geomean (`q1`,`q3`,`q6`)** | **118.6 ms**                        |          **136.9 ms** | **107.1 ms**                               |  **83.9 ms** |       **1.15× faster (3q)** |          1.11× slower |      1.41× slower |
 
 \*Main 224-trial scorecard recorded with `MORSEL_METRICS=1` so every Morsel
-trial captures `#138` per-pipeline metrics. A separate (non-interleaved)
-`MORSEL_METRICS=0` run gave `q1`: **`156.9 ms`** (`morsel_pushdown`, faster
-than even tuned `stock_pushdown_no_repartition`'s `159.4 ms`), `q3`: `121.6 ms`,
-`q6`: `85.2 ms` (`morsel_no_pushdown`), and `q12`: `180.0 ms`.
+trial captures `#138` per-pipeline metrics. A separate (non-interleaved,
+Morsel-only) `MORSEL_METRICS=0` check gave `q1`: `156.9 ms` (`morsel_pushdown`),
+`q3`: `121.6 ms`, `q6`: `85.2 ms` (`morsel_no_pushdown`), and `q12`: `180.0 ms`;
+deltas vs. the main run flip sign across queries (`−6.3` to `+5.7 ms`), reflecting
+run-to-run variance rather than measurable instrumentation overhead. All Stock
+comparisons use the interleaved main-run medians above.
 
 ### Headline Takeaways
 
 1. **Morsel beats unmodified Stock DataFusion (`stock_default`) on Q1, Q3, and
    Q6 — by `1.15×` geomean warm and `1.20×` geomean cold:**
-   - **Q1 (full query with `ORDER BY`):** `163.2 ms` (`156.9 ms` with metrics
-     off) beats `stock_default` (`208.6 ms`) by **`1.28×` (`−45.4 ms`)** and
-     `stock_pushdown` (`197.4 ms`) by **`1.21×` (`−34.2 ms`)**, and is even
-     faster than Checkpoint A's `q1_unordered` (`170.4 ms`) thanks to `#169`
-     `BatchView`. `#159` `SortSink` adds only `0.2 ms` (`0.1 ms` worker +
+   - **Q1 (full query with `ORDER BY`):** `morsel_pushdown` (`163.2 ms`) beats
+     `stock_default` (`208.6 ms`) by **`1.28×` (`−45.4 ms`)** and
+     `stock_pushdown` (`197.4 ms`) by **`1.21×` (`−34.2 ms`)**, while staying
+     within `3.7 ms` (`0.98×`) of manually tuned `stock_pushdown_no_repartition`
+     (`159.4 ms`). `#159` `SortSink` adds only `0.2 ms` (`0.1 ms` worker +
      `0.1 ms` finalize).
    - **Q3 (3-way join + `GROUP BY` + `TopN 10`):** `morsel_no_pushdown`
-     (`120.7 ms`) beats both `stock_default` (`125.7 ms`, `1.04×`) and
-     `stock_no_pushdown` (`122.4 ms`, `1.01×`). `#159` `TopNSink` takes just
-     `0.6 ms` (`0.4 ms` worker + `0.2 ms` finalize). However, Stock's
+     (`120.7 ms`) beats `stock_default` (`125.7 ms`, `1.04×`) and is at parity
+     within noise with `stock_no_pushdown` (`122.4 ms`, overlapping ranges
+     `117.4–135.2` vs. `116.5–140.1 ms`). `#159` `TopNSink` takes just `0.6 ms`
+     (`0.4 ms` worker + `0.2 ms` finalize). However, Stock's
      `stock_pushdown_no_repartition` (`92.9 ms`) and `stock_pushdown`
      (`97.6 ms`) leap ahead of both Morsel and DuckDB (`97.4 ms`) via
      **dynamic join filter pushdown (`#170`)**, which cuts Stock's Q3 CPU by
      `−182.9 ms` (`−32.8 ms` wall).
    - **Q6 (filtered revenue `SUM`):** `morsel_pruning` (`84.8 ms`) /
      `morsel_no_pushdown` (`85.7 ms`) beats `stock_default` (`97.9 ms`) by
-     **`1.16×` (`−13.1 ms`)** and improves `−2.6` to `−3.5 ms` over Checkpoint
-     A (`88.3 ms`) via `#169` `BatchView`.
+     **`1.16×` (`−13.1 ms`)** and stays within `1.7 ms` (`0.98×`) of
+     `stock_no_pushdown` (`83.0 ms`).
 2. **Q12 reveals a massive, immediately actionable join-build bottleneck (`#138`
    per-pipeline metrics caught it red-handed):**
    - Morsel takes `174.3 ms` (`165.1 ms` exec) on Q12 vs. Stock `64.5 ms` and
@@ -157,8 +160,9 @@ exact ordered DuckDB parity, and emitted the expected finalizations (`q1`:
 | `stock_pushdown` (`off`, defaults + `pd=true`, `repart=true`)                |       197.4 (193.8–198.1) |     4.6 + 6.3 |      186.5 (183.0–187.6) |     1,099.4 |       0 |
 | `duckdb_default` (DuckDB 2.0.1 defaults)                                     |   **111.8 (104.8–118.2)** |             — |                        — |       734.9 |       — |
 
-_(With `MORSEL_METRICS=0`: `morsel_pushdown` drops to **`156.9 ms`** total /
-`148.1 ms` exec; `morsel_no_pushdown` is `169.8 ms` total / `161.6 ms` exec.)_
+_(Separate non-interleaved `MORSEL_METRICS=0` check: `morsel_pushdown`
+`156.9 ms` total / `148.1 ms` exec; `morsel_no_pushdown` `169.8 ms` total /
+`161.6 ms` exec.)_
 
 ### TPC-H Q3 (3-Way `customer ⋈ orders ⋈ lineitem` + `GROUP BY` + `TopN 10`, 10 Rows)
 
@@ -341,8 +345,8 @@ summed by `type`).
   build finalize) removes `~110 ms` of serial wall time, projecting Q12 from
   **`174.3 ms → ~58–62 ms`** — matching or beating both `stock_default`
   (`64.5 ms`) and DuckDB (`62.3 ms`) and moving the 4-query Checkpoint B
-  geomean from `130.6 ms` to **`~99 ms`** (**`1.15×` faster than `stock_default`
-  across all 4 queries**).
+  geomean from `130.6 ms` to **`~99–101 ms`** (**`1.12–1.14×` faster than
+  `stock_default`'s `113.4 ms` across all 4 queries**).
 
 ### 2. Dynamic Join Filter Pushdown (`#170`) (Top Q3 Bottleneck: `−28 to −33 ms` Wall!)
 
@@ -404,9 +408,6 @@ summed by `type`).
 - **`#159` `SortSink` & `TopNSink`:** `0.2 ms` on Q1 (`0.1 ms` worker +
   `0.1 ms` finalize), `0.6 ms` on Q3 (`0.4 ms` + `0.2 ms`), `0.1 ms` on Q12 —
   matching or beating Stock `SortExec` and DuckDB `ORDER_BY`/`TOP_N`.
-- **`#169` `BatchView` zero-copy filtering:** Full Q1 with `ORDER BY`
-  (`163.2 ms`) runs `7.2 ms` faster than Checkpoint A's `q1_unordered`
-  (`170.4 ms`), and Q6 drops from `88.3 ms` to `84.8–85.7 ms`.
 - **Dynamic row-group work-stealing & backpressure:** `6..6` balanced claims on
   `lineitem`, `0.0 ms` `morsel_output_wait` across all 224 warm and 100 cold
   trials, and automatic elimination of Stock `stock_default`'s

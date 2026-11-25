@@ -26,6 +26,7 @@ from harness import (
     WORKLOADS,
     compare_tables,
     dataset_summary,
+    evict_files,
     generate,
     infer_scale_factor,
     render_workload_sql,
@@ -36,7 +37,54 @@ from harness import (
     summarize_jsonl,
     table_files,
     validate_plan,
+    warm_files,
 )
+
+
+def _linux_fstype(path: Path) -> str | None:
+    mounts = Path("/proc/mounts")
+    if not mounts.is_file():
+        return None
+    resolved = path.resolve()
+    best_len = -1
+    best_fstype = None
+    for line in mounts.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount_point = Path(parts[1].replace("\\040", " "))
+        try:
+            resolved.relative_to(mount_point)
+        except ValueError:
+            continue
+        mp_len = len(mount_point.as_posix())
+        if mp_len > best_len:
+            best_len = mp_len
+            best_fstype = parts[2]
+    return best_fstype
+
+
+def _find_disk_temp_parent() -> Path | None:
+    candidates: list[Path] = []
+    env_dir = os.getenv("MORSEL_TPCH_DISK_TMPDIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.extend(
+        [
+            Path(tempfile.gettempdir()),
+            Path.home() / ".cache",
+            Path(__file__).resolve().parent,
+        ]
+    )
+    for cand in candidates:
+        if not cand.is_dir() or not os.access(cand, os.W_OK | os.X_OK):
+            continue
+        fstype = _linux_fstype(cand)
+        if fstype is None or fstype in ("tmpfs", "ramfs"):
+            continue
+        return cand
+    return None
+
 
 EXPECTED_SF001_ROWS = {
     "lineitem": 60175,
@@ -615,6 +663,71 @@ class TpchHarnessTest(unittest.TestCase):
         with patch("harness.cache_pages", return_value={"resident": 0, "total": 2}):
             self.assertEqual(require_cold_cache([]), {"resident": 0, "total": 2})
 
+    @unittest.skipUnless(
+        sys.platform == "linux",
+        "cold-cache eviction via posix_fadvise/mincore requires Linux",
+    )
+    def test_evict_files_and_require_cold_cache_on_disk(self):
+        disk_parent = _find_disk_temp_parent()
+        if disk_parent is None:
+            self.skipTest("no non-tmpfs writable directory available")
+        with tempfile.TemporaryDirectory(
+            dir=disk_parent, prefix="morsel_tpch_cold_"
+        ) as tmp:
+            sample = Path(tmp) / "page_cache_probe.bin"
+            sample.write_bytes(b"a" * (256 * 1024))
+            warm_files([sample])
+            warm_pages = require_warm_cache([sample])
+            self.assertGreater(warm_pages["total"], 0)
+            self.assertEqual(warm_pages["resident"], warm_pages["total"])
+
+            evict_files([sample])
+            cold_pages = require_cold_cache([sample])
+            self.assertEqual(cold_pages, {"resident": 0, "total": warm_pages["total"]})
+
+    @unittest.skipUnless(
+        sys.platform == "linux",
+        "cold-cache duckdb-profile verification requires Linux",
+    )
+    def test_sf001_duckdb_profile_cold_cache(self):
+        disk_parent = _find_disk_temp_parent()
+        if disk_parent is None:
+            self.skipTest("no non-tmpfs writable directory available")
+        with tempfile.TemporaryDirectory(
+            dir=disk_parent, prefix="morsel_tpch_dprof_cold_"
+        ) as tmp:
+            data_dir = Path(tmp) / "tpch sf001 cold"
+            generate(data_dir, sf=0.01, row_group_size=131_072)
+            out = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).with_name("harness.py")),
+                    "duckdb-profile",
+                    str(data_dir),
+                    "--threads",
+                    "2",
+                    "--timeout",
+                    "60",
+                    "--cache",
+                    "cold",
+                    "--warmups",
+                    "0",
+                    "--repeats",
+                    "1",
+                    "--queries",
+                    "q6",
+                ],
+                text=True,
+                timeout=120,
+            )
+            report = json.loads(out)
+            self.assertEqual(report["cache_regime"], "cold")
+            self.assertEqual(report["queries"]["q6"]["output_rows"], 1)
+            self.assertIn(
+                "TABLE_SCAN", report["queries"]["q6"]["operator_timing_ms_median"]
+            )
+
     def test_sf001_duckdb_profile_reports_operator_timings(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "tpch sf001 dprof"
@@ -1044,3 +1157,59 @@ class TpchHarnessTest(unittest.TestCase):
                 "morsel_pipelines",
             ):
                 self.assertIsNone(sample[field], msg=field)
+
+    @unittest.skipUnless(
+        sys.platform == "linux"
+        and os.getenv("MORSEL_TPCH_RUNNER")
+        and os.getenv("MORSEL_BENCH_REVISION"),
+        "set MORSEL_TPCH_RUNNER and MORSEL_BENCH_REVISION for the Linux cold-cache bench smoke test",
+    )
+    def test_sf001_bench_cold_cache_smoke(self):
+        disk_parent = _find_disk_temp_parent()
+        if disk_parent is None:
+            self.skipTest("no non-tmpfs writable directory available")
+        with tempfile.TemporaryDirectory(
+            dir=disk_parent, prefix="morsel_tpch_bench_cold_"
+        ) as tmp:
+            data_dir = Path(tmp) / "tpch sf001 bench cold"
+            generate(data_dir, sf=0.01, row_group_size=131_072)
+            out = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).with_name("harness.py")),
+                    "bench",
+                    str(data_dir),
+                    "--runner",
+                    os.environ["MORSEL_TPCH_RUNNER"],
+                    "--revision",
+                    os.environ["MORSEL_BENCH_REVISION"],
+                    "--threads",
+                    "2",
+                    "--timeout",
+                    "60",
+                    "--cache",
+                    "cold",
+                    "--warmups",
+                    "0",
+                    "--repeats",
+                    "1",
+                    "--queries",
+                    "q6",
+                    "--morsel-arms",
+                    "morsel_no_pushdown",
+                    "duckdb_default",
+                ],
+                text=True,
+                timeout=120,
+            )
+            records = [json.loads(line) for line in out.splitlines()]
+            header, trials = records[0], records[1:]
+            self.assertEqual(header["cache_regime"], "cold")
+            self.assertEqual(len(trials), 2)
+            for trial in trials:
+                before = trial["cache_pages_before"]
+                after = trial["cache_pages_after"]
+                self.assertGreater(before["total"], 0)
+                self.assertEqual(before["resident"], 0)
+                self.assertGreater(after["resident"], 0)
