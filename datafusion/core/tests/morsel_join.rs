@@ -2766,14 +2766,11 @@ async fn dynamic_join_filter_concurrent_repeated_runs_and_memory_cleanup() -> Re
 
     // Execute the exact same prepared plan 4 times concurrently to prove zero
     // cross-run mutation of ParquetScan or dynamic join filters.
-    let mut handles = Vec::new();
-    for _ in 0..4 {
-        let p = Arc::clone(&plan);
-        let task_ctx = ctx.task_ctx();
-        handles.push(tokio::spawn(async move { collect(p, task_ctx).await }));
-    }
-    for h in handles {
-        let got = h.await.unwrap()?;
+    let runs = futures::future::try_join_all(
+        (0..4).map(|_| collect(Arc::clone(&plan), ctx.task_ctx())),
+    )
+    .await?;
+    for got in runs {
         assert_eq!(sorted_rows(&got)?, expected_rows);
     }
     assert_eq!(
