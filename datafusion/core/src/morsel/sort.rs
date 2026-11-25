@@ -1009,6 +1009,10 @@ pub(super) struct TopNSink {
     pub(super) finalize_gate: Option<super::tests::FinalizeGate>,
     #[cfg(test)]
     pub(super) peak_retained_rows: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(super) compaction_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(super) heap_rebuild_count: Arc<AtomicUsize>,
 }
 
 impl TopNSink {
@@ -1038,6 +1042,10 @@ impl TopNSink {
             finalize_gate: None,
             #[cfg(test)]
             peak_retained_rows: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            compaction_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            heap_rebuild_count: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -1079,11 +1087,16 @@ impl TopNSink {
             batches: Vec::new(),
             retained_rows: 0,
             batch_memory: RecordBatchMemoryTracker::new(),
+            row_map_bytes: 0,
             key_bytes: 0,
             first_col_fast,
             reservation,
             #[cfg(test)]
             peak_retained_rows: Arc::clone(&self.peak_retained_rows),
+            #[cfg(test)]
+            compaction_count: Arc::clone(&self.compaction_count),
+            #[cfg(test)]
+            heap_rebuild_count: Arc::clone(&self.heap_rebuild_count),
         })
     }
 
@@ -1757,25 +1770,56 @@ impl FirstColFastPath {
     }
 }
 
+struct RetainedBatch {
+    batch: RecordBatch,
+    /// Strictly ascending original `row_idx` values gathered into `batch`, or
+    /// `None` when `batch` is dense/1-to-1 (`row_idx` maps directly to `batch`).
+    row_map: Option<Vec<u32>>,
+}
+
+impl RetainedBatch {
+    #[inline]
+    fn resolve_row(&self, raw_row_idx: u32) -> usize {
+        match &self.row_map {
+            None => raw_row_idx as usize,
+            Some(map) => map
+                .binary_search(&raw_row_idx)
+                .expect("live heap row_idx must exist in RetainedBatch::row_map"),
+        }
+    }
+
+    fn row_map_bytes(&self) -> usize {
+        self.row_map
+            .as_ref()
+            .map_or(0, |m| m.capacity().saturating_mul(size_of::<u32>()))
+    }
+}
+
 pub(super) struct TopNState {
     ordering: LexOrdering,
     row_converter: RowConverter,
     limit: usize,
     heap: BinaryHeap<TopNHeapEntry>,
-    batches: Vec<RecordBatch>,
+    batches: Vec<RetainedBatch>,
     retained_rows: usize,
     batch_memory: RecordBatchMemoryTracker,
+    row_map_bytes: usize,
     key_bytes: usize,
     first_col_fast: Option<FirstColFastPath>,
     reservation: MemoryReservation,
     #[cfg(test)]
     peak_retained_rows: Arc<AtomicUsize>,
+    #[cfg(test)]
+    compaction_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    heap_rebuild_count: Arc<AtomicUsize>,
 }
 
 impl TopNState {
     fn current_memory_bytes(&self) -> usize {
         self.batch_memory
             .memory_usage()
+            .saturating_add(self.row_map_bytes)
             .saturating_add(self.key_bytes)
             .saturating_add(
                 self.heap
@@ -1792,9 +1836,10 @@ impl TopNState {
     fn refresh_threshold(&mut self) {
         if self.heap.len() == self.limit
             && let (Some(fast), Some(top)) = (&mut self.first_col_fast, self.heap.peek())
-            && let Some(batch) = self.batches.get(top.batch_idx as usize)
+            && let Some(retained) = self.batches.get(top.batch_idx as usize)
         {
-            fast.update_from_batch(batch, top.row_idx as usize);
+            let dense_row = retained.resolve_row(top.row_idx);
+            fast.update_from_batch(&retained.batch, dense_row);
         }
     }
 
@@ -1844,7 +1889,8 @@ impl TopNState {
         let pending_batch_idx = u32::try_from(self.batches.len()).map_err(|_| {
             datafusion_common::exec_datafusion_err!("Morsel TopN batch index overflow")
         })?;
-        let mut pending_wins = 0usize;
+        let mut entered_rows: Vec<u32> = Vec::new();
+        let mut evicted_pending: Vec<u32> = Vec::new();
         let mut heap_changed = false;
 
         for row_idx in 0..batch.num_rows() {
@@ -1858,7 +1904,7 @@ impl TopNState {
                     batch_idx: pending_batch_idx,
                     row_idx: row_idx as u32,
                 });
-                pending_wins += 1;
+                entered_rows.push(row_idx as u32);
                 heap_changed = true;
             } else if let Some(worst) = self.heap.peek()
                 && row_bytes < worst.key.as_ref()
@@ -1866,7 +1912,7 @@ impl TopNState {
                 let evicted = self.heap.pop().unwrap();
                 self.key_bytes = self.key_bytes.saturating_sub(evicted.key.len());
                 if evicted.batch_idx == pending_batch_idx {
-                    pending_wins -= 1;
+                    evicted_pending.push(evicted.row_idx);
                 }
                 let key: Box<[u8]> = row_bytes.into();
                 self.key_bytes = self.key_bytes.saturating_add(key.len());
@@ -1875,11 +1921,12 @@ impl TopNState {
                     batch_idx: pending_batch_idx,
                     row_idx: row_idx as u32,
                 });
-                pending_wins += 1;
+                entered_rows.push(row_idx as u32);
                 heap_changed = true;
             }
         }
 
+        let pending_wins = entered_rows.len() - evicted_pending.len();
         if pending_wins == 0 {
             if heap_changed {
                 self.update_reservation()?;
@@ -1888,32 +1935,53 @@ impl TopNState {
             return Ok(());
         }
 
-        // Gather only the surviving rows from this batch, rewriting their
-        // `row_idx` to the compacted batch coordinates.
-        let mut entries = std::mem::take(&mut self.heap).into_vec();
-        let mut take_indices = Vec::with_capacity(pending_wins);
-        for entry in &mut entries {
-            if entry.batch_idx == pending_batch_idx {
-                let new_row_idx = take_indices.len() as u32;
-                take_indices.push(entry.row_idx);
-                entry.row_idx = new_row_idx;
+        // Compute strictly sorted surviving row indices from this batch in O(winners)
+        // without touching or rebuilding `self.heap`.
+        let take_indices = if evicted_pending.is_empty() {
+            entered_rows
+        } else {
+            evicted_pending.sort_unstable();
+            let mut surviving = Vec::with_capacity(pending_wins);
+            let mut ev_idx = 0usize;
+            for r in entered_rows {
+                while ev_idx < evicted_pending.len() && evicted_pending[ev_idx] < r {
+                    ev_idx += 1;
+                }
+                if ev_idx < evicted_pending.len() && evicted_pending[ev_idx] == r {
+                    ev_idx += 1;
+                } else {
+                    surviving.push(r);
+                }
             }
-        }
-        self.heap = BinaryHeap::from(entries);
+            surviving
+        };
 
-        let raw_compacted = take_record_batch(batch, &UInt32Array::from(take_indices))?;
-        // Compact Utf8View/BinaryView columns so retained winners do not pin
-        // multi-megabyte source buffers.
-        let compacted = gc_view_batch(&raw_compacted)?;
-        drop(raw_compacted);
+        let (compacted, row_map) = if take_indices.len() == batch.num_rows() {
+            // Every row of `batch` survived (typical while heap is filling): keep
+            // 1-to-1 coordinates without a `take_record_batch` copy or `row_map`.
+            (gc_view_batch(batch)?, None)
+        } else {
+            let raw_compacted =
+                take_record_batch(batch, &UInt32Array::from(take_indices.clone()))?;
+            let compacted = gc_view_batch(&raw_compacted)?;
+            drop(raw_compacted);
+            (compacted, Some(take_indices))
+        };
 
-        let compacted_rows = compacted.num_rows();
-        self.batch_memory.count_batch(&compacted);
+        let retained = RetainedBatch {
+            batch: compacted,
+            row_map,
+        };
+        let compacted_rows = retained.batch.num_rows();
+        let added_map_bytes = retained.row_map_bytes();
+        self.batch_memory.count_batch(&retained.batch);
+        self.row_map_bytes = self.row_map_bytes.saturating_add(added_map_bytes);
         if let Err(err) = self.update_reservation() {
-            self.batch_memory.uncount_batch(&compacted);
+            self.batch_memory.uncount_batch(&retained.batch);
+            self.row_map_bytes = self.row_map_bytes.saturating_sub(added_map_bytes);
             return Err(err);
         }
-        self.batches.push(compacted);
+        self.batches.push(retained);
         self.retained_rows = self.retained_rows.saturating_add(compacted_rows);
         #[cfg(test)]
         self.peak_retained_rows
@@ -1927,23 +1995,32 @@ impl TopNState {
     }
 
     fn compact(&mut self) -> Result<()> {
+        #[cfg(test)]
+        self.compaction_count.fetch_add(1, AtomicOrdering::Relaxed);
         if self.heap.is_empty() {
             for old in &self.batches {
-                self.batch_memory.uncount_batch(old);
+                self.batch_memory.uncount_batch(&old.batch);
             }
             self.batches.clear();
             self.retained_rows = 0;
+            self.row_map_bytes = 0;
             self.update_reservation()?;
             return Ok(());
         }
+        #[cfg(test)]
+        self.heap_rebuild_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let mut entries = std::mem::take(&mut self.heap).into_vec();
         let mut interleave_indices = Vec::with_capacity(entries.len());
         for (new_idx, entry) in entries.iter_mut().enumerate() {
-            interleave_indices.push((entry.batch_idx as usize, entry.row_idx as usize));
+            let b_idx = entry.batch_idx as usize;
+            let dense_row = self.batches[b_idx].resolve_row(entry.row_idx);
+            interleave_indices.push((b_idx, dense_row));
             entry.batch_idx = 0;
             entry.row_idx = new_idx as u32;
         }
-        let batch_refs: Vec<&RecordBatch> = self.batches.iter().collect();
+        let batch_refs: Vec<&RecordBatch> =
+            self.batches.iter().map(|r| &r.batch).collect();
         let raw_compacted = interleave_record_batch(&batch_refs, &interleave_indices)?;
         let compacted = gc_view_batch(&raw_compacted)?;
         drop(raw_compacted);
@@ -1958,11 +2035,15 @@ impl TopNState {
 
         // Uncount old batches *before* dropping them.
         for old in &self.batches {
-            self.batch_memory.uncount_batch(old);
+            self.batch_memory.uncount_batch(&old.batch);
         }
         self.batches.clear();
-        self.batches.push(compacted);
+        self.batches.push(RetainedBatch {
+            batch: compacted,
+            row_map: None,
+        });
         self.retained_rows = compacted_rows;
+        self.row_map_bytes = 0;
         self.heap = BinaryHeap::from(entries);
         self.update_reservation()?;
         Ok(())
@@ -1977,35 +2058,67 @@ impl TopNState {
         let sorted_entries = self.heap.into_sorted_vec();
         let indices: Vec<(usize, usize)> = sorted_entries
             .iter()
-            .map(|e| (e.batch_idx as usize, e.row_idx as usize))
+            .map(|e| {
+                let b_idx = e.batch_idx as usize;
+                let dense_row = self.batches[b_idx].resolve_row(e.row_idx);
+                (b_idx, dense_row)
+            })
             .collect();
         drop(sorted_entries);
         self.key_bytes = 0;
+        self.row_map_bytes = 0;
 
-        let batch_refs: Vec<&RecordBatch> = self.batches.iter().collect();
+        let batch_refs: Vec<&RecordBatch> =
+            self.batches.iter().map(|r| &r.batch).collect();
         let chunk_size = batch_size.max(1);
+        // Interleave in slabs of at least 8,192 rows when many small batches are
+        // retained so Arrow's per-call interleave table setup is amortized.
+        let slab_size = if batch_refs.len() > 16 {
+            chunk_size.max(8192)
+        } else {
+            chunk_size
+        };
+        let has_view = schema_has_view(batch_refs[0].schema().as_ref());
         let mut out_batches = VecDeque::with_capacity(indices.len().div_ceil(chunk_size));
         let mut out_tracker = RecordBatchMemoryTracker::new();
-        for chunk in indices.chunks(chunk_size) {
-            let raw = interleave_record_batch(&batch_refs, chunk)?;
-            let out = gc_view_batch(&raw)?;
-            drop(raw);
-            self.batch_memory.count_batch(&out);
-            out_tracker.count_batch(&out);
-            let peak = self.batch_memory.memory_usage();
-            if let Err(err) = self.reservation.try_resize(peak) {
-                self.batch_memory.uncount_batch(&out);
-                out_tracker.uncount_batch(&out);
-                for b in &out_batches {
-                    self.batch_memory.uncount_batch(b);
-                    out_tracker.uncount_batch(b);
+        for slab_indices in indices.chunks(slab_size) {
+            let raw_slab = interleave_record_batch(&batch_refs, slab_indices)?;
+            let slab = if has_view {
+                gc_view_batch(&raw_slab)?
+            } else {
+                raw_slab
+            };
+            let mut offset = 0;
+            while offset < slab.num_rows() {
+                let len = (slab.num_rows() - offset).min(chunk_size);
+                let out = if offset == 0 && len == slab.num_rows() {
+                    slab.clone()
+                } else {
+                    let sliced = slab.slice(offset, len);
+                    if has_view {
+                        gc_view_batch(&sliced)?
+                    } else {
+                        sliced
+                    }
+                };
+                offset += len;
+                self.batch_memory.count_batch(&out);
+                out_tracker.count_batch(&out);
+                let peak = self.batch_memory.memory_usage();
+                if let Err(err) = self.reservation.try_resize(peak) {
+                    self.batch_memory.uncount_batch(&out);
+                    out_tracker.uncount_batch(&out);
+                    for b in &out_batches {
+                        self.batch_memory.uncount_batch(b);
+                        out_tracker.uncount_batch(b);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
+                out_batches.push_back(out);
             }
-            out_batches.push_back(out);
         }
         for old in &self.batches {
-            self.batch_memory.uncount_batch(old);
+            self.batch_memory.uncount_batch(&old.batch);
         }
         drop(self.batches);
         self.reservation.resize(out_tracker.memory_usage());
@@ -2608,6 +2721,146 @@ mod tests {
         drop(state);
         drop(shared);
         assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn topn_heap_rebuilds_track_compactions_not_input_batches() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let ordering = LexOrdering::from([PhysicalSortExpr::new(
+            Arc::new(Column::new("k", 0)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )]);
+
+        // Case 1: LIMIT > total_rows across 400 small 256-row batches -> 0 compactions, 0 rebuilds.
+        {
+            let sink =
+                TopNSink::try_new(Arc::clone(&schema), ordering.clone(), 0, 200_000)?
+                    .unwrap();
+            let pool = test_pool(None);
+            let mut state = sink.new_state(
+                MemoryConsumer::new("test_large_k_unfilled").register(&pool),
+            )?;
+            for b in (0..400).rev() {
+                let start = b * 256;
+                let ks: Vec<i32> = (start..start + 256).rev().collect();
+                let vs: Vec<i32> = ks.iter().map(|&x| x * 2).collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(ks)),
+                        Arc::new(Int32Array::from(vs)),
+                    ],
+                )?;
+                state.add_view(&BatchView::all(batch))?;
+            }
+            assert_eq!(sink.compaction_count.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(sink.heap_rebuild_count.load(AtomicOrdering::Relaxed), 0);
+            let run = state.finish(256)?.unwrap();
+            let SortedRun::Batches(run) = run else {
+                unreachable!()
+            };
+            let mut got = Vec::new();
+            for b in &run.batches {
+                let ks = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                got.extend_from_slice(ks.values());
+            }
+            let expected: Vec<i32> = (0..400 * 256).collect();
+            assert_eq!(got, expected);
+            drop(run);
+            assert_eq!(pool.reserved(), 0);
+        }
+
+        // Case 2: LIMIT < total_rows across 400 small 256-row batches (reverse order
+        // plus partial-batch winners + within-batch self-evictions).
+        // Full-heap rebuilds must equal compactions (NOT 400 input batches), and
+        // peak_retained_rows remains <= 3 * (K+O).
+        {
+            let limit = 10_000usize;
+            let sink =
+                TopNSink::try_new(Arc::clone(&schema), ordering, 0, limit)?.unwrap();
+            let pool = test_pool(None);
+            let mut state = sink
+                .new_state(MemoryConsumer::new("test_large_k_filled").register(&pool))?;
+            for b in (0..400).rev() {
+                let start = b * 256;
+                // Mix low keys and high keys inside each batch to exercise partial
+                // winners and `row_map` binary search + self-eviction.
+                let ks: Vec<i32> = (0..256)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            start + (255 - i)
+                        } else {
+                            1_000_000 + start + i
+                        }
+                    })
+                    .collect();
+                let vs: Vec<i32> = ks.iter().map(|&x| x + 7).collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(ks)),
+                        Arc::new(Int32Array::from(vs)),
+                    ],
+                )?;
+                state.add_view(&BatchView::all(batch))?;
+            }
+            let compactions = sink.compaction_count.load(AtomicOrdering::Relaxed);
+            let rebuilds = sink.heap_rebuild_count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                rebuilds, compactions,
+                "full-heap rebuilds ({rebuilds}) must track compactions ({compactions}), not input batches"
+            );
+            assert!(
+                rebuilds <= 10,
+                "expected few compactions/rebuilds (<= 10) across 400 batches, got {rebuilds}"
+            );
+            let peak = sink.peak_retained_rows.load(AtomicOrdering::Relaxed);
+            assert!(
+                peak <= 3 * limit,
+                "peak_retained_rows {peak} exceeded 3 * limit ({})",
+                3 * limit
+            );
+
+            let run = state.finish(256)?.unwrap();
+            let SortedRun::Batches(run) = run else {
+                unreachable!()
+            };
+            let mut got_k = Vec::new();
+            let mut got_v = Vec::new();
+            for b in &run.batches {
+                got_k.extend_from_slice(
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                );
+                got_v.extend_from_slice(
+                    b.column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                );
+            }
+            assert_eq!(got_k.len(), limit);
+            // Verify sorted order and exact value pairing (proving row_map resolution!).
+            for i in 0..limit {
+                assert_eq!(got_v[i], got_k[i] + 7);
+                if i > 0 {
+                    assert!(got_k[i - 1] <= got_k[i]);
+                }
+            }
+            drop(run);
+            assert_eq!(pool.reserved(), 0);
+        }
         Ok(())
     }
 }
