@@ -1093,17 +1093,10 @@ impl HashJoinProbe {
         if view.is_empty() || table.is_empty() {
             return Ok(None);
         }
-        if view.is_all() {
-            return self.start_probe_all(
-                view.into_parts().0,
-                table,
-                probe_reservation.new_empty(),
-            );
-        }
 
-        // Account for retained backing buffers while held by ProbeCursor across
-        // continuation yields, compacting proactively for tiny selections or when
-        // the memory pool cannot accommodate the uncompacted backing buffers.
+        // Apply the same retention accounting rule to unfiltered and filtered cursors:
+        // charge only pipeline-allocated memory (the selection buffer or any newly
+        // compacted copy), never preexisting backing storage.
         let mut cursor_reservation = probe_reservation.new_empty();
         let view = view.into_reserved_for_retention(&mut cursor_reservation)?;
         if view.is_all() {
@@ -2269,6 +2262,140 @@ mod tests {
 
         drop(table);
         assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_cursor_reservation_accounts_for_selection_and_compaction_only()
+    -> Result<()> {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+
+        let build_schema = Arc::new(Schema::new(vec![
+            Field::new("bk", DataType::Int64, false),
+            Field::new("bval", DataType::Int64, false),
+        ]));
+        let build_batch = RecordBatch::try_new(
+            Arc::clone(&build_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..16)),
+                Arc::new(Int64Array::from_iter_values((0..16).map(|i| i * 10))),
+            ],
+        )?;
+        let payload_schema = Arc::new(build_schema.project(&[1])?);
+        let build_sink = Arc::new(
+            HashJoinBuildSink::try_new(
+                vec![Arc::new(Column::new("bk", 0))],
+                vec!["bk".to_owned()],
+                vec![DataType::Int64],
+                vec![1],
+                payload_schema,
+            )?
+            .expect("valid build sink"),
+        );
+
+        let build_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut build_state =
+            build_sink.new_state(MemoryConsumer::new("test_build").register(&build_pool));
+        build_state.add_batch(&build_batch)?;
+        let (tx, _rx) = mpsc::channel(2);
+        let table = build_sink.finalize(build_state, &tx).await?.unwrap();
+
+        let probe_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("wide", DataType::Utf8, false),
+        ]));
+        let n = 4096usize;
+        let wide_str = "w".repeat(256);
+        let probe_batch = RecordBatch::try_new(
+            Arc::clone(&probe_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..n as i64)),
+                Arc::new(StringArray::from(vec![wide_str.as_str(); n])),
+            ],
+        )?;
+        assert!(get_record_batch_memory_size(&probe_batch) > 1024 * 1024);
+
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("wide", DataType::Utf8, false),
+            Field::new("bval", DataType::Int64, false),
+        ]));
+        let probe = HashJoinProbe::new(HashJoinProbeConfig {
+            build_pipeline: dummy_build_pipeline(build_schema, Arc::clone(&build_sink)),
+            build_side: BuildSide::Right,
+            probe_key_exprs: vec![Arc::new(Column::new("pk", 0))],
+            probe_key_names: vec!["pk".to_owned()],
+            key_types: vec![DataType::Int64],
+            output_projection: vec![
+                JoinOutputCol::Probe(0),
+                JoinOutputCol::Probe(1),
+                JoinOutputCol::Build(0),
+            ],
+            output_schema: out_schema,
+            build_id: 0,
+        });
+
+        // 1. Unfiltered Selection::All charges 0 bytes (never charges preexisting storage).
+        let pool_512k: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+        let res_512k = MemoryConsumer::new("test_probe_512k").register(&pool_512k);
+        {
+            let cursor = probe
+                .start_probe_view(BatchView::all(probe_batch.clone()), &table, &res_512k)?
+                .unwrap();
+            assert_eq!(cursor.batch.num_rows(), n);
+            assert_eq!(pool_512k.reserved(), 0);
+        }
+        assert_eq!(pool_512k.reserved(), 0);
+
+        // 2. 75% filtered view (`gate <> 0`): below 16x compaction threshold, so cursor
+        //    keeps the backing batch without charging it — reserves only the selection
+        //    bitmap (~512 B) and succeeds under 512 KiB pool.
+        let mask_75 = BooleanArray::from((0..n).map(|i| i % 4 != 0).collect::<Vec<_>>());
+        let view_75 = BatchView::from_boolean_array(probe_batch.clone(), &mask_75)?;
+        let sel_75_bytes = view_75.selection_memory_size();
+        assert!(sel_75_bytes > 0 && sel_75_bytes < 4096);
+        {
+            let cursor = probe.start_probe_view(view_75, &table, &res_512k)?.unwrap();
+            assert_eq!(cursor.batch.num_rows(), n);
+            assert_eq!(pool_512k.reserved(), sel_75_bytes);
+        }
+        assert_eq!(pool_512k.reserved(), 0);
+
+        // 3. Tiny selection (16/4096 rows): triggers proactive threshold compaction
+        //    (wasted > 512 KiB and ratio > 16x), reserves the newly compacted copy
+        //    (~4.5 KiB), and drops the 1 MiB backing batch from the cursor.
+        let mask_tiny =
+            BooleanArray::from((0..n).map(|i| i % 256 == 0).collect::<Vec<_>>());
+        let view_tiny = BatchView::from_boolean_array(probe_batch.clone(), &mask_tiny)?;
+        let pool_64k: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+        let res_64k = MemoryConsumer::new("test_probe_64k").register(&pool_64k);
+        {
+            let cursor = probe
+                .start_probe_view(view_tiny.clone(), &table, &res_64k)?
+                .unwrap();
+            assert_eq!(cursor.batch.num_rows(), 16);
+            let compacted_bytes = get_record_batch_memory_size(&cursor.batch);
+            assert!(compacted_bytes > 0 && compacted_bytes < 64 * 1024);
+            assert_eq!(pool_64k.reserved(), compacted_bytes);
+        }
+        assert_eq!(pool_64k.reserved(), 0);
+
+        // 4. Tiny selection under a 2 KiB pool (smaller than the compacted copy):
+        //    gracefully skips compaction and charges only the selection buffer instead
+        //    of failing with ResourcesExhausted.
+        let pool_2k: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2048));
+        let res_2k = MemoryConsumer::new("test_probe_2k").register(&pool_2k);
+        {
+            let cursor = probe
+                .start_probe_view(view_tiny.clone(), &table, &res_2k)?
+                .unwrap();
+            assert_eq!(cursor.batch.num_rows(), n);
+            assert_eq!(pool_2k.reserved(), view_tiny.selection_memory_size());
+        }
+        assert_eq!(pool_2k.reserved(), 0);
+
+        drop(table);
+        assert_eq!(build_pool.reserved(), 0);
         Ok(())
     }
 }

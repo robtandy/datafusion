@@ -373,8 +373,11 @@ async fn projection_udf_never_evaluates_rejected_rows_in_filtered_pipeline() -> 
 }
 
 #[tokio::test]
-async fn filtered_hash_join_build_compacts_under_tight_memory_pool() -> Result<()> {
-    // Build table has 4096 rows with 256-byte payloads (~1 MiB), but filter selects only 16 rows (~4 KiB).
+async fn filtered_hash_join_build_under_tight_memory_pool_parity() -> Result<()> {
+    // End-to-end tight-memory-pool parity test: build table has 4096 rows with 256-byte
+    // payloads (~1 MiB), filter selects 16 rows (~4 KiB), and 128 KiB GreedyMemoryPool
+    // verifies dead backing buffers are not retained in HashJoinBuildState and pool
+    // reservations return to 0.
     let build_schema = Arc::new(Schema::new(vec![
         Field::new("bk", DataType::Int64, false),
         Field::new("gate", DataType::Int64, false),
@@ -402,11 +405,9 @@ async fn filtered_hash_join_build_compacts_under_tight_memory_pool() -> Result<(
         ],
     )?;
 
-    // 128 KiB pool is far smaller than the 1 MiB unfiltered build batch,
-    // so succeeding proves dead backing buffers are not retained in the build sink.
-    let pool = Arc::new(GreedyMemoryPool::new(128 * 1024));
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(128 * 1024));
     let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(pool)
+        .with_memory_pool(Arc::clone(&pool))
         .build_arc()?;
     let mut config = SessionConfig::new()
         .with_target_partitions(2)
@@ -433,6 +434,7 @@ async fn filtered_hash_join_build_compacts_under_tight_memory_pool() -> Result<(
     let out = collect(plan, ctx.task_ctx()).await?;
     let total: usize = out.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 16);
+    assert_eq!(pool.reserved(), 0);
     Ok(())
 }
 
@@ -665,11 +667,14 @@ async fn direct_count_col_logical_nulls_for_null_type_and_dictionary_values() ->
 }
 
 #[tokio::test]
-async fn filtered_hash_join_probe_compacts_under_tight_memory_pool() -> Result<()> {
-    // Build table is tiny (16 rows); probe table is 1 batch of 4096 rows with 256-byte
-    // strings (~1.1 MiB backing buffer). Filter selects 25% (~1024 rows, ~280 KiB compacted):
-    // 4x retention ratio is below the 16x proactive compaction threshold, so succeeding under
-    // a 512 KiB GreedyMemoryPool exercises reservation-triggered compaction in start_probe_view.
+async fn filtered_hash_join_probe_under_tight_memory_pool_parity() -> Result<()> {
+    // End-to-end memory-limit parity test: build table is 16 rows and probe MemTable holds
+    // one 4096-row batch with a 256-byte Utf8 column (~1.1 MiB preexisting storage).
+    // Under a 512 KiB GreedyMemoryPool, unfiltered, 75%-filtered (`gate <> 0`),
+    // 25%-filtered (`gate = 0`), and tiny-filtered (`pk % 256 = 0`) probes must all
+    // succeed without charging preexisting MemTable storage and leave pool.reserved() == 0.
+    // (Direct cursor compaction and exact reservation bytes are verified in
+    // `morsel::hash_join::tests::probe_cursor_reservation_accounts_for_selection_and_compaction_only`.)
     let build_schema = Arc::new(Schema::new(vec![
         Field::new("bk", DataType::Int64, false),
         Field::new("bval", DataType::Int64, false),
@@ -721,13 +726,30 @@ async fn filtered_hash_join_probe_compacts_under_tight_memory_pool() -> Result<(
         Arc::new(MemTable::try_new(probe_schema, vec![vec![probe_batch]])?),
     )?;
 
-    // gate = 0 selects 1024 probe rows (0, 4, 8, 12, ...), of which 4 match b (0, 4, 8, 12).
-    let sql = "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk WHERE p.gate = 0";
-    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-    assert_eq!(plan.name(), "MorselExec");
-    let out = collect(plan, ctx.task_ctx()).await?;
-    let total: usize = out.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(total, 4);
-    assert_eq!(pool.reserved(), 0);
+    for (sql, expected_rows) in [
+        (
+            "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk",
+            16,
+        ),
+        (
+            "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk WHERE p.gate <> 0",
+            12,
+        ),
+        (
+            "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk WHERE p.gate = 0",
+            4,
+        ),
+        (
+            "SELECT p.pk, p.wide, b.bval FROM p JOIN b ON p.pk = b.bk WHERE p.pk % 256 = 0",
+            1,
+        ),
+    ] {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec", "{sql}");
+        let out = collect(plan, ctx.task_ctx()).await?;
+        let total: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, expected_rows, "{sql}");
+        assert_eq!(pool.reserved(), 0, "{sql}");
+    }
     Ok(())
 }

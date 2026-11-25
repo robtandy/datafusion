@@ -770,43 +770,41 @@ impl BatchView {
             && retained >= estimated.saturating_mul(max_retention_ratio)
     }
 
-    /// Compact to `Selection::All` when retention policy says keeping the backing
-    /// buffers would waste too much memory.
-    pub(super) fn into_compacted_for_retention(
-        self,
-        min_wasted_bytes: usize,
-        max_retention_ratio: usize,
-    ) -> Result<Self> {
-        if self.should_compact_for_retention(min_wasted_bytes, max_retention_ratio) {
-            Ok(Self::all(self.materialize()?))
-        } else {
-            Ok(self)
-        }
-    }
-
-    /// Reserve memory for retaining this view, proactively compacting oversized
-    /// backing buffers and falling back to compaction if the reservation limit
-    /// cannot accommodate the uncompacted backing buffers.
+    /// Prepare a view for retention across a continuation cursor or queue, charging
+    /// only pipeline-allocated memory (the `Selection` buffer or any newly
+    /// materialized compacted copy), never preexisting backing storage.
+    ///
+    /// When `should_compact_for_retention` triggers, reserves the transient peak
+    /// (`selection + estimated compacted copy`) before materializing and resizes to
+    /// the actual compacted copy bytes. If the pool cannot fit the compacted copy,
+    /// keeps the original view and charges only its selection buffer rather than
+    /// turning a selective filter into a `ResourcesExhausted` error.
     pub(super) fn into_reserved_for_retention(
         self,
         reservation: &mut MemoryReservation,
     ) -> Result<Self> {
-        let view = self.into_compacted_for_retention(
+        let sel_bytes = self.selection_memory_size();
+        if self.should_compact_for_retention(
             DEFAULT_COMPACT_MIN_WASTED_BYTES,
             DEFAULT_COMPACT_MAX_RETENTION_RATIO,
-        )?;
-        let retained = view.retained_memory_size();
-        if reservation.try_grow(retained).is_ok() {
-            return Ok(view);
+        ) {
+            let est = self.estimated_compacted_bytes();
+            let peak = sel_bytes.saturating_add(est);
+            if reservation.try_grow(peak).is_ok() {
+                let materialized =
+                    materialize_batch_with_selection(&self.batch, &self.selection)?;
+                let actual = get_record_batch_memory_size(&materialized);
+                if reservation.try_resize(actual).is_ok() {
+                    return Ok(Self::all(materialized));
+                }
+                drop(materialized);
+                reservation.resize(0);
+            }
         }
-        if !view.is_all() && view.estimated_compacted_bytes() < retained {
-            let compacted = Self::all(view.materialize()?);
-            let compacted_bytes = compacted.retained_memory_size();
-            reservation.try_grow(compacted_bytes)?;
-            return Ok(compacted);
+        if sel_bytes > 0 {
+            reservation.try_grow(sel_bytes)?;
         }
-        reservation.try_grow(retained)?;
-        Ok(view)
+        Ok(self)
     }
 }
 
@@ -1372,18 +1370,32 @@ mod tests {
             DEFAULT_COMPACT_MAX_RETENTION_RATIO
         ));
 
-        // Tight pool (64 KiB) cannot hold the 1 MiB backing buffer, but succeeds
-        // by compacting the 16-row selection (~3 KiB).
+        // Tight pool (64 KiB) cannot hold the 1 MiB backing buffer, but proactively
+        // compacts the 16-row selection (~3 KiB), reserving peak before materializing
+        // and holding only the actual compacted copy bytes.
         let tight_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
         let mut res = MemoryConsumer::new("test_batch_view").register(&tight_pool);
-        let reserved_view = view.into_reserved_for_retention(&mut res)?;
+        let reserved_view = view.clone().into_reserved_for_retention(&mut res)?;
         assert!(reserved_view.is_all());
         assert_eq!(reserved_view.num_rows(), 16);
-        assert!(res.size() < 64 * 1024);
-        assert_eq!(res.size(), reserved_view.retained_memory_size());
+        assert!(res.size() > 0 && res.size() < 64 * 1024);
+        assert_eq!(res.size(), reserved_view.backing_memory_size());
         drop(reserved_view);
         drop(res);
         assert_eq!(tight_pool.reserved(), 0);
+
+        // When the pool is even smaller than the compacted copy (~2 KiB), retention
+        // falls back to keeping the uncompacted view and charging only the selection
+        // buffer rather than failing with ResourcesExhausted.
+        let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2048));
+        let mut tiny_res = MemoryConsumer::new("test_tiny_pool").register(&tiny_pool);
+        let uncompacted = view.into_reserved_for_retention(&mut tiny_res)?;
+        assert!(!uncompacted.is_all());
+        assert_eq!(tiny_res.size(), uncompacted.selection_memory_size());
+        assert!(tiny_res.size() <= 2048);
+        drop(uncompacted);
+        drop(tiny_res);
+        assert_eq!(tiny_pool.reserved(), 0);
 
         // Small batch with low selectivity does NOT compact when wasted bytes < threshold.
         let small = sample_batch(16);
@@ -1396,28 +1408,34 @@ mod tests {
             DEFAULT_COMPACT_MAX_RETENTION_RATIO
         ));
 
-        // Moderate selectivity (40%) fails proactive 4x heuristic, yet still compacts
-        // under a tight memory pool that fits compacted bytes but not full backing bytes.
-        let mod_mask =
-            BooleanArray::from((0..rows).map(|i| i % 5 < 2).collect::<Vec<_>>());
-        let mod_view = BatchView::from_boolean_array(batch, &mod_mask)?;
-        assert!(!mod_view.should_compact_for_retention(
+        // Moderate/high selectivity (75%, below 16x compaction ratio) never charges the
+        // preexisting 1 MiB backing buffer; it charges only the selection bitmap (~1 KiB)
+        // and succeeds under a 512 KiB pool without compacting or failing.
+        let hi_mask =
+            BooleanArray::from((0..rows).map(|i| i % 4 != 0).collect::<Vec<_>>());
+        let hi_view = BatchView::from_boolean_array(batch.clone(), &hi_mask)?;
+        assert!(!hi_view.should_compact_for_retention(
             DEFAULT_COMPACT_MIN_WASTED_BYTES,
             DEFAULT_COMPACT_MAX_RETENTION_RATIO
         ));
-        let mod_est = mod_view.estimated_compacted_bytes();
-        assert!(mod_est < full_bytes);
-        let mid_pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(mod_est + 128 * 1024));
-        assert_eq!(mid_pool.reserved(), 0);
+        let mid_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
         let mut mid_res = MemoryConsumer::new("test_mid_pool").register(&mid_pool);
-        let compacted = mod_view.into_reserved_for_retention(&mut mid_res)?;
-        assert!(compacted.is_all());
-        let expected_mod_rows = (0..rows).filter(|i| i % 5 < 2).count();
-        assert_eq!(compacted.num_rows(), expected_mod_rows);
-        assert!(mid_res.size() < full_bytes);
-        drop(compacted);
+        let kept = hi_view.into_reserved_for_retention(&mut mid_res)?;
+        assert!(!kept.is_all());
+        assert_eq!(kept.num_rows(), rows * 3 / 4);
+        assert_eq!(mid_res.size(), kept.selection_memory_size());
+        assert!(mid_res.size() < 4096);
+        drop(kept);
         drop(mid_res);
+        assert_eq!(mid_pool.reserved(), 0);
+
+        // Unfiltered Selection::All charges 0 bytes (same rule: no pipeline-allocated selection or copy).
+        let mut all_res = MemoryConsumer::new("test_all_pool").register(&mid_pool);
+        let all_kept = BatchView::all(batch).into_reserved_for_retention(&mut all_res)?;
+        assert!(all_kept.is_all());
+        assert_eq!(all_res.size(), 0);
+        drop(all_kept);
+        drop(all_res);
         assert_eq!(mid_pool.reserved(), 0);
 
         // Unbounded pool still cleans up properly
