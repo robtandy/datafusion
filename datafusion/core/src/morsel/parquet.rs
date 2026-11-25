@@ -798,16 +798,20 @@ fn remap_probe_key_to_scan(
     preceding_ops: &[Operator],
     schemas: &[SchemaRef],
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    let mut crossed_residual_filter = false;
     for step in (0..preceding_ops.len()).rev() {
         let prev_schema = &schemas[step];
         match &preceding_ops[step] {
             Operator::Filter {
                 projection: None, ..
-            } => {}
+            } => {
+                crossed_residual_filter = true;
+            }
             Operator::Filter {
                 projection: Some(indices),
                 ..
             } => {
+                crossed_residual_filter = true;
                 expr = expr
                     .transform_up(|node| {
                         if let Some(col) = node.downcast_ref::<Column>() {
@@ -862,6 +866,11 @@ fn remap_probe_key_to_scan(
                 }
             }
         }
+    }
+    // Never push a potentially-fallible expression (e.g. `CAST(s AS BIGINT)`)
+    // below an unpushed residual `Operator::Filter` that may guard it.
+    if crossed_residual_filter && !expr.is::<Column>() {
+        return Ok(None);
     }
     let has_subquery = expr.exists(|e| Ok(e.is::<ScalarSubqueryExpr>()))?;
     if is_volatile(&expr) || has_subquery {

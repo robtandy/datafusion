@@ -2931,3 +2931,101 @@ async fn dynamic_join_filter_cascades_across_multi_join_build_chain() -> Result<
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_preserves_cross_column_guards_on_cast_join_key() -> Result<()>
+{
+    // Regression test: `fact JOIN dim ON CAST(f.s AS BIGINT) = d.dk WHERE f.s <> '' AND f.kind = 'num'`
+    // with `pushdown_filters = true` and `enable_join_dynamic_filter_pushdown = true`
+    // must never evaluate `CAST(f.s AS BIGINT)` on rows rejected by `f.kind = 'num'`
+    // (such as `'abcN'` rows) or `f.s <> ''`.
+    let n = 4000usize;
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let s_vals: Vec<String> = (0..n)
+        .map(|i| match i % 4 {
+            0 => String::new(),
+            1 => format!("abc{i}"),
+            _ => format!("{}", 10 + (i % 500)),
+        })
+        .collect();
+    let kind_vals: Vec<&str> = (0..n)
+        .map(|i| if i % 4 == 1 { "txt" } else { "num" })
+        .collect();
+    let fact_batch = RecordBatch::try_new(
+        fact_schema,
+        vec![
+            Arc::new(StringArray::from(s_vals)),
+            Arc::new(StringArray::from(kind_vals)),
+            Arc::new(Int64Array::from_iter_values(0..n as i64)),
+        ],
+    )?;
+    let fact_dir = write_parquet_files(&[fact_batch], 2, 500)?;
+
+    // Build dim with 200 keys (> 150 InList threshold so both bounds AND Bloom fire).
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("dv", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        dim_schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..200i64).map(|i| 10 + i * 2),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..200i64)),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 200)?;
+
+    let sql = "SELECT COUNT(*) AS n, SUM(f.v + d.dv) AS total \
+               FROM fact f INNER JOIN dim d ON CAST(f.s AS BIGINT) = d.dk \
+               WHERE f.s <> '' AND f.kind = 'num'";
+
+    for reorder in [false, true] {
+        for dyn_join in [false, true] {
+            let make_ctx = |mode: &str| {
+                let fact_path = fact_dir.path().to_str().unwrap().to_owned();
+                let dim_path = dim_dir.path().to_str().unwrap().to_owned();
+                let mode = mode.to_owned();
+                async move {
+                    let mut cfg = SessionConfig::new().with_target_partitions(4);
+                    cfg.options_mut().execution.parquet.pushdown_filters = true;
+                    cfg.options_mut().execution.parquet.reorder_filters = reorder;
+                    cfg.options_mut().execution.parquet.pruning = true;
+                    cfg.options_mut().execution.collect_statistics = false;
+                    cfg.options_mut()
+                        .optimizer
+                        .enable_join_dynamic_filter_pushdown = dyn_join;
+                    let ctx = SessionContext::new_with_config(cfg);
+                    ctx.register_parquet(
+                        "fact",
+                        &fact_path,
+                        ParquetReadOptions::default(),
+                    )
+                    .await?;
+                    ctx.register_parquet("dim", &dim_path, ParquetReadOptions::default())
+                        .await?;
+                    ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                        .await?;
+                    Ok::<_, DataFusionError>(ctx)
+                }
+            };
+
+            let stock = make_ctx("off").await?;
+            let native = make_ctx("required").await?;
+            let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+            if dyn_join {
+                assert!(
+                    metric(plan.as_ref(), "join_dynamic_filters_pushed") > 0,
+                    "reorder={reorder}: expected dynamic filter pushdown on CAST join key"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}

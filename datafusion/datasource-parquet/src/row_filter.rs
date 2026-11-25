@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, BooleanBufferBuilder};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
@@ -70,7 +70,7 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
 };
-use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 
 use datafusion_physical_plan::metrics;
@@ -562,6 +562,11 @@ pub(crate) struct PrebuiltRowFilterCandidate {
     /// `reorder_predicates` is enabled. Stable across row groups within a
     /// file, so we cache it once.
     required_bytes: usize,
+    /// True (on the grouped morsel path) when any stage in `physical_exprs`
+    /// may fail on unfiltered rows (e.g. `CAST`, division, UDF, or dynamic
+    /// expression key). Used so `reorder_predicates` never moves a fallible
+    /// candidate ahead of preceding infallible guards.
+    has_fallible: bool,
 }
 
 impl PrebuiltRowFilterCandidate {
@@ -589,6 +594,23 @@ pub(crate) fn prebuild_row_filter_candidates(
     prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false, None)
 }
 
+fn contains_float_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => contains_float_type(f.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|f| contains_float_type(f.data_type()))
+        }
+        DataType::Dictionary(_, v) => contains_float_type(v),
+        _ => false,
+    }
+}
+
 /// Returns `true` when Parquet row-group statistics prove `expr` evaluates to
 /// `TRUE` for every row in every surviving row group of the file (accounting
 /// for NULLs via [`build_inverted_predicate`]).
@@ -597,6 +619,18 @@ fn conjunct_is_always_true(
     file_schema: &SchemaRef,
     pruning_stats: &RowGroupPruningStatistics<'_>,
 ) -> bool {
+    // Parquet min/max statistics omit IEEE-754 NaN values, so a row group
+    // whose stats satisfy e.g. `f <= 10.0` may still contain NaN rows that
+    // fail the predicate. Never elide conjuncts referencing floating-point
+    // columns based on min/max statistics.
+    if collect_columns(expr).iter().any(|c| {
+        file_schema
+            .fields()
+            .get(c.index())
+            .is_none_or(|f| contains_float_type(f.data_type()))
+    }) {
+        return false;
+    }
     let Ok(pp) = PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(file_schema))
         .try_build(Arc::clone(expr))
@@ -665,12 +699,21 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     let candidates = if group_same_column && candidates.len() > 1 {
         let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
         for mut cand in candidates {
-            if !cand.leaf_indices.is_empty()
-                && let Some(existing) = grouped.iter_mut().find(|g| {
-                    g.leaf_indices == cand.leaf_indices
-                        && g.read_plan.projected_schema == cand.read_plan.projected_schema
-                })
-            {
+            let same_leaves = |g: &FilterCandidate, c: &FilterCandidate| {
+                !c.leaf_indices.is_empty()
+                    && g.leaf_indices == c.leaf_indices
+                    && g.read_plan.projected_schema == c.read_plan.projected_schema
+            };
+            // Only merge into an earlier non-adjacent group when `cand` is
+            // infallible; never move a potentially-fallible conjunct (e.g.
+            // `CAST`, division, or dynamic expression key) ahead of an
+            // intervening guard on another column.
+            let target = if cand.last_is_infallible {
+                grouped.iter_mut().find(|g| same_leaves(g, &cand))
+            } else {
+                grouped.last_mut().filter(|g| same_leaves(g, &cand))
+            };
+            if let Some(existing) = target {
                 let next_expr = cand.exprs.pop().expect("non-empty candidate exprs");
                 if existing.last_is_infallible && cand.last_is_infallible {
                     let tail =
@@ -692,6 +735,8 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
+            let has_fallible =
+                group_same_column && !candidate.exprs.iter().all(is_infallible_expr);
             let physical_exprs = candidate
                 .exprs
                 .into_iter()
@@ -703,6 +748,7 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
                 physical_exprs,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
+                has_fallible,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -727,7 +773,18 @@ pub(crate) fn row_filter_from_prebuilt(
     // can sort without disturbing the shared cache.
     let mut ordered: Vec<&PrebuiltRowFilterCandidate> = prebuilt.iter().collect();
     if reorder_predicates {
-        ordered.sort_unstable_by_key(|c| c.required_bytes);
+        if ordered.iter().any(|c| c.has_fallible) {
+            // Keep infallible guards ahead of potentially-fallible candidates
+            // and preserve the original order among fallible candidates.
+            ordered.sort_by_key(|c| {
+                (
+                    c.has_fallible,
+                    if c.has_fallible { 0 } else { c.required_bytes },
+                )
+            });
+        } else {
+            ordered.sort_unstable_by_key(|c| c.required_bytes);
+        }
     }
 
     let total = ordered.len();
@@ -2478,5 +2535,88 @@ mod test {
         assert!(grouped.iter().all(|c| !c.reads_leaf(0)));
         assert_eq!(grouped.iter().filter(|c| c.reads_leaf(1)).count(), 1);
         assert_eq!(grouped.iter().filter(|c| c.reads_leaf(2)).count(), 1);
+    }
+
+    #[test]
+    fn test_group_same_column_keeps_float_nan_and_does_not_reorder_fallible_past_guard() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    1.0,
+                    f64::NAN,
+                    2.0,
+                    3.0,
+                ])),
+                Arc::new(StringArray::from(vec!["", "abc", "4", "10"])),
+                Arc::new(StringArray::from(vec!["num", "txt", "num", "num"])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // 1. Float column with NaN: `f <= 10.0` MUST NOT be elided even though
+        // Parquet min/max stats are [1.0, 3.0] with 0 nulls!
+        let float_expr = col("f").lt_eq(lit(10.0f64)).and(col("kind").eq(lit("num")));
+        let float_phys = logical2physical(&float_expr, &file_schema);
+        let float_grouped = prebuild_row_filter_candidates_with_grouping(
+            &float_phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            float_grouped.len(),
+            2,
+            "f <= 10.0 must not be elided on Float64"
+        );
+        assert_eq!(float_grouped.iter().filter(|c| c.reads_leaf(0)).count(), 1);
+
+        // 2. Fallible conjunct `CAST(s AS INT) > 5` after intervening `kind = 'num'`
+        // MUST NOT be merged into the earlier `s <> ''` group ahead of `kind = 'num'`.
+        let guard_expr = col("s")
+            .not_eq(lit(""))
+            .and(col("kind").eq(lit("num")))
+            .and(
+                Expr::Cast(Cast::new(Box::new(col("s")), DataType::Int32)).gt(lit(5i32)),
+            );
+        let guard_phys = logical2physical(&guard_expr, &file_schema);
+        let guard_grouped = prebuild_row_filter_candidates_with_grouping(
+            &guard_phys,
+            &file_schema,
+            &metadata,
+            true,
+            Some(&[0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            guard_grouped.len(),
+            3,
+            "fallible CAST(s AS INT) must stay after intervening `kind = 'num'` guard"
+        );
+        assert!(!guard_grouped[0].has_fallible);
+        assert!(!guard_grouped[1].has_fallible);
+        assert!(guard_grouped[2].has_fallible);
     }
 }
