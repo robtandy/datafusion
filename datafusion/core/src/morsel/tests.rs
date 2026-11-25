@@ -2626,3 +2626,82 @@ async fn post_aggregate_sort_and_topn_lifecycle_gate_and_drop_cleanup() -> Resul
     assert_eq!(pool.reserved(), 0);
     Ok(())
 }
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn sort_with_shared_utf8view_slices_keeps_one_run_per_worker_and_bounded_pool()
+-> Result<()> {
+    use arrow::array::StringViewBuilder;
+    use arrow::compute::SortOptions;
+    use datafusion_physical_expr::PhysicalSortExpr;
+
+    // 100K-row (~6.6 MB) Utf8View batch stored as 400 zero-copy slices of 250 rows.
+    // Without deduplicating buffer accounting, 400 * 6.6 MB = 2.6 GB would OOM and
+    // trigger hundreds of local sort run flushes.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8View, false),
+    ]));
+    let total_rows = 100_000usize;
+    let ids: Vec<i32> = (0..total_rows as i32).rev().collect();
+    let mut vb = StringViewBuilder::with_capacity(total_rows);
+    for i in 0..total_rows {
+        vb.append_value(format!(
+            "item-name-{:06}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            (i * 37) % total_rows
+        ));
+    }
+    let big_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+    )?;
+    let slices: Vec<RecordBatch> = (0..total_rows)
+        .step_by(250)
+        .map(|s| big_batch.slice(s, 250))
+        .collect();
+    assert_eq!(slices.len(), 400);
+
+    let ordering = LexOrdering::from([
+        PhysicalSortExpr::new(Arc::new(Column::new("name", 1)), SortOptions::default()),
+        PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default()),
+    ]);
+    let workers = 4usize;
+    let sink = SortSink::try_new(Arc::clone(&schema), ordering, 0, None)?.unwrap();
+    let run_count = Arc::clone(&sink.completed_run_count);
+    let pipeline = Pipeline {
+        source: Source::Memory(MemorySource {
+            table: "sliced_views".into(),
+            batches: slices,
+            projection: None,
+            schema: Arc::clone(&schema),
+        }),
+        operators: vec![],
+        workers: NonZeroUsize::new(workers).unwrap(),
+        sink: Sink::Sort {
+            sink,
+            result_operators: vec![],
+        },
+        sink_capacity: SORT_RESULT_CAPACITY,
+    };
+    let plan = MorselExec::try_new(pipeline, schema)?;
+    let weak = Arc::downgrade(&plan.pipeline);
+    // 48 MiB pool: vastly smaller than 400 * 6.6 MB (~2.6 GB), easily fits 1x shared buffer + rows.
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(48 * 1024 * 1024));
+    let ctx = task_with_pool_and_batch_size(Arc::clone(&pool), 256)?;
+    let mut stream = plan.execute(0, ctx)?;
+    let mut out_rows = 0usize;
+    while let Some(batch) = timeout(DEADLINE, stream.next()).await.unwrap() {
+        out_rows += batch?.num_rows();
+    }
+    assert_eq!(out_rows, total_rows);
+    let produced_runs = run_count.load(Ordering::Relaxed);
+    assert!(
+        (1..=workers).contains(&produced_runs),
+        "expected at most 1 sorted run per worker (<= {workers}), got {produced_runs}"
+    );
+    drop(stream);
+    drop(plan);
+    assert_workers_stopped(&weak).await;
+    assert_eq!(pool.reserved(), 0);
+    Ok(())
+}

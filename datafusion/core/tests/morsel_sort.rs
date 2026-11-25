@@ -11,7 +11,8 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeStringArray, MapBuilder, RecordBatch, StringArray,
-    StringBuilder, StringViewArray, TimestampMicrosecondArray, UInt64Array,
+    StringBuilder, StringViewArray, StringViewBuilder, TimestampMicrosecondArray,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::row::{OwnedRow, RowConverter, SortField};
@@ -1054,5 +1055,155 @@ async fn morsel_metrics_138_explain_and_oom_cleanup_end_to_end() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn topn_utf8view_zero_copy_slices_bounded_pool_repro() -> Result<()> {
+    // Repro from PR #198 review: a ~6.6 MB Utf8View MemTable stored as zero-copy
+    // slices, ORDER BY id DESC LIMIT 10, under a 48 MB (and tighter 4 MB) pool.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("payload", DataType::Utf8View, false),
+    ]));
+    let total_rows = 100_000usize;
+    let ids: Vec<i32> = (0..total_rows as i32).collect();
+    let mut vb = StringViewBuilder::with_capacity(total_rows);
+    for i in 0..total_rows {
+        vb.append_value(format!(
+            "utf8view-row-{i:06}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ));
+    }
+    let backing = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+    )?;
+    // Partition into 4 partitions of 50 zero-copy slices (200 slices x 500 rows).
+    let mut partitions: Vec<Vec<RecordBatch>> = vec![vec![]; 4];
+    for (idx, start) in (0..total_rows).step_by(500).enumerate() {
+        partitions[idx % 4].push(backing.slice(start, 500));
+    }
+    let table = Arc::new(MemTable::try_new(schema, partitions)?);
+
+    let sql = "SELECT id, payload FROM sliced_views ORDER BY id DESC LIMIT 10";
+    let stock = stock_context(4, 8192);
+    stock.register_table("sliced_views", table.clone())?;
+
+    for budget in [4 * 1024 * 1024usize, 48 * 1024 * 1024usize] {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(budget));
+        let native = morsel_context_with_pool(4, 8192, Arc::clone(&pool), false)?;
+        native.register_table("sliced_views", table.clone())?;
+        let (_plan, actual) = assert_ordered_parity(&stock, &native, sql).await?;
+        assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        assert_eq!(pool.reserved(), 0, "budget={budget}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parquet_join_utf8view_topn_and_sort_bounded_pool_and_small_batch_sizes()
+-> Result<()> {
+    // Repro from PR #198 review: Parquet HashJoin where dim holds >12-byte Utf8View
+    // strings and fact probes dim at batch_size 8192, 1024, and 256 under a bounded pool.
+    let dim_rows = 20_000usize;
+    let fact_rows = 80_000usize;
+
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..dim_rows as i64)),
+            Arc::new(StringArray::from_iter_values((0..dim_rows).map(|i| {
+                format!(
+                    "dim-product-{:06}-long-utf8view-payload-string-buffer-check",
+                    (i * 97) % dim_rows
+                )
+            }))),
+            Arc::new(Int64Array::from_iter_values(
+                (0..dim_rows).map(|i| (i as i64) * 3 - 500),
+            )),
+        ],
+    )?;
+    let dim_dir =
+        write_parquet_files(std::slice::from_ref(&dim_batch), 2, 10_000, false)?;
+
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("k", DataType::Int64, false),
+    ]));
+    let fact_batch = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..fact_rows as i64)),
+            Arc::new(Int64Array::from_iter_values(
+                (0..fact_rows).map(|i| ((i * 131 + 7) % dim_rows) as i64),
+            )),
+        ],
+    )?;
+    let fact_dir =
+        write_parquet_files(std::slice::from_ref(&fact_batch), 4, 10_000, true)?;
+
+    // With 312 batches at batch_size=256 and ~1.5 MB dim Utf8View buffers, naive per-batch
+    // buffer charging would reserve >450 MB. A 64 MB pool easily suffices with deduplication.
+    let queries = [
+        "SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY d.name, f.id LIMIT 100",
+        "SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY f.id",
+        "SELECT d.name, f.id FROM fact_pq f JOIN dim_pq d ON f.k = d.k ORDER BY d.name, f.id",
+    ];
+
+    for batch_size in [8192usize, 1024usize, 256usize] {
+        let stock = stock_context(4, batch_size);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let native = morsel_context_with_pool(4, batch_size, Arc::clone(&pool), false)?;
+        for ctx in [&stock, &native] {
+            ctx.register_parquet(
+                "dim_pq",
+                dim_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+            ctx.register_parquet(
+                "fact_pq",
+                fact_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        }
+        // Verify Parquet read dim.name as Utf8View (DataFusion default).
+        let check_plan = physical(&native, queries[0]).await?;
+        assert_eq!(
+            check_plan.schema().field(0).data_type(),
+            &DataType::Utf8View
+        );
+
+        for sql in queries {
+            assert_ordered_parity(&stock, &native, sql).await?;
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "batch_size={batch_size} sql=`{sql}` leaked memory"
+            );
+        }
+    }
+
+    // Grouped aggregate emitting slices over Utf8View group keys -> full Sort under bounded pool.
+    let stock_agg = stock_context(4, 256);
+    let agg_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+    let native_agg = morsel_context_with_pool(4, 256, Arc::clone(&agg_pool), false)?;
+    for ctx in [&stock_agg, &native_agg] {
+        ctx.register_parquet(
+            "dim_pq",
+            dim_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    }
+    let agg_sql = "SELECT name, COUNT(*) AS n, SUM(weight) AS sw FROM dim_pq GROUP BY name ORDER BY name ASC";
+    assert_ordered_parity(&stock_agg, &native_agg, agg_sql).await?;
+    assert_eq!(agg_pool.reserved(), 0);
     Ok(())
 }

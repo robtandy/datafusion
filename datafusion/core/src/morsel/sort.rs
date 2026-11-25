@@ -6,7 +6,7 @@
 //! Sort (`ORDER BY ...`) sinks for the experimental morsel engine.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,23 +15,29 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, RecordBatch, RecordBatchOptions,
-    UInt32Array,
+    Array, ArrayDataBuilder, ArrayRef, ArrowPrimitiveType, BinaryViewArray, ByteView,
+    GenericByteArray, GenericByteViewArray, LargeStringArray, NullBufferBuilder,
+    PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
+    UInt32Array, make_array,
 };
+use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::compute::{
-    SortOptions, concat_batches, interleave_record_batch, lexsort_to_indices,
+    SortOptions, concat, concat_batches, interleave_record_batch, lexsort_to_indices,
     take_arrays, take_record_batch,
 };
 use arrow::datatypes::{
-    ArrowNativeTypeOp, DataType, Date32Type, Date64Type, Float32Type, Float64Type,
-    Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    ArrowNativeTypeOp, BinaryViewType, ByteViewType, DataType, Date32Type, Date64Type,
+    Float32Type, Float64Type, GenericStringType, Int8Type, Int16Type, Int32Type,
+    Int64Type, Schema, SchemaRef, StringViewType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::row::{RowConverter, SortField};
 use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::utils::memory::get_record_batch_memory_size;
+use datafusion_common::utils::memory::{
+    RecordBatchMemoryCounter, RecordBatchMemoryTracker,
+};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_expr::ColumnarValue;
@@ -41,15 +47,19 @@ use datafusion_physical_plan::execution_plan::apply_expression_roots;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use futures::{Stream, StreamExt};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::batch::{BatchView, Selection};
 use super::metrics::{self, RunMetrics};
 use super::{Operator, apply_operators};
 
-/// Maximum buffered bytes per worker-local sort run before flushing to a sorted run.
-/// Bounds peak temporary memory during `concat_batches` while keeping merge fan-in tiny.
+/// Maximum incremental buffered bytes (after the first batch's shared buffers)
+/// per worker-local sort run before flushing to a sorted run. Bounds peak
+/// temporary memory on huge single-worker sorts while keeping ~1 run per worker
+/// even when batches inherit large shared view buffers (e.g. from a hash join).
 const MAX_LOCAL_SORT_RUN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_INLINE_VIEW_LEN: u32 = 12;
 
 pub(super) fn is_supported_sort_key_type(dt: &DataType) -> bool {
     match dt {
@@ -119,19 +129,572 @@ pub(super) fn validate_sort_ordering(
     Ok(Ok(sort_fields))
 }
 
+// ---------------------------------------------------------------------------
+// View array compaction & deduplicating concat (Utf8View / BinaryView)
+// ---------------------------------------------------------------------------
+
+fn data_type_has_view(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::Dictionary(_, value) => data_type_has_view(value),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => data_type_has_view(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|f| data_type_has_view(f.data_type()))
+        }
+        _ => false,
+    }
+}
+
+fn schema_has_view(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|f| data_type_has_view(f.data_type()))
+}
+
+fn dedup_buffer_entries(buffers: &[Buffer]) -> (Vec<u32>, Vec<Buffer>) {
+    let mut first_index: HashMap<(*const u8, usize), u32> =
+        HashMap::with_capacity(buffers.len());
+    let mut unique: Vec<Buffer> = Vec::with_capacity(buffers.len());
+    let remap = buffers
+        .iter()
+        .map(|buffer| {
+            *first_index
+                .entry((buffer.as_ptr(), buffer.len()))
+                .or_insert_with(|| {
+                    unique.push(buffer.clone());
+                    (unique.len() - 1) as u32
+                })
+        })
+        .collect();
+    (remap, unique)
+}
+
+/// Compact or deduplicate a `GenericByteViewArray` so taking a small subset of
+/// rows does not pin multi-megabyte source data buffers, while avoiding copying
+/// shared bytes when many rows reference a smaller deduplicated buffer set.
+fn compact_view_array<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+) -> Option<GenericByteViewArray<T>> {
+    let buffers = array.data_buffers();
+    if buffers.is_empty() {
+        return None;
+    }
+
+    let (remap, unique) = dedup_buffer_entries(buffers);
+    let unique_size: usize = unique.iter().map(|b| b.len()).sum();
+    let used_bytes = array.total_buffer_bytes_used();
+    if used_bytes < unique_size || (unique.len() > 1 && used_bytes <= unique_size) {
+        return Some(array.gc());
+    }
+    if unique.len() == buffers.len() {
+        return None;
+    }
+
+    let views: Vec<u128> = array
+        .views()
+        .iter()
+        .enumerate()
+        .map(|(i, &raw)| {
+            if array.is_null(i) {
+                0
+            } else if (raw as u32) <= MAX_INLINE_VIEW_LEN {
+                raw
+            } else {
+                let view = ByteView::from(raw);
+                ByteView {
+                    buffer_index: remap[view.buffer_index as usize],
+                    ..view
+                }
+                .as_u128()
+            }
+        })
+        .collect();
+
+    // SAFETY: every non-null, non-inline view points at the same bytes as
+    // before, in an entry of `unique` that holds the same buffer, and inline
+    // views are unchanged.
+    Some(unsafe {
+        GenericByteViewArray::new_unchecked(
+            ScalarBuffer::from(views),
+            unique.into(),
+            array.nulls().cloned(),
+        )
+    })
+}
+
+fn gc_view_array(array: &ArrayRef) -> Result<(ArrayRef, bool)> {
+    match array.data_type() {
+        DataType::Utf8View => {
+            let sv = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("Utf8View array");
+            Ok(match compact_view_array(sv) {
+                Some(compacted) => (Arc::new(compacted) as ArrayRef, true),
+                None => (Arc::clone(array), false),
+            })
+        }
+        DataType::BinaryView => {
+            let bv = array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .expect("BinaryView array");
+            Ok(match compact_view_array(bv) {
+                Some(compacted) => (Arc::new(compacted) as ArrayRef, true),
+                None => (Arc::clone(array), false),
+            })
+        }
+        dt if data_type_has_view(dt) => {
+            let data = array.to_data();
+            if data.child_data().is_empty() {
+                return Ok((Arc::clone(array), false));
+            }
+            let mut mutated = false;
+            let mut child_data = Vec::with_capacity(data.child_data().len());
+            for child in data.child_data() {
+                let child_array = make_array(child.clone());
+                let (gc_child, child_mutated) = gc_view_array(&child_array)?;
+                mutated |= child_mutated;
+                child_data.push(gc_child.to_data());
+            }
+            if !mutated {
+                return Ok((Arc::clone(array), false));
+            }
+            let rebuilt = ArrayDataBuilder::new(data.data_type().clone())
+                .len(data.len())
+                .offset(data.offset())
+                .nulls(data.nulls().cloned())
+                .buffers(data.buffers().to_vec())
+                .child_data(child_data)
+                .build()?;
+            Ok((make_array(rebuilt), true))
+        }
+        _ => Ok((Arc::clone(array), false)),
+    }
+}
+
+fn gc_view_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    if !schema_has_view(batch.schema().as_ref()) {
+        return Ok(batch.clone());
+    }
+    let mut mutated = false;
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for col in batch.columns() {
+        let (gc_col, col_mutated) = gc_view_array(col)?;
+        mutated |= col_mutated;
+        new_columns.push(gc_col);
+    }
+    if mutated {
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        Ok(RecordBatch::try_new_with_options(
+            batch.schema(),
+            new_columns,
+            &options,
+        )?)
+    } else {
+        Ok(batch.clone())
+    }
+}
+
+/// Single-pass deduplicating concat for `GenericByteViewArray` columns.
+/// Avoids Arrow `concat`'s naive `data_buffers` concatenation (which duplicates
+/// shared buffers once per input batch and explodes buffer-reference counts on
+/// small-batch join probes).
+fn concat_view_arrays<T: ByteViewType>(
+    arrays: &[&dyn Array],
+    total_rows: usize,
+) -> GenericByteViewArray<T> {
+    let mut first_index: HashMap<(*const u8, usize), u32> = HashMap::new();
+    let mut unique_buffers: Vec<Buffer> = Vec::new();
+    let mut views: Vec<u128> = Vec::with_capacity(total_rows);
+    let any_nulls = arrays.iter().any(|a| a.null_count() > 0);
+    let mut null_builder = any_nulls.then(|| NullBufferBuilder::new(total_rows));
+
+    for &raw_arr in arrays {
+        let arr = raw_arr
+            .as_any()
+            .downcast_ref::<GenericByteViewArray<T>>()
+            .expect("view array type mismatch");
+        if arr.is_empty() {
+            continue;
+        }
+        let mut is_identity = true;
+        let mut remap = Vec::with_capacity(arr.data_buffers().len());
+        for (local_idx, buffer) in arr.data_buffers().iter().enumerate() {
+            let global_idx = *first_index
+                .entry((buffer.as_ptr(), buffer.len()))
+                .or_insert_with(|| {
+                    unique_buffers.push(buffer.clone());
+                    (unique_buffers.len() - 1) as u32
+                });
+            if global_idx as usize != local_idx {
+                is_identity = false;
+            }
+            remap.push(global_idx);
+        }
+
+        if let Some(nb) = null_builder.as_mut() {
+            if let Some(nulls) = arr.nulls() {
+                nb.append_buffer(nulls);
+            } else {
+                nb.append_n_non_nulls(arr.len());
+            }
+        }
+
+        if is_identity {
+            views.extend_from_slice(arr.views());
+        } else if arr.null_count() == 0 {
+            views.extend(arr.views().iter().map(|&raw| {
+                if (raw as u32) <= MAX_INLINE_VIEW_LEN {
+                    raw
+                } else {
+                    let view = ByteView::from(raw);
+                    ByteView {
+                        buffer_index: remap[view.buffer_index as usize],
+                        ..view
+                    }
+                    .as_u128()
+                }
+            }));
+        } else {
+            views.extend(arr.views().iter().enumerate().map(|(i, &raw)| {
+                if arr.is_null(i) {
+                    0
+                } else if (raw as u32) <= MAX_INLINE_VIEW_LEN {
+                    raw
+                } else {
+                    let view = ByteView::from(raw);
+                    ByteView {
+                        buffer_index: remap[view.buffer_index as usize],
+                        ..view
+                    }
+                    .as_u128()
+                }
+            }));
+        }
+    }
+
+    let nulls = null_builder.and_then(|mut nb| nb.finish());
+    // SAFETY: every non-null, non-inline view points into `unique_buffers` at
+    // the exact byte range of its original buffer; inline views are unchanged.
+    let result = unsafe {
+        GenericByteViewArray::new_unchecked(
+            ScalarBuffer::from(views),
+            unique_buffers.into(),
+            nulls,
+        )
+    };
+    let unique_size: usize = result.data_buffers().iter().map(|b| b.len()).sum();
+    let used_bytes = result.total_buffer_bytes_used();
+    if used_bytes < unique_size
+        || (result.data_buffers().len() > 1 && used_bytes <= unique_size)
+    {
+        result.gc()
+    } else {
+        result
+    }
+}
+
+fn concat_batches_compact_views(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<RecordBatch> {
+    if !schema_has_view(schema.as_ref()) {
+        return Ok(concat_batches(schema, batches)?);
+    }
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows == 0 {
+        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        match field.data_type() {
+            DataType::Utf8View => {
+                let col_refs: Vec<&dyn Array> =
+                    batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+                columns.push(Arc::new(concat_view_arrays::<StringViewType>(
+                    &col_refs, total_rows,
+                )));
+            }
+            DataType::BinaryView => {
+                let col_refs: Vec<&dyn Array> =
+                    batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+                columns.push(Arc::new(concat_view_arrays::<BinaryViewType>(
+                    &col_refs, total_rows,
+                )));
+            }
+            dt if data_type_has_view(dt) => {
+                let compacted: Vec<ArrayRef> = batches
+                    .iter()
+                    .map(|b| gc_view_array(b.column(col_idx)).map(|(a, _)| a))
+                    .collect::<Result<_>>()?;
+                let col_refs: Vec<&dyn Array> =
+                    compacted.iter().map(Arc::as_ref).collect();
+                columns.push(concat(&col_refs)?);
+            }
+            _ => {
+                let col_refs: Vec<&dyn Array> =
+                    batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+                columns.push(concat(&col_refs)?);
+            }
+        }
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(total_rows));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &options,
+    )?)
+}
+
+// ---------------------------------------------------------------------------
+// Shared deduplicating memory tracker for parallel Sort workers & runs
+// ---------------------------------------------------------------------------
+
+struct SharedSortMemoryInner {
+    tracker: RecordBatchMemoryTracker,
+    extra_bytes: usize,
+    reservation: MemoryReservation,
+}
+
+/// Deduplicates shared Arrow buffers across all workers and sorted runs of one
+/// `SortSink` execution so inherited buffers (e.g. hash-join build `Utf8View`
+/// buffers or zero-copy `MemTable`/aggregate slices) are reserved once instead
+/// of once per batch or per worker.
+pub(super) struct SharedSortMemory {
+    inner: Mutex<SharedSortMemoryInner>,
+}
+
+impl SharedSortMemory {
+    pub(super) fn new(reservation: MemoryReservation) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(SharedSortMemoryInner {
+                tracker: RecordBatchMemoryTracker::new(),
+                extra_bytes: 0,
+                reservation,
+            }),
+        })
+    }
+
+    fn count_batch(&self, batch: &RecordBatch) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.tracker.count_batch(batch);
+        let needed = inner
+            .tracker
+            .memory_usage()
+            .saturating_add(inner.extra_bytes);
+        if let Err(err) = inner.reservation.try_resize(needed) {
+            inner.tracker.uncount_batch(batch);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn uncount_batch(&self, batch: &RecordBatch) {
+        let mut inner = self.inner.lock();
+        inner.tracker.uncount_batch(batch);
+        let needed = inner
+            .tracker
+            .memory_usage()
+            .saturating_add(inner.extra_bytes);
+        inner.reservation.resize(needed);
+    }
+
+    fn uncount_batches(&self, batches: &[RecordBatch]) {
+        if batches.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for batch in batches {
+            inner.tracker.uncount_batch(batch);
+        }
+        let needed = inner
+            .tracker
+            .memory_usage()
+            .saturating_add(inner.extra_bytes);
+        inner.reservation.resize(needed);
+    }
+
+    fn reserve_extra(&self, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock();
+        let new_extra = inner.extra_bytes.saturating_add(bytes);
+        let needed = inner.tracker.memory_usage().saturating_add(new_extra);
+        inner.reservation.try_resize(needed)?;
+        inner.extra_bytes = new_extra;
+        Ok(())
+    }
+
+    fn adjust_extra(&self, old_bytes: usize, new_bytes: usize) -> Result<()> {
+        if old_bytes == new_bytes {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock();
+        let new_extra = inner
+            .extra_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        let needed = inner.tracker.memory_usage().saturating_add(new_extra);
+        inner.reservation.try_resize(needed)?;
+        inner.extra_bytes = new_extra;
+        Ok(())
+    }
+
+    fn release_extra(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        inner.extra_bytes = inner.extra_bytes.saturating_sub(bytes);
+        let needed = inner
+            .tracker
+            .memory_usage()
+            .saturating_add(inner.extra_bytes);
+        inner.reservation.resize(needed);
+    }
+}
+
+/// RAII guard ensuring `batches` are uncounted from `shared` *before* they are
+/// dropped (satisfying `RecordBatchMemoryTracker`'s contract on every error/unwind).
+struct TrackedBatches {
+    batches: Vec<RecordBatch>,
+    shared: Arc<SharedSortMemory>,
+}
+
+impl TrackedBatches {
+    fn take_single(mut self) -> RecordBatch {
+        debug_assert_eq!(self.batches.len(), 1);
+        self.batches.pop().unwrap()
+    }
+}
+
+impl Drop for TrackedBatches {
+    fn drop(&mut self) {
+        self.shared.uncount_batches(&self.batches);
+    }
+}
+
+struct TrackedBatch {
+    batch: Option<RecordBatch>,
+    shared: Arc<SharedSortMemory>,
+}
+
+impl TrackedBatch {
+    fn into_inner(mut self) -> RecordBatch {
+        self.batch.take().expect("TrackedBatch already taken")
+    }
+}
+
+impl Drop for TrackedBatch {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.as_ref() {
+            self.shared.uncount_batch(batch);
+        }
+    }
+}
+
+struct TrackedExtra {
+    bytes: usize,
+    shared: Arc<SharedSortMemory>,
+}
+
+impl TrackedExtra {
+    fn try_new(shared: Arc<SharedSortMemory>, bytes: usize) -> Result<Self> {
+        shared.reserve_extra(bytes)?;
+        Ok(Self { bytes, shared })
+    }
+
+    fn try_resize(&mut self, new_bytes: usize) -> Result<()> {
+        self.shared.adjust_extra(self.bytes, new_bytes)?;
+        self.bytes = new_bytes;
+        Ok(())
+    }
+
+    fn into_bytes(mut self) -> usize {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for TrackedExtra {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.shared.release_extra(self.bytes);
+            self.bytes = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sorted runs & k-way merge emission (shared by TopN and Sort)
+// ---------------------------------------------------------------------------
+
 /// A worker-local sorted run ready for k-way merge or direct emission.
 pub(super) enum SortedRun {
     /// Lazily slices `indices` and gathers `batch_size` chunks on demand.
-    Indexed {
-        batch: RecordBatch,
-        indices: UInt32Array,
-        reservation: MemoryReservation,
-    },
+    Indexed(IndexedRun),
     /// Already-materialized sorted chunks (used by TopN).
-    Batches {
-        batches: Vec<RecordBatch>,
-        reservation: MemoryReservation,
-    },
+    Batches(Box<BatchedRun>),
+}
+
+pub(super) struct IndexedRun {
+    batch: Option<RecordBatch>,
+    indices: UInt32Array,
+    indices_bytes: usize,
+    shared: Arc<SharedSortMemory>,
+}
+
+impl IndexedRun {
+    fn release(&mut self) {
+        if let Some(batch) = self.batch.as_ref() {
+            self.shared.uncount_batch(batch);
+        }
+        self.batch = None;
+        if self.indices_bytes > 0 {
+            self.shared.release_extra(self.indices_bytes);
+            self.indices_bytes = 0;
+        }
+    }
+}
+
+impl Drop for IndexedRun {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub(super) struct BatchedRun {
+    batches: VecDeque<RecordBatch>,
+    tracker: RecordBatchMemoryTracker,
+    reservation: MemoryReservation,
+}
+
+impl BatchedRun {
+    fn pop_front(&mut self) -> Option<RecordBatch> {
+        let next = self.batches.pop_front()?;
+        self.tracker.uncount_batch(&next);
+        self.reservation.resize(self.tracker.memory_usage());
+        Some(next)
+    }
+
+    fn release(&mut self) {
+        for batch in &self.batches {
+            self.tracker.uncount_batch(batch);
+        }
+        self.batches.clear();
+        self.reservation.free();
+    }
+}
+
+impl Drop for BatchedRun {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 struct SortedRunStream {
@@ -141,39 +704,24 @@ struct SortedRunStream {
 
 enum SortedRunStreamState {
     Indexed {
-        batch: Option<RecordBatch>,
-        indices: UInt32Array,
+        run: IndexedRun,
         offset: usize,
         batch_size: usize,
-        reservation: MemoryReservation,
     },
     Batches {
-        batches: VecDeque<RecordBatch>,
-        reservation: MemoryReservation,
+        run: Box<BatchedRun>,
     },
 }
 
 impl SortedRunStream {
     fn from_run(run: SortedRun, schema: SchemaRef, batch_size: usize) -> Self {
         let state = match run {
-            SortedRun::Indexed {
-                batch,
-                indices,
-                reservation,
-            } => SortedRunStreamState::Indexed {
-                batch: Some(batch),
-                indices,
+            SortedRun::Indexed(run) => SortedRunStreamState::Indexed {
+                run,
                 offset: 0,
                 batch_size: batch_size.max(1),
-                reservation,
             },
-            SortedRun::Batches {
-                batches,
-                reservation,
-            } => SortedRunStreamState::Batches {
-                batches: batches.into(),
-                reservation,
-            },
+            SortedRun::Batches(run) => SortedRunStreamState::Batches { run },
         };
         Self { schema, state }
     }
@@ -188,54 +736,53 @@ impl Stream for SortedRunStream {
     ) -> Poll<Option<Self::Item>> {
         match &mut self.state {
             SortedRunStreamState::Indexed {
-                batch,
-                indices,
+                run,
                 offset,
                 batch_size,
-                reservation,
             } => {
-                if *offset >= indices.len() {
-                    *batch = None;
-                    reservation.free();
+                if *offset >= run.indices.len() {
+                    run.release();
                     return Poll::Ready(None);
                 }
-                let Some(backing) = batch.as_ref() else {
-                    reservation.free();
+                let Some(backing) = run.batch.as_ref() else {
+                    run.release();
                     return Poll::Ready(None);
                 };
-                let len = (indices.len() - *offset).min(*batch_size);
-                let slice = indices.slice(*offset, len);
+                let len = (run.indices.len() - *offset).min(*batch_size);
+                let slice = run.indices.slice(*offset, len);
                 *offset += len;
-                let result =
-                    take_arrays(backing.columns(), &slice, None).and_then(|columns| {
+                let result = take_arrays(backing.columns(), &slice, None)
+                    .and_then(|columns| {
                         let options = RecordBatchOptions::new().with_row_count(Some(len));
                         RecordBatch::try_new_with_options(
                             backing.schema(),
                             columns,
                             &options,
                         )
+                    })
+                    .map_err(Into::into)
+                    .and_then(|chunk| {
+                        // Compact view columns when taking a chunk from a larger run
+                        // so StreamingMergeBuilder's BatchBuilder and FieldCursorStream
+                        // do not charge every chunk for the entire run's data buffers.
+                        if backing.num_rows() > len {
+                            gc_view_batch(&chunk)
+                        } else {
+                            Ok(chunk)
+                        }
                     });
-                if *offset >= indices.len() {
-                    *batch = None;
-                    reservation.free();
+                if *offset >= run.indices.len() {
+                    run.release();
                 }
-                Poll::Ready(Some(result.map_err(Into::into)))
+                Poll::Ready(Some(result))
             }
-            SortedRunStreamState::Batches {
-                batches,
-                reservation,
-            } => {
-                let Some(next) = batches.pop_front() else {
-                    reservation.free();
-                    return Poll::Ready(None);
-                };
-                let bytes = get_record_batch_memory_size(&next);
-                let _ = reservation.try_shrink(bytes);
-                if batches.is_empty() {
-                    reservation.free();
+            SortedRunStreamState::Batches { run } => match run.pop_front() {
+                Some(next) => Poll::Ready(Some(Ok(next))),
+                None => {
+                    run.release();
+                    Poll::Ready(None)
                 }
-                Poll::Ready(Some(Ok(next)))
-            }
+            },
         }
     }
 }
@@ -281,61 +828,58 @@ async fn emit_sorted_runs(
     if runs.len() == 1 {
         let run = runs.into_iter().next().unwrap();
         match run {
-            SortedRun::Indexed {
-                batch,
-                indices,
-                reservation,
-            } => {
-                let total = indices.len();
+            SortedRun::Indexed(mut run) => {
+                let total = run.indices.len();
                 let start = skip.min(total);
                 let remaining = total - start;
                 let len = fetch.map_or(remaining, |f| f.min(remaining));
                 if len == 0 {
-                    reservation.free();
+                    run.release();
                     return Ok(());
                 }
-                let sliced = indices.slice(start, len);
+                let sliced = run.indices.slice(start, len);
                 let chunk_size = batch_size.max(1);
                 let mut offset = 0;
                 while offset < sliced.len() {
                     if tx.is_closed() {
-                        reservation.free();
+                        run.release();
                         return Ok(());
                     }
                     let take_len = (sliced.len() - offset).min(chunk_size);
                     let chunk_idx = sliced.slice(offset, take_len);
                     offset += take_len;
-                    let columns = take_arrays(batch.columns(), &chunk_idx, None)?;
+                    let backing = run.batch.as_ref().expect("indexed run batch");
+                    let columns = take_arrays(backing.columns(), &chunk_idx, None)?;
                     let options =
                         RecordBatchOptions::new().with_row_count(Some(take_len));
                     let out = RecordBatch::try_new_with_options(
-                        batch.schema(),
+                        backing.schema(),
                         columns,
                         &options,
                     )?;
+                    let out = if backing.num_rows() > take_len {
+                        gc_view_batch(&out)?
+                    } else {
+                        out
+                    };
                     let projected = apply_operators(result_operators, out)?;
                     if projected.num_rows() > 0
                         && !send_batch(&tx, projected, measurement).await
                     {
-                        reservation.free();
+                        run.release();
                         return Ok(());
                     }
                 }
-                reservation.free();
+                run.release();
                 return Ok(());
             }
-            SortedRun::Batches {
-                batches,
-                reservation,
-            } => {
+            SortedRun::Batches(mut run) => {
                 let mut remaining_skip = skip;
                 let mut remaining_fetch = fetch;
-                for batch in batches {
+                while let Some(batch) = run.pop_front() {
                     if tx.is_closed() || remaining_fetch == Some(0) {
                         break;
                     }
-                    let bytes = get_record_batch_memory_size(&batch);
-                    let _ = reservation.try_shrink(bytes);
                     let Some(sliced) = slice_skip_fetch(
                         batch,
                         &mut remaining_skip,
@@ -350,7 +894,7 @@ async fn emit_sorted_runs(
                         break;
                     }
                 }
-                reservation.free();
+                run.release();
                 return Ok(());
             }
         }
@@ -534,7 +1078,7 @@ impl TopNSink {
             heap: BinaryHeap::new(),
             batches: Vec::new(),
             retained_rows: 0,
-            retained_batch_bytes: 0,
+            batch_memory: RecordBatchMemoryTracker::new(),
             key_bytes: 0,
             first_col_fast,
             reservation,
@@ -601,8 +1145,7 @@ impl PartialOrd for TopNHeapEntry {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PrimitiveThreshold {
+enum FirstColThreshold {
     Int8(Option<i8>),
     Int16(Option<i16>),
     Int32(Option<i32>),
@@ -613,13 +1156,14 @@ enum PrimitiveThreshold {
     UInt64(Option<u64>),
     Float32(Option<f32>),
     Float64(Option<f64>),
+    Str(Option<Box<str>>),
 }
 
 struct FirstColFastPath {
     col_idx: usize,
     options: SortOptions,
     is_single_key: bool,
-    threshold: Option<PrimitiveThreshold>,
+    threshold: Option<FirstColThreshold>,
 }
 
 #[inline]
@@ -656,13 +1200,40 @@ fn compare_opt_primitive<T: ArrowNativeTypeOp>(
 }
 
 #[inline]
-fn passes_threshold<T: ArrowNativeTypeOp>(
-    candidate: Option<T>,
-    threshold: Option<T>,
+fn compare_opt_str(
+    candidate: Option<&str>,
+    threshold: Option<&str>,
     options: SortOptions,
-    is_single_key: bool,
-) -> bool {
-    let ord = compare_opt_primitive(candidate, threshold, options);
+) -> CmpOrdering {
+    match (candidate, threshold) {
+        (None, None) => CmpOrdering::Equal,
+        (None, Some(_)) => {
+            if options.nulls_first {
+                CmpOrdering::Less
+            } else {
+                CmpOrdering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if options.nulls_first {
+                CmpOrdering::Greater
+            } else {
+                CmpOrdering::Less
+            }
+        }
+        (Some(a), Some(b)) => {
+            let ord = a.cmp(b);
+            if options.descending {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
+}
+
+#[inline]
+fn passes_ord(ord: CmpOrdering, is_single_key: bool) -> bool {
     if is_single_key {
         ord == CmpOrdering::Less
     } else {
@@ -685,9 +1256,6 @@ fn scan_primitive_array<P>(
     let has_nulls = array.null_count() > 0;
     if !has_nulls {
         let Some(t) = threshold else {
-            // Threshold is NULL and array has no NULLs:
-            // - nulls_first => every non-null value is strictly greater => 0 candidates.
-            // - nulls_last  => every non-null value is strictly less => all selected rows.
             if !options.nulls_first {
                 match selection {
                     Selection::All => out.extend(0..(values.len() as u32)),
@@ -707,11 +1275,7 @@ fn scan_primitive_array<P>(
             } else {
                 v.compare(t)
             };
-            if is_single_key {
-                ord == CmpOrdering::Less
-            } else {
-                ord != CmpOrdering::Greater
-            }
+            passes_ord(ord, is_single_key)
         };
         match selection {
             Selection::All => {
@@ -743,7 +1307,7 @@ fn scan_primitive_array<P>(
             } else {
                 Some(values[i])
             };
-            passes_threshold(v, threshold, options, is_single_key)
+            passes_ord(compare_opt_primitive(v, threshold, options), is_single_key)
         };
         match selection {
             Selection::All => {
@@ -772,6 +1336,62 @@ fn scan_primitive_array<P>(
 }
 
 impl FirstColFastPath {
+    fn scan_str_accessor<'a, F>(
+        &self,
+        len: usize,
+        has_nulls: bool,
+        get_opt: F,
+        selection: &Selection,
+        threshold: Option<&str>,
+        out: &mut Vec<u32>,
+    ) where
+        F: Fn(usize) -> Option<&'a str>,
+    {
+        if !has_nulls && threshold.is_none() {
+            if !self.options.nulls_first {
+                match selection {
+                    Selection::All => out.extend(0..(len as u32)),
+                    Selection::Mask { bits, .. } => {
+                        out.extend(bits.set_indices().map(|i| i as u32));
+                    }
+                    Selection::Indices(indices) => {
+                        out.extend_from_slice(indices.values());
+                    }
+                }
+            }
+            return;
+        }
+        let check = |i: usize| -> bool {
+            passes_ord(
+                compare_opt_str(get_opt(i), threshold, self.options),
+                self.is_single_key,
+            )
+        };
+        match selection {
+            Selection::All => {
+                for i in 0..len {
+                    if check(i) {
+                        out.push(i as u32);
+                    }
+                }
+            }
+            Selection::Mask { bits, .. } => {
+                for i in bits.set_indices() {
+                    if check(i) {
+                        out.push(i as u32);
+                    }
+                }
+            }
+            Selection::Indices(indices) => {
+                for &idx in indices.values() {
+                    if check(idx as usize) {
+                        out.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
     fn try_new(ordering: &LexOrdering, schema: &Schema) -> Option<Self> {
         let first = ordering.first();
         let col = first.expr.downcast_ref::<Column>()?;
@@ -791,6 +1411,9 @@ impl FirstColFastPath {
                 | DataType::Date32
                 | DataType::Date64
                 | DataType::Timestamp(_, _)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
         );
         supported.then_some(Self {
             col_idx: col.index(),
@@ -808,42 +1431,42 @@ impl FirstColFastPath {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int8Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int8((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int8((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Int16 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int16Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int16((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int16((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Int32 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int32Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int32((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int32((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Date32 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Date32Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int32((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int32((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Int64 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int64Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int64((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int64((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Date64 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Date64Type>>()
                     .unwrap();
-                PrimitiveThreshold::Int64((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::Int64((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Timestamp(unit, _) => {
                 let val = match unit {
@@ -876,48 +1499,42 @@ impl FirstColFastPath {
                         (!a.is_null(row_idx)).then(|| a.value(row_idx))
                     }
                 };
-                PrimitiveThreshold::Int64(val)
+                FirstColThreshold::Int64(val)
             }
             DataType::UInt8 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt8Type>>()
                     .unwrap();
-                PrimitiveThreshold::UInt8((!a.is_null(row_idx)).then(|| a.value(row_idx)))
+                FirstColThreshold::UInt8((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::UInt16 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt16Type>>()
                     .unwrap();
-                PrimitiveThreshold::UInt16(
-                    (!a.is_null(row_idx)).then(|| a.value(row_idx)),
-                )
+                FirstColThreshold::UInt16((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::UInt32 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt32Type>>()
                     .unwrap();
-                PrimitiveThreshold::UInt32(
-                    (!a.is_null(row_idx)).then(|| a.value(row_idx)),
-                )
+                FirstColThreshold::UInt32((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::UInt64 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt64Type>>()
                     .unwrap();
-                PrimitiveThreshold::UInt64(
-                    (!a.is_null(row_idx)).then(|| a.value(row_idx)),
-                )
+                FirstColThreshold::UInt64((!a.is_null(row_idx)).then(|| a.value(row_idx)))
             }
             DataType::Float32 => {
                 let a = col
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Float32Type>>()
                     .unwrap();
-                PrimitiveThreshold::Float32(
+                FirstColThreshold::Float32(
                     (!a.is_null(row_idx)).then(|| a.value(row_idx)),
                 )
             }
@@ -926,8 +1543,26 @@ impl FirstColFastPath {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Float64Type>>()
                     .unwrap();
-                PrimitiveThreshold::Float64(
+                FirstColThreshold::Float64(
                     (!a.is_null(row_idx)).then(|| a.value(row_idx)),
+                )
+            }
+            DataType::Utf8 => {
+                let a = col.as_any().downcast_ref::<StringArray>().unwrap();
+                FirstColThreshold::Str(
+                    (!a.is_null(row_idx)).then(|| a.value(row_idx).into()),
+                )
+            }
+            DataType::LargeUtf8 => {
+                let a = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                FirstColThreshold::Str(
+                    (!a.is_null(row_idx)).then(|| a.value(row_idx).into()),
+                )
+            }
+            DataType::Utf8View => {
+                let a = col.as_any().downcast_ref::<StringViewArray>().unwrap();
+                FirstColThreshold::Str(
+                    (!a.is_null(row_idx)).then(|| a.value(row_idx).into()),
                 )
             }
             _ => return,
@@ -936,7 +1571,7 @@ impl FirstColFastPath {
     }
 
     fn filter_candidates(&self, view: &BatchView) -> Option<Vec<u32>> {
-        let threshold = self.threshold?;
+        let threshold = self.threshold.as_ref()?;
         let batch = view.batch();
         if batch.num_rows() > u32::MAX as usize {
             return None;
@@ -945,60 +1580,60 @@ impl FirstColFastPath {
         let sel = view.selection();
         let mut out = Vec::new();
         match (col.data_type(), threshold) {
-            (DataType::Int8, PrimitiveThreshold::Int8(t)) => scan_primitive_array(
+            (DataType::Int8, FirstColThreshold::Int8(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Int8Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Int16, PrimitiveThreshold::Int16(t)) => scan_primitive_array(
+            (DataType::Int16, FirstColThreshold::Int16(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Int16Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Int32, PrimitiveThreshold::Int32(t)) => scan_primitive_array(
+            (DataType::Int32, FirstColThreshold::Int32(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Int32Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Date32, PrimitiveThreshold::Int32(t)) => scan_primitive_array(
+            (DataType::Date32, FirstColThreshold::Int32(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Date32Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Int64, PrimitiveThreshold::Int64(t)) => scan_primitive_array(
+            (DataType::Int64, FirstColThreshold::Int64(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Int64Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Date64, PrimitiveThreshold::Int64(t)) => scan_primitive_array(
+            (DataType::Date64, FirstColThreshold::Int64(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Date64Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Timestamp(unit, _), PrimitiveThreshold::Int64(t)) => match unit {
+            (DataType::Timestamp(unit, _), FirstColThreshold::Int64(t)) => match unit {
                 arrow::datatypes::TimeUnit::Second => scan_primitive_array(
                     col.as_any()
                         .downcast_ref::<PrimitiveArray<TimestampSecondType>>()?,
                     sel,
-                    t,
+                    *t,
                     self.options,
                     self.is_single_key,
                     &mut out,
@@ -1007,7 +1642,7 @@ impl FirstColFastPath {
                     col.as_any()
                         .downcast_ref::<PrimitiveArray<TimestampMillisecondType>>()?,
                     sel,
-                    t,
+                    *t,
                     self.options,
                     self.is_single_key,
                     &mut out,
@@ -1016,7 +1651,7 @@ impl FirstColFastPath {
                     col.as_any()
                         .downcast_ref::<PrimitiveArray<TimestampMicrosecondType>>()?,
                     sel,
-                    t,
+                    *t,
                     self.options,
                     self.is_single_key,
                     &mut out,
@@ -1025,60 +1660,97 @@ impl FirstColFastPath {
                     col.as_any()
                         .downcast_ref::<PrimitiveArray<TimestampNanosecondType>>()?,
                     sel,
-                    t,
+                    *t,
                     self.options,
                     self.is_single_key,
                     &mut out,
                 ),
             },
-            (DataType::UInt8, PrimitiveThreshold::UInt8(t)) => scan_primitive_array(
+            (DataType::UInt8, FirstColThreshold::UInt8(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<UInt8Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::UInt16, PrimitiveThreshold::UInt16(t)) => scan_primitive_array(
+            (DataType::UInt16, FirstColThreshold::UInt16(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<UInt16Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::UInt32, PrimitiveThreshold::UInt32(t)) => scan_primitive_array(
+            (DataType::UInt32, FirstColThreshold::UInt32(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<UInt32Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::UInt64, PrimitiveThreshold::UInt64(t)) => scan_primitive_array(
+            (DataType::UInt64, FirstColThreshold::UInt64(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<UInt64Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Float32, PrimitiveThreshold::Float32(t)) => scan_primitive_array(
+            (DataType::Float32, FirstColThreshold::Float32(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Float32Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
-            (DataType::Float64, PrimitiveThreshold::Float64(t)) => scan_primitive_array(
+            (DataType::Float64, FirstColThreshold::Float64(t)) => scan_primitive_array(
                 col.as_any().downcast_ref::<PrimitiveArray<Float64Type>>()?,
                 sel,
-                t,
+                *t,
                 self.options,
                 self.is_single_key,
                 &mut out,
             ),
+            (DataType::Utf8, FirstColThreshold::Str(t)) => {
+                let a = col
+                    .as_any()
+                    .downcast_ref::<GenericByteArray<GenericStringType<i32>>>()?;
+                self.scan_str_accessor(
+                    a.len(),
+                    a.null_count() > 0,
+                    |i| (!a.is_null(i)).then(|| a.value(i)),
+                    sel,
+                    t.as_deref(),
+                    &mut out,
+                );
+            }
+            (DataType::LargeUtf8, FirstColThreshold::Str(t)) => {
+                let a = col
+                    .as_any()
+                    .downcast_ref::<GenericByteArray<GenericStringType<i64>>>()?;
+                self.scan_str_accessor(
+                    a.len(),
+                    a.null_count() > 0,
+                    |i| (!a.is_null(i)).then(|| a.value(i)),
+                    sel,
+                    t.as_deref(),
+                    &mut out,
+                );
+            }
+            (DataType::Utf8View, FirstColThreshold::Str(t)) => {
+                let a = col.as_any().downcast_ref::<StringViewArray>()?;
+                self.scan_str_accessor(
+                    a.len(),
+                    a.null_count() > 0,
+                    |i| (!a.is_null(i)).then(|| a.value(i)),
+                    sel,
+                    t.as_deref(),
+                    &mut out,
+                );
+            }
             _ => return None,
         }
         Some(out)
@@ -1092,7 +1764,7 @@ pub(super) struct TopNState {
     heap: BinaryHeap<TopNHeapEntry>,
     batches: Vec<RecordBatch>,
     retained_rows: usize,
-    retained_batch_bytes: usize,
+    batch_memory: RecordBatchMemoryTracker,
     key_bytes: usize,
     first_col_fast: Option<FirstColFastPath>,
     reservation: MemoryReservation,
@@ -1102,7 +1774,8 @@ pub(super) struct TopNState {
 
 impl TopNState {
     fn current_memory_bytes(&self) -> usize {
-        self.retained_batch_bytes
+        self.batch_memory
+            .memory_usage()
             .saturating_add(self.key_bytes)
             .saturating_add(
                 self.heap
@@ -1228,18 +1901,23 @@ impl TopNState {
         }
         self.heap = BinaryHeap::from(entries);
 
-        let compacted = take_record_batch(batch, &UInt32Array::from(take_indices))?;
+        let raw_compacted = take_record_batch(batch, &UInt32Array::from(take_indices))?;
+        // Compact Utf8View/BinaryView columns so retained winners do not pin
+        // multi-megabyte source buffers.
+        let compacted = gc_view_batch(&raw_compacted)?;
+        drop(raw_compacted);
+
         let compacted_rows = compacted.num_rows();
-        let compacted_bytes = get_record_batch_memory_size(&compacted);
+        self.batch_memory.count_batch(&compacted);
+        if let Err(err) = self.update_reservation() {
+            self.batch_memory.uncount_batch(&compacted);
+            return Err(err);
+        }
         self.batches.push(compacted);
         self.retained_rows = self.retained_rows.saturating_add(compacted_rows);
-        self.retained_batch_bytes =
-            self.retained_batch_bytes.saturating_add(compacted_bytes);
         #[cfg(test)]
         self.peak_retained_rows
             .fetch_max(self.retained_rows, AtomicOrdering::Relaxed);
-
-        self.update_reservation()?;
 
         if self.retained_rows > self.limit.saturating_mul(2) && self.batches.len() > 1 {
             self.compact()?;
@@ -1250,9 +1928,11 @@ impl TopNState {
 
     fn compact(&mut self) -> Result<()> {
         if self.heap.is_empty() {
+            for old in &self.batches {
+                self.batch_memory.uncount_batch(old);
+            }
             self.batches.clear();
             self.retained_rows = 0;
-            self.retained_batch_bytes = 0;
             self.update_reservation()?;
             return Ok(());
         }
@@ -1264,22 +1944,31 @@ impl TopNState {
             entry.row_idx = new_idx as u32;
         }
         let batch_refs: Vec<&RecordBatch> = self.batches.iter().collect();
-        let compacted = interleave_record_batch(&batch_refs, &interleave_indices)?;
-        let compacted_bytes = get_record_batch_memory_size(&compacted);
+        let raw_compacted = interleave_record_batch(&batch_refs, &interleave_indices)?;
+        let compacted = gc_view_batch(&raw_compacted)?;
+        drop(raw_compacted);
         let compacted_rows = compacted.num_rows();
-        // Account for peak memory while both old and compacted batches are live.
-        self.reservation.try_grow(compacted_bytes)?;
 
+        // Account for peak memory while both old and compacted batches are live.
+        self.batch_memory.count_batch(&compacted);
+        if let Err(err) = self.update_reservation() {
+            self.batch_memory.uncount_batch(&compacted);
+            return Err(err);
+        }
+
+        // Uncount old batches *before* dropping them.
+        for old in &self.batches {
+            self.batch_memory.uncount_batch(old);
+        }
         self.batches.clear();
         self.batches.push(compacted);
         self.retained_rows = compacted_rows;
-        self.retained_batch_bytes = compacted_bytes;
         self.heap = BinaryHeap::from(entries);
         self.update_reservation()?;
         Ok(())
     }
 
-    pub(super) fn finish(self, batch_size: usize) -> Result<Option<SortedRun>> {
+    pub(super) fn finish(mut self, batch_size: usize) -> Result<Option<SortedRun>> {
         if self.heap.is_empty() {
             self.reservation.free();
             return Ok(None);
@@ -1291,24 +1980,40 @@ impl TopNState {
             .map(|e| (e.batch_idx as usize, e.row_idx as usize))
             .collect();
         drop(sorted_entries);
+        self.key_bytes = 0;
 
         let batch_refs: Vec<&RecordBatch> = self.batches.iter().collect();
         let chunk_size = batch_size.max(1);
-        let mut out_batches = Vec::with_capacity(indices.len().div_ceil(chunk_size));
-        let mut out_bytes = 0usize;
+        let mut out_batches = VecDeque::with_capacity(indices.len().div_ceil(chunk_size));
+        let mut out_tracker = RecordBatchMemoryTracker::new();
         for chunk in indices.chunks(chunk_size) {
-            let out = interleave_record_batch(&batch_refs, chunk)?;
-            let b = get_record_batch_memory_size(&out);
-            self.reservation.try_grow(b)?;
-            out_bytes = out_bytes.saturating_add(b);
-            out_batches.push(out);
+            let raw = interleave_record_batch(&batch_refs, chunk)?;
+            let out = gc_view_batch(&raw)?;
+            drop(raw);
+            self.batch_memory.count_batch(&out);
+            out_tracker.count_batch(&out);
+            let peak = self.batch_memory.memory_usage();
+            if let Err(err) = self.reservation.try_resize(peak) {
+                self.batch_memory.uncount_batch(&out);
+                out_tracker.uncount_batch(&out);
+                for b in &out_batches {
+                    self.batch_memory.uncount_batch(b);
+                    out_tracker.uncount_batch(b);
+                }
+                return Err(err);
+            }
+            out_batches.push_back(out);
+        }
+        for old in &self.batches {
+            self.batch_memory.uncount_batch(old);
         }
         drop(self.batches);
-        self.reservation.try_resize(out_bytes)?;
-        Ok(Some(SortedRun::Batches {
+        self.reservation.resize(out_tracker.memory_usage());
+        Ok(Some(SortedRun::Batches(Box::new(BatchedRun {
             batches: out_batches,
+            tracker: out_tracker,
             reservation: self.reservation,
-        }))
+        }))))
     }
 }
 
@@ -1324,6 +2029,8 @@ pub(super) struct SortSink {
     fetch: Option<usize>,
     #[cfg(test)]
     pub(super) finalize_gate: Option<super::tests::FinalizeGate>,
+    #[cfg(test)]
+    pub(super) completed_run_count: Arc<AtomicUsize>,
 }
 
 impl SortSink {
@@ -1343,6 +2050,8 @@ impl SortSink {
             fetch,
             #[cfg(test)]
             finalize_gate: None,
+            #[cfg(test)]
+            completed_run_count: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -1372,15 +2081,18 @@ impl SortSink {
         write!(f, "]")
     }
 
-    pub(super) fn new_state(&self, reservation: MemoryReservation) -> SortState {
+    pub(super) fn new_state(&self, shared_memory: Arc<SharedSortMemory>) -> SortState {
         SortState {
             schema: Arc::clone(&self.schema),
             ordering: self.ordering.clone(),
             batches: Vec::new(),
             buffered_rows: 0,
-            buffered_bytes: 0,
+            local_counter: RecordBatchMemoryCounter::new(),
+            first_batch_bytes: None,
             completed_runs: Vec::new(),
-            reservation,
+            shared_memory,
+            #[cfg(test)]
+            completed_run_count: Arc::clone(&self.completed_run_count),
         }
     }
 
@@ -1417,9 +2129,18 @@ pub(super) struct SortState {
     ordering: LexOrdering,
     batches: Vec<RecordBatch>,
     buffered_rows: usize,
-    buffered_bytes: usize,
+    local_counter: RecordBatchMemoryCounter,
+    first_batch_bytes: Option<usize>,
     completed_runs: Vec<SortedRun>,
-    reservation: MemoryReservation,
+    shared_memory: Arc<SharedSortMemory>,
+    #[cfg(test)]
+    completed_run_count: Arc<AtomicUsize>,
+}
+
+impl Drop for SortState {
+    fn drop(&mut self) {
+        self.shared_memory.uncount_batches(&self.batches);
+    }
 }
 
 impl SortState {
@@ -1431,8 +2152,12 @@ impl SortState {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        let incremental_bytes = self
+            .local_counter
+            .memory_usage()
+            .saturating_sub(self.first_batch_bytes.unwrap_or(0));
         if !self.batches.is_empty()
-            && (self.buffered_bytes >= MAX_LOCAL_SORT_RUN_BYTES
+            && (incremental_bytes >= MAX_LOCAL_SORT_RUN_BYTES
                 || self
                     .buffered_rows
                     .checked_add(batch.num_rows())
@@ -1440,10 +2165,12 @@ impl SortState {
         {
             self.flush_current_batches()?;
         }
-        let bytes = get_record_batch_memory_size(&batch);
-        self.reservation.try_grow(bytes)?;
+        self.shared_memory.count_batch(&batch)?;
+        self.local_counter.count_batch(&batch);
+        if self.first_batch_bytes.is_none() {
+            self.first_batch_bytes = Some(self.local_counter.memory_usage());
+        }
         self.buffered_rows += batch.num_rows();
-        self.buffered_bytes += bytes;
         self.batches.push(batch);
         Ok(())
     }
@@ -1452,48 +2179,61 @@ impl SortState {
         if self.batches.is_empty() {
             return Ok(());
         }
-        let batches = std::mem::take(&mut self.batches);
-        let chunk_bytes = std::mem::take(&mut self.buffered_bytes);
+        let tracked = TrackedBatches {
+            batches: std::mem::take(&mut self.batches),
+            shared: Arc::clone(&self.shared_memory),
+        };
         self.buffered_rows = 0;
-        let run_res = self.reservation.split(chunk_bytes);
+        self.local_counter = RecordBatchMemoryCounter::new();
+        self.first_batch_bytes = None;
 
-        let merged = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+        let merged_guard = if tracked.batches.len() == 1 {
+            TrackedBatch {
+                batch: Some(tracked.take_single()),
+                shared: Arc::clone(&self.shared_memory),
+            }
         } else {
-            run_res.try_grow(chunk_bytes)?;
-            let merged = concat_batches(&self.schema, &batches)?;
-            drop(batches);
-            let merged_bytes = get_record_batch_memory_size(&merged);
-            run_res.try_resize(merged_bytes)?;
-            merged
+            let merged = concat_batches_compact_views(&self.schema, &tracked.batches)?;
+            self.shared_memory.count_batch(&merged)?;
+            let guard = TrackedBatch {
+                batch: Some(merged),
+                shared: Arc::clone(&self.shared_memory),
+            };
+            drop(tracked);
+            guard
         };
 
+        let merged_ref = merged_guard.batch.as_ref().expect("merged batch");
         let sort_columns = self
             .ordering
             .iter()
-            .map(|e| e.evaluate_to_sort_column(&merged))
+            .map(|e| e.evaluate_to_sort_column(merged_ref))
             .collect::<Result<Vec<_>>>()?;
-        let indices_bytes = merged.num_rows().saturating_mul(size_of::<u32>());
-        run_res.try_grow(indices_bytes)?;
+        let est_indices_bytes = merged_ref.num_rows().saturating_mul(size_of::<u32>());
+        let mut indices_guard =
+            TrackedExtra::try_new(Arc::clone(&self.shared_memory), est_indices_bytes)?;
         let indices = lexsort_to_indices(&sort_columns, None)?;
         drop(sort_columns);
+        indices_guard.try_resize(indices.get_array_memory_size())?;
 
-        let final_bytes = get_record_batch_memory_size(&merged)
-            .saturating_add(indices.get_array_memory_size());
-        run_res.try_resize(final_bytes)?;
+        let merged = merged_guard.into_inner();
+        let indices_bytes = indices_guard.into_bytes();
+        #[cfg(test)]
+        self.completed_run_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
-        self.completed_runs.push(SortedRun::Indexed {
-            batch: merged,
+        self.completed_runs.push(SortedRun::Indexed(IndexedRun {
+            batch: Some(merged),
             indices,
-            reservation: run_res,
-        });
+            indices_bytes,
+            shared: Arc::clone(&self.shared_memory),
+        }));
         Ok(())
     }
 
     pub(super) fn finish(mut self) -> Result<Vec<SortedRun>> {
         self.flush_current_batches()?;
-        self.reservation.free();
-        Ok(self.completed_runs)
+        Ok(std::mem::take(&mut self.completed_runs))
     }
 }
 
@@ -1501,7 +2241,7 @@ impl SortState {
 mod tests {
     use super::*;
 
-    use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::array::{Float64Array, Int32Array, StringArray, StringViewBuilder};
     use arrow::datatypes::Field;
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, UnboundedMemoryPool,
@@ -1538,8 +2278,6 @@ mod tests {
         let res = MemoryConsumer::new("test_topn").register(&pool);
         let mut state = sink.new_state(res)?;
 
-        // Feed 50,000 rows in strictly descending order across 50 batches so every
-        // incoming batch beats every previously seen row (worst-case for TopN!).
         for b in (0..50).rev() {
             let start = b * 1000;
             let ks: Vec<i32> = (start..start + 1000).rev().collect();
@@ -1571,16 +2309,12 @@ mod tests {
         );
 
         let run = state.finish(1024)?.expect("non-empty run");
-        let SortedRun::Batches {
-            batches,
-            reservation,
-        } = run
-        else {
+        let SortedRun::Batches(run) = run else {
             unreachable!()
         };
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let total_rows: usize = run.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, limit);
-        let ks = batches[0]
+        let ks = run.batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -1588,16 +2322,170 @@ mod tests {
         let expected: Vec<i32> = (0..limit as i32).collect();
         assert_eq!(ks.values().as_ref(), expected.as_slice());
 
-        drop(batches);
-        drop(reservation);
+        drop(run);
         assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 
     #[test]
-    fn topn_first_col_fast_path_handles_floats_and_nulls() -> Result<()> {
+    fn topn_utf8view_zero_copy_slices_bounds_memory_in_bytes() -> Result<()> {
+        // Repro from review: 6.6 MB Utf8View backing buffer stored as zero-copy slices,
+        // ORDER BY id DESC LIMIT 10 under a tight memory pool (much smaller than slices * 6.6 MB).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Utf8View, false),
+        ]));
+        let total_rows = 100_000usize;
+        let ids: Vec<i32> = (0..total_rows as i32).collect();
+        let mut vb = StringViewBuilder::with_capacity(total_rows);
+        for i in 0..total_rows {
+            vb.append_value(format!(
+                "view-row-{i:06}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ));
+        }
+        let big_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+        )?;
+
+        let ordering = LexOrdering::from([PhysicalSortExpr::new(
+            Arc::new(Column::new("id", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        )]);
+        let sink = TopNSink::try_new(Arc::clone(&schema), ordering, 0, 10)?.unwrap();
+        // 512 KiB pool is << 6.6 MB single backing buffer and << 1.3 GB uncompacted slices!
+        let pool = test_pool(Some(512 * 1024));
+        let mut state =
+            sink.new_state(MemoryConsumer::new("test_view_topn").register(&pool))?;
+
+        // Feed 200 zero-copy slices in ascending id order so EVERY slice beats the heap!
+        for start in (0..total_rows).step_by(500) {
+            let slice = big_batch.slice(start, 500);
+            state.add_view(&BatchView::all(slice))?;
+            assert!(
+                pool.reserved() < 128 * 1024,
+                "TopN reserved {} bytes on Utf8View slice (expected << 128 KiB)",
+                pool.reserved()
+            );
+        }
+
+        let run = state.finish(16)?.unwrap();
+        let SortedRun::Batches(run) = run else {
+            unreachable!()
+        };
+        let got = run.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let expected: Vec<i32> = ((total_rows - 10) as i32..total_rows as i32)
+            .rev()
+            .collect();
+        assert_eq!(got.values().as_ref(), expected.as_slice());
+        drop(run);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sort_state_shared_utf8view_buffers_produce_one_run_with_deduped_buffers()
+    -> Result<()> {
+        // Simulate 500 small probe batches (batch_size=256) all sharing the same
+        // multi-MB Utf8View data buffers from a hash-join build table.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8View, false),
+        ]));
+        let dim_rows = 50_000usize;
+        let mut vb = StringViewBuilder::with_capacity(dim_rows);
+        for i in 0..dim_rows {
+            vb.append_value(format!(
+                "dim-product-name-{i:06}-padding-to-exceed-inline-threshold"
+            ));
+        }
+        let dim_views = Arc::new(vb.finish()) as ArrayRef;
+        let dim_buf_bytes: usize = dim_views
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .data_buffers()
+            .iter()
+            .map(|b| b.len())
+            .sum();
+        assert!(dim_buf_bytes > 2 * 1024 * 1024);
+
+        let ordering = LexOrdering::from([
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("name", 1)),
+                SortOptions::default(),
+            ),
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default()),
+        ]);
+        let sink = SortSink::try_new(Arc::clone(&schema), ordering, 0, None)?.unwrap();
+        // Pool far smaller than 200 * dim_buf_bytes (~600 MB), but easily holds 1x shared buffers + rows.
+        let pool = test_pool(Some(32 * 1024 * 1024));
+        let shared = SharedSortMemory::new(
+            MemoryConsumer::new("test_sort_shared").register(&pool),
+        );
+        let mut state = sink.new_state(Arc::clone(&shared));
+
+        for b in 0..200 {
+            let take_idx = UInt32Array::from_iter_values(
+                (0..256).map(|i| ((b * 256 + i) % dim_rows) as u32),
+            );
+            let taken_names = arrow::compute::take(dim_views.as_ref(), &take_idx, None)?;
+            let ids = Arc::new(Int32Array::from_iter_values(
+                (0..256).map(|i| (b * 256 + i) as i32),
+            ));
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![ids, taken_names])?;
+            state.add_view(BatchView::all(batch))?;
+        }
+
+        let runs = state.finish()?;
+        assert_eq!(
+            runs.len(),
+            1,
+            "expected 1 sorted run, not per-batch flushes"
+        );
+        assert_eq!(sink.completed_run_count.load(AtomicOrdering::Relaxed), 1);
+        let SortedRun::Indexed(run) = &runs[0] else {
+            unreachable!()
+        };
+        let merged_sv = run
+            .batch
+            .as_ref()
+            .unwrap()
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let dim_buf_count = dim_views
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .data_buffers()
+            .len();
+        assert!(
+            merged_sv.data_buffers().len() <= dim_buf_count,
+            "expected deduplicated/compacted view buffers <= {dim_buf_count}, got {}",
+            merged_sv.data_buffers().len()
+        );
+
+        drop(runs);
+        drop(shared);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn topn_first_col_fast_path_handles_floats_strings_and_nulls() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("f", DataType::Float64, true),
+            Field::new("s", DataType::Utf8View, true),
             Field::new("id", DataType::Int32, false),
         ]));
         let values = vec![
@@ -1612,63 +2500,82 @@ mod tests {
             None,
             None,
         ];
+        let strings = vec![
+            Some("zebra-long-string-value-001"),
+            Some("alpha-long-string-value-002"),
+            None,
+            Some("alpha-long-string-value-002"),
+            Some("short"),
+            Some(""),
+            Some("middle-long-string-value-003"),
+            None,
+            Some("beta-long-string-value-004"),
+            Some("alpha"),
+        ];
         let ids: Vec<i32> = (0..values.len() as i32).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(Float64Array::from(values)),
+                Arc::new(StringViewArray::from(strings)),
                 Arc::new(Int32Array::from(ids)),
             ],
         )?;
 
-        for descending in [false, true] {
-            for nulls_first in [false, true] {
-                let options = SortOptions {
-                    descending,
-                    nulls_first,
-                };
-                let ordering = LexOrdering::from([
-                    PhysicalSortExpr::new(Arc::new(Column::new("f", 0)), options),
-                    PhysicalSortExpr::new(
-                        Arc::new(Column::new("id", 1)),
-                        SortOptions::default(),
-                    ),
-                ]);
-                let sink =
-                    TopNSink::try_new(Arc::clone(&schema), ordering.clone(), 0, 4)?
+        for col_idx in [0usize, 1usize] {
+            let col_name = schema.field(col_idx).name();
+            for descending in [false, true] {
+                for nulls_first in [false, true] {
+                    let options = SortOptions {
+                        descending,
+                        nulls_first,
+                    };
+                    let ordering = LexOrdering::from([
+                        PhysicalSortExpr::new(
+                            Arc::new(Column::new(col_name, col_idx)),
+                            options,
+                        ),
+                        PhysicalSortExpr::new(
+                            Arc::new(Column::new("id", 2)),
+                            SortOptions::default(),
+                        ),
+                    ]);
+                    let sink =
+                        TopNSink::try_new(Arc::clone(&schema), ordering.clone(), 0, 4)?
+                            .unwrap();
+                    let pool = test_pool(None);
+                    let mut state = sink.new_state(
+                        MemoryConsumer::new("test_fast_path").register(&pool),
+                    )?;
+                    for i in 0..batch.num_rows() {
+                        state.add_view(&BatchView::all(batch.slice(i, 1)))?;
+                    }
+                    let run = state.finish(16)?.unwrap();
+                    let SortedRun::Batches(run) = run else {
+                        unreachable!()
+                    };
+                    let got_ids = run.batches[0]
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
                         .unwrap();
-                let pool = test_pool(None);
-                let mut state =
-                    sink.new_state(MemoryConsumer::new("test_float").register(&pool))?;
-                // Feed row-by-row in slices so the heap fills and exercises threshold rejection.
-                for i in 0..batch.num_rows() {
-                    state.add_view(&BatchView::all(batch.slice(i, 1)))?;
-                }
-                let run = state.finish(16)?.unwrap();
-                let SortedRun::Batches { batches, .. } = run else {
-                    unreachable!()
-                };
-                let got_ids = batches[0]
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
 
-                let expected = datafusion_physical_plan::sorts::sort::sort_batch(
-                    &batch,
-                    &ordering,
-                    Some(4),
-                )?;
-                let exp_ids = expected
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                assert_eq!(
-                    got_ids.values().as_ref(),
-                    exp_ids.values().as_ref(),
-                    "mismatch for descending={descending}, nulls_first={nulls_first}"
-                );
+                    let expected = datafusion_physical_plan::sorts::sort::sort_batch(
+                        &batch,
+                        &ordering,
+                        Some(4),
+                    )?;
+                    let exp_ids = expected
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    assert_eq!(
+                        got_ids.values().as_ref(),
+                        exp_ids.values().as_ref(),
+                        "mismatch for col={col_name}, descending={descending}, nulls_first={nulls_first}"
+                    );
+                }
             }
         }
         Ok(())
@@ -1683,7 +2590,9 @@ mod tests {
         )]);
         let sink = SortSink::try_new(Arc::clone(&schema), ordering, 0, None)?.unwrap();
         let pool = test_pool(Some(128));
-        let mut state = sink.new_state(MemoryConsumer::new("test_sort").register(&pool));
+        let shared =
+            SharedSortMemory::new(MemoryConsumer::new("test_sort").register(&pool));
+        let mut state = sink.new_state(Arc::clone(&shared));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from_iter_values(0..1024))],
@@ -1697,6 +2606,7 @@ mod tests {
             "{err}"
         );
         drop(state);
+        drop(shared);
         assert_eq!(pool.reserved(), 0);
         Ok(())
     }

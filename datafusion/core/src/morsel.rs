@@ -81,7 +81,7 @@ pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
 use parquet::{ClaimedWork, ParquetScan, ReadyReaders};
-use sort::{SortSink, SortState, SortedRun, TopNSink, TopNState};
+use sort::{SharedSortMemory, SortSink, SortState, SortedRun, TopNSink, TopNState};
 #[cfg(test)]
 mod tests;
 
@@ -2051,6 +2051,27 @@ impl Sink {
     }
 }
 
+enum WorkerSinkMemory {
+    Reservation(MemoryReservation),
+    SharedSort(Arc<SharedSortMemory>),
+}
+
+impl WorkerSinkMemory {
+    fn into_reservation(self) -> MemoryReservation {
+        match self {
+            Self::Reservation(r) => r,
+            Self::SharedSort(_) => panic!("expected MemoryReservation"),
+        }
+    }
+
+    fn into_shared_sort(self) -> Arc<SharedSortMemory> {
+        match self {
+            Self::SharedSort(s) => s,
+            Self::Reservation(_) => panic!("expected SharedSortMemory"),
+        }
+    }
+}
+
 enum WorkerSink {
     Result(Box<ResultBuffer>),
     Count(CountState),
@@ -2374,7 +2395,7 @@ impl Pipeline {
     fn worker_sink(
         &self,
         batch_size: usize,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
     ) -> Result<WorkerSink> {
         Ok(match &self.sink {
             Sink::Result => {
@@ -2390,19 +2411,35 @@ impl Pipeline {
             }
             Sink::Count { .. } => WorkerSink::Count(CountState::default()),
             Sink::GroupCount { sink, .. } => WorkerSink::GroupCount(
-                sink.new_state(reservation.expect("group count reservation")),
+                sink.new_state(
+                    sink_memory
+                        .expect("group count reservation")
+                        .into_reservation(),
+                ),
             ),
             Sink::Aggregate { sink, .. } => WorkerSink::Aggregate(
-                sink.new_state(reservation.expect("aggregate reservation"))?,
+                sink.new_state(
+                    sink_memory
+                        .expect("aggregate reservation")
+                        .into_reservation(),
+                )?,
             ),
             Sink::TopN { sink, .. } => {
-                WorkerSink::TopN(sink.new_state(reservation.expect("topn reservation"))?)
+                WorkerSink::TopN(sink.new_state(
+                    sink_memory.expect("topn reservation").into_reservation(),
+                )?)
             }
             Sink::Sort { sink, .. } => {
-                WorkerSink::Sort(sink.new_state(reservation.expect("sort reservation")))
+                WorkerSink::Sort(sink.new_state(
+                    sink_memory.expect("sort shared memory").into_shared_sort(),
+                ))
             }
             Sink::HashJoinBuild(sink) => WorkerSink::HashJoinBuild(
-                sink.new_state(reservation.expect("hash join build reservation")),
+                sink.new_state(
+                    sink_memory
+                        .expect("hash join build reservation")
+                        .into_reservation(),
+                ),
             ),
         })
     }
@@ -2412,11 +2449,11 @@ impl Pipeline {
         source: &MemorySource,
         next: &AtomicUsize,
         output: WorkerOutput,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
         join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
         let mut join_state =
             join_context.map(|(tables, probe_reservation)| JoinWorkerState {
                 tables,
@@ -2466,11 +2503,11 @@ impl Pipeline {
         &self,
         ready: ReadyReaders,
         output: WorkerOutput,
-        reservation: Option<MemoryReservation>,
+        sink_memory: Option<WorkerSinkMemory>,
         join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
-        let mut sink = self.worker_sink(output.batch_size, reservation)?;
+        let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
         let mut join_state =
             join_context.map(|(tables, probe_reservation)| JoinWorkerState {
                 tables,
@@ -3006,7 +3043,9 @@ impl Pipeline {
                         Arc::clone(&next),
                         build_output.clone(),
                     );
-                    let reservation = Some(build_reservation.new_empty());
+                    let reservation = Some(WorkerSinkMemory::Reservation(
+                        build_reservation.new_empty(),
+                    ));
                     let join_ctx = nested_tables.as_ref().map(|t| {
                         (
                             Arc::clone(t),
@@ -3054,7 +3093,9 @@ impl Pipeline {
                         ready.clone(),
                         build_output.clone(),
                     );
-                    let reservation = Some(build_reservation.new_empty());
+                    let reservation = Some(WorkerSinkMemory::Reservation(
+                        build_reservation.new_empty(),
+                    ));
                     let join_ctx = nested_tables.as_ref().map(|t| {
                         (
                             Arc::clone(t),
@@ -3327,11 +3368,14 @@ impl Pipeline {
         // Consumer tasks: dynamically claim finalized aggregate batches and feed local TopN / Sort.
         let stage_reservation =
             MemoryConsumer::new(consumer_name).register(context.memory_pool());
+        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. })
+            .then(|| SharedSortMemory::new(stage_reservation.new_empty()));
         for id in 0..sort_workers {
             let pipeline = Arc::clone(self);
             let agg_rx = Arc::clone(&agg_rx);
             let output_tx = tx.clone();
             let reservation = stage_reservation.new_empty();
+            let shared_sort = shared_sort_memory.as_ref().map(Arc::clone);
             let mut worker =
                 WorkerMetrics::for_pipeline(measurement.cloned(), id, stage_label);
             tasks.spawn(async move {
@@ -3346,9 +3390,9 @@ impl Pipeline {
                     PostSort::TopN { sink, .. } => {
                         LocalPostState::TopN(sink.new_state(reservation)?)
                     }
-                    PostSort::Sort { sink, .. } => {
-                        LocalPostState::Sort(sink.new_state(reservation))
-                    }
+                    PostSort::Sort { sink, .. } => LocalPostState::Sort(
+                        sink.new_state(shared_sort.expect("shared sort memory")),
+                    ),
                 };
                 loop {
                     let maybe_batch = tokio::select! {
@@ -3383,6 +3427,7 @@ impl Pipeline {
             });
         }
         drop(stage_reservation);
+        drop(shared_sort_memory);
         drop(agg_rx);
 
         let mut sorted_runs = Vec::new();
@@ -3508,11 +3553,14 @@ impl Pipeline {
                 Sink::TopN { .. } => Some(
                     MemoryConsumer::new("MorselTopN").register(context.memory_pool()),
                 ),
-                Sink::Sort { .. } => Some(
-                    MemoryConsumer::new("MorselSort").register(context.memory_pool()),
-                ),
+                Sink::Sort { .. } => None,
                 Sink::Result | Sink::Count { .. } | Sink::HashJoinBuild(_) => None,
             };
+            let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
+                SharedSortMemory::new(
+                    MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+                )
+            });
             let mut combined_group = match (&self.sink, &sink_reservation) {
                 (Sink::GroupCount { sink, .. }, Some(reservation)) => {
                     Some(sink.new_state(reservation.new_empty()))
@@ -3543,9 +3591,13 @@ impl Pipeline {
                         for id in 0..self.workers.get().min(morsels) {
                             let (pipeline, next, output) =
                                 (Arc::clone(&self), Arc::clone(&next), output.clone());
-                            let reservation = sink_reservation
-                                .as_ref()
-                                .map(MemoryReservation::new_empty);
+                            let sink_memory = if let Some(shared) = &shared_sort_memory {
+                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            } else {
+                                sink_reservation
+                                    .as_ref()
+                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                            };
                             let join_ctx = finalized_tables.as_ref().map(|t| {
                                 (
                                     Arc::clone(t),
@@ -3575,7 +3627,7 @@ impl Pipeline {
                                         source,
                                         &next,
                                         output,
-                                        reservation,
+                                        sink_memory,
                                         join_ctx,
                                         worker,
                                     )
@@ -3594,9 +3646,13 @@ impl Pipeline {
                         for id in 0..self.workers.get() {
                             let (pipeline, ready, output) =
                                 (Arc::clone(&self), ready.clone(), output.clone());
-                            let reservation = sink_reservation
-                                .as_ref()
-                                .map(MemoryReservation::new_empty);
+                            let sink_memory = if let Some(shared) = &shared_sort_memory {
+                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                            } else {
+                                sink_reservation
+                                    .as_ref()
+                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                            };
                             let join_ctx = finalized_tables.as_ref().map(|t| {
                                 (
                                     Arc::clone(t),
@@ -3620,7 +3676,7 @@ impl Pipeline {
                                     .run_parquet_worker(
                                         ready,
                                         output,
-                                        reservation,
+                                        sink_memory,
                                         join_ctx,
                                         worker,
                                     )
@@ -3630,6 +3686,7 @@ impl Pipeline {
                     }
                 }
                 drop(sink_reservation);
+                drop(shared_sort_memory);
                 drop(probe_reservation);
                 while let Some(result) = tasks.join_next().await {
                     let local = match result {
@@ -3732,6 +3789,7 @@ impl Pipeline {
                 }
             } else {
                 drop(sink_reservation);
+                drop(shared_sort_memory);
             }
             // Release finalized join build tables as soon as probe workers finish,
             // before publishing tails or finalizing downstream aggregate sinks.
