@@ -2784,3 +2784,153 @@ async fn dynamic_join_filter_concurrent_repeated_runs_and_memory_cleanup() -> Re
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_join_filter_cascades_across_multi_join_build_chain() -> Result<()> {
+    // Mirror TPC-H Q5's cascading star-schema join chain:
+    //   `region (1 row: r_key = 2)` -> `nation (25 rows -> 5 rows)`
+    //   -> `supplier (sorted by s_nationkey across 10 RGs)` -> `fact`
+    // Reverse build order must execute `region` -> `nation` -> `supplier` -> `fact`
+    // so `nation`'s 5 keys prune `supplier` row groups via dynamic InList/bounds
+    // BEFORE `supplier` opens its Parquet row groups.
+    let region_schema = Arc::new(Schema::new(vec![
+        Field::new("r_key", DataType::Int64, false),
+        Field::new("r_name", DataType::Utf8, false),
+    ]));
+    let region_batch = RecordBatch::try_new(
+        region_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec![
+                "AFRICA",
+                "AMERICA",
+                "ASIA",
+                "EUROPE",
+                "MIDDLE EAST",
+            ])),
+        ],
+    )?;
+    let region_dir = write_parquet_files(&[region_batch], 1, 100)?;
+
+    let nation_schema = Arc::new(Schema::new(vec![
+        Field::new("n_key", DataType::Int64, false),
+        Field::new("n_region", DataType::Int64, false),
+        Field::new("n_name", DataType::Utf8, false),
+    ]));
+    let nation_batch = RecordBatch::try_new(
+        nation_schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..25i64)),
+            Arc::new(Int64Array::from_iter_values((0..25i64).map(|i| i / 5))),
+            Arc::new(StringArray::from_iter_values(
+                (0..25i64).map(|i| format!("NATION_{i:02}")),
+            )),
+        ],
+    )?;
+    let nation_dir = write_parquet_files(&[nation_batch], 1, 100)?;
+
+    // Supplier sorted by `s_nation` across 25 row groups (1 RG per nation, 200 rows/RG),
+    // with wide padding so pruning 20/25 RGs visibly reduces `bytes_scanned`.
+    let supplier_schema = Arc::new(Schema::new(vec![
+        Field::new("s_key", DataType::Int64, false),
+        Field::new("s_nation", DataType::Int64, false),
+        Field::new("s_pad", DataType::Utf8, false),
+    ]));
+    let mut supplier_batches = Vec::with_capacity(25);
+    for nation in 0..25i64 {
+        let base = nation * 200;
+        supplier_batches.push(RecordBatch::try_new(
+            Arc::clone(&supplier_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(base..base + 200)),
+                Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                    nation, 200,
+                ))),
+                Arc::new(StringArray::from_iter_values((0..200).map(|i| {
+                    format!("supplier-padding-{nation:02}-{i:04}-xxxxxxxxxxxxxxxxxxxx")
+                }))),
+            ],
+        )?);
+    }
+    let supplier_dir = write_parquet_files(&supplier_batches, 5, 200)?;
+
+    // Fact table (20,000 rows across 4 RGs) joining `supplier` on `(f_skey, f_nation)`.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("f_skey", DataType::Int64, false),
+        Field::new("f_nation", DataType::Int64, false),
+        Field::new("f_val", DataType::Int64, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(4);
+    for rg in 0..4i64 {
+        let base = rg * 5_000;
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (base..base + 5_000).map(|i| i % 5_000),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (base..base + 5_000).map(|i| (i % 5_000) / 200),
+                )),
+                Arc::new(Int64Array::from_iter_values(base..base + 5_000)),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 2, 5_000)?;
+
+    let make_ctx = |mode: &str, dyn_join: bool| {
+        let paths = [
+            ("region", region_dir.path().to_str().unwrap().to_owned()),
+            ("nation", nation_dir.path().to_str().unwrap().to_owned()),
+            ("supplier", supplier_dir.path().to_str().unwrap().to_owned()),
+            ("fact", fact_dir.path().to_str().unwrap().to_owned()),
+        ];
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            cfg.options_mut()
+                .optimizer
+                .enable_join_dynamic_filter_pushdown = dyn_join;
+            let ctx = SessionContext::new_with_config(cfg);
+            for (name, path) in paths {
+                ctx.register_parquet(name, &path, ParquetReadOptions::default())
+                    .await?;
+            }
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT n.n_name, SUM(f.f_val) AS total \
+               FROM fact f \
+               INNER JOIN supplier s ON f.f_skey = s.s_key AND f.f_nation = s.s_nation \
+               INNER JOIN nation n ON s.s_nation = n.n_key \
+               INNER JOIN region r ON n.n_region = r.r_key \
+               WHERE r.r_name = 'ASIA' \
+               GROUP BY n.n_name";
+
+    let stock = make_ctx("off", true).await?;
+    let native_off = make_ctx("required", false).await?;
+    let native_on = make_ctx("required", true).await?;
+
+    let (plan_off, _) = assert_native_parity(&stock, &native_off, sql).await?;
+    let (plan_on, _) = assert_native_parity(&stock, &native_on, sql).await?;
+
+    let bytes_off = metric(plan_off.as_ref(), "bytes_scanned");
+    let bytes_on = metric(plan_on.as_ref(), "bytes_scanned");
+    assert!(
+        bytes_on < bytes_off,
+        "expected cascading cross-build dynamic filters to reduce bytes_scanned \
+         (on={bytes_on}, off={bytes_off})"
+    );
+    assert!(
+        metric(plan_on.as_ref(), "join_dynamic_filters_pushed") >= 3,
+        "expected cascading dynamic filters across region -> nation -> supplier -> fact"
+    );
+
+    Ok(())
+}
