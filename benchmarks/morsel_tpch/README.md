@@ -41,8 +41,9 @@ Three common scale modes are supported (or any positive `--sf`):
 - **SF5 benchmark mode (`--sf 5`):** 43,299,825 total rows across 35 files and
   353 row groups (1,400,570,073 bytes / 1.30 GiB on disk; 29,999,795 `lineitem`
   rows across 16 files / 240 row groups; see
-  [sf5_baseline_22q.md](sf5_baseline_22q.md) for the idle-`dduck2` 22-query
-  Stock vs. DuckDB 2.0.1 baseline and live Morsel admission matrix).
+  [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the idle-`dduck2` full
+  **22/22 3-way SF5 scorecard** and [sf5_baseline_22q.md](sf5_baseline_22q.md)
+  for the earlier pre-`#191` Stock vs. DuckDB 2.0.1 baseline).
 
 ### SF1 Dataset Layout (`--sf 1 --row-group-size 131072`)
 
@@ -74,32 +75,27 @@ in `q11`). Use `--queries all` for all 22 standard queries, `--queries morsel`
 for currently-admitted Morsel workloads, or space-/comma-separated subsets such
 as `--queries q1,q3,q6,q12` or `--queries q6_count q6_scan q1_unordered`.
 
-### Roadmap TPC-H Queries (Stock DataFusion vs DuckDB; Morsel Not Yet Admitted)
+### Morsel-Native Coverage (22 / 22 Standard TPC-H Queries + 3 Slices)
 
-14 of the 22 standard TPC-H queries (`q2`, `q4`, `q7`–`q9`, `q11`, `q13`,
-`q15`–`q18`, `q20`–`q22`) are currently rejected at planning time under
-`morsel_mode=required` (see
-[sf5_baseline_22q.md](sf5_baseline_22q.md#3-live-22-query-morsel-admission--operator-capability-checklist)
-for the 22-query operator-capability checklist and
-[checkpoint_b_results.md](checkpoint_b_results.md#5-live-22-query-admission-status-post-159)
-for the post-`#159` update). `harness.py verify` checks that
-`morsel_mode=required` explicitly rejects these 14 queries at planning time.
-
-### Currently-Admitted Morsel-Native Queries (Live 3-Way Comparison)
-
-Eleven workloads — **8 standard TPC-H queries** (`q1`, `q3`, `q5`, `q6`, `q10`,
-`q12`, `q14`, `q19`) plus 3 single-table slices (`q1_unordered`, `q6_count`,
-`q6_scan`) — run directly over the real TPC-H Parquet schemas (`l_quantity`,
+After `#191` (general multi-stage morsel DAG, `HAVING`, `DISTINCT`, and
+uncorrelated scalar subqueries), **all 22 standard TPC-H queries (`q1`–`q22`)
+plus 3 single-table slices (`q1_unordered`, `q6_count`, `q6_scan`) — 25/25
+workloads** — run directly over the real TPC-H Parquet schemas (`l_quantity`,
 `l_extendedprice`, `l_discount`, `l_tax` as `DECIMAL(15,2)`, `l_shipdate` as
 `DATE32`, `l_orderkey` / `p_partkey` as `INT64`, string columns as `Utf8View`)
-with zero casts or schema workarounds; `morsel_mode=required` admits all eleven
-natively under `MorselExec`:
+with zero casts or schema workarounds; `morsel_mode=required` admits all 25
+natively under `MorselExec` with zero fallbacks and verified DuckDB parity:
 
+- See [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the idle-`dduck2`
+  **full 22/22 SF5 3-way warm-cache scorecard** (Morsel `required` vs. Stock
+  `off` vs. DuckDB 2.0.1) with geometric means and `#138` per-pipeline
+  wait/work breakdowns (`#192`).
 - See [checkpoint_b_results.md](checkpoint_b_results.md) for the idle-`dduck2`
   **Checkpoint B** SF1 3-way warm + cold scorecard across `q1`, `q3`, `q6`, and
   `q12` with `#138` per-pipeline wait/work breakdowns (`#174`).
-- See [sf5_baseline_22q.md](sf5_baseline_22q.md) for the post-`#188` SF5
-  22-query Stock vs. DuckDB baseline and 5-arm Morsel comparison (`#189`).
+- See [sf5_baseline_22q.md](sf5_baseline_22q.md) for the pre-`#191` SF5
+  22-query Stock vs. DuckDB baseline and historical Morsel admission matrix
+  (`#189`).
 - See [checkpoint_a_results.md](checkpoint_a_results.md) for the idle-`dduck2`
   Checkpoint A SF1 3-way scorecard (`#173`).
 - See [morsel_aggregate.md](morsel_aggregate.md) for the `#168` `dduck1`
