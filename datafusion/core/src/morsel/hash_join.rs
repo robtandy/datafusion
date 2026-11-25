@@ -503,7 +503,7 @@ impl HashJoinBuildSink {
     pub(super) fn new_state(&self, reservation: MemoryReservation) -> HashJoinBuildState {
         let key_summary = self
             .dynamic_filter
-            .map(|_| LocalJoinKeySummary::new(self.key_types.len()));
+            .map(|_| LocalJoinKeySummary::new(self.key_types.len(), self.has_floats));
         HashJoinBuildState {
             key_exprs: self.key_exprs.clone(),
             key_kind: self.key_kind,
@@ -520,6 +520,23 @@ impl HashJoinBuildSink {
             num_rows: 0,
             has_null_key: false,
             reservation,
+        }
+    }
+
+    #[cfg(feature = "parquet")]
+    pub(super) fn payload_columns(&self) -> &[usize] {
+        &self.payload_columns
+    }
+
+    #[cfg(feature = "parquet")]
+    pub(super) fn enable_dynamic_filter(&mut self, cfg: DynamicJoinFilterConfig) {
+        match &mut self.dynamic_filter {
+            Some(existing) => {
+                existing.build_bloom |= cfg.build_bloom;
+            }
+            None => {
+                self.dynamic_filter = Some(cfg);
+            }
         }
     }
 
@@ -1803,6 +1820,7 @@ pub(super) struct HashJoinProbe {
     pub(super) output_projection: Vec<JoinOutputCol>,
     pub(super) output_schema: SchemaRef,
     pub(super) build_id: usize,
+    pub(super) filter_id: usize,
     #[cfg(test)]
     pub(super) build_emit_gate: Option<super::tests::FinalizeGate>,
 }
@@ -1846,6 +1864,7 @@ impl HashJoinProbe {
             output_projection: config.output_projection,
             output_schema: config.output_schema,
             build_id: config.build_id,
+            filter_id: 0,
             #[cfg(test)]
             build_emit_gate: None,
         }

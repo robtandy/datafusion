@@ -62,6 +62,11 @@ const MAX_BLOOM_BYTES: usize = 8 * 1024 * 1024;
 /// Skip Bloom construction above 5M build keys where an 8 MiB filter would lose selectivity.
 const MAX_BLOOM_KEYS: usize = 5_000_000;
 
+/// Cap for per-column distinct tracking on multi-key joins (enables exact
+/// `InList` pushdown on low-cardinality keys such as `s_nationkey` in TPC-H Q5
+/// when only one key of a composite join traces back to a scan).
+const MAX_PER_KEY_INLIST: usize = 32;
+
 /// Configuration carried onto [`HashJoinBuildSink`](super::hash_join::HashJoinBuildSink)
 /// when its probe side can consume a dynamic join filter.
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +155,72 @@ impl SplitBlockBloomFilter {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SmallDistinctValues {
+    Disabled,
+    Open(Vec<ScalarValue>),
+    Overflow,
+}
+
+impl Default for SmallDistinctValues {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl SmallDistinctValues {
+    fn update_from_array(&mut self, array: &dyn Array) {
+        let Self::Open(seen) = self else {
+            return;
+        };
+        for i in 0..array.len() {
+            if array.is_null(i) {
+                continue;
+            }
+            let Ok(sv) = ScalarValue::try_from_array(array, i) else {
+                *self = Self::Overflow;
+                return;
+            };
+            if !seen.contains(&sv) {
+                seen.push(sv);
+                if seen.len() > MAX_PER_KEY_INLIST {
+                    *self = Self::Overflow;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        match (self, other) {
+            (Self::Disabled, _) | (_, Self::Disabled) => {}
+            (s @ Self::Open(_), Self::Overflow) => *s = Self::Overflow,
+            (Self::Open(mine), Self::Open(theirs)) => {
+                for sv in theirs {
+                    if !mine.contains(sv) {
+                        mine.push(sv.clone());
+                        if mine.len() > MAX_PER_KEY_INLIST {
+                            *mine = Vec::new();
+                            break;
+                        }
+                    }
+                }
+            }
+            (Self::Overflow, _) => {}
+        }
+    }
+
+    fn into_inlist_array(self) -> Option<ArrayRef> {
+        let Self::Open(seen) = self else {
+            return None;
+        };
+        if seen.len() <= 1 || seen.len() > MAX_PER_KEY_INLIST {
+            return None;
+        }
+        ScalarValue::iter_to_array(seen).ok()
+    }
+}
+
 /// Per-key-column min/max range and NULL/NaN summary accumulated across build workers.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ColumnKeyBounds {
@@ -157,14 +228,33 @@ pub(super) struct ColumnKeyBounds {
     pub(super) max: Option<ScalarValue>,
     pub(super) has_null: bool,
     pub(super) has_nan: bool,
+    small_distinct: SmallDistinctValues,
+    /// Optional small per-key `InList` (<= 32 distinct values) finalized for
+    /// multi-key joins so partially-bound keys can push exact `IN (...)`.
+    pub(super) per_key_inlist: Option<ArrayRef>,
 }
 
 impl ColumnKeyBounds {
+    fn new(track_small_distinct: bool) -> Self {
+        Self {
+            small_distinct: if track_small_distinct {
+                SmallDistinctValues::Open(Vec::new())
+            } else {
+                SmallDistinctValues::Disabled
+            },
+            ..Self::default()
+        }
+    }
+
     fn update_from_array(&mut self, array: &dyn Array) {
         if array.null_count() > 0 {
             self.has_null = true;
         }
-        if self.has_nan || array.null_count() == array.len() {
+        if array.null_count() == array.len() {
+            return;
+        }
+        self.small_distinct.update_from_array(array);
+        if self.has_nan {
             return;
         }
         match array_min_max(array) {
@@ -172,6 +262,7 @@ impl ColumnKeyBounds {
                 self.has_nan = true;
                 self.min = None;
                 self.max = None;
+                self.small_distinct = SmallDistinctValues::Overflow;
             }
             MinMaxResult::Bounds(lo, hi) => {
                 match &mut self.min {
@@ -195,7 +286,17 @@ impl ColumnKeyBounds {
         if self.has_nan {
             self.min = None;
             self.max = None;
+            self.small_distinct = SmallDistinctValues::Overflow;
             return;
+        }
+        let was_open = matches!(self.small_distinct, SmallDistinctValues::Open(_));
+        self.small_distinct.merge(&other.small_distinct);
+        if was_open
+            && let SmallDistinctValues::Open(ref v) = self.small_distinct
+            && v.is_empty()
+            && !matches!(other.small_distinct, SmallDistinctValues::Open(ref ov) if ov.is_empty())
+        {
+            self.small_distinct = SmallDistinctValues::Overflow;
         }
         if let Some(other_min) = &other.min {
             match &mut self.min {
@@ -212,6 +313,11 @@ impl ColumnKeyBounds {
             }
         }
     }
+
+    fn finalize_per_key_inlist(&mut self) {
+        let distinct = std::mem::take(&mut self.small_distinct);
+        self.per_key_inlist = distinct.into_inlist_array();
+    }
 }
 
 /// Worker-local dynamic join key bounds accumulated during build `sink` and merged in `combine`.
@@ -221,9 +327,12 @@ pub(super) struct LocalJoinKeySummary {
 }
 
 impl LocalJoinKeySummary {
-    pub(super) fn new(num_keys: usize) -> Self {
+    pub(super) fn new(num_keys: usize, has_floats: bool) -> Self {
+        let track_small_distinct = num_keys > 1 && !has_floats;
         Self {
-            columns: vec![ColumnKeyBounds::default(); num_keys],
+            columns: (0..num_keys)
+                .map(|_| ColumnKeyBounds::new(track_small_distinct))
+                .collect(),
         }
     }
 
@@ -265,7 +374,10 @@ impl LocalJoinKeySummary {
         }
     }
 
-    pub(super) fn into_bounds(self) -> Vec<ColumnKeyBounds> {
+    pub(super) fn into_bounds(mut self) -> Vec<ColumnKeyBounds> {
+        for col in &mut self.columns {
+            col.finalize_per_key_inlist();
+        }
         self.columns
     }
 }
@@ -321,7 +433,13 @@ impl DynamicJoinFilterData {
     }
 
     pub(super) fn memory_bytes(&self) -> usize {
-        self.membership.memory_bytes()
+        let per_key_bytes: usize = self
+            .bounds
+            .iter()
+            .filter_map(|b| b.per_key_inlist.as_ref())
+            .map(|a| a.get_array_memory_size())
+            .fold(0usize, usize::saturating_add);
+        self.membership.memory_bytes().saturating_add(per_key_bytes)
     }
 
     #[cfg(any(feature = "parquet", test))]
@@ -335,10 +453,9 @@ impl DynamicJoinFilterData {
 #[cfg(any(feature = "parquet", test))]
 #[derive(Debug, Clone)]
 pub(super) struct JoinFilterBinding {
-    pub(super) build_id: usize,
+    pub(super) filter_id: usize,
     /// Per-join-key expression in `ParquetScan.schema` coordinates (`None` when
-    /// a key cannot be traced back to the probe scan, e.g. it comes from an
-    /// intervening join's build side).
+    /// a key cannot be traced back to the target scan).
     pub(super) probe_key_exprs: Vec<Option<Arc<dyn PhysicalExpr>>>,
     pub(super) all_keys_bound: bool,
 }
@@ -425,6 +542,34 @@ impl JoinFilterBinding {
                 }
             } else if let Some(range_conjuncts) = range_pred {
                 preds.extend(range_conjuncts);
+            }
+
+            // For partially-bound multi-key joins (e.g. `c_nationkey` from
+            // `supplier(s_suppkey, s_nationkey)` in TPC-H Q5), push any small
+            // per-key `InList` directly onto this key column.
+            if !self.all_keys_bound
+                && let Some(values) = &col_bounds.per_key_inlist
+            {
+                let in_list: Arc<dyn PhysicalExpr> =
+                    Arc::new(InListExpr::try_new_from_array(
+                        Arc::clone(probe_expr),
+                        Arc::clone(values),
+                        false,
+                        scan_schema,
+                    )?);
+                if data.null_equality == NullEquality::NullEqualsNull
+                    && col_bounds.has_null
+                {
+                    let is_null: Arc<dyn PhysicalExpr> =
+                        Arc::new(IsNullExpr::new(Arc::clone(probe_expr)));
+                    preds.push(Arc::new(BinaryExpr::new(
+                        in_list,
+                        ExprOperator::Or,
+                        is_null,
+                    )));
+                } else {
+                    preds.push(in_list);
+                }
             }
         }
 
@@ -1001,8 +1146,8 @@ mod tests {
 
     #[test]
     fn bounds_drop_on_nan_and_merge_nulls_safely() -> Result<()> {
-        let mut s1 = LocalJoinKeySummary::new(1);
-        let mut s2 = LocalJoinKeySummary::new(1);
+        let mut s1 = LocalJoinKeySummary::new(1, true);
+        let mut s2 = LocalJoinKeySummary::new(1, true);
         let a1: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), Some(3.5)]));
         let a2: ArrayRef = Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(2.0)]));
         s1.update(&[a1], None, NullEquality::NullEqualsNothing)?;

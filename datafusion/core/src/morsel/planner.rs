@@ -50,9 +50,7 @@ use super::hash_join::{
     HashJoinProbeConfig, JoinOutputCol, ProbeJoinKind, is_supported_join_key_type,
 };
 #[cfg(feature = "parquet")]
-use super::join_filter::DynamicJoinFilterConfig;
-#[cfg(feature = "parquet")]
-use super::parquet::ParquetScan;
+use super::parquet::{ParquetScan, bind_pipeline_dynamic_join_filters};
 use super::sort::{SortSink, TopNSink};
 use super::{
     BoxFuture, Lowering, MemorySource, MorselExec, MorselQueryPlanner, Operator,
@@ -131,6 +129,7 @@ struct DagBuilder<'a> {
     cte_stages: HashMap<MaterializedCteId, CteBinding>,
     lowered_subqueries: Vec<bool>,
     scalar_subquery_specs: Vec<ScalarSubquerySpec>,
+    next_filter_id: usize,
 }
 
 impl MorselQueryPlanner {
@@ -163,6 +162,7 @@ impl MorselQueryPlanner {
             cte_stages: HashMap::new(),
             lowered_subqueries,
             scalar_subquery_specs: Vec::new(),
+            next_filter_id: 0,
         };
 
         let root_node = match builder.lower_node(plan, false).await? {
@@ -679,11 +679,11 @@ impl DagBuilder<'_> {
     }
 
     fn finalize_pipeline_joins(
-        &self,
+        &mut self,
         source: &mut Source,
         operators: &mut [Operator],
     ) -> Result<()> {
-        assign_join_build_ids(operators)?;
+        assign_join_build_ids(operators, &mut self.next_filter_id)?;
         #[cfg(not(feature = "parquet"))]
         let _ = source;
         #[cfg(feature = "parquet")]
@@ -691,9 +691,13 @@ impl DagBuilder<'_> {
             let opt = &self.session.config_options().optimizer;
             if opt.enable_dynamic_filter_pushdown
                 && opt.enable_join_dynamic_filter_pushdown
-                && let Source::Parquet(parquet_scan) = source
             {
-                parquet_scan.bind_join_dynamic_filters(operators)?;
+                bind_pipeline_dynamic_join_filters(
+                    source,
+                    operators,
+                    opt.hash_join_inlist_pushdown_max_distinct_values,
+                    opt.hash_join_inlist_pushdown_max_size,
+                )?;
             }
         }
         Ok(())
@@ -1918,30 +1922,6 @@ impl DagBuilder<'_> {
         prune_filter_input(&mut post_ops, &probe_output_schema);
 
         let payload_schema = Arc::new(build_schema.project(&build_payload_columns)?);
-        #[cfg(feature = "parquet")]
-        let dynamic_filter = {
-            let opt = &self.session.config_options().optimizer;
-            let blocked_by_intervening_build_emit = probe_ops.iter().any(
-                |op| matches!(op, Operator::HashProbe(p) if p.needs_build_emission()),
-            );
-            if opt.enable_dynamic_filter_pushdown
-                && opt.enable_join_dynamic_filter_pushdown
-                && let Source::Parquet(ref probe_parquet) = probe_source
-                && kind.allows_dynamic_filter_pushdown()
-                && !blocked_by_intervening_build_emit
-            {
-                Some(DynamicJoinFilterConfig {
-                    max_inlist_values: opt.hash_join_inlist_pushdown_max_distinct_values,
-                    max_inlist_bytes: opt.hash_join_inlist_pushdown_max_size,
-                    build_bloom: probe_parquet.pushdown_filters(),
-                })
-            } else {
-                None
-            }
-        };
-        #[cfg(not(feature = "parquet"))]
-        let dynamic_filter = None;
-
         let build_sink = match HashJoinBuildSink::try_new(HashJoinBuildConfig {
             key_exprs: build_key_exprs,
             key_names: build_key_names,
@@ -1952,7 +1932,7 @@ impl DagBuilder<'_> {
             needs_matched_bitset: kind.needs_matched_bitset(),
             payload_columns: build_payload_columns,
             payload_schema,
-            dynamic_filter,
+            dynamic_filter: None,
         })? {
             Ok(sink) => Arc::new(sink),
             Err(reason) => return Ok(Err(reason)),
