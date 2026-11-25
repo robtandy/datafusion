@@ -14,10 +14,10 @@ use arrow::array::{
     PrimitiveArray, RecordBatch, UInt32Array,
 };
 use arrow::buffer::BooleanBuffer;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{HashMap, Result, ScalarValue, internal_err};
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_common::{DataFusionError, HashMap, Result, ScalarValue, internal_err};
+use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
 use datafusion_expr::logical_plan::Aggregate;
 use datafusion_expr::{ColumnarValue, Expr};
 use datafusion_physical_expr::PhysicalExpr;
@@ -25,7 +25,13 @@ use tokio::sync::mpsc;
 
 use super::batch::{BatchView, Selection};
 use super::count::count_overflow;
+use super::hash_join::mix_u64;
 use super::metrics::{self, RunMetrics};
+use super::radix_agg::{
+    NULL_GROUP_HASH, PREAGG_FLUSH_GROUPS, RADIX_TRANSITION_GROUPS, RadixFinalizeConfig,
+    RadixGroupMerger, RadixPartitionStore, ResultOpsRef, finalize_and_emit_radix,
+};
+use super::spill::SpillContext;
 use super::{Operator, apply_operators, filter_batch};
 
 const MERGE_YIELD_INTERVAL: usize = 4096;
@@ -55,6 +61,120 @@ impl IntKeyType {
             DataType::UInt64 => Some(Self::UInt64),
             _ => None,
         }
+    }
+
+    pub(super) fn data_type(self) -> DataType {
+        match self {
+            Self::Int8 => DataType::Int8,
+            Self::Int16 => DataType::Int16,
+            Self::Int32 => DataType::Int32,
+            Self::Int64 => DataType::Int64,
+            Self::UInt8 => DataType::UInt8,
+            Self::UInt16 => DataType::UInt16,
+            Self::UInt32 => DataType::UInt32,
+            Self::UInt64 => DataType::UInt64,
+        }
+    }
+}
+
+pub(super) trait IntKeyHash: Copy {
+    fn hash_group_key(self) -> u64;
+}
+
+impl IntKeyHash for i8 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for i16 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for i32 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for i64 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for u8 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for u16 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for u32 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self as u64)
+    }
+}
+impl IntKeyHash for u64 {
+    #[inline]
+    fn hash_group_key(self) -> u64 {
+        mix_u64(self)
+    }
+}
+
+pub(super) fn hash_int_key_array(
+    array: &ArrayRef,
+    key_type: IntKeyType,
+    hashes: &mut Vec<u64>,
+) -> Result<()> {
+    macro_rules! hash_prim {
+        ($ty:ty) => {{
+            let arr = array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<$ty>>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Morsel GROUP BY key array type mismatch: expected {:?}, got {:?}",
+                        <$ty as ArrowPrimitiveType>::DATA_TYPE,
+                        array.data_type()
+                    )
+                })?;
+            hashes.clear();
+            hashes.reserve(arr.len());
+            if arr.null_count() == 0 {
+                for &v in arr.values().iter() {
+                    hashes.push(v.hash_group_key());
+                }
+            } else {
+                let nulls = arr.nulls().unwrap();
+                for (i, &v) in arr.values().iter().enumerate() {
+                    if nulls.is_valid(i) {
+                        hashes.push(v.hash_group_key());
+                    } else {
+                        hashes.push(NULL_GROUP_HASH);
+                    }
+                }
+            }
+            Ok(())
+        }};
+    }
+    match key_type {
+        IntKeyType::Int8 => hash_prim!(Int8Type),
+        IntKeyType::Int16 => hash_prim!(Int16Type),
+        IntKeyType::Int32 => hash_prim!(Int32Type),
+        IntKeyType::Int64 => hash_prim!(Int64Type),
+        IntKeyType::UInt8 => hash_prim!(UInt8Type),
+        IntKeyType::UInt16 => hash_prim!(UInt16Type),
+        IntKeyType::UInt32 => hash_prim!(UInt32Type),
+        IntKeyType::UInt64 => hash_prim!(UInt64Type),
     }
 }
 
@@ -111,23 +231,129 @@ fn estimated_next_table_bytes<K>(current_alloc: usize) -> usize {
 
 struct GroupCountMap<T: ArrowPrimitiveType>
 where
-    T::Native: Eq + Hash,
+    T::Native: Eq + Hash + IntKeyHash,
 {
     counts: HashMap<T::Native, i64>,
     null_count: Option<i64>,
+    tracked_bytes: usize,
     reservation: MemoryReservation,
 }
 
 impl<T: ArrowPrimitiveType> GroupCountMap<T>
 where
-    T::Native: Eq + Hash,
+    T::Native: Eq + Hash + IntKeyHash,
 {
     fn new(reservation: MemoryReservation) -> Self {
         Self {
             counts: HashMap::new(),
             null_count: None,
+            tracked_bytes: 0,
             reservation,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.counts.len() + usize::from(self.null_count.is_some())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.counts.is_empty() && self.null_count.is_none()
+    }
+
+    fn sync_reservation(&mut self) -> Result<()> {
+        let actual = self.counts.allocation_size();
+        if actual > self.tracked_bytes {
+            self.reservation.try_grow(actual - self.tracked_bytes)?;
+        } else if actual < self.tracked_bytes {
+            self.reservation.shrink(self.tracked_bytes - actual);
+        }
+        self.tracked_bytes = actual;
+        Ok(())
+    }
+
+    fn drain_to_partial_batch(
+        &mut self,
+        partial_schema: &SchemaRef,
+    ) -> Result<(RecordBatch, Vec<u64>)> {
+        let total = self.len();
+        let mut keys = Vec::with_capacity(total);
+        let mut counts = Vec::with_capacity(total);
+        let mut hashes = Vec::with_capacity(total);
+        let mut nulls_builder = self
+            .null_count
+            .is_some()
+            .then(|| NullBufferBuilder::new(total));
+
+        if let Some(n) = self.null_count.take() {
+            keys.push(T::Native::default());
+            counts.push(n);
+            hashes.push(NULL_GROUP_HASH);
+            if let Some(nb) = nulls_builder.as_mut() {
+                nb.append_null();
+            }
+        }
+        for (k, c) in self.counts.drain() {
+            keys.push(k);
+            counts.push(c);
+            hashes.push(k.hash_group_key());
+            if let Some(nb) = nulls_builder.as_mut() {
+                nb.append_non_null();
+            }
+        }
+        self.counts = HashMap::new();
+        if self.tracked_bytes > 0 {
+            self.reservation.shrink(self.tracked_bytes);
+            self.tracked_bytes = 0;
+        }
+        let nulls = nulls_builder.and_then(|mut nb| nb.finish());
+        let key_array: ArrayRef = Arc::new(PrimitiveArray::<T>::new(keys.into(), nulls));
+        let count_array: ArrayRef = Arc::new(Int64Array::from(counts));
+        let batch = RecordBatch::try_new(
+            Arc::clone(partial_schema),
+            vec![key_array, count_array],
+        )?;
+        Ok((batch, hashes))
+    }
+
+    fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let key_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .ok_or_else(|| {
+                datafusion_common::internal_datafusion_err!(
+                    "GroupCount partial key array type mismatch"
+                )
+            })?;
+        let count_arr = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                datafusion_common::internal_datafusion_err!(
+                    "GroupCount partial count array type mismatch"
+                )
+            })?;
+        let key_vals = key_arr.values();
+        let count_vals = count_arr.values();
+        if key_arr.null_count() == 0 {
+            for (&k, &c) in key_vals.iter().zip(count_vals.iter()) {
+                self.add_key(k, c)?;
+            }
+        } else {
+            let nulls = key_arr.nulls().unwrap();
+            for (i, (&k, &c)) in key_vals.iter().zip(count_vals.iter()).enumerate() {
+                if nulls.is_valid(i) {
+                    self.add_key(k, c)?;
+                } else {
+                    self.add_null(c)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn add_null(&mut self, rows: i64) -> Result<()> {
@@ -140,6 +366,129 @@ where
         };
         self.null_count = Some(updated);
         Ok(())
+    }
+
+    #[inline]
+    fn add_key_unchecked(&mut self, key: T::Native, delta: i64) -> Result<()> {
+        if let Some(count) = self.counts.get_mut(&key) {
+            *count = count.checked_add(delta).ok_or_else(count_overflow)?;
+            return Ok(());
+        }
+        self.counts.insert(key, delta);
+        Ok(())
+    }
+
+    fn add_array_unchecked(&mut self, array: &PrimitiveArray<T>) -> Result<()> {
+        let len = array.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let null_count = array.null_count();
+        if null_count == 0 {
+            for &key in array.values().iter() {
+                self.add_key_unchecked(key, 1)?;
+            }
+            return Ok(());
+        }
+        if null_count == len {
+            let rows = i64::try_from(len).map_err(|_| count_overflow())?;
+            return self.add_null(rows);
+        }
+        let values = array.values();
+        let nulls = array.nulls().unwrap();
+        let mut null_rows: i64 = 0;
+        for (i, &key) in values.iter().enumerate() {
+            if nulls.is_valid(i) {
+                self.add_key_unchecked(key, 1)?;
+            } else {
+                null_rows = null_rows.checked_add(1).ok_or_else(count_overflow)?;
+            }
+        }
+        self.add_null(null_rows)
+    }
+
+    fn add_array_selected_unchecked(
+        &mut self,
+        array: &PrimitiveArray<T>,
+        selected: &BooleanBuffer,
+    ) -> Result<()> {
+        let null_count = array.null_count();
+        if null_count == array.len() {
+            let rows =
+                i64::try_from(selected.count_set_bits()).map_err(|_| count_overflow())?;
+            return self.add_null(rows);
+        }
+        let values = array.values();
+        if null_count == 0 {
+            for i in selected.set_indices() {
+                self.add_key_unchecked(values[i], 1)?;
+            }
+            return Ok(());
+        }
+        let nulls = array.nulls().unwrap();
+        let mut null_rows: i64 = 0;
+        for i in selected.set_indices() {
+            if nulls.is_valid(i) {
+                self.add_key_unchecked(values[i], 1)?;
+            } else {
+                null_rows = null_rows.checked_add(1).ok_or_else(count_overflow)?;
+            }
+        }
+        self.add_null(null_rows)
+    }
+
+    fn add_array_indices_unchecked(
+        &mut self,
+        array: &PrimitiveArray<T>,
+        indices: &UInt32Array,
+    ) -> Result<()> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let null_count = array.null_count();
+        if null_count == array.len() {
+            let rows = i64::try_from(indices.len()).map_err(|_| count_overflow())?;
+            return self.add_null(rows);
+        }
+        let values = array.values();
+        if null_count == 0 {
+            for &idx in indices.values() {
+                self.add_key_unchecked(values[idx as usize], 1)?;
+            }
+            return Ok(());
+        }
+        let nulls = array.nulls().unwrap();
+        let mut null_rows: i64 = 0;
+        for &idx in indices.values() {
+            let i = idx as usize;
+            if nulls.is_valid(i) {
+                self.add_key_unchecked(values[i], 1)?;
+            } else {
+                null_rows = null_rows.checked_add(1).ok_or_else(count_overflow)?;
+            }
+        }
+        self.add_null(null_rows)
+    }
+
+    fn add_array_masked_unchecked(
+        &mut self,
+        array: &PrimitiveArray<T>,
+        mask: &BooleanArray,
+    ) -> Result<()> {
+        if mask.len() != array.len() {
+            return internal_err!(
+                "Mask length {} does not match array length {}",
+                mask.len(),
+                array.len()
+            );
+        }
+        match mask.nulls() {
+            Some(nulls) => {
+                let effective = mask.values() & nulls.inner();
+                self.add_array_selected_unchecked(array, &effective)
+            }
+            None => self.add_array_selected_unchecked(array, mask.values()),
+        }
     }
 
     #[inline]
@@ -158,14 +507,11 @@ where
                 estimated_next_table_bytes::<T::Native>(self.counts.allocation_size());
             self.reservation.try_grow(next_bytes)?;
             self.counts.insert(key, count);
-            let actual = self.counts.allocation_size();
-            self.reservation.try_resize(actual)?;
+            self.reservation.shrink(next_bytes);
+            self.sync_reservation()?;
         } else {
             self.counts.insert(key, count);
-            let actual = self.counts.allocation_size();
-            if actual != self.reservation.size() {
-                self.reservation.try_resize(actual)?;
-            }
+            self.sync_reservation()?;
         }
         Ok(())
     }
@@ -298,11 +644,13 @@ where
         }
         if self.counts.is_empty() {
             std::mem::swap(&mut self.counts, &mut other.counts);
+            std::mem::swap(&mut self.tracked_bytes, &mut other.tracked_bytes);
             std::mem::swap(&mut self.reservation, &mut other.reservation);
             return Ok(true);
         }
         if other.counts.len() > self.counts.len() {
             std::mem::swap(&mut self.counts, &mut other.counts);
+            std::mem::swap(&mut self.tracked_bytes, &mut other.tracked_bytes);
             std::mem::swap(&mut self.reservation, &mut other.reservation);
         }
         let mut processed = 0usize;
@@ -432,38 +780,140 @@ enum GroupCountMapKind {
     UInt64(GroupCountMap<UInt64Type>),
 }
 
-pub(super) struct GroupCountState(GroupCountMapKind);
+fn group_count_partial_schema(key_type: IntKeyType) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k", key_type.data_type(), true),
+        Field::new("c", DataType::Int64, false),
+    ]))
+}
+
+impl GroupCountMapKind {
+    fn new(key_type: IntKeyType, reservation: MemoryReservation) -> Self {
+        match key_type {
+            IntKeyType::Int8 => Self::Int8(GroupCountMap::new(reservation)),
+            IntKeyType::Int16 => Self::Int16(GroupCountMap::new(reservation)),
+            IntKeyType::Int32 => Self::Int32(GroupCountMap::new(reservation)),
+            IntKeyType::Int64 => Self::Int64(GroupCountMap::new(reservation)),
+            IntKeyType::UInt8 => Self::UInt8(GroupCountMap::new(reservation)),
+            IntKeyType::UInt16 => Self::UInt16(GroupCountMap::new(reservation)),
+            IntKeyType::UInt32 => Self::UInt32(GroupCountMap::new(reservation)),
+            IntKeyType::UInt64 => Self::UInt64(GroupCountMap::new(reservation)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        dispatch_group_map!(self, m => m.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        dispatch_group_map!(self, m => m.is_empty())
+    }
+
+    fn tracked_bytes(&self) -> usize {
+        dispatch_group_map!(self, m => m.tracked_bytes)
+    }
+
+    fn reservation(&self) -> &MemoryReservation {
+        dispatch_group_map!(self, m => &m.reservation)
+    }
+
+    fn into_reservation(self) -> MemoryReservation {
+        dispatch_group_map!(self, m => m.reservation)
+    }
+
+    fn drain_to_partial_batch(
+        &mut self,
+        partial_schema: &SchemaRef,
+    ) -> Result<(RecordBatch, Vec<u64>)> {
+        dispatch_group_map!(self, m => m.drain_to_partial_batch(partial_schema))
+    }
+
+    fn sync_reservation(&mut self) -> Result<()> {
+        dispatch_group_map!(self, m => m.sync_reservation())
+    }
+
+    fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        dispatch_group_map!(self, m => m.merge_partial_batch(batch))
+    }
+}
+
+pub(super) struct GroupCountState {
+    map: GroupCountMapKind,
+    key_type: IntKeyType,
+    partial_schema: SchemaRef,
+    radix: Option<RadixPartitionStore>,
+    spill: Option<SpillContext>,
+}
 
 impl GroupCountState {
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new(key_type: IntKeyType, reservation: MemoryReservation) -> Self {
-        Self(match key_type {
-            IntKeyType::Int8 => GroupCountMapKind::Int8(GroupCountMap::new(reservation)),
-            IntKeyType::Int16 => {
-                GroupCountMapKind::Int16(GroupCountMap::new(reservation))
-            }
-            IntKeyType::Int32 => {
-                GroupCountMapKind::Int32(GroupCountMap::new(reservation))
-            }
-            IntKeyType::Int64 => {
-                GroupCountMapKind::Int64(GroupCountMap::new(reservation))
-            }
-            IntKeyType::UInt8 => {
-                GroupCountMapKind::UInt8(GroupCountMap::new(reservation))
-            }
-            IntKeyType::UInt16 => {
-                GroupCountMapKind::UInt16(GroupCountMap::new(reservation))
-            }
-            IntKeyType::UInt32 => {
-                GroupCountMapKind::UInt32(GroupCountMap::new(reservation))
-            }
-            IntKeyType::UInt64 => {
-                GroupCountMapKind::UInt64(GroupCountMap::new(reservation))
-            }
-        })
+        Self::new_with_spill(key_type, reservation, None)
+    }
+
+    pub(super) fn new_with_spill(
+        key_type: IntKeyType,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+    ) -> Self {
+        Self {
+            map: GroupCountMapKind::new(key_type, reservation),
+            key_type,
+            partial_schema: group_count_partial_schema(key_type),
+            radix: None,
+            spill,
+        }
+    }
+
+    async fn flush_map_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        if self.map.is_empty() {
+            return Ok(());
+        }
+        let (partial, hashes) = self.map.drain_to_partial_batch(&self.partial_schema)?;
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        let extra = self.map.tracked_bytes();
+        let res = self.map.reservation();
+        radix
+            .push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
+            .await
+    }
+
+    async fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        let len = self.map.len();
+        let should_flush = if self.radix.is_some() {
+            len >= PREAGG_FLUSH_GROUPS
+        } else {
+            len >= RADIX_TRANSITION_GROUPS
+        };
+        if should_flush {
+            self.flush_map_to_radix(tx).await?;
+        }
+        Ok(())
+    }
+
+    async fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        let Some(spill_ctx) = self.spill.clone() else {
+            return Err(DataFusionError::ResourcesExhausted(
+                "GroupCount spilling is disabled".into(),
+            ));
+        };
+        spill_ctx.mark_spilled();
+        if !self.map.is_empty() {
+            self.flush_map_to_radix(tx).await?;
+        }
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        let extra = self.map.tracked_bytes();
+        let res = self.map.reservation();
+        radix.spill_all_mem(extra, res, &spill_ctx, tx).await?;
+        Ok(())
     }
 
     pub(super) fn add_column(&mut self, array: &ArrayRef) -> Result<()> {
-        match &mut self.0 {
+        match &mut self.map {
             GroupCountMapKind::Int8(m) => {
                 m.add_array(downcast_primitive!(array, Int8Type))
             }
@@ -491,12 +941,81 @@ impl GroupCountState {
         }
     }
 
+    async fn precheck_spill_headroom(
+        &mut self,
+        est_rows: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.spill.is_some() && !self.map.is_empty() {
+            let est_bytes = est_rows.saturating_mul(24);
+            let probe = self.map.reservation().new_empty();
+            if probe.try_grow(est_bytes).is_err() {
+                drop(probe);
+                self.spill_on_oom(tx).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_column_unchecked(&mut self, array: &ArrayRef) -> Result<()> {
+        match &mut self.map {
+            GroupCountMapKind::Int8(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, Int8Type))
+            }
+            GroupCountMapKind::Int16(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, Int16Type))
+            }
+            GroupCountMapKind::Int32(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, Int32Type))
+            }
+            GroupCountMapKind::Int64(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, Int64Type))
+            }
+            GroupCountMapKind::UInt8(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, UInt8Type))
+            }
+            GroupCountMapKind::UInt16(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, UInt16Type))
+            }
+            GroupCountMapKind::UInt32(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, UInt32Type))
+            }
+            GroupCountMapKind::UInt64(m) => {
+                m.add_array_unchecked(downcast_primitive!(array, UInt64Type))
+            }
+        }
+    }
+
+    pub(super) async fn add_column_async(
+        &mut self,
+        array: &ArrayRef,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if array.is_empty() {
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            self.add_column(array)?;
+            return self.maybe_flush_preagg(tx).await;
+        }
+        self.precheck_spill_headroom(array.len(), tx).await?;
+        self.add_column_unchecked(array)?;
+        if let Err(err) = self.map.sync_reservation() {
+            if matches!(err, DataFusionError::ResourcesExhausted(_)) {
+                self.spill_on_oom(tx).await?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+        self.maybe_flush_preagg(tx).await
+    }
+
     fn add_column_selected(
         &mut self,
         array: &ArrayRef,
         bits: &BooleanBuffer,
     ) -> Result<()> {
-        match &mut self.0 {
+        match &mut self.map {
             GroupCountMapKind::Int8(m) => {
                 m.add_array_selected(downcast_primitive!(array, Int8Type), bits)
             }
@@ -529,7 +1048,7 @@ impl GroupCountState {
         array: &ArrayRef,
         indices: &UInt32Array,
     ) -> Result<()> {
-        match &mut self.0 {
+        match &mut self.map {
             GroupCountMapKind::Int8(m) => {
                 m.add_array_indices(downcast_primitive!(array, Int8Type), indices)
             }
@@ -575,8 +1094,114 @@ impl GroupCountState {
         }
     }
 
+    fn add_view_unchecked(&mut self, view: &BatchView, key_index: usize) -> Result<()> {
+        let col = view.batch().column(key_index);
+        match view.selection() {
+            Selection::All => self.add_column_unchecked(col),
+            Selection::Mask { bits, selected } => {
+                if *selected == view.batch().num_rows() {
+                    self.add_column_unchecked(col)
+                } else {
+                    match &mut self.map {
+                        GroupCountMapKind::Int8(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, Int8Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::Int16(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, Int16Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::Int32(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, Int32Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::Int64(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, Int64Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::UInt8(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, UInt8Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::UInt16(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, UInt16Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::UInt32(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, UInt32Type),
+                            bits,
+                        ),
+                        GroupCountMapKind::UInt64(m) => m.add_array_selected_unchecked(
+                            downcast_primitive!(col, UInt64Type),
+                            bits,
+                        ),
+                    }
+                }
+            }
+            Selection::Indices(indices) => match &mut self.map {
+                GroupCountMapKind::Int8(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, Int8Type),
+                    indices,
+                ),
+                GroupCountMapKind::Int16(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, Int16Type),
+                    indices,
+                ),
+                GroupCountMapKind::Int32(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, Int32Type),
+                    indices,
+                ),
+                GroupCountMapKind::Int64(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, Int64Type),
+                    indices,
+                ),
+                GroupCountMapKind::UInt8(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, UInt8Type),
+                    indices,
+                ),
+                GroupCountMapKind::UInt16(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, UInt16Type),
+                    indices,
+                ),
+                GroupCountMapKind::UInt32(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, UInt32Type),
+                    indices,
+                ),
+                GroupCountMapKind::UInt64(m) => m.add_array_indices_unchecked(
+                    downcast_primitive!(col, UInt64Type),
+                    indices,
+                ),
+            },
+        }
+    }
+
+    pub(super) async fn add_view_async(
+        &mut self,
+        view: &BatchView,
+        key_index: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            self.add_view(view, key_index)?;
+            return self.maybe_flush_preagg(tx).await;
+        }
+        self.precheck_spill_headroom(view.num_rows(), tx).await?;
+        self.add_view_unchecked(view, key_index)?;
+        if let Err(err) = self.map.sync_reservation() {
+            if matches!(err, DataFusionError::ResourcesExhausted(_)) {
+                self.spill_on_oom(tx).await?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+        self.maybe_flush_preagg(tx).await
+    }
+
     fn add_column_masked(&mut self, array: &ArrayRef, mask: &BooleanArray) -> Result<()> {
-        match &mut self.0 {
+        match &mut self.map {
             GroupCountMapKind::Int8(m) => {
                 m.add_array_masked(downcast_primitive!(array, Int8Type), mask)
             }
@@ -637,12 +1262,129 @@ impl GroupCountState {
         }
     }
 
+    pub(super) async fn add_filtered_batch_async(
+        &mut self,
+        batch: &RecordBatch,
+        predicate: &Arc<dyn PhysicalExpr>,
+        key_index: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.spill.is_none() {
+            self.add_filtered_batch(batch, predicate, key_index)?;
+            return self.maybe_flush_preagg(tx).await;
+        }
+        match predicate.evaluate(batch)? {
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => {
+                self.add_column_async(batch.column(key_index), tx).await
+            }
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(false) | None)) => Ok(()),
+            ColumnarValue::Scalar(_) => {
+                internal_err!("Cannot create filter_array from non-boolean predicates")
+            }
+            ColumnarValue::Array(array) => {
+                let Ok(mask) = as_boolean_array(&array) else {
+                    return internal_err!(
+                        "Cannot create filter_array from non-boolean predicates"
+                    );
+                };
+                if mask.len() == batch.num_rows() {
+                    self.precheck_spill_headroom(mask.true_count(), tx).await?;
+                    let col = batch.column(key_index);
+                    match &mut self.map {
+                        GroupCountMapKind::Int8(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, Int8Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::Int16(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, Int16Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::Int32(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, Int32Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::Int64(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, Int64Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::UInt8(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, UInt8Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::UInt16(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, UInt16Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::UInt32(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, UInt32Type),
+                            mask,
+                        )?,
+                        GroupCountMapKind::UInt64(m) => m.add_array_masked_unchecked(
+                            downcast_primitive!(col, UInt64Type),
+                            mask,
+                        )?,
+                    }
+                    if let Err(err) = self.map.sync_reservation() {
+                        if matches!(err, DataFusionError::ResourcesExhausted(_)) {
+                            self.spill_on_oom(tx).await?;
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                    self.maybe_flush_preagg(tx).await
+                } else {
+                    let filtered = filter_batch(batch, mask, Some(&[key_index]))?;
+                    if filtered.num_rows() > 0 {
+                        self.add_column_async(filtered.column(0), tx).await?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+
     pub(super) async fn merge_from(
         &mut self,
-        other: Self,
+        mut other: Self,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<bool> {
-        match (&mut self.0, other.0) {
+        if self.radix.is_some() || other.radix.is_some() {
+            self.flush_map_to_radix(tx).await?;
+            other.flush_map_to_radix(tx).await?;
+            if tx.is_closed() {
+                return Ok(false);
+            }
+            if let Some(other_radix) = other.radix.take() {
+                let radix = self
+                    .radix
+                    .get_or_insert_with(RadixPartitionStore::new_default);
+                let transferred = other.map.reservation().free();
+                self.map.reservation().grow(transferred);
+                radix.combine_from(other_radix);
+            }
+            return Ok(true);
+        }
+
+        // Low-cardinality fast path (`R = 0`): merge directly in memory unless
+        // combined cardinality crosses threshold or OOM triggers radix spill.
+        if self.map.len().saturating_add(other.map.len()) >= RADIX_TRANSITION_GROUPS {
+            self.flush_map_to_radix(tx).await?;
+            other.flush_map_to_radix(tx).await?;
+            if tx.is_closed() {
+                return Ok(false);
+            }
+            if let Some(other_radix) = other.radix.take() {
+                let radix = self
+                    .radix
+                    .get_or_insert_with(RadixPartitionStore::new_default);
+                let transferred = other.map.reservation().free();
+                self.map.reservation().grow(transferred);
+                radix.combine_from(other_radix);
+            }
+            return Ok(true);
+        }
+
+        match (&mut self.map, other.map) {
             (GroupCountMapKind::Int8(a), GroupCountMapKind::Int8(b)) => {
                 a.merge_from(b, tx).await
             }
@@ -669,6 +1411,63 @@ impl GroupCountState {
             }
             _ => internal_err!("Morsel GROUP BY worker state key type mismatch"),
         }
+    }
+}
+
+struct GroupCountRadixMerger {
+    schema: SchemaRef,
+    partial_schema: SchemaRef,
+    key_type: IntKeyType,
+}
+
+impl RadixGroupMerger for GroupCountRadixMerger {
+    type Table = GroupCountMapKind;
+
+    fn partial_schema(&self) -> &SchemaRef {
+        &self.partial_schema
+    }
+
+    fn num_group_cols(&self) -> usize {
+        1
+    }
+
+    fn new_table(&self, reservation: MemoryReservation) -> Result<Self::Table> {
+        Ok(GroupCountMapKind::new(self.key_type, reservation))
+    }
+
+    fn merge_partial_batch(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        table.merge_partial_batch(batch)
+    }
+
+    fn hash_partial_batch(
+        &self,
+        batch: &RecordBatch,
+        hashes: &mut Vec<u64>,
+    ) -> Result<()> {
+        hash_int_key_array(batch.column(0), self.key_type, hashes)
+    }
+
+    fn table_is_empty(&self, table: &Self::Table) -> bool {
+        table.is_empty()
+    }
+
+    fn emit_table<'a>(
+        &'a self,
+        table: Self::Table,
+        result_operators: &'a [Operator],
+        batch_size: usize,
+        tx: &'a mpsc::Sender<RecordBatch>,
+        measurement: Option<&'a RunMetrics>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            dispatch_group_map!(table, map => {
+                map.emit_batches(&self.schema, result_operators, batch_size, tx, measurement).await
+            })
+        })
     }
 }
 
@@ -699,8 +1498,21 @@ impl GroupCountSink {
         }
     }
 
+    pub(super) fn partial_schema(&self) -> SchemaRef {
+        group_count_partial_schema(self.key_type)
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new_state(&self, reservation: MemoryReservation) -> GroupCountState {
         GroupCountState::new(self.key_type, reservation)
+    }
+
+    pub(super) fn new_state_with_spill(
+        &self,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+    ) -> GroupCountState {
+        GroupCountState::new_with_spill(self.key_type, reservation, spill)
     }
 
     pub(super) fn finalize(&self, combined: GroupCountState) -> FinalizedGroupCounts {
@@ -717,16 +1529,49 @@ pub(super) struct FinalizedGroupCounts {
 }
 
 impl FinalizedGroupCounts {
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn emit(
-        self,
-        result_operators: &[Operator],
+        mut self,
+        result_operators: ResultOpsRef,
+        workers: usize,
         batch_size: usize,
+        memory_pool: &Arc<dyn MemoryPool>,
         tx: mpsc::Sender<RecordBatch>,
-        measurement: Option<&RunMetrics>,
+        measurement: Option<Arc<RunMetrics>>,
     ) -> Result<()> {
+        if self.state.radix.is_some() {
+            self.state.flush_map_to_radix(&tx).await?;
+            let store = self.state.radix.take().expect("radix store");
+            let spill = self.state.spill.take();
+            let key_type = self.state.key_type;
+            let partial_schema = self.state.partial_schema;
+            let input_res = self.state.map.into_reservation();
+            let merger = Arc::new(GroupCountRadixMerger {
+                schema: self.schema,
+                partial_schema,
+                key_type,
+            });
+            return finalize_and_emit_radix(
+                merger,
+                store,
+                input_res,
+                RadixFinalizeConfig {
+                    workers,
+                    batch_size,
+                    memory_pool,
+                    spill,
+                    consumer_name: "MorselGroupCountFinalize",
+                    result_operators,
+                    measurement,
+                },
+                tx,
+            )
+            .await;
+        }
         let schema = self.schema;
-        dispatch_group_map!(self.state.0, map => {
-            map.emit_batches(&schema, result_operators, batch_size, &tx, measurement).await
+        let ops = result_operators.ops();
+        dispatch_group_map!(self.state.map, map => {
+            map.emit_batches(&schema, ops, batch_size, &tx, measurement.as_deref()).await
         })
     }
 }
@@ -1025,8 +1870,12 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(4);
             assert!(w0.merge_from(w1, &tx).await?);
             let finalized = sink.finalize(w0);
-            let emit =
-                SpawnedTask::spawn(async move { finalized.emit(&[], 2, tx, None).await });
+            let emit_pool = Arc::clone(&pool);
+            let emit = SpawnedTask::spawn(async move {
+                finalized
+                    .emit(ResultOpsRef::Empty, 1, 2, &emit_pool, tx, None)
+                    .await
+            });
             let mut rows = 0;
             let mut total_count = 0i64;
             while let Some(batch) = rx.recv().await {

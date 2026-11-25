@@ -6,18 +6,19 @@
 //! morsel `GROUP BY`, `HashJoin`, and `Sort`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 use datafusion_physical_plan::spill::SpillManager;
 use tokio::sync::mpsc;
 
-/// Cap for the minimum memory-pool viability check before entering spill mode.
+/// Cap for the minimum memory-pool viability check before enabling spilling.
 /// Respected alongside `execution.sort_spill_reservation_bytes` so pools that
 /// cannot even hold minimal IPC framing + one radix partition fail fast with
 /// `ResourcesExhausted` instead of thrashing.
@@ -27,6 +28,7 @@ const MIN_SPILL_WORKING_SET_CAP: usize = 256 * 1024;
 pub(super) struct SpillContext {
     pub(super) manager: SpillManager,
     pub(super) min_headroom_bytes: usize,
+    spilled: Arc<AtomicBool>,
 }
 
 impl SpillContext {
@@ -40,22 +42,41 @@ impl SpillContext {
             return None;
         }
         let opts = &context.session_config().options().execution;
-        let manager =
-            SpillManager::new(env, SpillMetrics::new(plan_metrics, 0), schema)
-                .with_compression_type(opts.spill_compression);
         let min_headroom_bytes = opts
             .sort_spill_reservation_bytes
             .min(MIN_SPILL_WORKING_SET_CAP);
+        if min_headroom_bytes > 0 {
+            let probe = MemoryConsumer::new("MorselSpillViability")
+                .with_can_spill(true)
+                .register(context.memory_pool());
+            let viable = probe.try_grow(min_headroom_bytes).is_ok();
+            drop(probe);
+            if !viable {
+                return None;
+            }
+        }
+        let manager =
+            SpillManager::new(env, SpillMetrics::new(plan_metrics, 0), schema)
+                .with_compression_type(opts.spill_compression);
         Some(Self {
             manager,
             min_headroom_bytes,
+            spilled: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(super) fn mark_spilled(&self) {
+        self.spilled.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_spilled(&self) -> bool {
+        self.spilled.load(Ordering::Acquire)
     }
 }
 
-/// Verify that `reservation` can temporarily admit `min_headroom_bytes` (after
-/// the caller has already freed any spillable local state). If not, the pool is
-/// too small for out-of-core spilling and we return `ResourcesExhausted`.
+/// Verify that `reservation` can temporarily admit `min_headroom_bytes` when no
+/// other consumers hold memory.
+#[allow(dead_code)]
 pub(super) fn check_spill_headroom(
     reservation: &MemoryReservation,
     min_headroom_bytes: usize,
