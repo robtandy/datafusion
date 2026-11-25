@@ -8,7 +8,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{
@@ -30,6 +30,7 @@ use datafusion::morsel::MorselQueryPlanner;
 use datafusion::physical_plan::{ExecutionPlan, collect, execute_stream};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_common::test_util::batches_to_sort_string;
+use datafusion_common_runtime::SpawnedTask;
 use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -1292,5 +1293,238 @@ async fn group_by_recursive_radix_split_and_sorted_spill_fallback_parity() -> Re
     );
     drop(plan);
     assert_zero_leaks(&runtime, "grouped_sorted_fallback");
+    Ok(())
+}
+
+/// Spawn a lightweight sampler that tracks the peak `active_files_count` on
+/// `runtime.disk_manager` while a query executes.
+async fn collect_with_peak_active_files(
+    plan: Arc<dyn ExecutionPlan>,
+    ctx: &SessionContext,
+    runtime: &Arc<RuntimeEnv>,
+) -> Result<(Vec<RecordBatch>, usize)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let stop_bg = Arc::clone(&stop);
+    let peak_bg = Arc::clone(&peak);
+    let rt_bg = Arc::clone(runtime);
+    let sampler = SpawnedTask::spawn(async move {
+        while !stop_bg.load(Ordering::Relaxed) {
+            let cur = rt_bg.disk_manager.spilling_progress().active_files_count;
+            peak_bg.fetch_max(cur, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_micros(500)).await;
+        }
+    });
+    let res = collect(plan, ctx.task_ctx()).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = sampler.join().await;
+    Ok((res?, peak.load(Ordering::Relaxed)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peak_active_spill_files_stay_bounded_across_group_by_hash_join_and_sort()
+-> Result<()> {
+    // 1. High-cardinality GROUP BY with many spill flushes: peak active spill
+    //    files must scale with partition count (<= 64 L0), NOT partitions x workers x flushes.
+    {
+        let table = high_cardinality_group_table(96, 1024);
+        let stock = stock_context(4, 512);
+        stock.register_table("t", table.clone())?;
+        let sql = "SELECT k_str, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY k_str";
+        let expected = stock.sql(sql).await?.collect().await?;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("t", table)?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let (actual, peak_files) =
+            collect_with_peak_active_files(Arc::clone(&plan), &ctx, &runtime).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+        );
+        let total_files = spill_count(plan.as_ref());
+        assert!(
+            spilled_bytes(plan.as_ref()) > 0,
+            "expected GROUP BY to spill"
+        );
+        assert!(
+            peak_files <= 128 && total_files <= 128,
+            "GROUP BY open spill files unbounded: peak_active={peak_files}, total_created={total_files}"
+        );
+        drop(plan);
+        assert_zero_leaks(&runtime, "bounded_files_group_by");
+    }
+
+    // 2. Spilled HashJoin (build + probe): peak active spill files bounded by
+    //    O(partitions) (`<= 64` build + `<= 64` probe + `<= 1` null-key).
+    {
+        let (build_tbl, probe_tbl) = large_join_tables(28_000, 36_000, 1024);
+        let stock = stock_context(4, 512);
+        stock.register_table("b", build_tbl.clone())?;
+        stock.register_table("p", probe_tbl.clone())?;
+        let sql = "SELECT b.bk, b.bval, p.pval FROM b LEFT JOIN p ON b.bk = p.pk";
+        let expected = stock.sql(sql).await?.collect().await?;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1536 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("b", build_tbl)?;
+        ctx.register_table("p", probe_tbl)?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let (actual, peak_files) =
+            collect_with_peak_active_files(Arc::clone(&plan), &ctx, &runtime).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+        );
+        let total_files = spill_count(plan.as_ref());
+        assert!(
+            spilled_bytes(plan.as_ref()) > 0,
+            "expected HashJoin to spill"
+        );
+        assert!(
+            peak_files <= 160 && total_files <= 160,
+            "HashJoin open spill files unbounded: peak_active={peak_files}, total_created={total_files}"
+        );
+        drop(plan);
+        assert_zero_leaks(&runtime, "bounded_files_hash_join");
+    }
+
+    // 3. Spilled Sort across many small batches: periodic per-worker compaction
+    //    bounds peak active spill files to `O(workers)`.
+    {
+        let table = large_sort_table(128, 1024);
+        let stock = stock_context(4, 512);
+        stock.register_table("s", table.clone())?;
+        let sql = "SELECT id, sort_key, payload FROM s ORDER BY sort_key ASC NULLS LAST, id ASC";
+        let expected = stock.sql(sql).await?.collect().await?;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1536 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("s", table)?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let (actual, peak_files) =
+            collect_with_peak_active_files(Arc::clone(&plan), &ctx, &runtime).await?;
+        assert_exact_order(expected, actual, "bounded_files_sort")?;
+        assert!(spilled_bytes(plan.as_ref()) > 0, "expected Sort to spill");
+        assert!(
+            peak_files <= 128,
+            "Sort peak active spill files unbounded: peak_active={peak_files}"
+        );
+        drop(plan);
+        wait_zero_leaks(&runtime, "bounded_files_sort").await;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topn_spill_truncates_runs_to_limit_instead_of_spilling_full_input() -> Result<()>
+{
+    // 128 batches x 1024 rows (~11 MiB raw payload) -> verifies TopN neither
+    // falsely spills on small `LIMIT 10` nor spills the full input when a
+    // larger `LIMIT` does trigger spill fallback.
+    let table = large_sort_table(128, 1024);
+    let stock = stock_context(4, 512);
+    stock.register_table("s", table.clone())?;
+
+    // 1. `LIMIT 10` under a 2 MiB pool must NOT spill the 11 MiB input.
+    {
+        let sql = "SELECT id, sort_key, payload FROM s ORDER BY sort_key DESC NULLS LAST, id DESC LIMIT 10";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2 * 1024 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("s", table.clone())?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_exact_order(expected, actual, "topn_limit10_2mb")?;
+        assert_eq!(
+            spilled_bytes(plan.as_ref()),
+            0,
+            "LIMIT 10 under 2 MiB pool should not spill (spilled {} bytes)",
+            spilled_bytes(plan.as_ref())
+        );
+        drop(plan);
+        assert_zero_leaks(&runtime, "topn_limit10_2mb");
+    }
+
+    // 2. `LIMIT 150 OFFSET 50` (limit = 200 << 4096-row batches) over ~11 MiB
+    //    input under a tight 512 KiB pool: even when TopN spills, every run is
+    //    truncated to `<= 200` rows so spilled bytes stay tiny (< 2 MiB vs ~11 MiB input).
+    {
+        let wide_batches = large_sort_table(32, 4096);
+        let stock_wide = stock_context(4, 512);
+        stock_wide.register_table("sw", wide_batches.clone())?;
+        let sql = "SELECT id, sort_key, payload FROM sw ORDER BY sort_key DESC NULLS FIRST, id DESC LIMIT 150 OFFSET 50";
+        let expected = stock_wide.sql(sql).await?.collect().await?;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("sw", wide_batches)?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let (actual, peak_files) =
+            collect_with_peak_active_files(Arc::clone(&plan), &ctx, &runtime).await?;
+        assert_exact_order(expected, actual, "topn_limit150_512kb")?;
+        let spilled = spilled_bytes(plan.as_ref());
+        assert!(
+            spilled < 2 * 1024 * 1024,
+            "TopN LIMIT 150 OFFSET 50 spilled {spilled} bytes (expected < 2 MiB on 11 MiB input)"
+        );
+        assert!(
+            peak_files <= 128,
+            "TopN peak active spill files unbounded: {peak_files}"
+        );
+        drop(plan);
+        wait_zero_leaks(&runtime, "topn_limit150_512kb").await;
+    }
+
+    // 3. Large `LIMIT 2000 OFFSET 500` under a tight 768 KiB pool genuinely
+    //    spills, keeps total spilled bytes well below full-input sort (~25 MiB),
+    //    and keeps peak active spill files bounded.
+    {
+        let sql = "SELECT id, sort_key, payload FROM s ORDER BY sort_key DESC NULLS FIRST, id DESC LIMIT 2000 OFFSET 500";
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(768 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("s", table)?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let (actual, peak_files) =
+            collect_with_peak_active_files(Arc::clone(&plan), &ctx, &runtime).await?;
+        assert_exact_order(expected, actual, "topn_limit2000_768kb")?;
+        let spilled = spilled_bytes(plan.as_ref());
+        assert!(
+            spilled > 0,
+            "expected large TopN under 768 KiB pool to spill"
+        );
+        assert!(
+            spilled < 12 * 1024 * 1024,
+            "TopN LIMIT 2000 OFFSET 500 spilled {spilled} bytes (expected < 12 MiB)"
+        );
+        assert!(
+            peak_files <= 128,
+            "TopN peak active spill files unbounded: {peak_files}"
+        );
+        drop(plan);
+        wait_zero_leaks(&runtime, "topn_limit2000_768kb").await;
+    }
+
     Ok(())
 }
