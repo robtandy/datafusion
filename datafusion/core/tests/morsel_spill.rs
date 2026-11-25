@@ -1528,3 +1528,117 @@ async fn topn_spill_truncates_runs_to_limit_instead_of_spilling_full_input() -> 
 
     Ok(())
 }
+
+fn nested_join_memtable(
+    key_col: &str,
+    val_col: &str,
+    rows: usize,
+    key_domain: usize,
+    batch_rows: usize,
+    prefix: &str,
+) -> Arc<MemTable> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(key_col, DataType::Int64, true),
+        Field::new(val_col, DataType::Utf8, true),
+    ]));
+    let mut parts: Vec<Vec<RecordBatch>> = vec![Vec::new(); 4];
+    for (idx, start) in (0..rows).step_by(batch_rows).enumerate() {
+        let len = (rows - start).min(batch_rows);
+        let mut keys = Vec::with_capacity(len);
+        let mut vals = Vec::with_capacity(len);
+        for i in start..start + len {
+            if i % 199 == 0 {
+                keys.push(None);
+            } else {
+                keys.push(Some(((i * 37 + 13) % key_domain) as i64));
+            }
+            vals.push(Some(format!(
+                "{prefix}-payload-{i:08}-padding-0123456789abcdef0123456789"
+            )));
+        }
+        parts[idx % 4].push(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(StringArray::from(vals)),
+                ],
+            )
+            .unwrap(),
+        );
+    }
+    Arc::new(MemTable::try_new(schema, parts).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_join_build_side_spills_parent_build_on_nested_p2_oom() -> Result<()> {
+    // Regression test for commit 45fca6ad9: a join whose build side is itself
+    // a join (`z JOIN (a JOIN b) ab`) must spill parent `HashJoinBuild`
+    // buffers when the nested join's P2 partition replay needs pool headroom.
+    // Make `z` larger than `a` and `b` so the planner places `(a JOIN b)` on
+    // the build side of the outer join, while `a` and `b` are large enough to
+    // trigger spilling under a 1.5 MiB GreedyMemoryPool.
+    let a = nested_join_memtable("ak", "aval", 20_000, 18_000, 512, "a");
+    let b = nested_join_memtable("bk", "bval", 22_000, 18_000, 512, "b");
+    let z = nested_join_memtable("zk", "zval", 40_000, 18_000, 512, "z");
+
+    let stock = stock_context(4, 512);
+    stock.register_table("a", a.clone())?;
+    stock.register_table("b", b.clone())?;
+    stock.register_table("z", z.clone())?;
+
+    let cases = [
+        (
+            "nested_build_inner",
+            "SELECT z.zk, ab.ak, ab.bk, z.zval, ab.aval, ab.bval \
+             FROM z \
+             INNER JOIN (SELECT a.ak, b.bk, a.aval, b.bval FROM a INNER JOIN b ON a.ak = b.bk) ab \
+               ON z.zk = ab.ak",
+        ),
+        (
+            "nested_build_full",
+            "SELECT z.zk, ab.ak, ab.bk, z.zval, ab.aval, ab.bval \
+             FROM z \
+             FULL OUTER JOIN (SELECT a.ak, b.bk, a.aval, b.bval FROM a FULL OUTER JOIN b ON a.ak = b.bk) ab \
+               ON z.zk = COALESCE(ab.ak, ab.bk)",
+        ),
+    ];
+
+    for (label, sql) in cases {
+        let expected = stock.sql(sql).await?.collect().await?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1536 * 1024));
+        let runtime = runtime_with_pool(Arc::clone(&pool), None)?;
+        let ctx = morsel_context(4, 512, Arc::clone(&runtime))?;
+        ctx.register_table("a", a.clone())?;
+        ctx.register_table("b", b.clone())?;
+        ctx.register_table("z", z.clone())?;
+
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec", "{label}");
+        let plan_str = datafusion_physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+        let has_nested_build_probe = plan_str.split("[Build:").skip(1).any(|seg| {
+            seg.contains("HashJoinProbe") && seg.contains("HashJoinBuildSink")
+        });
+        assert!(
+            has_nested_build_probe,
+            "{label}: expected a [Build: ...] stage with HashJoinProbe feeding HashJoinBuildSink, got:\n{plan_str}"
+        );
+
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "{label}"
+        );
+        assert!(
+            spilled_bytes(plan.as_ref()) > 0,
+            "{label}: expected nested join under 1.5 MiB pool to spill"
+        );
+        drop(plan);
+        wait_zero_leaks(&runtime, label).await;
+    }
+
+    Ok(())
+}
