@@ -2731,3 +2731,134 @@ async fn same_column_row_filter_conjuncts_decode_once() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_column_row_filter_preserves_guarded_filters_and_respects_pruning_setting()
+-> Result<()> {
+    let dir = TempDir::new()?;
+    let n = 2_000usize;
+    let s_values: Vec<Option<String>> = (0..n)
+        .map(|i| match i % 7 {
+            0 => Some(String::new()),
+            1 => None,
+            2 => Some("3".to_owned()),
+            3 => Some("6".to_owned()),
+            4 => Some("42".to_owned()),
+            5 => Some("-10".to_owned()),
+            _ => Some((i % 20).to_string()),
+        })
+        .collect();
+    let x_values: Vec<Option<i32>> = (0..n)
+        .map(|i| match i % 6 {
+            0 => Some(0),
+            1 => None,
+            2 => Some(-5),
+            3 => Some(10),
+            4 => Some(25),
+            _ => Some(50),
+        })
+        .collect();
+    let non_null_values: Vec<i64> = (10..10 + n as i64).collect();
+    let batch = RecordBatch::try_from_iter([
+        ("s", Arc::new(StringArray::from(s_values)) as _),
+        ("x", Arc::new(Int32Array::from(x_values)) as _),
+        ("k", Arc::new(Int64Array::from(non_null_values)) as _),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(500))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("guarded.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let make_ctx = |mode: &str, reorder: bool, pruning: bool| {
+        let dir_path = dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut config = SessionConfig::new().with_target_partitions(2);
+            config.options_mut().execution.parquet.pushdown_filters = true;
+            config.options_mut().execution.parquet.reorder_filters = reorder;
+            config.options_mut().execution.parquet.pruning = pruning;
+            config.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_parquet("t", &dir_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(ctx)
+        }
+    };
+
+    // 1. Guarded CAST and guarded division must never evaluate the fallible
+    // conjunct on rows rejected by the earlier guard, while still grouping
+    // same-column conjuncts into 1 ArrowPredicate so the column decodes once.
+    let guarded_queries = [
+        "SELECT COUNT(*) FROM t WHERE s <> '' AND CAST(s AS INT) > 5",
+        "SELECT COUNT(*) FROM t WHERE x <> 0 AND 100 / x > 3",
+        "SELECT k FROM t WHERE s <> '' AND CAST(s AS INT) > 5 AND x <> 0 AND 100 / x > 3",
+    ];
+    for reorder in [false, true] {
+        let stock = make_ctx("off", reorder, true).await?;
+        let native = make_ctx("required", reorder, true).await?;
+        for sql in guarded_queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            assert!(
+                displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string()
+                    .contains("MorselExec")
+            );
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "reorder={reorder}: {sql}"
+            );
+            let expected_preds = if sql.contains("AND x") { 2 } else { 1 };
+            assert_eq!(
+                metric(plan.as_ref(), "row_filter_predicates"),
+                expected_preds,
+                "reorder={reorder}: {sql}"
+            );
+        }
+    }
+
+    // 2. Always-true conjunct elision MUST respect `execution.parquet.pruning=false`:
+    // `k >= 0` is strictly contained in every RG's stats (min=10, 0 nulls), so with
+    // `pruning=true` it is elided (only `x > 5` remains -> 1 predicate), whereas
+    // with `pruning=false` row-group stats are NOT consulted (`k >= 0` and `x > 5`
+    // both remain -> 2 predicates).
+    let sql_elision = "SELECT COUNT(*) FROM t WHERE k >= 0 AND x > 5";
+    let native_pruning_off = make_ctx("required", false, false).await?;
+    let plan_off = native_pruning_off
+        .sql(sql_elision)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let _ = collect(Arc::clone(&plan_off), native_pruning_off.task_ctx()).await?;
+    assert_eq!(
+        metric(plan_off.as_ref(), "row_filter_predicates"),
+        2,
+        "pruning=false must NOT elide conjuncts using row-group statistics"
+    );
+
+    let native_pruning_on = make_ctx("required", false, true).await?;
+    let plan_on = native_pruning_on
+        .sql(sql_elision)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let _ = collect(Arc::clone(&plan_on), native_pruning_on.task_ctx()).await?;
+    assert_eq!(
+        metric(plan_on.as_ref(), "row_filter_predicates"),
+        1,
+        "pruning=true should elide always-true `k >= 0` using row-group statistics"
+    );
+
+    Ok(())
+}

@@ -54,7 +54,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
+use arrow::array::{Array, BooleanArray, BooleanBufferBuilder};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
@@ -65,6 +66,10 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::TreeNode;
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 
@@ -97,8 +102,13 @@ use crate::projection_read_plan::{
 ///   decoding.
 #[derive(Debug)]
 pub(crate) struct DatafusionArrowPredicate {
-    /// the filter expression
-    physical_expr: Arc<dyn PhysicalExpr>,
+    /// Ordered filter expressions over `projection_mask`. In the common case
+    /// (ungrouped, or grouped infallible conjuncts) this holds a single
+    /// expression. When a potentially-fallible conjunct (e.g. `CAST`, division)
+    /// follows a guard on the same column (`s <> '' AND CAST(s AS INT) > 5`),
+    /// stages run sequentially on only the surviving rows so earlier guards
+    /// prevent errors while still decoding the column once.
+    physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
@@ -123,16 +133,63 @@ impl DatafusionArrowPredicate {
         rows_matched: metrics::Count,
         time: metrics::Time,
     ) -> Result<Self> {
-        let physical_expr =
-            reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let physical_exprs = candidate
+            .exprs
+            .into_iter()
+            .map(|expr| {
+                reassign_expr_columns(expr, &candidate.read_plan.projected_schema)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            physical_expr,
+            physical_exprs,
             projection_mask: candidate.read_plan.projection_mask,
             rows_pruned,
             rows_matched,
             time,
         })
+    }
+
+    fn eval_single_mask(
+        expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<BooleanArray> {
+        let array = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        Ok(as_boolean_array(&array)?.clone())
+    }
+
+    fn eval_staged(&self, batch: &RecordBatch) -> Result<BooleanArray> {
+        let mut mask = Self::eval_single_mask(&self.physical_exprs[0], batch)?;
+        if self.physical_exprs.len() == 1 {
+            return Ok(mask);
+        }
+        let num_rows = batch.num_rows();
+        for expr in &self.physical_exprs[1..] {
+            let surviving = mask.true_count();
+            if surviving == 0 {
+                break;
+            }
+            if surviving == num_rows {
+                mask = Self::eval_single_mask(expr, batch)?;
+                continue;
+            }
+            let sub_batch = filter_record_batch(batch, &mask)?;
+            let sub_mask = Self::eval_single_mask(expr, &sub_batch)?;
+            let mut builder = BooleanBufferBuilder::new(num_rows);
+            builder.append_n(num_rows, false);
+            let mut sub_idx = 0usize;
+            for row_idx in 0..num_rows {
+                if mask.is_valid(row_idx) && mask.value(row_idx) {
+                    if sub_mask.is_valid(sub_idx) && sub_mask.value(sub_idx) {
+                        builder.set_bit(row_idx, true);
+                    }
+                    sub_idx += 1;
+                }
+            }
+            debug_assert_eq!(sub_idx, sub_mask.len());
+            mask = BooleanArray::new(builder.finish(), None);
+        }
+        Ok(mask)
     }
 }
 
@@ -145,17 +202,14 @@ impl ArrowPredicate for DatafusionArrowPredicate {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
 
-        self.physical_expr
-            .evaluate(&batch)
-            .and_then(|v| v.into_array(batch.num_rows()))
-            .and_then(|array| {
-                let bool_arr = as_boolean_array(&array)?.clone();
+        self.eval_staged(&batch)
+            .map(|bool_arr| {
                 let num_matched = bool_arr.true_count();
                 let num_pruned = bool_arr.len() - num_matched;
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
                 timer.stop();
-                Ok(bool_arr)
+                bool_arr
             })
             // `ExternalError` is the only `ArrowError` variant that keeps a
             // source, and therefore the only one that leaves the original error
@@ -175,7 +229,8 @@ impl ArrowPredicate for DatafusionArrowPredicate {
 ///
 /// See the module level documentation for more information.
 pub(crate) struct FilterCandidate {
-    expr: Arc<dyn PhysicalExpr>,
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    last_is_infallible: bool,
     /// Estimate for the total number of bytes that will need to be processed
     /// to evaluate this filter. This is used to estimate the cost of evaluating
     /// the filter and to order the filters when `reorder_predicates` is true.
@@ -184,8 +239,50 @@ pub(crate) struct FilterCandidate {
     /// The resolved Parquet read plan (leaf indices + projected schema).
     read_plan: ParquetReadPlan,
     /// Sorted, deduplicated Parquet leaf column indices required to evaluate
-    /// `expr`. Used to merge conjuncts that read the exact same column set.
+    /// `exprs`. Used to merge conjuncts that read the exact same column set.
     leaf_indices: Vec<usize>,
+}
+
+/// Returns `true` when `expr` is a simple column/literal predicate that cannot
+/// error on valid Arrow input values, so consecutive infallible conjuncts on
+/// the same column can be fused directly into a single `BinaryExpr(And)`
+/// without staging.
+fn is_infallible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if expr.is::<Column>() || expr.is::<Literal>() {
+        return true;
+    }
+    if let Some(e) = expr.downcast_ref::<IsNullExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<IsNotNullExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<NotExpr>() {
+        return is_infallible_expr(e.arg());
+    }
+    if let Some(e) = expr.downcast_ref::<InListExpr>() {
+        return is_infallible_expr(e.expr()) && e.list().iter().all(is_infallible_expr);
+    }
+    if let Some(e) = expr.downcast_ref::<LikeExpr>() {
+        return is_infallible_expr(e.expr()) && is_infallible_expr(e.pattern());
+    }
+    if let Some(e) = expr.downcast_ref::<BinaryExpr>() {
+        return matches!(
+            e.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom
+                | Operator::And
+                | Operator::Or
+        ) && is_infallible_expr(e.left())
+            && is_infallible_expr(e.right());
+    }
+    false
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -219,11 +316,15 @@ impl FilterCandidateBuilder {
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
         Ok(
             build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
-                |(read_plan, leaf_indices, required_bytes)| FilterCandidate {
-                    expr: self.expr,
-                    required_bytes,
-                    read_plan,
-                    leaf_indices,
+                |(read_plan, leaf_indices, required_bytes)| {
+                    let last_is_infallible = is_infallible_expr(&self.expr);
+                    FilterCandidate {
+                        exprs: vec![self.expr],
+                        last_is_infallible,
+                        required_bytes,
+                        read_plan,
+                        leaf_indices,
+                    }
                 },
             ),
         )
@@ -451,9 +552,9 @@ pub fn build_row_filter(
 /// on `fully_matched → not-fully-matched` boundaries.
 #[derive(Clone, Debug)]
 pub(crate) struct PrebuiltRowFilterCandidate {
-    /// The predicate expression with all `Column` indices rewritten to point
-    /// into the projected file schema.
-    physical_expr: Arc<dyn PhysicalExpr>,
+    /// Ordered predicate expressions with all `Column` indices rewritten to
+    /// point into the projected file schema.
+    physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
@@ -564,14 +665,22 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
 
     let candidates = if group_same_column && candidates.len() > 1 {
         let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
-        for cand in candidates {
+        for mut cand in candidates {
             if !cand.leaf_indices.is_empty()
                 && let Some(existing) = grouped.iter_mut().find(|g| {
                     g.leaf_indices == cand.leaf_indices
                         && g.read_plan.projected_schema == cand.read_plan.projected_schema
                 })
             {
-                existing.expr = conjunction([Arc::clone(&existing.expr), cand.expr]);
+                let next_expr = cand.exprs.pop().expect("non-empty candidate exprs");
+                if existing.last_is_infallible && cand.last_is_infallible {
+                    let tail =
+                        existing.exprs.last_mut().expect("non-empty grouped exprs");
+                    *tail = conjunction([Arc::clone(tail), next_expr]);
+                } else {
+                    existing.exprs.push(next_expr);
+                    existing.last_is_infallible = cand.last_is_infallible;
+                }
             } else {
                 grouped.push(cand);
             }
@@ -584,12 +693,15 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
-            let physical_expr = reassign_expr_columns(
-                Arc::clone(&candidate.expr),
-                &candidate.read_plan.projected_schema,
-            )?;
+            let physical_exprs = candidate
+                .exprs
+                .into_iter()
+                .map(|expr| {
+                    reassign_expr_columns(expr, &candidate.read_plan.projected_schema)
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(PrebuiltRowFilterCandidate {
-                physical_expr,
+                physical_exprs,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
             })
@@ -632,7 +744,7 @@ pub(crate) fn row_filter_from_prebuilt(
                 metrics::Count::new()
             };
             Box::new(DatafusionArrowPredicate {
-                physical_expr: Arc::clone(&candidate.physical_expr),
+                physical_exprs: candidate.physical_exprs.clone(),
                 projection_mask: candidate.projection_mask.clone(),
                 rows_pruned: predicate_rows_pruned,
                 rows_matched: predicate_rows_matched,

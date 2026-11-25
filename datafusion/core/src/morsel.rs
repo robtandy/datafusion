@@ -4,7 +4,7 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use datafusion_physical_expr::expressions::Column;
 #[cfg(test)]
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
-use datafusion_physical_expr::utils::split_conjunction;
+use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
@@ -215,36 +215,60 @@ fn estimate_side_size(
             }
         }
     }
-    let mut filter_conjuncts = 0u32;
+    SideEstimate { is_empty, ..base }
+}
+
+/// Join-specific cardinality estimate used only by [`choose_build_side`].
+///
+/// Counts distinct referenced column sets across conjunctive predicates on
+/// non-`Stage` inputs so range pairs on the same column (e.g. `l_shipdate >= a
+/// AND l_shipdate <= b` in TPC-H Q7) count as one filter group rather than two,
+/// and `StageSource` estimates (which already carry aggregate reduction) are
+/// never double-discounted (TPC-H Q20), while heavily multi-predicate scans
+/// (e.g. TPC-H Q12 `lineitem` vs unfiltered `orders`) still place the smaller
+/// filtered side on build.
+fn estimate_join_side_size(
+    source: &Source,
+    operators: &[Operator],
+    stages: &[StageSpec],
+) -> SideEstimate {
+    let base = estimate_side_size(source, operators, stages);
+    if base.is_empty || matches!(source, Source::Stage(_)) {
+        return base;
+    }
+    let mut distinct_groups: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
+        for conjunct in split_conjunction(pred) {
+            let mut cols: Vec<String> = collect_columns(conjunct)
+                .into_iter()
+                .map(|c| c.name().to_owned())
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            if !cols.is_empty() {
+                distinct_groups.insert(cols);
+            }
+        }
+    };
     #[cfg(feature = "parquet")]
     if let Source::Parquet(pq) = source
         && let Some(pred) = pq.pushed_predicate()
     {
-        filter_conjuncts =
-            filter_conjuncts.saturating_add(split_conjunction(&pred).len() as u32);
+        record_predicate(&pred);
     }
     for op in operators {
         if let Operator::Filter { predicate, .. } = op {
-            filter_conjuncts = filter_conjuncts
-                .saturating_add(split_conjunction(predicate).len() as u32);
+            record_predicate(predicate);
         }
     }
-    // Discount filtered scans by 2x per conjunctive filter (capped at 32x) so
-    // heavily selective fact-table filters (e.g. TPC-H Q12 `lineitem` vs
-    // unfiltered `orders`) place the smaller filtered side on build and push
-    // dynamic join filters into the larger unfiltered table.
-    let shift = filter_conjuncts.min(5);
-    let approx_bytes = if is_empty || shift == 0 {
-        base.approx_bytes
-    } else {
-        (base.approx_bytes >> shift).max(1)
-    };
-    let mem_rows = match base.mem_rows {
-        Some(rows) if !is_empty && shift > 0 => Some((rows >> shift).max(1)),
-        other => other,
-    };
+    let shift = (distinct_groups.len() as u32).min(4);
+    if shift == 0 {
+        return base;
+    }
+    let approx_bytes = (base.approx_bytes >> shift).max(1);
+    let mem_rows = base.mem_rows.map(|rows| (rows >> shift).max(1));
     SideEstimate {
-        is_empty,
+        is_empty: base.is_empty,
         mem_rows,
         approx_bytes,
     }

@@ -55,8 +55,8 @@ use super::sort::{SortSink, TopNSink};
 use super::{
     BoxFuture, Lowering, MemorySource, MorselExec, MorselQueryPlanner, Operator,
     Pipeline, PostSort, SideEstimate, Sink, Source, assign_join_build_ids,
-    choose_build_side, estimate_side_size, prune_filter_input, result_capacity,
-    sink_result_capacity, supported_expr, unsupported_provider_reason,
+    choose_build_side, estimate_join_side_size, estimate_side_size, prune_filter_input,
+    result_capacity, sink_result_capacity, supported_expr, unsupported_provider_reason,
 };
 
 #[cfg(feature = "parquet")]
@@ -1680,8 +1680,8 @@ impl DagBuilder<'_> {
             }
         } else {
             choose_build_side(
-                estimate_side_size(&left_source, &left_ops, &self.stages),
-                estimate_side_size(&right_source, &right_ops, &self.stages),
+                estimate_join_side_size(&left_source, &left_ops, &self.stages),
+                estimate_join_side_size(&right_source, &right_ops, &self.stages),
             )
         };
         let kind = ProbeJoinKind::from_logical(

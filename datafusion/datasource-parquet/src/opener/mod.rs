@@ -592,8 +592,8 @@ impl DecoderReadPlans {
                 prepared.file_metrics.clone(),
                 prepared.max_predicate_cache_size,
                 prepared.group_row_filter_conjuncts,
-                prepared
-                    .group_row_filter_conjuncts
+                (prepared.group_row_filter_conjuncts
+                    && prepared.enable_row_group_stats_pruning)
                     .then_some(surviving_row_groups),
             )
         });
