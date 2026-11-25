@@ -11,6 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(any(feature = "parquet", test))]
 use arrow::array::RecordBatch;
@@ -163,6 +164,50 @@ impl SplitBlockBloomFilter {
             all &= (word & bit) != 0;
         }
         all
+    }
+}
+
+/// Lock-free atomic builder for [`SplitBlockBloomFilter`], enabling parallel
+/// radix-partition join build finalization without cross-partition locks.
+pub(super) struct AtomicSplitBlockBloomFilter {
+    blocks: Vec<[AtomicU32; 8]>,
+    block_mask: usize,
+}
+
+impl AtomicSplitBlockBloomFilter {
+    pub(super) fn with_blocks(num_blocks: usize) -> Self {
+        debug_assert!(num_blocks.is_power_of_two());
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            blocks.push(std::array::from_fn(|_| AtomicU32::new(0)));
+        }
+        Self {
+            blocks,
+            block_mask: num_blocks - 1,
+        }
+    }
+
+    #[inline]
+    pub(super) fn insert(&self, h: u64) {
+        let block = &self.blocks[(h as usize) & self.block_mask];
+        let mask = SplitBlockBloomFilter::intra_block_mask(h);
+        for (word, bit) in block.iter().zip(mask) {
+            if (word.load(Ordering::Relaxed) & bit) == 0 {
+                word.fetch_or(bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn into_bloom(self) -> SplitBlockBloomFilter {
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|b| b.map(AtomicU32::into_inner))
+            .collect();
+        SplitBlockBloomFilter {
+            blocks,
+            block_mask: self.block_mask,
+        }
     }
 }
 

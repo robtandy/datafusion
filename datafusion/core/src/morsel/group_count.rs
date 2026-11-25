@@ -1691,10 +1691,7 @@ mod tests {
             for k in 0..1024i64 {
                 if let Err(err) = m.add_key(k, 1) {
                     assert!(
-                        matches!(
-                            err,
-                            datafusion_common::DataFusionError::ResourcesExhausted(_)
-                        ),
+                        matches!(err, DataFusionError::ResourcesExhausted(_)),
                         "{err}"
                     );
                     hit_oom = true;
@@ -1725,10 +1722,7 @@ mod tests {
             assert_eq!(merge_pool.reserved(), 2 * one_worker_bytes);
             let err = a.merge_from(b, &tx).await.unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "expected ResourcesExhausted at merge peak, got: {err}"
             );
         }
@@ -1928,10 +1922,10 @@ mod tests {
         let mut s_idx = GroupCountState::new(IntKeyType::Int32, test_reservation(&pool));
         s_mask.add_view(&view_mask, 0)?;
         s_idx.add_view(&view_idx, 0)?;
-        let GroupCountMapKind::Int32(m1) = &s_mask.0 else {
+        let GroupCountMapKind::Int32(m1) = &s_mask.map else {
             unreachable!()
         };
-        let GroupCountMapKind::Int32(m2) = &s_idx.0 else {
+        let GroupCountMapKind::Int32(m2) = &s_idx.map else {
             unreachable!()
         };
         assert_eq!(m1.counts, m2.counts);

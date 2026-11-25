@@ -3429,10 +3429,7 @@ mod tests {
             let mut state = sink.new_state(test_reservation(&tight))?;
             let err = state.add_batch(&make_batch(0, 1024)?).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "expected ResourcesExhausted, got: {err}"
             );
         }
@@ -3452,10 +3449,7 @@ mod tests {
             assert_eq!(merge_pool.reserved(), 2 * one_worker_bytes);
             let err = a.merge_from(b, &tx).await.unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "expected ResourcesExhausted at merge peak, got: {err}"
             );
         }
@@ -3472,7 +3466,7 @@ mod tests {
         assert!(a.merge_from(b, &tx).await?);
         assert!(ample.reserved() > 0);
         let finalized = sink.finalize(a);
-        let emit_pool = Arc::clone(&pool);
+        let emit_pool = Arc::clone(&ample);
         let emit = SpawnedTask::spawn(async move {
             finalized
                 .emit(ResultOpsRef::Empty, 1, 64, &emit_pool, tx, None)
@@ -3667,10 +3661,7 @@ mod tests {
             let mut state = sink.new_state(test_reservation(&tight))?;
             let err = state.add_view(&BatchView::all(big)).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "{err}"
             );
         }
