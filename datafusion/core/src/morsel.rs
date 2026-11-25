@@ -12,36 +12,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+#[cfg(test)]
+use arrow::datatypes::DataType;
+use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::config::MorselMode;
 use datafusion_common::instant::Instant;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::utils::combine_limit;
 use datafusion_common::utils::memory::get_record_batch_memory_size;
-use datafusion_common::{
-    DFSchema, JoinType, NullEquality, Result, exec_datafusion_err, internal_err,
-    plan_err, project_schema,
-};
+use datafusion_common::{Result, exec_datafusion_err, internal_err, plan_err};
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::expr::physical_name;
-use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion_expr::{Expr, FetchType, LogicalPlan, SkipType};
-use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
+use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs, Projector};
-use datafusion_physical_expr::{
-    EquivalenceProperties, LexOrdering, PhysicalExpr, create_physical_expr,
-    create_physical_sort_exprs,
-};
+#[cfg(test)]
+use datafusion_physical_expr::projection::ProjectionExpr;
+use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType, apply_expression_roots,
 };
-use datafusion_physical_plan::joins::utils::build_join_schema;
 use datafusion_physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -55,29 +48,36 @@ use futures::stream::{self, Stream, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::datasource::{MemTable, source_as_provider};
+#[cfg(test)]
+use crate::datasource::MemTable;
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
 mod aggregate;
 mod batch;
 mod count;
+mod dag;
 mod fallback;
 mod group_count;
 mod hash_join;
 mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
+mod planner;
 mod sort;
 
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
-use group_count::{FinalizedGroupCounts, GroupCountSink, GroupCountState, IntKeyType};
+use dag::{
+    DagRuntime, MaterializedStage, ScalarSubqueryState, StageId, StageSource, StageSpec,
+    bind_stage_dependencies, collect_pipeline_stage_deps, validate_dag,
+};
+#[cfg(test)]
+use group_count::IntKeyType;
+use group_count::{FinalizedGroupCounts, GroupCountSink, GroupCountState};
 use hash_join::{
-    BuildSide, CompiledJoinFilter, FinalizedHashTable, HashJoinBuildConfig,
-    HashJoinBuildSink, HashJoinBuildState, HashJoinProbe, HashJoinProbeConfig,
-    JoinOutputCol, OperatorStep, ProbeCursor, ProbeJoinKind, ProbeScratch,
-    is_supported_join_key_type,
+    FinalizedHashTable, HashJoinBuildSink, HashJoinBuildState, HashJoinProbe,
+    OperatorStep, ProbeCursor, ProbeScratch,
 };
 pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
@@ -93,10 +93,24 @@ const GROUP_COUNT_RESULT_CAPACITY: usize = 2;
 const AGGREGATE_RESULT_CAPACITY: usize = 2;
 const TOPN_RESULT_CAPACITY: usize = 2;
 const SORT_RESULT_CAPACITY: usize = 2;
+const LIMIT_RESULT_CAPACITY: usize = 2;
 const MAX_RESULT_CAPACITY: usize = 32;
 
 fn result_capacity(workers: NonZeroUsize) -> usize {
     workers.get().saturating_mul(2).min(MAX_RESULT_CAPACITY)
+}
+
+fn sink_result_capacity(sink: &Sink, workers: NonZeroUsize) -> usize {
+    match sink {
+        Sink::Result => result_capacity(workers),
+        Sink::Count { .. } => COUNT_RESULT_CAPACITY,
+        Sink::GroupCount { .. } => GROUP_COUNT_RESULT_CAPACITY,
+        Sink::Aggregate { .. } => AGGREGATE_RESULT_CAPACITY,
+        Sink::TopN { .. } => TOPN_RESULT_CAPACITY,
+        Sink::Sort { .. } => SORT_RESULT_CAPACITY,
+        Sink::Limit { .. } => LIMIT_RESULT_CAPACITY,
+        Sink::HashJoinBuild(_) => 1,
+    }
 }
 
 /// Opt-in planner for an experimental morsel pipeline over [`MemTable`]
@@ -128,1245 +142,16 @@ pub struct MorselQueryPlanner {
 }
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-type LoweredSide = std::result::Result<(Source, Vec<Operator>, SchemaRef), String>;
 
 enum Lowering {
     Native(MorselExec),
     Unsupported(String),
 }
 
-enum LoweredAggregate<'a> {
-    Count {
-        aggregate: &'a datafusion_expr::logical_plan::Aggregate,
-        count_expr: &'a Expr,
-        result_nodes: Vec<&'a LogicalPlan>,
-    },
-    GroupCount {
-        aggregate: &'a datafusion_expr::logical_plan::Aggregate,
-        key_expr: &'a Expr,
-        key_index: usize,
-        key_type: IntKeyType,
-        count_expr: &'a Expr,
-        result_nodes: Vec<&'a LogicalPlan>,
-    },
-    General {
-        aggregate: &'a datafusion_expr::logical_plan::Aggregate,
-        result_nodes: Vec<&'a LogicalPlan>,
-    },
-}
-
-struct LoweredSort<'a> {
-    sort: &'a datafusion_expr::logical_plan::Sort,
-    skip: usize,
-    fetch: Option<usize>,
-    result_nodes: Vec<&'a LogicalPlan>,
-}
-
 impl MorselQueryPlanner {
     /// Set the maximum number of workers per execution of a native pipeline.
     pub fn new(workers: NonZeroUsize) -> Self {
         Self { workers }
-    }
-
-    async fn try_lower(
-        &self,
-        plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Lowering> {
-        let mut nodes: Vec<&LogicalPlan> = Vec::new();
-        let mut pending_limit: Option<(usize, Option<usize>)> = None;
-        let mut lowered_sort = None;
-        let mut lowered_aggregate = None;
-        let mut node = plan;
-        enum Leaf<'a> {
-            Scan(&'a datafusion_expr::logical_plan::TableScan),
-            Join(&'a datafusion_expr::logical_plan::Join),
-            Empty(SchemaRef),
-        }
-        let leaf = loop {
-            match node {
-                LogicalPlan::Limit(limit) => {
-                    if lowered_aggregate.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET below Aggregate: {}",
-                            node.display()
-                        )));
-                    }
-                    if lowered_sort.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET below Sort: {}",
-                            node.display()
-                        )));
-                    }
-                    if !nodes
-                        .iter()
-                        .all(|n| matches!(n, LogicalPlan::Projection(_)))
-                    {
-                        return Ok(Lowering::Unsupported(
-                            "only projection is supported above LIMIT/OFFSET".into(),
-                        ));
-                    }
-                    let SkipType::Literal(skip) = limit.get_skip_type()? else {
-                        return Ok(Lowering::Unsupported(format!(
-                            "unsupported non-literal OFFSET expression in native morsels: {}",
-                            node.display()
-                        )));
-                    };
-                    let FetchType::Literal(fetch) = limit.get_fetch_type()? else {
-                        return Ok(Lowering::Unsupported(format!(
-                            "unsupported non-literal LIMIT expression in native morsels: {}",
-                            node.display()
-                        )));
-                    };
-                    pending_limit = Some(match pending_limit {
-                        Some((p_skip, p_fetch)) => {
-                            combine_limit(p_skip, p_fetch, skip, fetch)
-                        }
-                        None => (skip, fetch),
-                    });
-                    node = &limit.input;
-                }
-                LogicalPlan::Sort(sort) => {
-                    if lowered_aggregate.is_some() {
-                        return Ok(Lowering::Unsupported(
-                            "Sort below Aggregate is not supported in native morsels"
-                                .into(),
-                        ));
-                    }
-                    if lowered_sort.is_some() {
-                        return Ok(Lowering::Unsupported(
-                            "nested Sort is not supported in native morsels".into(),
-                        ));
-                    }
-                    if !nodes
-                        .iter()
-                        .all(|n| matches!(n, LogicalPlan::Projection(_)))
-                    {
-                        return Ok(Lowering::Unsupported(
-                            "only projection and limit are supported above Sort".into(),
-                        ));
-                    }
-                    if sort.expr.is_empty() {
-                        return Ok(Lowering::Unsupported(
-                            "Sort requires at least one sort expression".into(),
-                        ));
-                    }
-                    for sort_expr in &sort.expr {
-                        if !supported_expr(&sort_expr.expr)? {
-                            return Ok(Lowering::Unsupported(format!(
-                                "unsupported sort expression: {}",
-                                sort_expr.expr
-                            )));
-                        }
-                    }
-                    let (skip, fetch) = match pending_limit.take() {
-                        Some((p_skip, p_fetch)) => {
-                            combine_limit(p_skip, p_fetch, 0, sort.fetch)
-                        }
-                        None => (0, sort.fetch),
-                    };
-                    lowered_sort = Some(LoweredSort {
-                        sort,
-                        skip,
-                        fetch,
-                        result_nodes: std::mem::take(&mut nodes),
-                    });
-                    node = &sort.input;
-                }
-                LogicalPlan::Filter(filter) => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
-                            node.display()
-                        )));
-                    }
-                    if !supported_expr(&filter.predicate)? {
-                        return Ok(Lowering::Unsupported(format!(
-                            "unsupported filter predicate: {}",
-                            filter.predicate
-                        )));
-                    }
-                    nodes.push(node);
-                    node = &filter.input;
-                }
-                LogicalPlan::Projection(projection) => {
-                    for expr in &projection.expr {
-                        if !supported_expr(expr)? {
-                            return Ok(Lowering::Unsupported(format!(
-                                "unsupported projection expression: {expr}"
-                            )));
-                        }
-                    }
-                    nodes.push(node);
-                    node = &projection.input;
-                }
-                LogicalPlan::Aggregate(aggregate) if lowered_aggregate.is_none() => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
-                            node.display()
-                        )));
-                    }
-                    if !nodes
-                        .iter()
-                        .all(|node| matches!(node, LogicalPlan::Projection(_)))
-                    {
-                        return Ok(Lowering::Unsupported(
-                            "only projection is supported above aggregate".into(),
-                        ));
-                    }
-                    if let Some(count_expr) = count::count_star_aggr_expr(aggregate) {
-                        if aggregate.group_expr.is_empty() {
-                            lowered_aggregate = Some(LoweredAggregate::Count {
-                                aggregate,
-                                count_expr,
-                                result_nodes: std::mem::take(&mut nodes),
-                            });
-                        } else if let Ok(key) =
-                            group_count::group_by_integer_column(aggregate)?
-                        {
-                            lowered_aggregate = Some(LoweredAggregate::GroupCount {
-                                aggregate,
-                                key_expr: key.expr,
-                                key_index: key.column_index,
-                                key_type: key.key_type,
-                                count_expr,
-                                result_nodes: std::mem::take(&mut nodes),
-                            });
-                        } else {
-                            match aggregate::validate_aggregate(aggregate)? {
-                                Ok(()) => {
-                                    lowered_aggregate = Some(LoweredAggregate::General {
-                                        aggregate,
-                                        result_nodes: std::mem::take(&mut nodes),
-                                    });
-                                }
-                                Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                            }
-                        }
-                    } else {
-                        match aggregate::validate_aggregate(aggregate)? {
-                            Ok(()) => {
-                                lowered_aggregate = Some(LoweredAggregate::General {
-                                    aggregate,
-                                    result_nodes: std::mem::take(&mut nodes),
-                                });
-                            }
-                            Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                        }
-                    }
-                    node = &aggregate.input;
-                }
-                LogicalPlan::Aggregate(_) => {
-                    return Ok(Lowering::Unsupported(
-                        "nested aggregates (such as DISTINCT rewrites) are not supported in native morsel aggregates"
-                            .into(),
-                    ));
-                }
-                LogicalPlan::TableScan(scan) => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
-                            node.display()
-                        )));
-                    }
-                    break Leaf::Scan(scan);
-                }
-                LogicalPlan::Join(join) => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
-                            node.display()
-                        )));
-                    }
-                    break Leaf::Join(join);
-                }
-                LogicalPlan::EmptyRelation(empty) if !empty.produce_one_row => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET without ORDER BY: {}",
-                            node.display()
-                        )));
-                    }
-                    break Leaf::Empty(Arc::clone(empty.schema.inner()));
-                }
-                _ => {
-                    if pending_limit.is_some() {
-                        return Ok(Lowering::Unsupported(format!(
-                            "native morsels do not support LIMIT/OFFSET: {}",
-                            node.display()
-                        )));
-                    }
-                    return Ok(Lowering::Unsupported(format!(
-                        "unsupported logical operator: {}",
-                        node.display()
-                    )));
-                }
-            }
-        };
-        let (source, operators, mut schema) = match leaf {
-            Leaf::Scan(scan) => {
-                let source = match self.lower_scan_source(scan, session).await? {
-                    Ok(source) => source,
-                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                };
-                #[cfg(feature = "parquet")]
-                let mut source = source;
-                let (mut operators, schema) =
-                    Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
-                #[cfg(feature = "parquet")]
-                if let Source::Parquet(ref mut parquet_scan) = source {
-                    parquet_scan.pushdown_operators(
-                        &mut operators,
-                        matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. })),
-                        &scan.filters,
-                        &scan.projected_schema,
-                        session,
-                    )?;
-                }
-                let prune_filter = match source {
-                    Source::Memory(_) => {
-                        self.workers == NonZeroUsize::MIN
-                            || matches!(
-                                lowered_aggregate,
-                                Some(LoweredAggregate::General { .. })
-                            )
-                            || lowered_sort.is_some()
-                    }
-                    #[cfg(feature = "parquet")]
-                    Source::Parquet(_) => true,
-                };
-                if !matches!(
-                    lowered_aggregate,
-                    Some(
-                        LoweredAggregate::Count { .. }
-                            | LoweredAggregate::GroupCount { .. }
-                    )
-                ) && prune_filter
-                {
-                    prune_filter_input(&mut operators, source.schema());
-                }
-                (source, operators, schema)
-            }
-            Leaf::Join(join) => {
-                let count_only =
-                    matches!(lowered_aggregate, Some(LoweredAggregate::Count { .. }))
-                        && nodes.is_empty();
-                match self
-                    .lower_join_plan(join, nodes, count_only, session)
-                    .await?
-                {
-                    Ok((source, mut operators, schema)) => {
-                        assign_join_build_ids(&mut operators)?;
-                        (source, operators, schema)
-                    }
-                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                }
-            }
-            Leaf::Empty(empty_schema) => {
-                let source = Source::Memory(MemorySource {
-                    table: "EmptyRelation".to_owned(),
-                    batches: Vec::new(),
-                    projection: None,
-                    schema: empty_schema,
-                });
-                let (operators, schema) =
-                    Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
-                (source, operators, schema)
-            }
-        };
-        let mut sink = match lowered_aggregate {
-            Some(LoweredAggregate::Count {
-                aggregate,
-                count_expr,
-                result_nodes,
-            }) => {
-                let field = LoweredAggregateBuilder::new(
-                    count_expr,
-                    aggregate.input.schema(),
-                    &schema,
-                    session.execution_props(),
-                    &PhysicalPlanningContext::default(),
-                )
-                .build()?
-                .aggregate
-                .field();
-                let count_schema = Arc::new(Schema::new_with_metadata(
-                    vec![field],
-                    schema.metadata().clone(),
-                ));
-                let sink = CountSink::new(Arc::clone(&count_schema));
-                let (result_operators, result_schema) =
-                    Self::lower_operators(result_nodes, count_schema, session)?;
-                schema = result_schema;
-                Sink::Count {
-                    sink,
-                    result_operators,
-                    post_sort: None,
-                }
-            }
-            Some(LoweredAggregate::GroupCount {
-                aggregate,
-                key_expr,
-                key_index,
-                key_type,
-                count_expr,
-                result_nodes,
-            }) => {
-                let Some(input_field) = schema.fields().get(key_index) else {
-                    return internal_err!(
-                        "Morsel GROUP BY key index {key_index} out of bounds for schema"
-                    );
-                };
-                let Some(physical_key_type) =
-                    IntKeyType::from_data_type(input_field.data_type())
-                else {
-                    return Ok(Lowering::Unsupported(format!(
-                        "unsupported GROUP BY key type {}: only a single integer column is supported",
-                        input_field.data_type()
-                    )));
-                };
-                if physical_key_type != key_type {
-                    return internal_err!(
-                        "Morsel GROUP BY key type mismatch between logical and physical schemas"
-                    );
-                }
-                let key_name = physical_name(key_expr)?;
-                let key_field = Arc::new(
-                    Field::new(
-                        &key_name,
-                        input_field.data_type().clone(),
-                        input_field.is_nullable(),
-                    )
-                    .with_metadata(input_field.metadata().clone()),
-                );
-                let count_field = LoweredAggregateBuilder::new(
-                    count_expr,
-                    aggregate.input.schema(),
-                    &schema,
-                    session.execution_props(),
-                    &PhysicalPlanningContext::default(),
-                )
-                .build()?
-                .aggregate
-                .field();
-                let agg_schema = Arc::new(Schema::new_with_metadata(
-                    vec![key_field, count_field],
-                    schema.metadata().clone(),
-                ));
-                let sink = GroupCountSink::new(
-                    Arc::clone(&agg_schema),
-                    key_index,
-                    physical_key_type,
-                    key_name,
-                );
-                let (result_operators, result_schema) =
-                    Self::lower_operators(result_nodes, agg_schema, session)?;
-                schema = result_schema;
-                Sink::GroupCount {
-                    sink,
-                    result_operators,
-                    post_sort: None,
-                }
-            }
-            Some(LoweredAggregate::General {
-                aggregate,
-                result_nodes,
-            }) => {
-                let sink = match AggregateSink::try_new(aggregate, &schema, session)? {
-                    Ok(sink) => sink,
-                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                };
-                let (result_operators, result_schema) = Self::lower_operators(
-                    result_nodes,
-                    Arc::clone(sink.schema()),
-                    session,
-                )?;
-                schema = result_schema;
-                Sink::Aggregate {
-                    sink,
-                    result_operators,
-                    post_sort: None,
-                }
-            }
-            None => Sink::Result,
-        };
-        if let Some(LoweredSort {
-            sort,
-            skip,
-            fetch,
-            result_nodes,
-        }) = lowered_sort
-        {
-            let sort_exprs = create_physical_sort_exprs(
-                &sort.expr,
-                sort.input.schema(),
-                session.execution_props(),
-                &PhysicalPlanningContext::default(),
-            )?;
-            let Some(ordering) = LexOrdering::new(sort_exprs) else {
-                return Ok(Lowering::Unsupported(
-                    "Sort requires at least one sort expression".into(),
-                ));
-            };
-            let (sort_result_operators, out_schema) =
-                Self::lower_operators(result_nodes, Arc::clone(&schema), session)?;
-            let post_sort = if let Some(k) = fetch
-                && (k == 0 || skip.checked_add(k).is_some())
-            {
-                let topn_sink =
-                    match TopNSink::try_new(Arc::clone(&schema), ordering, skip, k)? {
-                        Ok(s) => s,
-                        Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                    };
-                PostSort::TopN {
-                    sink: topn_sink,
-                    result_operators: sort_result_operators,
-                }
-            } else {
-                let sort_sink = match SortSink::try_new(
-                    Arc::clone(&schema),
-                    ordering,
-                    skip,
-                    fetch,
-                )? {
-                    Ok(s) => s,
-                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
-                };
-                PostSort::Sort {
-                    sink: sort_sink,
-                    result_operators: sort_result_operators,
-                }
-            };
-            schema = out_schema;
-            sink = match sink {
-                Sink::Result => match post_sort {
-                    PostSort::TopN {
-                        sink,
-                        result_operators,
-                    } => Sink::TopN {
-                        sink,
-                        result_operators,
-                    },
-                    PostSort::Sort {
-                        sink,
-                        result_operators,
-                    } => Sink::Sort {
-                        sink,
-                        result_operators,
-                    },
-                },
-                Sink::Count {
-                    sink,
-                    result_operators,
-                    ..
-                } => Sink::Count {
-                    sink,
-                    result_operators,
-                    post_sort: Some(post_sort),
-                },
-                Sink::GroupCount {
-                    sink,
-                    result_operators,
-                    ..
-                } => Sink::GroupCount {
-                    sink,
-                    result_operators,
-                    post_sort: Some(post_sort),
-                },
-                Sink::Aggregate {
-                    sink,
-                    result_operators,
-                    ..
-                } => Sink::Aggregate {
-                    sink,
-                    result_operators,
-                    post_sort: Some(post_sort),
-                },
-                Sink::TopN { .. } | Sink::Sort { .. } | Sink::HashJoinBuild(_) => {
-                    unreachable!()
-                }
-            };
-        }
-        let sink_capacity = match sink {
-            Sink::Result => result_capacity(self.workers),
-            Sink::Count { .. } => COUNT_RESULT_CAPACITY,
-            Sink::GroupCount { .. } => GROUP_COUNT_RESULT_CAPACITY,
-            Sink::Aggregate { .. } => AGGREGATE_RESULT_CAPACITY,
-            Sink::TopN { .. } => TOPN_RESULT_CAPACITY,
-            Sink::Sort { .. } => SORT_RESULT_CAPACITY,
-            Sink::HashJoinBuild(_) => unreachable!(),
-        };
-        Ok(Lowering::Native(MorselExec::try_new(
-            Pipeline {
-                source,
-                operators,
-                workers: self.workers,
-                sink,
-                sink_capacity,
-            },
-            schema,
-        )?))
-    }
-
-    async fn lower_scan_source(
-        &self,
-        scan: &datafusion_expr::logical_plan::TableScan,
-        session: &dyn Session,
-    ) -> Result<std::result::Result<Source, String>> {
-        #[cfg(not(feature = "parquet"))]
-        let _ = session;
-        for (present, feature) in [
-            (scan.fetch.is_some(), "LIMIT"),
-            (scan.skip.is_some(), "OFFSET"),
-            (!scan.statistics_requests.is_empty(), "statistics requests"),
-        ] {
-            if present {
-                return Ok(Err(format!(
-                    "native morsel scan of {} does not support {feature}",
-                    scan.table_name
-                )));
-            }
-        }
-        let Ok(provider) = source_as_provider(&scan.source) else {
-            return Ok(Err(format!(
-                "unsupported table source for {}",
-                scan.table_name
-            )));
-        };
-        if let Some(table) = provider.downcast_ref::<MemTable>() {
-            if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
-                return Ok(Err(format!(
-                    "MemTable scan of {} has advertised ordering or scan filters",
-                    scan.table_name
-                )));
-            }
-            // Like MemTable::scan, snapshot the batch handles at planning time.
-            let mut batches = Vec::new();
-            for partition in &table.batches {
-                batches.extend(partition.read().await.iter().cloned());
-            }
-            Ok(Ok(Source::Memory(MemorySource {
-                table: scan.table_name.to_string(),
-                batches,
-                projection: scan.projection.clone(),
-                schema: project_schema(&provider.schema(), scan.projection.as_deref())?,
-            })))
-        } else {
-            #[cfg(feature = "parquet")]
-            if let Some(table) =
-                provider.downcast_ref::<crate::datasource::listing::ListingTable>()
-            {
-                ParquetScan::lower(table, scan, session)
-                    .await
-                    .map(|res| res.map(Source::Parquet))
-            } else {
-                Ok(Err(unsupported_provider_reason(&scan.table_name)))
-            }
-            #[cfg(not(feature = "parquet"))]
-            Ok(Err(unsupported_provider_reason(&scan.table_name)))
-        }
-    }
-
-    fn lower_side_plan<'a>(
-        &'a self,
-        plan: &'a LogicalPlan,
-        session: &'a dyn Session,
-    ) -> BoxFuture<'a, Result<LoweredSide>> {
-        Box::pin(async move {
-            let mut nodes = Vec::new();
-            let mut node = plan;
-            loop {
-                match node {
-                    LogicalPlan::SubqueryAlias(alias) => {
-                        node = &alias.input;
-                    }
-                    LogicalPlan::Filter(filter) => {
-                        if !supported_expr(&filter.predicate)? {
-                            return Ok(Err(format!(
-                                "unsupported filter predicate: {}",
-                                filter.predicate
-                            )));
-                        }
-                        nodes.push(node);
-                        node = &filter.input;
-                    }
-                    LogicalPlan::Projection(projection) => {
-                        for expr in &projection.expr {
-                            if !supported_expr(expr)? {
-                                return Ok(Err(format!(
-                                    "unsupported projection expression: {expr}"
-                                )));
-                            }
-                        }
-                        nodes.push(node);
-                        node = &projection.input;
-                    }
-                    LogicalPlan::TableScan(scan) => {
-                        let source = match self.lower_scan_source(scan, session).await? {
-                            Ok(source) => source,
-                            Err(reason) => return Ok(Err(reason)),
-                        };
-                        #[cfg(feature = "parquet")]
-                        let mut source = source;
-                        let (mut operators, schema) = Self::lower_operators(
-                            nodes,
-                            Arc::clone(source.schema()),
-                            session,
-                        )?;
-                        #[cfg(feature = "parquet")]
-                        if let Source::Parquet(ref mut parquet_scan) = source {
-                            parquet_scan.pushdown_operators(
-                                &mut operators,
-                                false,
-                                &scan.filters,
-                                &scan.projected_schema,
-                                session,
-                            )?;
-                        }
-                        prune_filter_input(&mut operators, source.schema());
-                        return Ok(Ok((source, operators, schema)));
-                    }
-                    LogicalPlan::Join(join) => {
-                        return self.lower_join_plan(join, nodes, false, session).await;
-                    }
-                    LogicalPlan::EmptyRelation(empty) if !empty.produce_one_row => {
-                        let source = Source::Memory(MemorySource {
-                            table: "EmptyRelation".to_owned(),
-                            batches: Vec::new(),
-                            projection: None,
-                            schema: Arc::clone(empty.schema.inner()),
-                        });
-                        let (operators, schema) = Self::lower_operators(
-                            nodes,
-                            Arc::clone(source.schema()),
-                            session,
-                        )?;
-                        return Ok(Ok((source, operators, schema)));
-                    }
-                    LogicalPlan::Limit(_) => {
-                        return Ok(Err(format!(
-                            "native morsels do not support LIMIT/OFFSET: {}",
-                            node.display()
-                        )));
-                    }
-                    _ => {
-                        return Ok(Err(format!(
-                            "unsupported logical operator: {}",
-                            node.display()
-                        )));
-                    }
-                }
-            }
-        })
-    }
-
-    async fn lower_join_plan<'a>(
-        &'a self,
-        join: &'a datafusion_expr::logical_plan::Join,
-        post_nodes: Vec<&'a LogicalPlan>,
-        count_only: bool,
-        session: &'a dyn Session,
-    ) -> Result<std::result::Result<(Source, Vec<Operator>, SchemaRef), String>> {
-        if !matches!(
-            join.join_type,
-            JoinType::Inner
-                | JoinType::Left
-                | JoinType::Right
-                | JoinType::Full
-                | JoinType::LeftSemi
-                | JoinType::RightSemi
-                | JoinType::LeftAnti
-                | JoinType::RightAnti
-        ) {
-            return Ok(Err(format!(
-                "unsupported join type {:?} in native morsel hash join",
-                join.join_type
-            )));
-        }
-
-        let is_cross = join.on.is_empty();
-        if is_cross {
-            if join.join_type != JoinType::Inner {
-                return Ok(Err(format!(
-                    "non-equi {:?} join without equi-join keys is not supported in native morsel join",
-                    join.join_type
-                )));
-            }
-            if join.null_aware {
-                return Ok(Err(
-                    "null-aware join without equi-join keys is not supported in native morsel join"
-                        .into(),
-                ));
-            }
-        }
-
-        if join.null_aware {
-            if !matches!(join.join_type, JoinType::LeftAnti | JoinType::RightAnti) {
-                return Ok(Err(format!(
-                    "null-aware {:?} join is not supported in native morsel hash join",
-                    join.join_type
-                )));
-            }
-            if join.null_equality != NullEquality::NullEqualsNothing {
-                return Ok(Err(
-                    "null-aware join with IS NOT DISTINCT FROM is not supported in native morsel hash join"
-                        .into(),
-                ));
-            }
-            if join.on.len() != 1 || join.filter.is_some() {
-                return Ok(Err(
-                    "correlated, multi-key, or filtered null-aware NOT IN join is not supported in native morsel hash join"
-                        .into(),
-                ));
-            }
-        }
-
-        for (l_expr, r_expr) in &join.on {
-            if !supported_expr(l_expr)? {
-                return Ok(Err(format!(
-                    "unsupported left join key expression: {l_expr}"
-                )));
-            }
-            if !supported_expr(r_expr)? {
-                return Ok(Err(format!(
-                    "unsupported right join key expression: {r_expr}"
-                )));
-            }
-        }
-        if let Some(filter) = &join.filter
-            && !supported_expr(filter)?
-        {
-            return Ok(Err(format!("unsupported join filter expression: {filter}")));
-        }
-
-        let (left_source, left_ops, left_schema) =
-            match self.lower_side_plan(&join.left, session).await? {
-                Ok(v) => v,
-                Err(reason) => return Ok(Err(reason)),
-            };
-        let (right_source, right_ops, right_schema) =
-            match self.lower_side_plan(&join.right, session).await? {
-                Ok(v) => v,
-                Err(reason) => return Ok(Err(reason)),
-            };
-
-        let props = session.execution_props();
-        let planning_ctx = PhysicalPlanningContext::default();
-        let mut left_key_exprs = Vec::with_capacity(join.on.len());
-        let mut right_key_exprs = Vec::with_capacity(join.on.len());
-        let mut left_key_names = Vec::with_capacity(join.on.len());
-        let mut right_key_names = Vec::with_capacity(join.on.len());
-        let mut key_types = Vec::with_capacity(join.on.len());
-
-        for (l_expr, r_expr) in &join.on {
-            let l_phys =
-                create_physical_expr(l_expr, join.left.schema(), props, &planning_ctx)?;
-            let r_phys =
-                create_physical_expr(r_expr, join.right.schema(), props, &planning_ctx)?;
-            let l_type = l_phys.data_type(&left_schema)?;
-            let r_type = r_phys.data_type(&right_schema)?;
-            if l_type != r_type {
-                return Ok(Err(format!(
-                    "mismatched join key types: left={l_type}, right={r_type}"
-                )));
-            }
-            if !is_supported_join_key_type(&l_type) {
-                return Ok(Err(format!(
-                    "unsupported join key type {l_type} in native morsel hash join"
-                )));
-            }
-            left_key_names.push(physical_name(l_expr)?);
-            right_key_names.push(physical_name(r_expr)?);
-            left_key_exprs.push(l_phys);
-            right_key_exprs.push(r_phys);
-            key_types.push(l_type);
-        }
-
-        let left_len = left_schema.fields().len();
-        let join_output_schema =
-            Arc::new(build_join_schema(&left_schema, &right_schema, &join.join_type).0);
-
-        // For INNER hash joins, keep residual `join.filter` as a post-probe
-        // `Operator::Filter` so probing uses the specialized no-filter fast loops
-        // and downstream operators benefit from lazy `BatchView` filtering.
-        let inner_post_filter = !is_cross && join.join_type == JoinType::Inner;
-        let mut post_ops = Vec::new();
-        if inner_post_filter && let Some(filter_expr) = &join.filter {
-            let predicate =
-                create_physical_expr(filter_expr, &join.schema, props, &planning_ctx)?;
-            if predicate.data_type(&join_output_schema)? != DataType::Boolean {
-                return plan_err!(
-                    "Morsel join filter predicate must return Boolean: {predicate}"
-                );
-            }
-            post_ops.push(Operator::Filter {
-                predicate,
-                projection: None,
-            });
-        }
-        let (extra_post_ops, mut final_schema) =
-            Self::lower_operators(post_nodes, Arc::clone(&join_output_schema), session)?;
-        post_ops.extend(extra_post_ops);
-
-        let build_side = if join.null_aware {
-            match join.join_type {
-                JoinType::LeftAnti => BuildSide::Right,
-                JoinType::RightAnti => BuildSide::Left,
-                _ => unreachable!(),
-            }
-        } else {
-            choose_build_side(
-                estimate_side_size(&left_source, &left_ops),
-                estimate_side_size(&right_source, &right_ops),
-            )
-        };
-        let kind = ProbeJoinKind::from_logical(
-            join.join_type,
-            build_side,
-            join.null_aware,
-            is_cross,
-        )?;
-
-        let (
-            build_source,
-            mut build_ops,
-            build_schema,
-            build_key_exprs,
-            build_key_names,
-            probe_source,
-            mut probe_ops,
-            probe_key_exprs,
-            probe_key_names,
-        ) = match build_side {
-            BuildSide::Left => (
-                left_source,
-                left_ops,
-                Arc::clone(&left_schema),
-                left_key_exprs,
-                left_key_names,
-                right_source,
-                right_ops,
-                right_key_exprs,
-                right_key_names,
-            ),
-            BuildSide::Right => (
-                right_source,
-                right_ops,
-                Arc::clone(&right_schema),
-                right_key_exprs,
-                right_key_names,
-                left_source,
-                left_ops,
-                left_key_exprs,
-                left_key_names,
-            ),
-        };
-
-        let map_join_col = |join_col: usize,
-                            payload_cols: &mut Vec<usize>|
-         -> JoinOutputCol {
-            let (col_side, side_idx) = match join.join_type {
-                JoinType::LeftSemi | JoinType::LeftAnti => (BuildSide::Left, join_col),
-                JoinType::RightSemi | JoinType::RightAnti => (BuildSide::Right, join_col),
-                JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-                    if join_col < left_len {
-                        (BuildSide::Left, join_col)
-                    } else {
-                        (BuildSide::Right, join_col - left_len)
-                    }
-                }
-                JoinType::LeftMark | JoinType::RightMark => unreachable!(),
-            };
-            if col_side == build_side {
-                let pos = payload_cols
-                    .iter()
-                    .position(|&c| c == side_idx)
-                    .unwrap_or_else(|| {
-                        payload_cols.push(side_idx);
-                        payload_cols.len() - 1
-                    });
-                JoinOutputCol::Build(pos)
-            } else {
-                JoinOutputCol::Probe(side_idx)
-            }
-        };
-
-        // Fuse a pure-column post-join Projection (or count-only zero-column output)
-        // directly into HashJoinProbe so we avoid taking unused columns and storing
-        // unneeded build payload columns in the hash table.
-        let (mut build_payload_columns, output_projection, probe_output_schema) =
-            if count_only && post_ops.is_empty() {
-                let empty = Arc::new(Schema::new_with_metadata(
-                    Vec::<Field>::new(),
-                    join_output_schema.metadata().clone(),
-                ));
-                final_schema = Arc::clone(&empty);
-                (Vec::new(), Vec::new(), empty)
-            } else if let Some(Operator::Projection(projector)) = post_ops.first()
-                && projector
-                    .projection()
-                    .as_ref()
-                    .iter()
-                    .all(|p| p.expr.is::<Column>())
-            {
-                let mut payload_cols: Vec<usize> = Vec::new();
-                let mut output_proj =
-                    Vec::with_capacity(projector.projection().as_ref().len());
-                for p in projector.projection().as_ref() {
-                    let join_col = p.expr.downcast_ref::<Column>().unwrap().index();
-                    output_proj.push(map_join_col(join_col, &mut payload_cols));
-                }
-                let out_schema = Arc::clone(projector.output_schema());
-                post_ops.remove(0);
-                (payload_cols, output_proj, out_schema)
-            } else if let Some(Operator::Projection(projector)) = post_ops.first_mut()
-                && projector.projection().column_indices().len()
-                    < join_output_schema.fields().len()
-            {
-                let needed = projector.projection().column_indices();
-                let narrow = ProjectionExprs::from_indices(&needed, &join_output_schema);
-                let narrowed_schema = Arc::new(join_output_schema.project(&needed)?);
-                let remapped = projector
-                    .projection()
-                    .clone()
-                    .try_map_exprs(|expr| narrow.project_expr(&expr))?
-                    .make_projector_with_schema_metadata(
-                        &narrowed_schema,
-                        projector.output_schema(),
-                    )?;
-                let mut payload_cols: Vec<usize> = Vec::new();
-                if remapped.output_schema() == projector.output_schema() {
-                    let mut output_proj = Vec::with_capacity(needed.len());
-                    for &join_col in &needed {
-                        output_proj.push(map_join_col(join_col, &mut payload_cols));
-                    }
-                    *projector = remapped;
-                    (payload_cols, output_proj, narrowed_schema)
-                } else {
-                    let out_len = join_output_schema.fields().len();
-                    let mut output_proj = Vec::with_capacity(out_len);
-                    for join_col in 0..out_len {
-                        output_proj.push(map_join_col(join_col, &mut payload_cols));
-                    }
-                    (payload_cols, output_proj, Arc::clone(&join_output_schema))
-                }
-            } else {
-                let mut payload_cols: Vec<usize> = Vec::new();
-                let out_len = join_output_schema.fields().len();
-                let mut output_proj = Vec::with_capacity(out_len);
-                for join_col in 0..out_len {
-                    output_proj.push(map_join_col(join_col, &mut payload_cols));
-                }
-                (payload_cols, output_proj, Arc::clone(&join_output_schema))
-            };
-
-        let compiled_filter = if !inner_post_filter
-            && let Some(filter_expr) = &join.filter
-        {
-            let left_df_schema = join.left.schema();
-            let right_df_schema = join.right.schema();
-            let cols = filter_expr.column_refs();
-
-            let mut left_field_indices: Vec<usize> = cols
-                .iter()
-                .filter_map(|c| left_df_schema.index_of_column(c).ok())
-                .collect();
-            left_field_indices.sort_unstable();
-            left_field_indices.dedup();
-
-            let mut right_field_indices: Vec<usize> = cols
-                .iter()
-                .filter_map(|c| right_df_schema.index_of_column(c).ok())
-                .collect();
-            right_field_indices.sort_unstable();
-            right_field_indices.dedup();
-
-            let (filter_df_fields, filter_fields): (Vec<_>, Vec<_>) = left_field_indices
-                .iter()
-                .map(|&i| {
-                    let (q, f) = left_df_schema.qualified_field(i);
-                    ((q.cloned(), Arc::clone(f)), left_schema.field(i).clone())
-                })
-                .chain(right_field_indices.iter().map(|&i| {
-                    let (q, f) = right_df_schema.qualified_field(i);
-                    ((q.cloned(), Arc::clone(f)), right_schema.field(i).clone())
-                }))
-                .unzip();
-
-            let metadata: HashMap<_, _> = left_df_schema
-                .metadata()
-                .clone()
-                .into_iter()
-                .chain(right_df_schema.metadata().clone())
-                .collect();
-            let filter_df_schema =
-                DFSchema::new_with_metadata(filter_df_fields, metadata.clone())?;
-            let filter_schema =
-                Arc::new(Schema::new_with_metadata(filter_fields, metadata));
-
-            let filter_phys = create_physical_expr(
-                filter_expr,
-                &filter_df_schema,
-                props,
-                &planning_ctx,
-            )?;
-            if filter_phys.data_type(&filter_schema)? != DataType::Boolean {
-                return plan_err!(
-                    "Morsel join filter predicate must return Boolean: {filter_phys}"
-                );
-            }
-
-            let mut filter_columns =
-                Vec::with_capacity(left_field_indices.len() + right_field_indices.len());
-            for left_idx in left_field_indices {
-                let col = if build_side == BuildSide::Left {
-                    let pos = build_payload_columns
-                        .iter()
-                        .position(|&c| c == left_idx)
-                        .unwrap_or_else(|| {
-                            build_payload_columns.push(left_idx);
-                            build_payload_columns.len() - 1
-                        });
-                    JoinOutputCol::Build(pos)
-                } else {
-                    JoinOutputCol::Probe(left_idx)
-                };
-                filter_columns.push(col);
-            }
-            for right_idx in right_field_indices {
-                let col = if build_side == BuildSide::Right {
-                    let pos = build_payload_columns
-                        .iter()
-                        .position(|&c| c == right_idx)
-                        .unwrap_or_else(|| {
-                            build_payload_columns.push(right_idx);
-                            build_payload_columns.len() - 1
-                        });
-                    JoinOutputCol::Build(pos)
-                } else {
-                    JoinOutputCol::Probe(right_idx)
-                };
-                filter_columns.push(col);
-            }
-
-            Some(CompiledJoinFilter {
-                expr: filter_phys,
-                schema: filter_schema,
-                columns: filter_columns,
-            })
-        } else {
-            None
-        };
-
-        prune_filter_input(&mut post_ops, &probe_output_schema);
-
-        let payload_schema = Arc::new(build_schema.project(&build_payload_columns)?);
-        let build_sink = match HashJoinBuildSink::try_new(HashJoinBuildConfig {
-            key_exprs: build_key_exprs,
-            key_names: build_key_names,
-            key_types: key_types.clone(),
-            null_equality: join.null_equality,
-            keep_null_key_rows: kind.keep_null_key_build_rows(),
-            track_null_keys: kind.is_null_aware_anti(),
-            needs_matched_bitset: kind.needs_matched_bitset(),
-            payload_columns: build_payload_columns,
-            payload_schema,
-        })? {
-            Ok(sink) => Arc::new(sink),
-            Err(reason) => return Ok(Err(reason)),
-        };
-
-        assign_join_build_ids(&mut build_ops)?;
-        let build_pipeline = Arc::new(Pipeline {
-            source: build_source,
-            operators: build_ops,
-            workers: self.workers,
-            sink: Sink::HashJoinBuild(build_sink),
-            sink_capacity: 1,
-        });
-
-        let probe = Arc::new(HashJoinProbe::new(HashJoinProbeConfig {
-            build_pipeline,
-            build_side,
-            kind,
-            join_type: join.join_type,
-            null_equality: join.null_equality,
-            probe_key_exprs,
-            probe_key_names,
-            key_types,
-            filter: compiled_filter,
-            output_projection,
-            output_schema: probe_output_schema,
-            build_id: 0,
-        }));
-        probe_ops.push(Operator::HashProbe(probe));
-        probe_ops.extend(post_ops);
-        Ok(Ok((probe_source, probe_ops, final_schema)))
-    }
-
-    fn lower_operators(
-        nodes: Vec<&LogicalPlan>,
-        mut schema: SchemaRef,
-        session: &dyn Session,
-    ) -> Result<(Vec<Operator>, SchemaRef)> {
-        let mut operators = Vec::with_capacity(nodes.len());
-        let props = session.execution_props();
-        let planning_ctx = PhysicalPlanningContext::default();
-        for node in nodes.into_iter().rev() {
-            match node {
-                LogicalPlan::Filter(filter) => {
-                    let predicate = create_physical_expr(
-                        &filter.predicate,
-                        filter.input.schema(),
-                        props,
-                        &planning_ctx,
-                    )?;
-                    if predicate.data_type(&schema)? != DataType::Boolean {
-                        return plan_err!(
-                            "Morsel filter predicate must return Boolean: {predicate}"
-                        );
-                    }
-                    operators.push(Operator::Filter {
-                        predicate,
-                        projection: None,
-                    });
-                }
-                LogicalPlan::Projection(projection) => {
-                    let input = projection.input.schema();
-                    let expressions = projection
-                        .expr
-                        .iter()
-                        .map(|expr| {
-                            let alias = match expr {
-                                Expr::Column(column) => schema
-                                    .field(input.index_of_column(column)?)
-                                    .name()
-                                    .clone(),
-                                _ => physical_name(expr)?,
-                            };
-                            Ok(ProjectionExpr {
-                                expr: create_physical_expr(
-                                    expr,
-                                    input,
-                                    props,
-                                    &planning_ctx,
-                                )?,
-                                alias,
-                            })
-                        })
-                        .collect::<Result<ProjectionExprs>>()?;
-                    let projector = expressions.make_projector_with_schema_metadata(
-                        &schema,
-                        projection.schema.as_arrow(),
-                    )?;
-                    schema = Arc::clone(projector.output_schema());
-                    operators.push(Operator::Projection(projector));
-                }
-                _ => unreachable!(),
-            }
-        }
-        Ok((operators, schema))
     }
 }
 
@@ -1381,28 +166,12 @@ struct SideEstimate {
     approx_bytes: u64,
 }
 
-fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
-    let mut is_empty = match source {
-        Source::Memory(mem) => {
-            mem.batches.iter().map(RecordBatch::num_rows).sum::<usize>() == 0
-        }
-        #[cfg(feature = "parquet")]
-        Source::Parquet(pq) => pq.is_empty(),
-    };
-    for op in operators {
-        if let Operator::HashProbe(probe) = op {
-            let build_est = estimate_side_size(
-                &probe.build_pipeline.source,
-                &probe.build_pipeline.operators,
-            );
-            if build_est.is_empty && probe.empty_build_short_circuits() {
-                is_empty = true;
-            } else if !build_est.is_empty && probe.needs_build_emission() {
-                is_empty = false;
-            }
-        }
-    }
-    match source {
+fn estimate_side_size(
+    source: &Source,
+    operators: &[Operator],
+    stages: &[StageSpec],
+) -> SideEstimate {
+    let base = match source {
         Source::Memory(mem) => {
             let rows = mem.batches.iter().map(RecordBatch::num_rows).sum::<usize>();
             let bytes = mem
@@ -1411,7 +180,7 @@ fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
                 .map(get_record_batch_memory_size)
                 .fold(0usize, usize::saturating_add) as u64;
             SideEstimate {
-                is_empty,
+                is_empty: rows == 0,
                 mem_rows: Some(rows),
                 approx_bytes: bytes,
             }
@@ -1420,15 +189,33 @@ fn estimate_side_size(source: &Source, operators: &[Operator]) -> SideEstimate {
         Source::Parquet(pq) => {
             let file_bytes = pq.total_file_bytes();
             SideEstimate {
-                is_empty,
+                is_empty: pq.is_empty(),
                 mem_rows: None,
                 approx_bytes: file_bytes.saturating_mul(4),
             }
         }
+        Source::Stage(stage_src) => stages[stage_src.stage_id.0].estimate,
+    };
+    let mut is_empty = base.is_empty;
+    for op in operators {
+        if let Operator::HashProbe(probe) = op {
+            let build_est = estimate_side_size(
+                &probe.build_pipeline.source,
+                &probe.build_pipeline.operators,
+                stages,
+            );
+            if build_est.is_empty && probe.empty_build_short_circuits() {
+                is_empty = true;
+            } else if !build_est.is_empty && probe.needs_build_emission() {
+                is_empty = false;
+            }
+        }
     }
+    SideEstimate { is_empty, ..base }
 }
 
-fn choose_build_side(left: SideEstimate, right: SideEstimate) -> BuildSide {
+fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::BuildSide {
+    use hash_join::BuildSide;
     if left.is_empty && !right.is_empty {
         return BuildSide::Left;
     }
@@ -1477,8 +264,8 @@ fn supported_expr(expr: &Expr) -> Result<bool> {
                     || fun.func.inner().is::<InputFileNameFunc>()
                     || fun.func.inner().is::<FileRowIndexFunc>()
             }
-            Expr::ScalarSubquery(_)
-            | Expr::Exists(_)
+            Expr::ScalarSubquery(sq) => !sq.outer_ref_columns.is_empty(),
+            Expr::Exists(_)
             | Expr::InSubquery(_)
             | Expr::SetComparison(_)
             | Expr::OuterReferenceColumn(..)
@@ -1556,6 +343,7 @@ enum Source {
     Memory(MemorySource),
     #[cfg(feature = "parquet")]
     Parquet(ParquetScan),
+    Stage(StageSource),
 }
 
 impl Source {
@@ -1564,12 +352,13 @@ impl Source {
             Self::Memory(source) => &source.schema,
             #[cfg(feature = "parquet")]
             Self::Parquet(source) => &source.schema,
+            Self::Stage(source) => &source.schema,
         }
     }
 
     fn has_pushed_filter(&self) -> bool {
         match self {
-            Self::Memory(_) => false,
+            Self::Memory(_) | Self::Stage(_) => false,
             #[cfg(feature = "parquet")]
             Self::Parquet(source) => source.pushed_predicate().is_some(),
         }
@@ -2136,10 +925,93 @@ enum Sink {
         sink: SortSink,
         result_operators: Vec<Operator>,
     },
+    Limit {
+        skip: usize,
+        fetch: Option<usize>,
+        result_operators: Vec<Operator>,
+    },
     HashJoinBuild(Arc<HashJoinBuildSink>),
 }
 
 impl Sink {
+    fn can_attach_post_sort(&self) -> bool {
+        matches!(
+            self,
+            Self::Count {
+                post_sort: None,
+                ..
+            } | Self::GroupCount {
+                post_sort: None,
+                ..
+            } | Self::Aggregate {
+                post_sort: None,
+                ..
+            }
+        )
+    }
+
+    fn attach_post_sort(&mut self, ps: PostSort) {
+        match self {
+            Self::Count { post_sort, .. }
+            | Self::GroupCount { post_sort, .. }
+            | Self::Aggregate { post_sort, .. } => {
+                *post_sort = Some(ps);
+            }
+            _ => unreachable!("can_attach_post_sort checked before attach_post_sort"),
+        }
+    }
+
+    fn extend_result_operators(&mut self, ops: Vec<Operator>) -> Result<()> {
+        match self {
+            Self::Count {
+                result_operators,
+                post_sort,
+                ..
+            }
+            | Self::GroupCount {
+                result_operators,
+                post_sort,
+                ..
+            }
+            | Self::Aggregate {
+                result_operators,
+                post_sort,
+                ..
+            } => {
+                if let Some(ps) = post_sort {
+                    match ps {
+                        PostSort::TopN {
+                            result_operators: ps_ops,
+                            ..
+                        }
+                        | PostSort::Sort {
+                            result_operators: ps_ops,
+                            ..
+                        } => ps_ops.extend(ops),
+                    }
+                } else {
+                    result_operators.extend(ops);
+                }
+                Ok(())
+            }
+            Self::TopN {
+                result_operators, ..
+            }
+            | Self::Sort {
+                result_operators, ..
+            }
+            | Self::Limit {
+                result_operators, ..
+            } => {
+                result_operators.extend(ops);
+                Ok(())
+            }
+            Self::Result | Self::HashJoinBuild(_) => {
+                internal_err!("Cannot attach result operators to non-blocking sink")
+            }
+        }
+    }
+
     fn root_sort_ordering(&self) -> Option<(&SchemaRef, &LexOrdering, &[Operator])> {
         match self {
             Self::TopN {
@@ -2172,6 +1044,7 @@ impl Sink {
             | Self::Aggregate {
                 post_sort: None, ..
             }
+            | Self::Limit { .. }
             | Self::HashJoinBuild(_) => None,
         }
     }
@@ -2376,7 +1249,10 @@ impl Pipeline {
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
-            Sink::Result | Sink::Count { .. } | Sink::GroupCount { .. } => {}
+            Sink::Result
+            | Sink::Count { .. }
+            | Sink::GroupCount { .. }
+            | Sink::Limit { .. } => {}
         }
         let (result_operators, post_sort) = match &self.sink {
             Sink::Result | Sink::HashJoinBuild(_) => (&[][..], None),
@@ -2399,6 +1275,9 @@ impl Pipeline {
                 result_operators, ..
             }
             | Sink::Sort {
+                result_operators, ..
+            }
+            | Sink::Limit {
                 result_operators, ..
             } => (result_operators.as_slice(), None),
         };
@@ -2429,6 +1308,7 @@ impl Pipeline {
                     Source::Memory(source) => source,
                     #[cfg(feature = "parquet")]
                     Source::Parquet(_) => unreachable!(),
+                    Source::Stage(_) => unreachable!(),
                 };
                 loop {
                     let output = worker.process(|| {
@@ -2537,7 +1417,7 @@ impl Pipeline {
         sink_memory: Option<WorkerSinkMemory>,
     ) -> Result<WorkerSink> {
         Ok(match &self.sink {
-            Sink::Result => {
+            Sink::Result | Sink::Limit { .. } => {
                 if self.has_join() {
                     WorkerSink::Result(Box::new(ResultBuffer::new(&[], batch_size, true)))
                 } else {
@@ -2612,6 +1492,67 @@ impl Pipeline {
                     return Ok(WorkerState::None);
                 }
                 let batch = worker.process(|| source.read(input))?;
+                let cont = if let Some(js) = join_state.as_mut() {
+                    self.consume_with_joins(
+                        batch,
+                        tx,
+                        output.batch_size,
+                        &mut sink,
+                        js,
+                        &mut worker,
+                    )
+                    .await?
+                } else {
+                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                };
+                if !cont {
+                    return Ok(WorkerState::None);
+                }
+                if index + 1 == end {
+                    worker.complete();
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        self.finish_worker(sink, &output, worker)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn run_stage_worker(
+        &self,
+        batches: &[RecordBatch],
+        next: &AtomicUsize,
+        sequential: bool,
+        output: WorkerOutput,
+        sink_memory: Option<WorkerSinkMemory>,
+        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
+        mut worker: WorkerMetrics,
+    ) -> Result<WorkerState> {
+        let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
+        let mut join_state =
+            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
+                tables,
+                scratch: ProbeScratch::default(),
+                probe_reservation,
+            });
+        let tx = &output.tx;
+        let stride = if sequential {
+            batches.len().max(1)
+        } else {
+            BATCHES_PER_MORSEL
+        };
+        while !tx.is_closed() {
+            let start = next.fetch_add(stride, Ordering::Relaxed);
+            if start >= batches.len() {
+                break;
+            }
+            worker.claim();
+            let end = (start + stride).min(batches.len());
+            for (index, input) in (start..end).zip(&batches[start..end]) {
+                if tx.is_closed() {
+                    return Ok(WorkerState::None);
+                }
+                let batch = input.clone();
                 let cont = if let Some(js) = join_state.as_mut() {
                     self.consume_with_joins(
                         batch,
@@ -3076,6 +2017,7 @@ impl Pipeline {
     fn run_build_pipelines<'a>(
         &'a self,
         label_prefix: Option<&'a str>,
+        stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
         context: &'a Arc<TaskContext>,
         plan_metrics: &'a ExecutionPlanMetricsSet,
         measurement: Option<&'a Arc<RunMetrics>>,
@@ -3114,6 +2056,7 @@ impl Pipeline {
                 let Some(table) = Self::run_single_build_pipeline(
                     &probe.build_pipeline,
                     &build_label,
+                    stage_inputs,
                     context,
                     plan_metrics,
                     measurement,
@@ -3405,6 +2348,7 @@ impl Pipeline {
     async fn run_single_build_pipeline(
         build_pipeline: &Arc<Pipeline>,
         build_label: &str,
+        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
         context: &Arc<TaskContext>,
         plan_metrics: &ExecutionPlanMetricsSet,
         measurement: Option<&Arc<RunMetrics>>,
@@ -3418,6 +2362,7 @@ impl Pipeline {
             match build_pipeline
                 .run_build_pipelines(
                     Some(build_label),
+                    stage_inputs,
                     context,
                     plan_metrics,
                     measurement,
@@ -3494,11 +2439,59 @@ impl Pipeline {
                                 Source::Memory(source) => source,
                                 #[cfg(feature = "parquet")]
                                 Source::Parquet(_) => unreachable!(),
+                                Source::Stage(_) => unreachable!(),
                             };
                             pipeline
                                 .run_memory_worker(
                                     source,
                                     &next,
+                                    output,
+                                    reservation,
+                                    join_ctx,
+                                    worker,
+                                )
+                                .await
+                        });
+                    }
+                }
+                Source::Stage(stage_src) => {
+                    let stage_data = Arc::clone(
+                        stage_inputs
+                            .get(&stage_src.stage_id)
+                            .expect("bound upstream stage artifact"),
+                    );
+                    let next = Arc::new(AtomicUsize::new(0));
+                    let morsels = stage_data.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                    for id in 0..build_pipeline.workers.get().min(morsels) {
+                        let (pipeline, stage_data, next, output) = (
+                            Arc::clone(build_pipeline),
+                            Arc::clone(&stage_data),
+                            Arc::clone(&next),
+                            build_output.clone(),
+                        );
+                        let reservation = Some(WorkerSinkMemory::Reservation(
+                            build_reservation.new_empty(),
+                        ));
+                        let join_ctx = nested_tables.as_ref().map(|t| {
+                            (
+                                Arc::clone(t),
+                                nested_probe_reservation
+                                    .as_ref()
+                                    .expect("nested probe reservation")
+                                    .new_empty(),
+                            )
+                        });
+                        let worker = WorkerMetrics::for_pipeline(
+                            measurement.cloned(),
+                            id,
+                            build_label,
+                        );
+                        tasks.spawn(async move {
+                            pipeline
+                                .run_stage_worker(
+                                    &stage_data.batches,
+                                    &next,
+                                    false,
                                     output,
                                     reservation,
                                     join_ctx,
@@ -3681,6 +2674,7 @@ impl Pipeline {
             Sink::Result
             | Sink::TopN { .. }
             | Sink::Sort { .. }
+            | Sink::Limit { .. }
             | Sink::HashJoinBuild(_) => None,
         }
     }
@@ -3964,208 +2958,464 @@ impl Pipeline {
     ) -> Result<()> {
         if !tx.is_closed() {
             let batch = apply_operators(operators, finalized.into_batch())?;
-            if let Some(run) = measurement {
-                metrics::send(run, None, &tx, batch).await;
-            } else {
-                let _ = tx.send(batch).await;
+            if batch.num_rows() > 0 {
+                if let Some(run) = measurement {
+                    metrics::send(run, None, &tx, batch).await;
+                } else {
+                    let _ = tx.send(batch).await;
+                }
             }
         }
         Ok(())
     }
 
-    fn start(
+    #[expect(clippy::too_many_arguments)]
+    pub(super) async fn run_pipeline_to_tx(
         self: Arc<Self>,
-        context: Arc<TaskContext>,
-        metrics: ExecutionPlanMetricsSet,
-        measurement: Option<Arc<RunMetrics>>,
-    ) -> PipelineRun {
-        let (tx, rx) = mpsc::channel(self.sink_capacity);
+        label_prefix: Option<&str>,
+        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        context: &Arc<TaskContext>,
+        metrics: &ExecutionPlanMetricsSet,
+        measurement: Option<&Arc<RunMetrics>>,
+        tx: mpsc::Sender<RecordBatch>,
+        cancel_tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if let Sink::Limit {
+            skip,
+            fetch,
+            result_operators,
+        } = &self.sink
+        {
+            if *fetch == Some(0) || cancel_tx.is_closed() || tx.is_closed() {
+                return Ok(());
+            }
+            let (limit_tx, mut limit_rx) = mpsc::channel(result_capacity(self.workers));
+            let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
+            {
+                let pipeline = Arc::clone(&self);
+                let stage_inputs = Arc::clone(stage_inputs);
+                let ctx = Arc::clone(context);
+                let metrics = metrics.clone();
+                let meas = measurement.cloned();
+                let label = label_prefix.map(str::to_owned);
+                let cancel = cancel_tx.clone();
+                inner_tasks.spawn(async move {
+                    pipeline
+                        .run_pipeline_body_to_tx(
+                            label.as_deref(),
+                            &stage_inputs,
+                            &ctx,
+                            &metrics,
+                            meas.as_ref(),
+                            limit_tx,
+                            cancel,
+                        )
+                        .await
+                });
+            }
+
+            let mut remaining_skip = *skip;
+            let mut remaining_fetch = *fetch;
+            let mut inner_done = false;
+
+            loop {
+                let maybe_batch = if !inner_done {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_tx.closed() => {
+                            drop(limit_rx);
+                            abort_and_drain(&mut inner_tasks).await;
+                            return Ok(());
+                        }
+                        result = inner_tasks.join_next() => {
+                            inner_done = true;
+                            match result {
+                                Some(Ok(Ok(()))) | None => continue,
+                                Some(Ok(Err(err))) => {
+                                    drop(limit_rx);
+                                    return Err(err);
+                                }
+                                Some(Err(err)) if err.is_panic() => {
+                                    drop(limit_rx);
+                                    std::panic::resume_unwind(err.into_panic())
+                                }
+                                Some(Err(err)) => {
+                                    drop(limit_rx);
+                                    return Err(exec_datafusion_err!(
+                                        "Morsel limit task failed: {err}"
+                                    ));
+                                }
+                            }
+                        }
+                        batch = limit_rx.recv() => batch,
+                    }
+                } else {
+                    limit_rx.recv().await
+                };
+
+                let Some(mut batch) = maybe_batch else {
+                    break;
+                };
+                if cancel_tx.is_closed() || tx.is_closed() {
+                    drop(limit_rx);
+                    abort_and_drain(&mut inner_tasks).await;
+                    return Ok(());
+                }
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                if remaining_skip >= batch.num_rows() {
+                    remaining_skip -= batch.num_rows();
+                    continue;
+                }
+                if remaining_skip > 0 {
+                    batch =
+                        batch.slice(remaining_skip, batch.num_rows() - remaining_skip);
+                    remaining_skip = 0;
+                }
+                if let Some(rem) = remaining_fetch.as_mut() {
+                    if *rem == 0 {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                    if batch.num_rows() > *rem {
+                        batch = batch.slice(0, *rem);
+                    }
+                    *rem -= batch.num_rows();
+                }
+                let out = apply_operators(result_operators, batch)?;
+                if out.num_rows() > 0 {
+                    let sent = if let Some(run) = measurement {
+                        metrics::send(run, None, &tx, out).await
+                    } else {
+                        tx.send(out).await.is_ok()
+                    };
+                    if !sent {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                }
+                if remaining_fetch == Some(0) {
+                    drop(limit_rx);
+                    abort_and_drain(&mut inner_tasks).await;
+                    return Ok(());
+                }
+            }
+
+            if !inner_done {
+                while let Some(result) = inner_tasks.join_next().await {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => return Err(err),
+                        Err(err) if err.is_panic() => {
+                            std::panic::resume_unwind(err.into_panic())
+                        }
+                        Err(err) => {
+                            return Err(exec_datafusion_err!(
+                                "Morsel limit task failed: {err}"
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        self.run_pipeline_body_to_tx(
+            label_prefix,
+            stage_inputs,
+            context,
+            metrics,
+            measurement,
+            tx,
+            cancel_tx,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn run_pipeline_body_to_tx(
+        self: Arc<Self>,
+        label_prefix: Option<&str>,
+        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        context: &Arc<TaskContext>,
+        metrics: &ExecutionPlanMetricsSet,
+        measurement: Option<&Arc<RunMetrics>>,
+        tx: mpsc::Sender<RecordBatch>,
+        cancel_tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
         let output = WorkerOutput {
             tx,
             batch_size: context.session_config().batch_size(),
             tails: Arc::default(),
         };
-        // Supervise independently of the consumer: an error must abort peers
-        // even when they are waiting for space and the stream isn't polled.
-        let worker_measurement = measurement.clone();
-        let supervisor = SpawnedTask::spawn(async move {
-            let measurement = worker_measurement;
-            let has_join = self.has_join();
+        let has_join = self.has_join();
 
-            // Phase 1: execute all join build pipelines and finalize hash tables
-            // strictly before any probe work begins.
-            let (finalized_tables, short_circuit_op, skip_all) = if has_join {
-                match self
-                    .run_build_pipelines(
-                        None,
-                        &context,
-                        &metrics,
-                        measurement.as_ref(),
-                        &output.tx,
-                    )
-                    .await?
-                {
-                    BuildRunOutcome::Ready {
-                        tables,
-                        short_circuit_op,
-                    } => (Some(tables), short_circuit_op, false),
-                    BuildRunOutcome::ShortCircuitAll => (None, None, true),
-                    BuildRunOutcome::Cancelled => return Ok(()),
-                }
-            } else {
-                (None, None, false)
-            };
+        if cancel_tx.is_closed() || output.tx.is_closed() {
+            return Ok(());
+        }
 
-            let sink_reservation = match &self.sink {
-                Sink::GroupCount { .. } => Some(
-                    MemoryConsumer::new("MorselGroupCount")
-                        .register(context.memory_pool()),
-                ),
-                Sink::Aggregate { .. } => Some(
-                    MemoryConsumer::new("MorselAggregate")
-                        .register(context.memory_pool()),
-                ),
-                Sink::TopN { .. } => Some(
-                    MemoryConsumer::new("MorselTopN").register(context.memory_pool()),
-                ),
-                Sink::Sort { .. } => None,
-                Sink::Result | Sink::Count { .. } | Sink::HashJoinBuild(_) => None,
-            };
-            let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
-                SharedSortMemory::new(
-                    MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+        // Phase 1: execute all join build pipelines and finalize hash tables
+        // strictly before any probe work begins.
+        let (finalized_tables, short_circuit_op, skip_all) = if has_join {
+            match self
+                .run_build_pipelines(
+                    label_prefix,
+                    stage_inputs,
+                    context,
+                    metrics,
+                    measurement,
+                    &cancel_tx,
                 )
-            });
-            let mut combined_group = match (&self.sink, &sink_reservation) {
-                (Sink::GroupCount { sink, .. }, Some(reservation)) => {
-                    Some(sink.new_state(reservation.new_empty()))
-                }
-                _ => None,
-            };
-            let mut combined_agg = match (&self.sink, &sink_reservation) {
-                (Sink::Aggregate { sink, .. }, Some(reservation)) => {
-                    Some(sink.new_state(reservation.new_empty())?)
-                }
-                _ => None,
-            };
-            let mut combined_count = CountState::default();
-            let mut sorted_runs: Vec<SortedRun> = Vec::new();
+                .await?
+            {
+                BuildRunOutcome::Ready {
+                    tables,
+                    short_circuit_op,
+                } => (Some(tables), short_circuit_op, false),
+                BuildRunOutcome::ShortCircuitAll => (None, None, true),
+                BuildRunOutcome::Cancelled => return Ok(()),
+            }
+        } else {
+            (None, None, false)
+        };
 
-            // Phase 2: execute probe/scan pipeline unless short-circuited by an
-            // empty or null-aware build table.
-            let skip_probe = skip_all || short_circuit_op.is_some();
-            if !skip_probe {
-                let probe_reservation = finalized_tables.as_ref().map(|_| {
-                    MemoryConsumer::new("MorselHashJoinProbe")
-                        .register(context.memory_pool())
-                });
-                let mut tasks = JoinSet::new();
-                match &self.source {
-                    Source::Memory(source) => {
-                        let next = Arc::new(AtomicUsize::new(0));
-                        let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
-                        for id in 0..self.workers.get().min(morsels) {
-                            let (pipeline, next, output) =
-                                (Arc::clone(&self), Arc::clone(&next), output.clone());
-                            let sink_memory = if let Some(shared) = &shared_sort_memory {
-                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                            } else {
-                                sink_reservation
+        let sink_reservation = match &self.sink {
+            Sink::GroupCount { .. } => Some(
+                MemoryConsumer::new("MorselGroupCount").register(context.memory_pool()),
+            ),
+            Sink::Aggregate { .. } => Some(
+                MemoryConsumer::new("MorselAggregate").register(context.memory_pool()),
+            ),
+            Sink::TopN { .. } => {
+                Some(MemoryConsumer::new("MorselTopN").register(context.memory_pool()))
+            }
+            Sink::Sort { .. } => None,
+            Sink::Result
+            | Sink::Count { .. }
+            | Sink::Limit { .. }
+            | Sink::HashJoinBuild(_) => None,
+        };
+        let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
+            SharedSortMemory::new(
+                MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+            )
+        });
+        let mut combined_group = match (&self.sink, &sink_reservation) {
+            (Sink::GroupCount { sink, .. }, Some(reservation)) => {
+                Some(sink.new_state(reservation.new_empty()))
+            }
+            _ => None,
+        };
+        let mut combined_agg = match (&self.sink, &sink_reservation) {
+            (Sink::Aggregate { sink, .. }, Some(reservation)) => {
+                Some(sink.new_state(reservation.new_empty())?)
+            }
+            _ => None,
+        };
+        let mut combined_count = CountState::default();
+        let mut sorted_runs: Vec<SortedRun> = Vec::new();
+
+        // Phase 2: execute probe/scan pipeline unless short-circuited by an
+        // empty or null-aware build table.
+        let skip_probe = skip_all || short_circuit_op.is_some();
+        if !skip_probe {
+            let probe_reservation = finalized_tables.as_ref().map(|_| {
+                MemoryConsumer::new("MorselHashJoinProbe").register(context.memory_pool())
+            });
+            let mut tasks = JoinSet::new();
+            let make_worker_metrics = |id: usize| match (label_prefix, has_join) {
+                (Some(prefix), true) => WorkerMetrics::for_pipeline(
+                    measurement.cloned(),
+                    id,
+                    format!("{prefix}_probe"),
+                ),
+                (Some(prefix), false) => {
+                    WorkerMetrics::for_pipeline(measurement.cloned(), id, prefix)
+                }
+                (None, true) => {
+                    WorkerMetrics::for_pipeline(measurement.cloned(), id, "probe")
+                }
+                (None, false) => WorkerMetrics::new(measurement.cloned(), id),
+            };
+            match &self.source {
+                Source::Memory(source) => {
+                    let next = Arc::new(AtomicUsize::new(0));
+                    let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                    for id in 0..self.workers.get().min(morsels) {
+                        let (pipeline, next, output) =
+                            (Arc::clone(&self), Arc::clone(&next), output.clone());
+                        let sink_memory = if let Some(shared) = &shared_sort_memory {
+                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                        } else {
+                            sink_reservation
+                                .as_ref()
+                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                        };
+                        let join_ctx = finalized_tables.as_ref().map(|t| {
+                            (
+                                Arc::clone(t),
+                                probe_reservation
                                     .as_ref()
-                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                                    .expect("probe reservation")
+                                    .new_empty(),
+                            )
+                        });
+                        let worker = make_worker_metrics(id);
+                        tasks.spawn(async move {
+                            let source = match &pipeline.source {
+                                Source::Memory(source) => source,
+                                #[cfg(feature = "parquet")]
+                                Source::Parquet(_) => unreachable!(),
+                                Source::Stage(_) => unreachable!(),
                             };
-                            let join_ctx = finalized_tables.as_ref().map(|t| {
-                                (
-                                    Arc::clone(t),
-                                    probe_reservation
-                                        .as_ref()
-                                        .expect("probe reservation")
-                                        .new_empty(),
+                            pipeline
+                                .run_memory_worker(
+                                    source,
+                                    &next,
+                                    output,
+                                    sink_memory,
+                                    join_ctx,
+                                    worker,
                                 )
-                            });
-                            let worker = if has_join {
-                                WorkerMetrics::for_pipeline(
-                                    measurement.clone(),
-                                    id,
-                                    "probe",
-                                )
-                            } else {
-                                WorkerMetrics::new(measurement.clone(), id)
-                            };
-                            tasks.spawn(async move {
-                                let source = match &pipeline.source {
-                                    Source::Memory(source) => source,
-                                    #[cfg(feature = "parquet")]
-                                    Source::Parquet(_) => unreachable!(),
-                                };
-                                pipeline
-                                    .run_memory_worker(
-                                        source,
-                                        &next,
-                                        output,
-                                        sink_memory,
-                                        join_ctx,
-                                        worker,
-                                    )
-                                    .await
-                            });
-                        }
-                    }
-                    #[cfg(feature = "parquet")]
-                    Source::Parquet(source) => {
-                        let ready = source.start(
-                            &context,
-                            &mut tasks,
-                            self.workers,
-                            measurement.as_ref(),
-                        )?;
-                        for id in 0..self.workers.get() {
-                            let (pipeline, ready, output) =
-                                (Arc::clone(&self), ready.clone(), output.clone());
-                            let sink_memory = if let Some(shared) = &shared_sort_memory {
-                                Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                            } else {
-                                sink_reservation
-                                    .as_ref()
-                                    .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
-                            };
-                            let join_ctx = finalized_tables.as_ref().map(|t| {
-                                (
-                                    Arc::clone(t),
-                                    probe_reservation
-                                        .as_ref()
-                                        .expect("probe reservation")
-                                        .new_empty(),
-                                )
-                            });
-                            let worker = if has_join {
-                                WorkerMetrics::for_pipeline(
-                                    measurement.clone(),
-                                    id,
-                                    "probe",
-                                )
-                            } else {
-                                WorkerMetrics::new(measurement.clone(), id)
-                            };
-                            tasks.spawn(async move {
-                                pipeline
-                                    .run_parquet_worker(
-                                        ready,
-                                        output,
-                                        sink_memory,
-                                        join_ctx,
-                                        worker,
-                                    )
-                                    .await
-                            });
-                        }
+                                .await
+                        });
                     }
                 }
-                drop(probe_reservation);
-                while let Some(result) = tasks.join_next().await {
-                    let local = match result {
-                        Ok(Ok(local)) => local,
-                        Ok(Err(err)) => {
+                Source::Stage(stage_src) => {
+                    let stage_data = Arc::clone(
+                        stage_inputs
+                            .get(&stage_src.stage_id)
+                            .expect("bound upstream stage artifact"),
+                    );
+                    let sequential = stage_src.ordered
+                        && matches!(self.sink, Sink::Result | Sink::Limit { .. });
+                    let next = Arc::new(AtomicUsize::new(0));
+                    let worker_count = if sequential {
+                        usize::from(!stage_data.batches.is_empty())
+                    } else {
+                        let morsels =
+                            stage_data.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                        self.workers.get().min(morsels)
+                    };
+                    for id in 0..worker_count {
+                        let (pipeline, stage_data, next, output) = (
+                            Arc::clone(&self),
+                            Arc::clone(&stage_data),
+                            Arc::clone(&next),
+                            output.clone(),
+                        );
+                        let sink_memory = if let Some(shared) = &shared_sort_memory {
+                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                        } else {
+                            sink_reservation
+                                .as_ref()
+                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                        };
+                        let join_ctx = finalized_tables.as_ref().map(|t| {
+                            (
+                                Arc::clone(t),
+                                probe_reservation
+                                    .as_ref()
+                                    .expect("probe reservation")
+                                    .new_empty(),
+                            )
+                        });
+                        let worker = make_worker_metrics(id);
+                        tasks.spawn(async move {
+                            pipeline
+                                .run_stage_worker(
+                                    &stage_data.batches,
+                                    &next,
+                                    sequential,
+                                    output,
+                                    sink_memory,
+                                    join_ctx,
+                                    worker,
+                                )
+                                .await
+                        });
+                    }
+                }
+                #[cfg(feature = "parquet")]
+                Source::Parquet(source) => {
+                    let ready =
+                        source.start(context, &mut tasks, self.workers, measurement)?;
+                    for id in 0..self.workers.get() {
+                        let (pipeline, ready, output) =
+                            (Arc::clone(&self), ready.clone(), output.clone());
+                        let sink_memory = if let Some(shared) = &shared_sort_memory {
+                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
+                        } else {
+                            sink_reservation
+                                .as_ref()
+                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                        };
+                        let join_ctx = finalized_tables.as_ref().map(|t| {
+                            (
+                                Arc::clone(t),
+                                probe_reservation
+                                    .as_ref()
+                                    .expect("probe reservation")
+                                    .new_empty(),
+                            )
+                        });
+                        let worker = make_worker_metrics(id);
+                        tasks.spawn(async move {
+                            pipeline
+                                .run_parquet_worker(
+                                    ready,
+                                    output,
+                                    sink_memory,
+                                    join_ctx,
+                                    worker,
+                                )
+                                .await
+                        });
+                    }
+                }
+            }
+            drop(probe_reservation);
+            while let Some(result) = tasks.join_next().await {
+                let local = match result {
+                    Ok(Ok(local)) => local,
+                    Ok(Err(err)) => {
+                        drop(combined_group);
+                        drop(combined_agg);
+                        drop(sorted_runs);
+                        abort_and_drain(&mut tasks).await;
+                        drop(sink_reservation);
+                        drop(shared_sort_memory);
+                        drop(finalized_tables);
+                        return Err(err);
+                    }
+                    Err(err) if err.is_panic() => {
+                        drop(combined_group);
+                        drop(combined_agg);
+                        drop(sorted_runs);
+                        abort_and_drain(&mut tasks).await;
+                        drop(sink_reservation);
+                        drop(shared_sort_memory);
+                        drop(finalized_tables);
+                        std::panic::resume_unwind(err.into_panic())
+                    }
+                    Err(err) => {
+                        drop(combined_group);
+                        drop(combined_agg);
+                        drop(sorted_runs);
+                        abort_and_drain(&mut tasks).await;
+                        drop(sink_reservation);
+                        drop(shared_sort_memory);
+                        drop(finalized_tables);
+                        return Err(exec_datafusion_err!("Morsel task failed: {err}"));
+                    }
+                };
+                match local {
+                    WorkerState::None | WorkerState::HashJoinBuild(_) => {}
+                    WorkerState::Count(local) => {
+                        if let Err(err) = combined_count.combine(local) {
                             drop(combined_group);
                             drop(combined_agg);
                             drop(sorted_runs);
@@ -4175,335 +3425,377 @@ impl Pipeline {
                             drop(finalized_tables);
                             return Err(err);
                         }
-                        Err(err) if err.is_panic() => {
-                            drop(combined_group);
-                            drop(combined_agg);
+                    }
+                    WorkerState::GroupCount(local) => {
+                        if let Some(combined) = combined_group.as_mut() {
+                            match combined.merge_from(local, &cancel_tx).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
+                                    drop(sorted_runs);
+                                    abort_and_drain(&mut tasks).await;
+                                    drop(sink_reservation);
+                                    drop(shared_sort_memory);
+                                    drop(finalized_tables);
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
+                                    drop(sorted_runs);
+                                    abort_and_drain(&mut tasks).await;
+                                    drop(sink_reservation);
+                                    drop(shared_sort_memory);
+                                    drop(finalized_tables);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                    WorkerState::Aggregate(local) => {
+                        if let Some(combined) = combined_agg.as_mut() {
+                            match combined.merge_from(local, &cancel_tx).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
+                                    drop(sorted_runs);
+                                    abort_and_drain(&mut tasks).await;
+                                    drop(sink_reservation);
+                                    drop(shared_sort_memory);
+                                    drop(finalized_tables);
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    drop(combined_group);
+                                    drop(combined_agg);
+                                    drop(sorted_runs);
+                                    abort_and_drain(&mut tasks).await;
+                                    drop(sink_reservation);
+                                    drop(shared_sort_memory);
+                                    drop(finalized_tables);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                    WorkerState::SortedRuns(runs) => {
+                        sorted_runs.extend(runs);
+                        if cancel_tx.is_closed() || output.tx.is_closed() {
                             drop(sorted_runs);
                             abort_and_drain(&mut tasks).await;
                             drop(sink_reservation);
                             drop(shared_sort_memory);
                             drop(finalized_tables);
-                            std::panic::resume_unwind(err.into_panic())
-                        }
-                        Err(err) => {
-                            drop(combined_group);
-                            drop(combined_agg);
-                            drop(sorted_runs);
-                            abort_and_drain(&mut tasks).await;
-                            drop(sink_reservation);
-                            drop(shared_sort_memory);
-                            drop(finalized_tables);
-                            return Err(exec_datafusion_err!(
-                                "Morsel task failed: {err}"
-                            ));
-                        }
-                    };
-                    match local {
-                        WorkerState::None | WorkerState::HashJoinBuild(_) => {}
-                        WorkerState::Count(local) => {
-                            if let Err(err) = combined_count.combine(local) {
-                                drop(combined_group);
-                                drop(combined_agg);
-                                drop(sorted_runs);
-                                abort_and_drain(&mut tasks).await;
-                                drop(sink_reservation);
-                                drop(shared_sort_memory);
-                                drop(finalized_tables);
-                                return Err(err);
-                            }
-                        }
-                        WorkerState::GroupCount(local) => {
-                            if let Some(combined) = combined_group.as_mut() {
-                                match combined.merge_from(local, &output.tx).await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        drop(combined_group);
-                                        drop(combined_agg);
-                                        drop(sorted_runs);
-                                        abort_and_drain(&mut tasks).await;
-                                        drop(sink_reservation);
-                                        drop(shared_sort_memory);
-                                        drop(finalized_tables);
-                                        return Ok(());
-                                    }
-                                    Err(err) => {
-                                        drop(combined_group);
-                                        drop(combined_agg);
-                                        drop(sorted_runs);
-                                        abort_and_drain(&mut tasks).await;
-                                        drop(sink_reservation);
-                                        drop(shared_sort_memory);
-                                        drop(finalized_tables);
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                        }
-                        WorkerState::Aggregate(local) => {
-                            if let Some(combined) = combined_agg.as_mut() {
-                                match combined.merge_from(local, &output.tx).await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        drop(combined_group);
-                                        drop(combined_agg);
-                                        drop(sorted_runs);
-                                        abort_and_drain(&mut tasks).await;
-                                        drop(sink_reservation);
-                                        drop(shared_sort_memory);
-                                        drop(finalized_tables);
-                                        return Ok(());
-                                    }
-                                    Err(err) => {
-                                        drop(combined_group);
-                                        drop(combined_agg);
-                                        drop(sorted_runs);
-                                        abort_and_drain(&mut tasks).await;
-                                        drop(sink_reservation);
-                                        drop(shared_sort_memory);
-                                        drop(finalized_tables);
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                        }
-                        WorkerState::SortedRuns(runs) => {
-                            sorted_runs.extend(runs);
-                            if output.tx.is_closed() {
-                                drop(sorted_runs);
-                                abort_and_drain(&mut tasks).await;
-                                drop(sink_reservation);
-                                drop(shared_sort_memory);
-                                drop(finalized_tables);
-                                return Ok(());
-                            }
+                            return Ok(());
                         }
                     }
                 }
             }
+        }
 
-            // Phase 3: run dependent build-side emission child pipelines (RIGHT/FULL
-            // OUTER unmatched build rows, RIGHT/LEFT SEMI matched build rows, ANTI
-            // unmatched build rows) strictly after all probe workers complete.
-            if let Some(tables) = &finalized_tables {
-                let mut targets = BuildEmissionTargets {
-                    combined_count: Some(&mut combined_count),
-                    combined_group: Some(&mut combined_group),
-                    combined_agg: Some(&mut combined_agg),
-                    sorted_runs: Some(&mut sorted_runs),
-                    combined_build: None,
-                    sink_reservation: sink_reservation.as_ref(),
-                    shared_sort_memory: shared_sort_memory.as_ref(),
-                };
-                match self
-                    .run_build_emission_pipelines(
-                        tables,
-                        short_circuit_op,
-                        None,
-                        &output,
-                        &context,
-                        &metrics,
-                        measurement.as_ref(),
-                        &mut targets,
-                    )
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        drop(combined_group);
-                        drop(combined_agg);
-                        drop(sorted_runs);
-                        drop(sink_reservation);
-                        drop(shared_sort_memory);
-                        drop(finalized_tables);
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        drop(combined_group);
-                        drop(combined_agg);
-                        drop(sorted_runs);
-                        drop(sink_reservation);
-                        drop(shared_sort_memory);
-                        drop(finalized_tables);
-                        return Err(err);
-                    }
+        // Phase 3: run dependent build-side emission child pipelines (RIGHT/FULL
+        // OUTER unmatched build rows, RIGHT/LEFT SEMI matched build rows, ANTI
+        // unmatched build rows) strictly after all probe workers complete.
+        if let Some(tables) = &finalized_tables {
+            let mut targets = BuildEmissionTargets {
+                combined_count: Some(&mut combined_count),
+                combined_group: Some(&mut combined_group),
+                combined_agg: Some(&mut combined_agg),
+                sorted_runs: Some(&mut sorted_runs),
+                combined_build: None,
+                sink_reservation: sink_reservation.as_ref(),
+                shared_sort_memory: shared_sort_memory.as_ref(),
+            };
+            match self
+                .run_build_emission_pipelines(
+                    tables,
+                    short_circuit_op,
+                    label_prefix,
+                    &output,
+                    context,
+                    metrics,
+                    measurement,
+                    &mut targets,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(combined_group);
+                    drop(combined_agg);
+                    drop(sorted_runs);
+                    drop(sink_reservation);
+                    drop(shared_sort_memory);
+                    drop(finalized_tables);
+                    return Ok(());
+                }
+                Err(err) => {
+                    drop(combined_group);
+                    drop(combined_agg);
+                    drop(sorted_runs);
+                    drop(sink_reservation);
+                    drop(shared_sort_memory);
+                    drop(finalized_tables);
+                    return Err(err);
                 }
             }
-            drop(sink_reservation);
-            drop(shared_sort_memory);
-            // Release finalized join build tables as soon as probe and build-emission
-            // workers finish, before publishing tails or finalizing downstream sinks.
-            drop(finalized_tables);
+        }
+        drop(sink_reservation);
+        drop(shared_sort_memory);
+        drop(finalized_tables);
 
-            // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
-            // buffered tail only after all workers and any scan producers succeed.
-            let tails = std::mem::take(&mut *output.tails.lock());
-            let tx = output.tx;
-            for (batches, mut worker) in tails {
-                for batch in batches {
-                    if !worker.send(&tx, batch).await {
-                        return Ok(());
+        // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
+        // buffered tail only after all workers and any scan producers succeed.
+        let tails = std::mem::take(&mut *output.tails.lock());
+        let tx = output.tx;
+        for (batches, mut worker) in tails {
+            for batch in batches {
+                if cancel_tx.is_closed() || !worker.send(&tx, batch).await {
+                    return Ok(());
+                }
+            }
+        }
+        if cancel_tx.is_closed() {
+            return Ok(());
+        }
+        match &self.sink {
+            Sink::Result | Sink::Limit { .. } | Sink::HashJoinBuild(_) => {}
+            Sink::Count {
+                sink,
+                result_operators,
+                post_sort,
+            } => {
+                if !tx.is_closed() && !cancel_tx.is_closed() {
+                    #[cfg(test)]
+                    if let Some(gate) = &sink.finalize_gate {
+                        gate.wait().await;
+                    }
+                    if !tx.is_closed() && !cancel_tx.is_closed() {
+                        let finalized = sink.finalize(combined_count)?;
+                        MetricBuilder::new(metrics)
+                            .counter("count_finalizations", 0)
+                            .add(1);
+                        if post_sort.is_some() {
+                            self.run_post_sort_stage(
+                                FinalizedAggOutput::Count(finalized),
+                                output.batch_size,
+                                context,
+                                metrics,
+                                tx,
+                                measurement,
+                            )
+                            .await?;
+                        } else {
+                            Self::run_count_result(
+                                finalized,
+                                result_operators,
+                                tx,
+                                measurement.map(Arc::as_ref),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
-            match &self.sink {
-                Sink::Result | Sink::HashJoinBuild(_) => {}
-                Sink::Count {
-                    sink,
-                    result_operators,
-                    post_sort,
-                } => {
-                    if !tx.is_closed() {
-                        // Run the dependent pipeline only on successful finalization. It
-                        // has no independent task to wake on error or cancellation.
-                        #[cfg(test)]
-                        if let Some(gate) = &sink.finalize_gate {
-                            gate.wait().await;
-                        }
-                        if !tx.is_closed() {
-                            let finalized = sink.finalize(combined_count)?;
-                            MetricBuilder::new(&metrics)
-                                .counter("count_finalizations", 0)
-                                .add(1);
-                            if post_sort.is_some() {
-                                self.run_post_sort_stage(
-                                    FinalizedAggOutput::Count(finalized),
-                                    output.batch_size,
-                                    &context,
-                                    &metrics,
-                                    tx,
-                                    measurement.as_ref(),
-                                )
-                                .await?;
-                            } else {
-                                Self::run_count_result(
-                                    finalized,
+            Sink::GroupCount {
+                sink,
+                result_operators,
+                post_sort,
+            } => {
+                if !tx.is_closed() && !cancel_tx.is_closed() {
+                    #[cfg(test)]
+                    if let Some(gate) = &sink.finalize_gate {
+                        gate.wait().await;
+                    }
+                    if !tx.is_closed()
+                        && !cancel_tx.is_closed()
+                        && let Some(combined) = combined_group.take()
+                    {
+                        let finalized = sink.finalize(combined);
+                        MetricBuilder::new(metrics)
+                            .counter("group_count_finalizations", 0)
+                            .add(1);
+                        if post_sort.is_some() {
+                            self.run_post_sort_stage(
+                                FinalizedAggOutput::GroupCount(finalized),
+                                output.batch_size,
+                                context,
+                                metrics,
+                                tx,
+                                measurement,
+                            )
+                            .await?;
+                        } else {
+                            finalized
+                                .emit(
                                     result_operators,
-                                    tx,
-                                    measurement.as_deref(),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                }
-                Sink::GroupCount {
-                    sink,
-                    result_operators,
-                    post_sort,
-                } => {
-                    if !tx.is_closed() {
-                        #[cfg(test)]
-                        if let Some(gate) = &sink.finalize_gate {
-                            gate.wait().await;
-                        }
-                        if !tx.is_closed()
-                            && let Some(combined) = combined_group.take()
-                        {
-                            let finalized = sink.finalize(combined);
-                            MetricBuilder::new(&metrics)
-                                .counter("group_count_finalizations", 0)
-                                .add(1);
-                            if post_sort.is_some() {
-                                self.run_post_sort_stage(
-                                    FinalizedAggOutput::GroupCount(finalized),
                                     output.batch_size,
-                                    &context,
-                                    &metrics,
                                     tx,
-                                    measurement.as_ref(),
+                                    measurement.map(Arc::as_ref),
                                 )
                                 .await?;
-                            } else {
-                                finalized
-                                    .emit(
-                                        result_operators,
-                                        output.batch_size,
-                                        tx,
-                                        measurement.as_deref(),
-                                    )
-                                    .await?;
-                            }
                         }
                     }
-                }
-                Sink::Aggregate {
-                    sink,
-                    result_operators,
-                    post_sort,
-                } => {
-                    if !tx.is_closed() {
-                        #[cfg(test)]
-                        if let Some(gate) = &sink.finalize_gate {
-                            gate.wait().await;
-                        }
-                        if !tx.is_closed()
-                            && let Some(combined) = combined_agg.take()
-                        {
-                            let finalized = sink.finalize(combined);
-                            MetricBuilder::new(&metrics)
-                                .counter("aggregate_finalizations", 0)
-                                .add(1);
-                            if post_sort.is_some() {
-                                self.run_post_sort_stage(
-                                    FinalizedAggOutput::Aggregate(finalized),
-                                    output.batch_size,
-                                    &context,
-                                    &metrics,
-                                    tx,
-                                    measurement.as_ref(),
-                                )
-                                .await?;
-                            } else {
-                                finalized
-                                    .emit(
-                                        result_operators,
-                                        output.batch_size,
-                                        tx,
-                                        measurement.as_deref(),
-                                    )
-                                    .await?;
-                            }
-                        }
-                    }
-                }
-                Sink::TopN {
-                    sink,
-                    result_operators,
-                } => {
-                    Self::finalize_direct_topn(
-                        sink,
-                        result_operators,
-                        sorted_runs,
-                        SortFinalizeCtx {
-                            batch_size: output.batch_size,
-                            context: &context,
-                            metrics: &metrics,
-                            measurement: measurement.as_deref(),
-                        },
-                        tx,
-                    )
-                    .await?;
-                }
-                Sink::Sort {
-                    sink,
-                    result_operators,
-                } => {
-                    Self::finalize_direct_sort(
-                        sink,
-                        result_operators,
-                        sorted_runs,
-                        SortFinalizeCtx {
-                            batch_size: output.batch_size,
-                            context: &context,
-                            metrics: &metrics,
-                            measurement: measurement.as_deref(),
-                        },
-                        tx,
-                    )
-                    .await?;
                 }
             }
-            Ok(())
+            Sink::Aggregate {
+                sink,
+                result_operators,
+                post_sort,
+            } => {
+                if !tx.is_closed() && !cancel_tx.is_closed() {
+                    #[cfg(test)]
+                    if let Some(gate) = &sink.finalize_gate {
+                        gate.wait().await;
+                    }
+                    if !tx.is_closed()
+                        && !cancel_tx.is_closed()
+                        && let Some(combined) = combined_agg.take()
+                    {
+                        let finalized = sink.finalize(combined);
+                        MetricBuilder::new(metrics)
+                            .counter("aggregate_finalizations", 0)
+                            .add(1);
+                        if post_sort.is_some() {
+                            self.run_post_sort_stage(
+                                FinalizedAggOutput::Aggregate(finalized),
+                                output.batch_size,
+                                context,
+                                metrics,
+                                tx,
+                                measurement,
+                            )
+                            .await?;
+                        } else {
+                            finalized
+                                .emit(
+                                    result_operators,
+                                    output.batch_size,
+                                    tx,
+                                    measurement.map(Arc::as_ref),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+            }
+            Sink::TopN {
+                sink,
+                result_operators,
+            } => {
+                Self::finalize_direct_topn(
+                    sink,
+                    result_operators,
+                    sorted_runs,
+                    SortFinalizeCtx {
+                        batch_size: output.batch_size,
+                        context,
+                        metrics,
+                        measurement: measurement.map(Arc::as_ref),
+                    },
+                    tx,
+                )
+                .await?;
+            }
+            Sink::Sort {
+                sink,
+                result_operators,
+            } => {
+                Self::finalize_direct_sort(
+                    sink,
+                    result_operators,
+                    sorted_runs,
+                    SortFinalizeCtx {
+                        batch_size: output.batch_size,
+                        context,
+                        metrics,
+                        measurement: measurement.map(Arc::as_ref),
+                    },
+                    tx,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn start(
+        self: Arc<Self>,
+        context: Arc<TaskContext>,
+        metrics: ExecutionPlanMetricsSet,
+        measurement: Option<Arc<RunMetrics>>,
+    ) -> PipelineRun {
+        self.start_dag(
+            Arc::new(Vec::new()),
+            Vec::new(),
+            None,
+            context,
+            metrics,
+            measurement,
+        )
+    }
+
+    fn start_dag(
+        self: Arc<Self>,
+        stages: Arc<Vec<StageSpec>>,
+        consumer_counts: Vec<usize>,
+        scalar_subqueries: Option<Arc<ScalarSubqueryState>>,
+        context: Arc<TaskContext>,
+        metrics: ExecutionPlanMetricsSet,
+        measurement: Option<Arc<RunMetrics>>,
+    ) -> PipelineRun {
+        let (tx, rx) = mpsc::channel(self.sink_capacity);
+        let worker_measurement = measurement.clone();
+        let supervisor = SpawnedTask::spawn(async move {
+            let measurement = worker_measurement;
+            let _sq_guard = scalar_subqueries
+                .as_ref()
+                .map(ScalarSubqueryState::acquire_run);
+            let mut dag = DagRuntime::new(stages, consumer_counts);
+
+            if let Some(sq_state) = &scalar_subqueries {
+                let cont = sq_state
+                    .populate(&mut dag, &context, &metrics, measurement.as_ref(), &tx)
+                    .await?;
+                if !cont {
+                    return Ok(());
+                }
+            }
+
+            let root_deps = collect_pipeline_stage_deps(&self);
+            let bound_deps = if root_deps.is_empty() {
+                Arc::new(HashMap::new())
+            } else {
+                let Some(deps) = bind_stage_dependencies(
+                    &root_deps,
+                    &mut dag,
+                    &context,
+                    &metrics,
+                    measurement.as_ref(),
+                    &tx,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                deps
+            };
+            drop(dag);
+
+            let cancel_tx = tx.clone();
+            self.run_pipeline_to_tx(
+                None,
+                &bound_deps,
+                &context,
+                &metrics,
+                measurement.as_ref(),
+                tx,
+                cancel_tx,
+            )
+            .await
         });
         PipelineRun {
             rx,
@@ -4551,6 +3843,9 @@ impl PipelineRun {
 
 #[derive(Debug)]
 struct MorselExec {
+    stages: Arc<Vec<StageSpec>>,
+    consumer_counts: Vec<usize>,
+    scalar_subqueries: Option<Arc<ScalarSubqueryState>>,
     pipeline: Arc<Pipeline>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -4562,15 +3857,33 @@ impl MorselExec {
         Self::try_new(pipeline, schema).expect("valid test MorselExec")
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     fn try_new(pipeline: Pipeline, schema: SchemaRef) -> Result<Self> {
-        let emission = match pipeline.sink {
-            Sink::Result => EmissionType::Incremental,
-            Sink::Count { .. }
-            | Sink::GroupCount { .. }
-            | Sink::Aggregate { .. }
-            | Sink::TopN { .. }
-            | Sink::Sort { .. }
-            | Sink::HashJoinBuild(_) => EmissionType::Final,
+        Self::try_new_dag(Vec::new(), None, pipeline, schema, None)
+    }
+
+    fn try_new_dag(
+        stages: Vec<StageSpec>,
+        scalar_subqueries: Option<Arc<ScalarSubqueryState>>,
+        pipeline: Pipeline,
+        schema: SchemaRef,
+        root_ordering: Option<LexOrdering>,
+    ) -> Result<Self> {
+        let consumer_counts =
+            validate_dag(&stages, scalar_subqueries.as_deref(), &pipeline)?;
+        let has_blocking_prefix = !stages.is_empty() || scalar_subqueries.is_some();
+        let emission = if has_blocking_prefix {
+            EmissionType::Final
+        } else {
+            match pipeline.sink {
+                Sink::Result | Sink::Limit { .. } => EmissionType::Incremental,
+                Sink::Count { .. }
+                | Sink::GroupCount { .. }
+                | Sink::Aggregate { .. }
+                | Sink::TopN { .. }
+                | Sink::Sort { .. }
+                | Sink::HashJoinBuild(_) => EmissionType::Final,
+            }
         };
         let eq_properties = if let Some((sort_schema, ordering, result_ops)) =
             pipeline.sink.root_sort_ordering()
@@ -4585,15 +3898,22 @@ impl MorselExec {
                 }
             }
             eq
+        } else if let Some(ordering) = root_ordering {
+            let mut eq = EquivalenceProperties::new(schema);
+            eq.add_ordering(ordering);
+            eq
         } else {
             EquivalenceProperties::new(schema)
         };
         let metrics = match &pipeline.source {
-            Source::Memory(_) => ExecutionPlanMetricsSet::new(),
+            Source::Memory(_) | Source::Stage(_) => ExecutionPlanMetricsSet::new(),
             #[cfg(feature = "parquet")]
             Source::Parquet(source) => source.metrics.clone(),
         };
         Ok(Self {
+            stages: Arc::new(stages),
+            consumer_counts,
+            scalar_subqueries,
             metrics,
             pipeline: Arc::new(pipeline),
             properties: Arc::new(
@@ -4606,6 +3926,12 @@ impl MorselExec {
                 .with_scheduling_type(SchedulingType::Cooperative),
             ),
         })
+    }
+
+    fn is_inline_memory_stream(&self) -> bool {
+        self.stages.is_empty()
+            && self.scalar_subqueries.is_none()
+            && self.pipeline.is_inline_memory_stream()
     }
 }
 
@@ -4623,7 +3949,93 @@ fn display_source(source: &Source, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             }
             None => write!(f, "NativeParquet[{}]", source.table),
         },
+        Source::Stage(source) => {
+            if source.ordered {
+                write!(f, "StageSource[stage_{}, ordered]", source.stage_id.0)
+            } else {
+                write!(f, "StageSource[stage_{}]", source.stage_id.0)
+            }
+        }
     }
+}
+
+fn display_pipeline_body(pipeline: &Pipeline, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    display_build_pipelines(&pipeline.operators, f)?;
+    display_source(&pipeline.source, f)?;
+    display_operators(&pipeline.operators, f)?;
+    match &pipeline.sink {
+        Sink::Result => {}
+        Sink::Count {
+            result_operators,
+            post_sort,
+            ..
+        } => {
+            write!(f, " -> CountSink; FinalizedCountSource")?;
+            display_operators(result_operators, f)?;
+            if let Some(ps) = post_sort {
+                ps.display_summary(f)?;
+            }
+        }
+        Sink::GroupCount {
+            sink,
+            result_operators,
+            post_sort,
+        } => {
+            write!(
+                f,
+                " -> GroupCountSink[key={}@{}]; FinalizedGroupCountSource",
+                sink.key_name, sink.key_index
+            )?;
+            display_operators(result_operators, f)?;
+            if let Some(ps) = post_sort {
+                ps.display_summary(f)?;
+            }
+        }
+        Sink::Aggregate {
+            sink,
+            result_operators,
+            post_sort,
+        } => {
+            write!(f, " -> ")?;
+            sink.display_summary(f)?;
+            write!(f, "; FinalizedAggregateSource")?;
+            display_operators(result_operators, f)?;
+            if let Some(ps) = post_sort {
+                ps.display_summary(f)?;
+            }
+        }
+        Sink::TopN {
+            sink,
+            result_operators,
+        } => {
+            write!(f, " -> ")?;
+            sink.display_summary(f)?;
+            write!(f, "; FinalizedTopNSource")?;
+            display_operators(result_operators, f)?;
+        }
+        Sink::Sort {
+            sink,
+            result_operators,
+        } => {
+            write!(f, " -> ")?;
+            sink.display_summary(f)?;
+            write!(f, "; FinalizedSortSource")?;
+            display_operators(result_operators, f)?;
+        }
+        Sink::Limit {
+            skip,
+            fetch,
+            result_operators,
+        } => {
+            write!(f, " -> LimitSink[skip={skip}, fetch={fetch:?}]")?;
+            display_operators(result_operators, f)?;
+        }
+        Sink::HashJoinBuild(sink) => {
+            write!(f, " -> ")?;
+            sink.display_summary(f)?;
+        }
+    }
+    Ok(())
 }
 
 fn display_build_pipelines(
@@ -4651,74 +4063,13 @@ impl DisplayAs for MorselExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pipeline = &self.pipeline;
         write!(f, "MorselExec: workers={}, ", pipeline.workers)?;
-        display_build_pipelines(&pipeline.operators, f)?;
-        display_source(&pipeline.source, f)?;
-        display_operators(&pipeline.operators, f)?;
-        match &pipeline.sink {
-            Sink::Result => {}
-            Sink::Count {
-                result_operators,
-                post_sort,
-                ..
-            } => {
-                write!(f, " -> CountSink; FinalizedCountSource")?;
-                display_operators(result_operators, f)?;
-                if let Some(ps) = post_sort {
-                    ps.display_summary(f)?;
-                }
-            }
-            Sink::GroupCount {
-                sink,
-                result_operators,
-                post_sort,
-            } => {
-                write!(
-                    f,
-                    " -> GroupCountSink[key={}@{}]; FinalizedGroupCountSource",
-                    sink.key_name, sink.key_index
-                )?;
-                display_operators(result_operators, f)?;
-                if let Some(ps) = post_sort {
-                    ps.display_summary(f)?;
-                }
-            }
-            Sink::Aggregate {
-                sink,
-                result_operators,
-                post_sort,
-            } => {
-                write!(f, " -> ")?;
-                sink.display_summary(f)?;
-                write!(f, "; FinalizedAggregateSource")?;
-                display_operators(result_operators, f)?;
-                if let Some(ps) = post_sort {
-                    ps.display_summary(f)?;
-                }
-            }
-            Sink::TopN {
-                sink,
-                result_operators,
-            } => {
-                write!(f, " -> ")?;
-                sink.display_summary(f)?;
-                write!(f, "; FinalizedTopNSource")?;
-                display_operators(result_operators, f)?;
-            }
-            Sink::Sort {
-                sink,
-                result_operators,
-            } => {
-                write!(f, " -> ")?;
-                sink.display_summary(f)?;
-                write!(f, "; FinalizedSortSource")?;
-                display_operators(result_operators, f)?;
-            }
-            Sink::HashJoinBuild(sink) => {
-                write!(f, " -> ")?;
-                sink.display_summary(f)?;
-            }
+        for stage in self.stages.iter() {
+            write!(f, "[Stage {}: ", stage.label)?;
+            display_pipeline_body(&stage.pipeline, f)?;
+            write!(f, "]; ")?;
         }
-        if pipeline.is_inline_memory_stream() {
+        display_pipeline_body(pipeline, f)?;
+        if self.is_inline_memory_stream() {
             write!(f, " -> ResultSink[inline]")
         } else {
             write!(f, " -> ResultSink[capacity={}]", pipeline.sink_capacity)
@@ -4765,6 +4116,14 @@ impl ExecutionPlan for MorselExec {
         {
             let mut combined = self.metrics.clone_inner();
             let mut build_sets = Vec::new();
+            for stage in self.stages.iter() {
+                if let Source::Parquet(source) = &stage.pipeline.source {
+                    build_sets.push(&source.metrics);
+                }
+                stage
+                    .pipeline
+                    .collect_build_parquet_metrics(&mut build_sets);
+            }
             self.pipeline.collect_build_parquet_metrics(&mut build_sets);
             for set in build_sets {
                 for metric in set.clone_inner().iter() {
@@ -4787,7 +4146,19 @@ impl ExecutionPlan for MorselExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
+        for stage in self.stages.iter() {
+            if stage.pipeline.apply_expressions(f)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
         self.pipeline.apply_expressions(f)
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(sq) = &self.scalar_subqueries {
+            sq.results.clear();
+        }
+        Ok(self)
     }
 
     fn with_new_children(
@@ -4823,7 +4194,7 @@ impl ExecutionPlan for MorselExec {
         }
         let pipeline = Arc::clone(&self.pipeline);
         let collector = context.session_config().get_extension::<MorselMetrics>();
-        if pipeline.is_inline_memory_stream() {
+        if self.is_inline_memory_stream() {
             let stream = stream::once(async move {
                 pipeline.inline_memory_stream(
                     context.session_config().batch_size(),
@@ -4836,11 +4207,21 @@ impl ExecutionPlan for MorselExec {
                 stream,
             )));
         }
+        let stages = Arc::clone(&self.stages);
+        let consumer_counts = self.consumer_counts.clone();
+        let scalar_subqueries = self.scalar_subqueries.clone();
         let metrics = self.metrics.clone();
         let stream = stream::once(async move {
             let measurement = collector.map(RunMetrics::start);
             stream::try_unfold(
-                pipeline.start(context, metrics, measurement),
+                pipeline.start_dag(
+                    stages,
+                    consumer_counts,
+                    scalar_subqueries,
+                    context,
+                    metrics,
+                    measurement,
+                ),
                 |mut run| async move { Ok(run.next().await?.map(|batch| (batch, run))) },
             )
         })

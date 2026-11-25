@@ -368,14 +368,18 @@ where
                 RecordBatch::try_new(Arc::clone(schema), vec![key_array, count_array])?;
             let batch = apply_operators(result_operators, batch)?;
 
-            let sent = if let Some(run) = measurement {
-                metrics::send(run, None, tx, batch).await
+            if batch.num_rows() > 0 {
+                let sent = if let Some(run) = measurement {
+                    metrics::send(run, None, tx, batch).await
+                } else {
+                    tx.send(batch).await.is_ok()
+                };
+                drop(batch_reservation);
+                if !sent {
+                    break;
+                }
             } else {
-                tx.send(batch).await.is_ok()
-            };
-            drop(batch_reservation);
-            if !sent {
-                break;
+                drop(batch_reservation);
             }
             if remaining > rows {
                 tokio::task::yield_now().await;
