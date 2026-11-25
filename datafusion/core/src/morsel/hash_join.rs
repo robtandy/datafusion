@@ -2111,6 +2111,58 @@ impl HashJoinBuildState {
         Ok(())
     }
 
+    /// Flush and spill all buffered in-memory build state to disk to release
+    /// `MemoryPool` headroom for an upstream spilled operator (e.g. a nested
+    /// join's `P2` partition replay).
+    pub(super) async fn spill_in_memory(
+        &mut self,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<bool> {
+        let Some(build_spill) = self.build_spill.clone() else {
+            return Ok(false);
+        };
+        if !self.can_radix {
+            return Ok(false);
+        }
+        let before = self.reservation.size();
+        if before == 0 {
+            return Ok(false);
+        }
+        self.flush_r0_to_radix(tx).await?;
+        self.flush_pending_radix(tx).await?;
+        if !self.null_key_payloads.is_empty()
+            && let Some(nk_spill) = self.null_key_spill.clone()
+        {
+            let to_spill = std::mem::take(&mut self.null_key_payloads);
+            if self.null_key_mem_bytes > 0 {
+                let shrink = self.null_key_mem_bytes.min(self.reservation.size());
+                self.reservation.shrink(shrink);
+                self.null_key_mem_bytes = 0;
+            }
+            if let Some((sf, _)) = spill_batches_async(
+                &nk_spill.manager,
+                &to_spill,
+                "MorselHashJoinNullKeySpill",
+                tx,
+            )
+            .await?
+            {
+                self.null_key_spill_files.push(sf);
+            }
+        }
+        if let Some(radix) = self.radix.as_mut() {
+            radix
+                .spill_all_mem(
+                    self.null_key_mem_bytes,
+                    &self.reservation,
+                    &build_spill,
+                    tx,
+                )
+                .await?;
+        }
+        Ok(self.reservation.size() < before)
+    }
+
     pub(super) async fn add_view_async(
         &mut self,
         view: &BatchView,

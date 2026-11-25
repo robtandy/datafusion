@@ -2603,74 +2603,76 @@ impl Pipeline {
             })?;
 
             // Attempt to load the entire build partition into one SingleHashTable.
-            let build_res = MemoryConsumer::new("MorselHashJoinSpillBuild")
-                .with_can_spill(true)
-                .register(context.memory_pool());
-            match load_spilled_build_partition_sync_or_async(
-                &build_files,
-                build_mgr,
-                meta,
-                build_res,
-                &output.tx,
-            )
-            .await
-            {
-                Ok(None) => return Ok(false),
-                Ok(Some(single_table)) => {
-                    // Release build spill files immediately before streaming probe!
-                    drop(build_files);
-                    let mut local_scratch = ProbeScratch::default();
-                    let local_probe_res = MemoryConsumer::new("MorselHashJoinSpillProbe")
-                        .register(context.memory_pool());
-                    for pf in probe_files {
+            // If `sink` is holding buffered RAM from earlier P2 partitions, spill
+            // `sink` and retry once before falling back to recursive split / BNL.
+            let mut loaded_table = None;
+            for attempt in 0..2 {
+                let build_res = MemoryConsumer::new("MorselHashJoinSpillBuild")
+                    .with_can_spill(true)
+                    .register(context.memory_pool());
+                match load_spilled_build_partition_sync_or_async(
+                    &build_files,
+                    build_mgr,
+                    meta,
+                    build_res,
+                    &output.tx,
+                )
+                .await
+                {
+                    Ok(None) => return Ok(false),
+                    Ok(Some(single_table)) => {
+                        loaded_table = Some(single_table);
+                        break;
+                    }
+                    Err(datafusion_common::DataFusionError::ResourcesExhausted(_)) => {
+                        if attempt == 0
+                            && let WorkerSink::HashJoinBuild(b) = sink
+                            && b.spill_in_memory(&output.tx).await?
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if let Some(single_table) = loaded_table {
+                // Release build spill files immediately before streaming probe!
+                drop(build_files);
+                let mut local_scratch = ProbeScratch::default();
+                let local_probe_res = MemoryConsumer::new("MorselHashJoinSpillProbe")
+                    .register(context.memory_pool());
+                for pf in probe_files {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    let mut stream =
+                        probe_mgr.read_spill_as_stream_unbuffered(pf, None)?;
+                    while let Some(batch_res) = stream.next().await {
                         if output.tx.is_closed() {
                             return Ok(false);
                         }
-                        let mut stream =
-                            probe_mgr.read_spill_as_stream_unbuffered(pf, None)?;
-                        while let Some(batch_res) = stream.next().await {
-                            if output.tx.is_closed() {
-                                return Ok(false);
-                            }
-                            let batch = batch_res?;
-                            if batch.num_rows() == 0 {
-                                continue;
-                            }
-                            let Some(mut cursor) = probe.start_single_table_probe(
-                                BatchView::all(batch),
+                        let batch = batch_res?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let Some(mut cursor) = probe.start_single_table_probe(
+                            BatchView::all(batch),
+                            &single_table,
+                            &local_probe_res,
+                        )?
+                        else {
+                            continue;
+                        };
+                        loop {
+                            match probe.next_chunk_single(
+                                &mut cursor,
                                 &single_table,
-                                &local_probe_res,
-                            )?
-                            else {
-                                continue;
-                            };
-                            loop {
-                                match probe.next_chunk_single(
-                                    &mut cursor,
-                                    &single_table,
-                                    output.batch_size,
-                                    &mut local_scratch,
-                                )? {
-                                    OperatorStep::NeedMoreInput(opt) => {
-                                        if let Some(out) = opt {
-                                            let cont = self
-                                                .consume_with_joins_from(
-                                                    op_idx + 1,
-                                                    out,
-                                                    &output.tx,
-                                                    output.batch_size,
-                                                    sink,
-                                                    join_state,
-                                                    worker,
-                                                )
-                                                .await?;
-                                            if !cont {
-                                                return Ok(false);
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    OperatorStep::HaveMoreOutput(out) => {
+                                output.batch_size,
+                                &mut local_scratch,
+                            )? {
+                                OperatorStep::NeedMoreInput(opt) => {
+                                    if let Some(out) = opt {
                                         let cont = self
                                             .consume_with_joins_from(
                                                 op_idx + 1,
@@ -2685,31 +2687,44 @@ impl Pipeline {
                                         if !cont {
                                             return Ok(false);
                                         }
-                                        tokio::task::yield_now().await;
                                     }
+                                    break;
+                                }
+                                OperatorStep::HaveMoreOutput(out) => {
+                                    let cont = self
+                                        .consume_with_joins_from(
+                                            op_idx + 1,
+                                            out,
+                                            &output.tx,
+                                            output.batch_size,
+                                            sink,
+                                            join_state,
+                                            worker,
+                                        )
+                                        .await?;
+                                    if !cont {
+                                        return Ok(false);
+                                    }
+                                    tokio::task::yield_now().await;
                                 }
                             }
                         }
                     }
-                    drop(local_probe_res);
-                    let cont = self
-                        .emit_single_table_build_rows(
-                            op_idx,
-                            probe,
-                            &single_table,
-                            output,
-                            sink,
-                            join_state,
-                            worker,
-                        )
-                        .await?;
-                    drop(single_table);
-                    return Ok(cont);
                 }
-                Err(datafusion_common::DataFusionError::ResourcesExhausted(_)) => {
-                    // Single partition exceeded MemoryPool -> try recursive radix split!
-                }
-                Err(err) => return Err(err),
+                drop(local_probe_res);
+                let cont = self
+                    .emit_single_table_build_rows(
+                        op_idx,
+                        probe,
+                        &single_table,
+                        output,
+                        sink,
+                        join_state,
+                        worker,
+                    )
+                    .await?;
+                drop(single_table);
+                return Ok(cont);
             }
 
             // Recursive radix split on the next disjoint bit window.
@@ -3591,6 +3606,11 @@ impl Pipeline {
         }
 
         if let Some(tables) = &nested_tables {
+            if nested_any_spilled {
+                // Free memory held by P1 build rows before P2 replays spilled
+                // nested join partitions.
+                let _ = combined_build.spill_in_memory(tx).await?;
+            }
             let mut targets = BuildEmissionTargets {
                 combined_count: None,
                 combined_group: None,
