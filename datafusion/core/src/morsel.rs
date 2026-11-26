@@ -3764,6 +3764,7 @@ impl Pipeline {
                         build_pipeline.workers,
                         measurement,
                         published_filters,
+                        true,
                     )?;
                     for id in 0..build_pipeline.workers.get() {
                         let (pipeline, ready, output) = (
@@ -4796,6 +4797,7 @@ impl Pipeline {
                         self.workers,
                         measurement,
                         &published_filters,
+                        !self.has_join(),
                     )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =

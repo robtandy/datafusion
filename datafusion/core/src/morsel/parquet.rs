@@ -560,6 +560,7 @@ impl ParquetScan {
         workers: NonZeroUsize,
         measurement: Option<&Arc<RunMetrics>>,
         published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
+        keep_dynamic_preds_in_bulk: bool,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
         let claimed_counter =
@@ -659,24 +660,26 @@ impl ParquetScan {
                 .as_ref()
                 .map(|plan| plan.pushed_static_preds.clone())
                 .unwrap_or_default();
-            for dyn_pred in pushed_dynamic_preds {
-                let remapped = if let Some(cols) = &bulk_to_output {
-                    dyn_pred
-                        .transform_up(|node| {
-                            if let Some(col) = node.downcast_ref::<Column>() {
-                                let bulk_idx = cols[col.index()];
-                                return Ok(Transformed::yes(Arc::new(Column::new(
-                                    bulk_schema.field(bulk_idx).name(),
-                                    bulk_idx,
-                                ))));
-                            }
-                            Ok(Transformed::no(node))
-                        })?
-                        .data
-                } else {
-                    dyn_pred
-                };
-                bulk_preds.push(remapped);
+            if keep_dynamic_preds_in_bulk {
+                for dyn_pred in pushed_dynamic_preds {
+                    let remapped = if let Some(cols) = &bulk_to_output {
+                        dyn_pred
+                            .transform_up(|node| {
+                                if let Some(col) = node.downcast_ref::<Column>() {
+                                    let bulk_idx = cols[col.index()];
+                                    return Ok(Transformed::yes(Arc::new(Column::new(
+                                        bulk_schema.field(bulk_idx).name(),
+                                        bulk_idx,
+                                    ))));
+                                }
+                                Ok(Transformed::no(node))
+                            })?
+                            .data
+                    } else {
+                        dyn_pred
+                    };
+                    bulk_preds.push(remapped);
+                }
             }
             let compiled_filter = (!bulk_preds.is_empty())
                 .then(|| CompiledFilter::try_new(conjunction(bulk_preds), &bulk_schema))
