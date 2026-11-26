@@ -313,14 +313,15 @@ pub(super) fn estimate_conjunct_cost(
     }
     #[cfg(any(feature = "parquet", test))]
     if let Some(bloom) = expr.downcast_ref::<JoinBloomFilterExpr>() {
-        // L1/L2-resident Bloom filters come from small/selective build sides;
-        // multi-MB Bloom filters spill to L3/DRAM and are typically much less
-        // selective (e.g. unfiltered dimension tables).
+        // Tiny L1-resident Bloom filters (<= 32 KiB, ~<= 20K keys) come from
+        // highly selective build sides; medium L2 Blooms (<= 512 KiB) sit just
+        // after static integer/date predicates (preserving join order on ties),
+        // and multi-MB L3/DRAM Blooms sort after cheaper fixed-width filters.
         let bytes = bloom.filter_memory_bytes();
-        return if bytes <= 64 * 1024 {
+        return if bytes <= 32 * 1024 {
             3
         } else if bytes <= 512 * 1024 {
-            6
+            12
         } else {
             20
         };

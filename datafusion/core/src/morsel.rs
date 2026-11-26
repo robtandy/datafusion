@@ -73,7 +73,9 @@ mod radix_join;
 mod sort;
 mod spill;
 
-use adaptive_filter::{CompiledFilter, WorkerFilterState};
+#[cfg(feature = "parquet")]
+use adaptive_filter::CompiledFilter;
+use adaptive_filter::WorkerFilterState;
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};

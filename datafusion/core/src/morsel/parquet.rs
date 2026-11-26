@@ -562,144 +562,191 @@ impl ParquetScan {
         published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
-        let bulk_filter_plan = self
-            .bulk_scan_plan
-            .as_ref()
-            .map(|plan| -> Result<Arc<BulkFilterPlan>> {
-                let compiled_filter = (!plan.pushed_static_preds.is_empty())
-                    .then(|| {
-                        CompiledFilter::try_new(
-                            conjunction(plan.pushed_static_preds.clone()),
-                            &plan.bulk_schema,
-                        )
-                    })
-                    .transpose()?;
-                Ok(Arc::new(BulkFilterPlan {
-                    compiled_filter,
-                    bulk_to_output: plan.bulk_to_output.clone(),
-                    output_schema: Arc::clone(&self.schema),
-                }))
-            })
-            .transpose()?;
+        let claimed_counter =
+            MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0);
+        let Some(base_config) = &self.config else {
+            let (_, _, ready) =
+                ready::channel(read_ahead, measurement.cloned(), claimed_counter, None);
+            return Ok(ready);
+        };
+
+        let mut runtime_config_owned: Option<FileScanConfig> = None;
+        let mut pushed_dynamic_preds: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        if !self.dynamic_join_filters.is_empty() && !published_filters.is_empty() {
+            let mut dynamic_preds = Vec::new();
+            for binding in &self.dynamic_join_filters {
+                let Some(filter_data) = published_filters.get(&binding.filter_id) else {
+                    continue;
+                };
+                match binding.build_predicates(
+                    filter_data,
+                    self.pushdown_filters,
+                    &self.schema,
+                )? {
+                    BoundJoinPredicates::ShortCircuitEmpty => {
+                        MetricBuilder::new(&self.metrics)
+                            .counter("join_dynamic_filter_short_circuits", 0)
+                            .add(1);
+                        let (_, _, ready) = ready::channel(
+                            read_ahead,
+                            measurement.cloned(),
+                            claimed_counter,
+                            None,
+                        );
+                        return Ok(ready);
+                    }
+                    BoundJoinPredicates::Predicates(preds) => {
+                        dynamic_preds.extend(preds);
+                    }
+                }
+            }
+            if !dynamic_preds.is_empty() {
+                let mut runtime_opts =
+                    context.session_config().options().as_ref().clone();
+                runtime_opts.execution.parquet.pushdown_filters = self.pushdown_filters;
+                let pushed_count = dynamic_preds.len();
+                let update = base_config
+                    .try_pushdown_filters(dynamic_preds.clone(), &runtime_opts)?;
+                if let Some(updated) = update.updated_node {
+                    let updated_cfg = updated
+                        .downcast_ref::<FileScanConfig>()
+                        .ok_or_else(|| {
+                            internal_datafusion_err!(
+                                "Expected FileScanConfig from dynamic join filter pushdown"
+                            )
+                        })?
+                        .clone();
+                    MetricBuilder::new(&self.metrics)
+                        .counter("join_dynamic_filters_pushed", 0)
+                        .add(pushed_count);
+                    if self.pushdown_filters {
+                        for (pred, pushed) in
+                            dynamic_preds.into_iter().zip(update.filters)
+                        {
+                            if matches!(pushed, PushedDown::Yes) {
+                                pushed_dynamic_preds.push(pred);
+                            }
+                        }
+                    }
+                    runtime_config_owned = Some(updated_cfg);
+                }
+            }
+        }
+        let pushed_dynamic_filter = !pushed_dynamic_preds.is_empty();
+        let config = runtime_config_owned.as_ref().unwrap_or(base_config);
+        let parquet = config
+            .file_source()
+            .downcast_ref::<ParquetSource>()
+            .ok_or_else(|| {
+                internal_datafusion_err!("Expected the admitted ParquetSource")
+            })?;
+        let has_pushed_filter = parquet.exact_filter().is_some();
+        let can_adapt = has_pushed_filter
+            && self.pushdown_filters
+            && (self.bulk_scan_plan.is_some() || pushed_dynamic_filter);
+
+        let bulk_filter_plan = if can_adapt {
+            let bulk_schema = self.bulk_scan_plan.as_ref().map_or_else(
+                || Arc::clone(&self.schema),
+                |plan| Arc::clone(&plan.bulk_schema),
+            );
+            let bulk_to_output = self
+                .bulk_scan_plan
+                .as_ref()
+                .and_then(|plan| plan.bulk_to_output.clone());
+            let mut bulk_preds: Vec<Arc<dyn PhysicalExpr>> = self
+                .bulk_scan_plan
+                .as_ref()
+                .map(|plan| plan.pushed_static_preds.clone())
+                .unwrap_or_default();
+            for dyn_pred in pushed_dynamic_preds {
+                let remapped = if let Some(cols) = &bulk_to_output {
+                    dyn_pred
+                        .transform_up(|node| {
+                            if let Some(col) = node.downcast_ref::<Column>() {
+                                let bulk_idx = cols[col.index()];
+                                return Ok(Transformed::yes(Arc::new(Column::new(
+                                    bulk_schema.field(bulk_idx).name(),
+                                    bulk_idx,
+                                ))));
+                            }
+                            Ok(Transformed::no(node))
+                        })?
+                        .data
+                } else {
+                    dyn_pred
+                };
+                bulk_preds.push(remapped);
+            }
+            let compiled_filter = (!bulk_preds.is_empty())
+                .then(|| CompiledFilter::try_new(conjunction(bulk_preds), &bulk_schema))
+                .transpose()?;
+            Some(Arc::new(BulkFilterPlan {
+                compiled_filter,
+                bulk_to_output,
+                output_schema: Arc::clone(&self.schema),
+            }))
+        } else {
+            None
+        };
+
         let (publish, phase2, ready) = ready::channel(
             read_ahead,
             measurement.cloned(),
-            MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
+            claimed_counter,
             bulk_filter_plan,
         );
-        if let Some(base_config) = &self.config {
-            let mut runtime_config_owned: Option<FileScanConfig> = None;
-            let mut pushed_dynamic_filter = false;
-            if !self.dynamic_join_filters.is_empty() && !published_filters.is_empty() {
-                let mut dynamic_preds = Vec::new();
-                for binding in &self.dynamic_join_filters {
-                    let Some(filter_data) = published_filters.get(&binding.filter_id)
-                    else {
-                        continue;
-                    };
-                    match binding.build_predicates(
-                        filter_data,
-                        self.pushdown_filters,
-                        &self.schema,
-                    )? {
-                        BoundJoinPredicates::ShortCircuitEmpty => {
-                            MetricBuilder::new(&self.metrics)
-                                .counter("join_dynamic_filter_short_circuits", 0)
-                                .add(1);
-                            return Ok(ready);
-                        }
-                        BoundJoinPredicates::Predicates(preds) => {
-                            dynamic_preds.extend(preds);
-                        }
-                    }
-                }
-                if !dynamic_preds.is_empty() {
-                    let mut runtime_opts =
-                        context.session_config().options().as_ref().clone();
-                    runtime_opts.execution.parquet.pushdown_filters =
-                        self.pushdown_filters;
-                    let pushed_count = dynamic_preds.len();
-                    let update =
-                        base_config.try_pushdown_filters(dynamic_preds, &runtime_opts)?;
-                    if let Some(updated) = update.updated_node {
-                        let updated_cfg = updated
-                            .downcast_ref::<FileScanConfig>()
-                            .ok_or_else(|| {
-                                internal_datafusion_err!(
-                                    "Expected FileScanConfig from dynamic join filter pushdown"
-                                )
-                            })?
-                            .clone();
-                        MetricBuilder::new(&self.metrics)
-                            .counter("join_dynamic_filters_pushed", 0)
-                            .add(pushed_count);
-                        pushed_dynamic_filter = true;
-                        runtime_config_owned = Some(updated_cfg);
-                    }
-                }
-            }
-            let config = runtime_config_owned.as_ref().unwrap_or(base_config);
-            let parquet = config
-                .file_source()
-                .downcast_ref::<ParquetSource>()
-                .ok_or_else(|| {
-                    internal_datafusion_err!("Expected the admitted ParquetSource")
-                })?;
-            let has_pushed_filter = parquet.exact_filter().is_some();
-            let can_adapt = has_pushed_filter
-                && self.pushdown_filters
-                && (self.bulk_scan_plan.is_some() || pushed_dynamic_filter);
-            let adaptive_ctx = can_adapt.then(|| {
-                let adaptive_cfg = context
-                    .session_config()
-                    .get_extension::<AdaptiveRowFilterConfig>()
-                    .map(|c| (*c).clone())
-                    .unwrap_or_default();
-                let bulk_proj = self.bulk_scan_plan.as_ref().and_then(|plan| {
-                    plan.bulk_projection
-                        .as_ref()
-                        .map(|proj| (proj.clone(), Arc::clone(&plan.bulk_schema)))
-                });
-                Arc::new(AdaptiveRowFilterContext::new(
-                    adaptive_cfg,
-                    self.files.len(),
-                    pushed_dynamic_filter,
-                    bulk_proj,
-                    Some(Arc::new(adaptive_filter::analyze_conjunct)),
-                    &self.metrics,
-                ))
+
+        let adaptive_ctx = can_adapt.then(|| {
+            let adaptive_cfg = context
+                .session_config()
+                .get_extension::<AdaptiveRowFilterConfig>()
+                .map(|c| (*c).clone())
+                .unwrap_or_default();
+            let bulk_proj = self.bulk_scan_plan.as_ref().and_then(|plan| {
+                plan.bulk_projection
+                    .as_ref()
+                    .map(|proj| (proj.clone(), Arc::clone(&plan.bulk_schema)))
             });
-            let work = Arc::new(FileWork {
-                morselizer: parquet.create_adaptive_buffered_morselizer(
-                    config,
-                    context,
-                    adaptive_ctx,
-                )?,
-                files: Arc::clone(&self.files),
-                next: AtomicUsize::new(0),
-                publish,
-                measurement: measurement.cloned(),
+            Arc::new(AdaptiveRowFilterContext::new(
+                adaptive_cfg,
+                self.files.len(),
+                pushed_dynamic_filter,
+                bulk_proj,
+                Some(Arc::new(adaptive_filter::analyze_conjunct)),
+                &self.metrics,
+            ))
+        });
+        let work = Arc::new(FileWork {
+            morselizer: parquet.create_adaptive_buffered_morselizer(
+                config,
+                context,
+                adaptive_ctx,
+            )?,
+            files: Arc::clone(&self.files),
+            next: AtomicUsize::new(0),
+            publish,
+            measurement: measurement.cloned(),
+        });
+        // Each lane owns one planner and can drive at most one pending I/O
+        // phase or hold one reader waiting to publish.
+        for _ in 0..read_ahead.min(self.files.len()) {
+            let work = Arc::clone(&work);
+            tasks.spawn(async move {
+                work.produce().await?;
+                Ok(WorkerState::None)
             });
-            // Each lane owns one planner and can drive at most one pending I/O
-            // phase or hold one reader waiting to publish.
-            for _ in 0..read_ahead.min(self.files.len()) {
-                let work = Arc::clone(&work);
+        }
+        if has_pushed_filter && !self.files.is_empty() {
+            // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
+            // by workers so workers never await object-store I/O.
+            for _ in 0..read_ahead {
+                let phase2 = phase2.clone();
+                let measurement = measurement.cloned();
                 tasks.spawn(async move {
-                    work.produce().await?;
+                    run_phase2_lane(phase2, measurement).await?;
                     Ok(WorkerState::None)
                 });
-            }
-            if has_pushed_filter && !self.files.is_empty() {
-                // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
-                // by workers so workers never await object-store I/O.
-                for _ in 0..read_ahead {
-                    let phase2 = phase2.clone();
-                    let measurement = measurement.cloned();
-                    tasks.spawn(async move {
-                        run_phase2_lane(phase2, measurement).await?;
-                        Ok(WorkerState::None)
-                    });
-                }
             }
         }
         Ok(ready)

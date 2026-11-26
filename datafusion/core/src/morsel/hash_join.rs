@@ -3977,7 +3977,20 @@ impl HashJoinProbe {
                 &radix.meta,
             )?;
             let (rows, valid_mask) = match selection {
-                Selection::All => unreachable!(),
+                Selection::All => {
+                    if num_rows == 0 {
+                        return Ok(None);
+                    }
+                    let valid_mask = if self.null_equality == NullEquality::NullEqualsNull
+                    {
+                        None
+                    } else if key_arr.null_count() > 0 {
+                        Some(key_arr.nulls().unwrap().inner().clone())
+                    } else {
+                        None
+                    };
+                    (ProbeRows::All { num_rows }, valid_mask)
+                }
                 Selection::Mask { bits, .. } => {
                     if key_arr.null_count() > 0 {
                         let nulls = key_arr.nulls().unwrap().inner();
