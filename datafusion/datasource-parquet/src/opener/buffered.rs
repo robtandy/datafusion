@@ -259,13 +259,13 @@ fn build_file_row_filter_plan(
     for cand in candidates {
         let (cand_infallible, cand_cost) = if let Some(analyze) = analyzer {
             let mut inf = true;
-            let mut min_cost = u64::MAX;
+            let mut total_cost = 0u64;
             for expr in cand.physical_exprs() {
                 let (e_inf, e_cost) = analyze(expr, cand.projected_schema());
                 inf &= e_inf;
-                min_cost = min_cost.min(e_cost);
+                total_cost = total_cost.saturating_add(e_cost);
             }
-            (inf, if min_cost == u64::MAX { 100 } else { min_cost })
+            (inf, if total_cost == 0 { 100 } else { total_cost })
         } else {
             (!cand.has_fallible(), cand.required_bytes() as u64)
         };
@@ -936,13 +936,16 @@ impl Drop for CaptureGuard {
     }
 }
 
-fn publish_into_stream_handle(handle: RgProbeHandle) {
+fn publish_into_stream_handle(handle: RgProbeHandle) -> bool {
     INTO_STREAM_CAPTURE.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.active {
             slot.handle = Some(handle);
+            true
+        } else {
+            false
         }
-    });
+    })
 }
 
 /// Synchronously capture the [`RgProbeHandle`] (if any) emitted by
@@ -5585,7 +5588,15 @@ impl Morsel for BufferedReader {
             ..
         } = *self;
         if let Some(handle) = rg_handle {
-            publish_into_stream_handle(handle);
+            let is_bulk = handle.is_bulk();
+            if !publish_into_stream_handle(handle) && is_bulk {
+                return stream::once(async {
+                    Err(internal_datafusion_err!(
+                        "BulkDecode Parquet morsel consumed without an active capture_rg_handle scope"
+                    ))
+                })
+                .boxed();
+            }
         }
         stream::iter(BufferedReaderIter {
             reader,
@@ -7400,5 +7411,100 @@ mod tests {
         assert!(key_b.is_some());
         assert_eq!(ord_f, vec![0, 1]);
         assert!(key_f.is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_decode_morsel_fails_closed_without_capture_scope() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let data = write_parquet_bytes(&batch, WriterProperties::builder().build());
+        let reader_metadata = load_metadata(&data, false);
+        let proj = ProjectionExprs::from_indices(&[0], &schema);
+        let decoder_proj = Arc::new(
+            DecoderProjection::try_new(
+                &proj,
+                &schema,
+                reader_metadata.parquet_schema(),
+                &schema,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let build_morsel = |mode: AdaptiveRowFilterMode| {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let ctx = Arc::new(AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode,
+                    ..Default::default()
+                },
+                1,
+                false,
+                None,
+                None,
+                &metrics,
+            ));
+            let handle = ctx.assign_rg(true, 1, 4);
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                    data.clone(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            Box::new(BufferedReader {
+                reader,
+                decoded_lease: None,
+                in_flight_guard: None,
+                rg_handle: Some(handle),
+                compressed_bytes: data.len() as u64,
+                projection: Arc::clone(&decoder_proj),
+                file_name: Arc::from("test.parquet"),
+                row_context: None,
+                elapsed_compute: Time::new(),
+                cache_metrics: None,
+            }) as Box<dyn Morsel>
+        };
+
+        // 1. Calling `into_stream()` on a BulkDecode morsel WITHOUT `capture_rg_handle`
+        // must fail closed with an error rather than yielding unfiltered rows.
+        let bulk_morsel = build_morsel(AdaptiveRowFilterMode::ForceBulk);
+        let mut uncaptured_stream = bulk_morsel.into_stream();
+        let first = uncaptured_stream.next().await.expect("expected error item");
+        let err = first.expect_err("uncaptured BulkDecode morsel must error");
+        assert!(
+            err.to_string().contains("BulkDecode"),
+            "unexpected error: {err}"
+        );
+
+        // 2. Calling `into_stream()` on a BulkDecode morsel WITH `capture_rg_handle`
+        // captures the handle cleanly and streams batches.
+        let bulk_morsel_ok = build_morsel(AdaptiveRowFilterMode::ForceBulk);
+        let (mut captured_stream, handle) =
+            capture_rg_handle(|| bulk_morsel_ok.into_stream());
+        let handle = handle.expect("expected captured RgProbeHandle");
+        assert!(handle.is_bulk());
+        let out = captured_stream
+            .next()
+            .await
+            .expect("expected batch")
+            .expect("captured BulkDecode stream should succeed");
+        assert_eq!(out.num_rows(), 4);
+        handle.finish(100);
+
+        // 3. Calling `into_stream()` on an already-filtered RowFilter morsel without
+        // `capture_rg_handle` still streams normally (rows are already filtered).
+        let rf_morsel = build_morsel(AdaptiveRowFilterMode::ForceRowFilter);
+        let mut rf_stream = rf_morsel.into_stream();
+        let rf_batch = rf_stream
+            .next()
+            .await
+            .expect("expected batch")
+            .expect("RowFilter morsel should succeed without capture scope");
+        assert_eq!(rf_batch.num_rows(), 4);
     }
 }
