@@ -552,8 +552,10 @@ pub fn build_row_filter(
 #[derive(Clone, Debug)]
 pub(crate) struct PrebuiltRowFilterCandidate {
     /// Ordered predicate expressions with all `Column` indices rewritten to
-    /// point into the projected file schema.
+    /// point into `projected_schema`.
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// Projected file schema matching `physical_exprs` column indices.
+    projected_schema: SchemaRef,
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
@@ -572,6 +574,22 @@ pub(crate) struct PrebuiltRowFilterCandidate {
 impl PrebuiltRowFilterCandidate {
     pub(crate) fn reads_leaf(&self, leaf_idx: usize) -> bool {
         self.projection_mask.leaf_included(leaf_idx)
+    }
+
+    pub(crate) fn physical_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.physical_exprs
+    }
+
+    pub(crate) fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
+    pub(crate) fn required_bytes(&self) -> usize {
+        self.required_bytes
+    }
+
+    pub(crate) fn has_fallible(&self) -> bool {
+        self.has_fallible
     }
 }
 
@@ -746,6 +764,7 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
                 .collect::<Result<Vec<_>>>()?;
             Ok(PrebuiltRowFilterCandidate {
                 physical_exprs,
+                projected_schema: candidate.read_plan.projected_schema,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
                 has_fallible,
@@ -765,10 +784,6 @@ pub(crate) fn row_filter_from_prebuilt(
     reorder_predicates: bool,
     file_metrics: &ParquetFileMetrics,
 ) -> RowFilter {
-    let rows_pruned = &file_metrics.pushdown_rows_pruned;
-    let rows_matched = &file_metrics.pushdown_rows_matched;
-    let time = &file_metrics.row_pushdown_eval_time;
-
     // Clone (cheap: Arc bumps + ProjectionMask clone) into a working list we
     // can sort without disturbing the shared cache.
     let mut ordered: Vec<&PrebuiltRowFilterCandidate> = prebuilt.iter().collect();
@@ -787,6 +802,28 @@ pub(crate) fn row_filter_from_prebuilt(
         }
     }
 
+    row_filter_from_ordered(ordered, file_metrics)
+}
+
+/// Wrap prebuilt candidates into a fresh [`RowFilter`] in an explicit caller-provided
+/// `permutation` order (used by the native buffered morsel adaptive filter path).
+pub(crate) fn row_filter_from_prebuilt_with_order(
+    prebuilt: &[PrebuiltRowFilterCandidate],
+    permutation: &[usize],
+    file_metrics: &ParquetFileMetrics,
+) -> RowFilter {
+    let ordered: Vec<&PrebuiltRowFilterCandidate> =
+        permutation.iter().map(|&idx| &prebuilt[idx]).collect();
+    row_filter_from_ordered(ordered, file_metrics)
+}
+
+fn row_filter_from_ordered(
+    ordered: Vec<&PrebuiltRowFilterCandidate>,
+    file_metrics: &ParquetFileMetrics,
+) -> RowFilter {
+    let rows_pruned = &file_metrics.pushdown_rows_pruned;
+    let rows_matched = &file_metrics.pushdown_rows_matched;
+    let time = &file_metrics.row_pushdown_eval_time;
     let total = ordered.len();
     let filters: Vec<Box<dyn ArrowPredicate>> = ordered
         .into_iter()

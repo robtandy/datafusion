@@ -11,6 +11,7 @@ use crate::CachedParquetFileReaderFactory;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use crate::ParquetFileSchemaProvider;
+use crate::opener::AdaptiveRowFilterContext;
 use crate::opener::ParquetMorselizer;
 use crate::opener::ParquetSplitConfig;
 use crate::opener::SplitContext;
@@ -582,6 +583,17 @@ impl ParquetSource {
 
     /// Open a morselizer that publishes buffered row-group readers, not file streams.
     /// The caller must admit only unordered whole files with static predicates.
+    /// Return the current projection expressions for this source.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn projection_exprs(&self) -> &ProjectionExprs {
+        &self.projection
+    }
+
     ///
     /// # Public Only for Internal Use:
     /// This is not a public API and is for internal use only; see [API policy] for details.
@@ -592,6 +604,24 @@ impl ParquetSource {
         &self,
         base_config: &FileScanConfig,
         context: &TaskContext,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.create_adaptive_buffered_morselizer(base_config, context, None)
+    }
+
+    /// Like [`Self::create_buffered_morselizer`], attaching an optional shared
+    /// [`AdaptiveRowFilterContext`] for per-row-group `RowFilter` vs.
+    /// `BulkDecode` switching and adaptive `RowFilter` candidate reordering.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn create_adaptive_buffered_morselizer(
+        &self,
+        base_config: &FileScanConfig,
+        context: &TaskContext,
+        adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
         let store = context
             .runtime_env()
@@ -615,7 +645,14 @@ impl ParquetSource {
                 self.metrics().clone(),
             ))
         });
-        source.make_morselizer(store, base_config, 0, true, split_context)
+        source.make_morselizer(
+            store,
+            base_config,
+            0,
+            true,
+            split_context,
+            adaptive_context,
+        )
     }
 
     fn make_morselizer(
@@ -625,6 +662,7 @@ impl ParquetSource {
         partition: usize,
         buffered: bool,
         split_context: Option<Arc<SplitContext>>,
+        adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
@@ -733,6 +771,7 @@ impl ParquetSource {
             buffered,
             direct_store,
             split_context,
+            adaptive_context,
         }))
     }
 }
@@ -755,7 +794,7 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        self.make_morselizer(object_store, base_config, partition, false, None)
+        self.make_morselizer(object_store, base_config, partition, false, None, None)
     }
 
     fn reorder_files(

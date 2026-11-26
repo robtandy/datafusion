@@ -55,7 +55,7 @@ use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::row_filter::{
     PrebuiltRowFilterCandidate, prebuild_row_filter_candidates_with_grouping,
-    row_filter_from_prebuilt,
+    row_filter_from_prebuilt, row_filter_from_prebuilt_with_order,
 };
 use crate::row_group_filter::RowGroupPruningStatistics;
 
@@ -400,6 +400,11 @@ impl RowFilterContext {
         self.prebuilt.as_slice().len()
     }
 
+    /// Prebuilt candidates for adaptive ordering on the native buffered morsel path.
+    pub(crate) fn candidates(&self) -> &[PrebuiltRowFilterCandidate] {
+        self.prebuilt.as_slice()
+    }
+
     /// Build a fresh [`RowFilter`] for the next non-fully-matched run using
     /// the cached candidates. Cheap: no tree walks, only counter allocation
     /// and (optionally) a sort by `required_bytes`.
@@ -410,6 +415,15 @@ impl RowFilterContext {
         row_filter_from_prebuilt(
             self.prebuilt.as_slice(),
             self.reorder_predicates,
+            &self.file_metrics,
+        )
+    }
+
+    /// Build a fresh [`RowFilter`] using an explicit candidate `permutation`.
+    pub(crate) fn build_row_filter_with_order(&self, permutation: &[usize]) -> RowFilter {
+        row_filter_from_prebuilt_with_order(
+            self.prebuilt.as_slice(),
+            permutation,
             &self.file_metrics,
         )
     }
