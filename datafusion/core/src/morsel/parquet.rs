@@ -905,8 +905,8 @@ fn remap_keys_through_ops(
 /// stage pipeline's pre-sink schema.
 ///
 /// Only grouped `Aggregate` / `GroupCount` (direct pass-through `GROUP BY`
-/// column references, never ungrouped or `TopN`), `Sort`, and `Result` stages
-/// allow sound pushdown.
+/// column references, never ungrouped, `TopN`, or `Sort` with `OFFSET`/`LIMIT`),
+/// plain `Sort` (without `OFFSET`/`LIMIT`), and `Result` stages allow sound pushdown.
 fn remap_keys_through_stage_sink(
     sink: &Sink,
     pre_sink_schema: &SchemaRef,
@@ -920,11 +920,16 @@ fn remap_keys_through_stage_sink(
             Some(PostSort::Sort {
                 sink: sort_sink,
                 result_operators,
-            }) => Ok(Some(remap_keys_through_ops(
-                keys,
-                result_operators,
-                sort_sink.input_schema(),
-            )?)),
+            }) => {
+                if sort_sink.has_skip_or_fetch() {
+                    return Ok(None);
+                }
+                Ok(Some(remap_keys_through_ops(
+                    keys,
+                    result_operators,
+                    sort_sink.input_schema(),
+                )?))
+            }
             Some(PostSort::TopN { .. }) => Ok(None),
         }
     };
@@ -992,11 +997,16 @@ fn remap_keys_through_stage_sink(
         Sink::Sort {
             sink: sort_sink,
             result_operators,
-        } => Ok(Some(remap_keys_through_ops(
-            stage_out_keys,
-            result_operators,
-            sort_sink.input_schema(),
-        )?)),
+        } => {
+            if sort_sink.has_skip_or_fetch() {
+                return Ok(None);
+            }
+            Ok(Some(remap_keys_through_ops(
+                stage_out_keys,
+                result_operators,
+                sort_sink.input_schema(),
+            )?))
+        }
         Sink::Result => Ok(Some(stage_out_keys.to_vec())),
         Sink::Count { .. }
         | Sink::TopN { .. }

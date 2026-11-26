@@ -3346,14 +3346,16 @@ async fn cross_aggregate_dynamic_join_filter_empty_build_short_circuits_stage()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards()
 -> Result<()> {
-    // Fact table with 8 row groups, NULL keys, negative keys, and duplicates.
+    // Fact table with 8 row groups, unique `id`, NULL keys, and duplicates.
     let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
         Field::new("k1", DataType::Int64, true),
         Field::new("k2", DataType::Int64, true),
         Field::new("val", DataType::Int64, false),
     ]));
     let mut fact_batches = Vec::with_capacity(8);
     for rg in 0..8i64 {
+        let mut ids = Vec::with_capacity(500);
         let mut k1s = Vec::with_capacity(500);
         let mut k2s = Vec::with_capacity(500);
         let mut vals = Vec::with_capacity(500);
@@ -3368,6 +3370,7 @@ async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards(
             } else {
                 Some((rg * 100 + (i % 100)) % 30)
             };
+            ids.push(rg * 500 + i);
             k1s.push(k1);
             k2s.push(k2);
             vals.push((i % 25) + 1);
@@ -3375,6 +3378,7 @@ async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards(
         fact_batches.push(RecordBatch::try_new(
             Arc::clone(&fact_schema),
             vec![
+                Arc::new(Int64Array::from(ids)),
                 Arc::new(Int64Array::from(k1s)),
                 Arc::new(Int64Array::from(k2s)),
                 Arc::new(Int64Array::from(vals)),
@@ -3556,6 +3560,37 @@ async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards(
             "topn_agg_no_push",
             "SELECT d.dk1, a.s FROM (VALUES (305), (306)) AS d(dk1) \
              INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1 ORDER BY s DESC, k1 ASC LIMIT 5) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: Sort with OFFSET MUST NOT push (filtering before Sort changes which rows OFFSET skips!).
+        // `dim1` keys live in RG 3 (k1 in 300..315, id in 1500..2000), so OFFSET 250 skips RG 0 rows
+        // and keeps all matching rows; a pushed filter would prune RG 0..2 and skip the matching rows.
+        (
+            "sort_offset_no_push",
+            "SELECT d.dk1, a.id FROM dim1 d \
+             INNER JOIN (SELECT id, k1 FROM fact ORDER BY id OFFSET 250) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1, a.id",
+            false,
+            false,
+        ),
+        // Guard: Grouped Aggregate + ORDER BY + OFFSET (PostSort::Sort with skip > 0) MUST NOT push.
+        // Without pushdown, OFFSET 250 skips k1 in 0..249 and keeps all 15 groups in 300..314;
+        // pushing dim1's filter before Aggregate would leave <= 15 groups and OFFSET 250 would return 0 rows!
+        (
+            "agg_sort_offset_no_push",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1 ORDER BY k1 OFFSET 250) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: GroupCount + ORDER BY + OFFSET (PostSort::Sort with skip > 0) MUST NOT push.
+        (
+            "group_count_sort_offset_no_push",
+            "SELECT d.dk1, a.cnt FROM dim1 d \
+             INNER JOIN (SELECT k1, COUNT(*) AS cnt FROM fact GROUP BY k1 ORDER BY k1 OFFSET 250) a \
              ON d.dk1 = a.k1 ORDER BY d.dk1",
             false,
             false,

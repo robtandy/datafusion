@@ -14,8 +14,9 @@ filter propagation and join build-side estimation improvements in `#206`:
    `planner.rs`, `dag.rs`, `morsel.rs`):** A whole-DAG dynamic join filter
    binding pass propagates finalized build-side filters (`min/max` bounds,
    `InList`, and `SplitBlockBloomFilter`) across single-consumer `StageSource`
-   boundaries backed by grouped `Aggregate`, `GroupCount`, `Sort`, or `Result`
-   stages (strictly skipping ungrouped aggregates, `TopN`/`Limit` stages,
+   boundaries backed by grouped `Aggregate`, `GroupCount`, plain `Sort` (without
+   `OFFSET`/`LIMIT`), or `Result` stages (strictly skipping ungrouped
+   aggregates, `TopN`/`Limit` stages, sorts with `OFFSET`/`LIMIT`,
    `HAVING`-altered or aggregate-derived key expressions, probe-preserving
    joins, and multi-consumer stages). At runtime, `Pipeline::prepare_execution`
    executes join build pipelines before ensuring the probe `StageSource` so
