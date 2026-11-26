@@ -3669,3 +3669,114 @@ async fn adaptive_row_filter_per_file_fallible_stats_elision_preserves_guard_ord
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn radix_probe_compacted_sparse_batch_view_parity() -> Result<()> {
+    // Regression test for `RadixProbeCursor` handling `Selection::All` after
+    // `BatchView::into_reserved_for_retention` compacts a sparse `Selection::Mask`
+    // (1% selectivity on a wide-payload fact table joined against a 20,000-row
+    // radix-partitioned build table). Reachable under both `pushdown_filters=false`
+    // and `pushdown_filters=true` (Mode B `BulkDecode`).
+    let fact_dir = TempDir::new()?;
+    let big_dir = TempDir::new()?;
+
+    let rows_per_file = 16_384usize;
+    let payload_pad = "x".repeat(110);
+    for file_idx in 0..3usize {
+        let base = (file_idx * rows_per_file) as i32;
+        let ks: Vec<i32> = (0..rows_per_file as i32)
+            .map(|i| (base + i) % 20_000)
+            .collect();
+        let gates: Vec<i32> = (0..rows_per_file as i32)
+            .map(|i| (base + i) % 100)
+            .collect();
+        let payloads: Vec<String> = (0..rows_per_file as i32)
+            .map(|i| format!("row-{:07}-{payload_pad}", base + i))
+            .collect();
+        let batch = RecordBatch::try_from_iter([
+            ("k", Arc::new(Int32Array::from(ks)) as _),
+            ("gate", Arc::new(Int32Array::from(gates)) as _),
+            ("payload", Arc::new(StringArray::from(payloads)) as _),
+        ])?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8_192))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(fact_dir.path().join(format!("fact_{file_idx}.parquet")))?,
+            batch.schema(),
+            Some(props),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let big_rows = 20_000i32;
+    let big_batch = RecordBatch::try_from_iter([
+        (
+            "bk",
+            Arc::new(Int32Array::from_iter_values(0..big_rows)) as _,
+        ),
+        (
+            "bval",
+            Arc::new(Int32Array::from_iter_values((0..big_rows).map(|v| v * 7))) as _,
+        ),
+    ])?;
+    let mut big_writer = ArrowWriter::try_new(
+        File::create(big_dir.path().join("big.parquet"))?,
+        big_batch.schema(),
+        None,
+    )?;
+    big_writer.write(&big_batch)?;
+    big_writer.close()?;
+
+    let sql =
+        "SELECT f.payload, b.bval FROM fact f JOIN big b ON f.k = b.bk WHERE f.gate = 3";
+
+    let stock = adaptive_context(&fact_dir, "fact", "off", false, None).await?;
+    stock
+        .register_parquet(
+            "big",
+            big_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    let expected = stock.sql(sql).await?.collect().await?;
+
+    for (pushdown, adaptive_cfg) in [
+        (false, None),
+        (
+            true,
+            Some(AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::ForceBulk,
+                ..Default::default()
+            }),
+        ),
+        (true, None),
+    ] {
+        let native =
+            adaptive_context(&fact_dir, "fact", "required", pushdown, adaptive_cfg)
+                .await?;
+        native
+            .register_parquet(
+                "big",
+                big_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec")
+        );
+        let actual = collect(plan, native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "radix probe parity mismatch for pushdown={pushdown}"
+        );
+    }
+
+    Ok(())
+}
