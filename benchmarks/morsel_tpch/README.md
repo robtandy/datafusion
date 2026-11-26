@@ -41,8 +41,10 @@ Three common scale modes are supported (or any positive `--sf`):
 - **SF5 benchmark mode (`--sf 5`):** 43,299,825 total rows across 35 files and
   353 row groups (1,400,570,073 bytes / 1.30 GiB on disk; 29,999,795 `lineitem`
   rows across 16 files / 240 row groups; see
-  [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the idle-`dduck2` full
-  **22/22 3-way SF5 scorecard** and [sf5_baseline_22q.md](sf5_baseline_22q.md)
+  [sf5_22q_final_scorecard.md](sf5_22q_final_scorecard.md) for the final
+  post-`#193`/`#194` idle-`dduck2` **22/22 3-way SF5 scorecard + spill check**,
+  [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the initial `#192`
+  22/22 SF5 scorecard, and [sf5_baseline_22q.md](sf5_baseline_22q.md)
   for the earlier pre-`#191` Stock vs. DuckDB 2.0.1 baseline).
 
 ### SF1 Dataset Layout (`--sf 1 --row-group-size 131072`)
@@ -86,7 +88,11 @@ workloads** — run directly over the real TPC-H Parquet schemas (`l_quantity`,
 with zero casts or schema workarounds; `morsel_mode=required` admits all 25
 natively under `MorselExec` with zero fallbacks and verified DuckDB parity:
 
-- See [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the idle-`dduck2`
+- See [sf5_22q_final_scorecard.md](sf5_22q_final_scorecard.md) for the final
+  post-`#193`/`#194` idle-`dduck2` **22/22 SF5 3-way warm-cache scorecard**
+  (before vs. after, `bytes_scanned` dynamic join pushdown analysis, and
+  tight-memory SF5 spill completion under `RLIMIT_NOFILE=1024`, `#195`).
+- See [sf5_22q_scorecard.md](sf5_22q_scorecard.md) for the initial idle-`dduck2`
   **full 22/22 SF5 3-way warm-cache scorecard** (Morsel `required` vs. Stock
   `off` vs. DuckDB 2.0.1) with geometric means and `#138` per-pipeline
   wait/work breakdowns (`#192`).

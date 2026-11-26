@@ -1436,3 +1436,60 @@ class TpchHarnessTest(unittest.TestCase):
                 self.assertGreater(before["total"], 0)
                 self.assertEqual(before["resident"], 0)
                 self.assertGreater(after["resident"], 0)
+
+    @unittest.skipUnless(
+        os.getenv("MORSEL_TPCH_RUNNER") and os.getenv("MORSEL_BENCH_REVISION"),
+        "set MORSEL_TPCH_RUNNER and MORSEL_BENCH_REVISION for the spill/pushdown runner test",
+    )
+    def test_sf001_runner_memory_limit_spill_and_dynamic_filter_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "tpch sf001 spill"
+            generate(data_dir, sf=0.01, row_group_size=131_072)
+            runner = os.environ["MORSEL_TPCH_RUNNER"]
+            # Check dynamic join filter metrics on Q3 under pushdown.
+            q3 = WORKLOADS["q3"]
+            q3_out = subprocess.check_output(
+                [
+                    runner,
+                    "measure",
+                    "required",
+                    "pushdown",
+                    "2",
+                    str(data_dir),
+                    ",".join(q3.tables),
+                    q3.sql,
+                ],
+                text=True,
+                timeout=60,
+            )
+            q3_report = json.loads(q3_out)
+            self.assertIsNone(q3_report["memory_limit_bytes"])
+            self.assertEqual(q3_report["spill_count"], 0)
+            self.assertEqual(q3_report["spilled_bytes"], 0)
+            self.assertEqual(q3_report["spilled_rows"], 0)
+            self.assertGreater(q3_report["join_dynamic_filters_pushed"], 0)
+
+            # Check bounded-memory spill execution and metrics via MORSEL_MEMORY_LIMIT_BYTES.
+            q18 = WORKLOADS["q18"]
+            env = dict(os.environ, MORSEL_MEMORY_LIMIT_BYTES=str(512 * 1024))
+            q18_out = subprocess.check_output(
+                [
+                    runner,
+                    "measure",
+                    "required",
+                    "pushdown",
+                    "2",
+                    str(data_dir),
+                    ",".join(q18.tables),
+                    q18.sql,
+                ],
+                text=True,
+                env=env,
+                timeout=60,
+            )
+            q18_report = json.loads(q18_out)
+            self.assertEqual(q18_report["memory_limit_bytes"], 512 * 1024)
+            self.assertEqual(q18_report["output_rows"], EXPECTED_SF001_QUERY_ROWS["q18"])
+            self.assertGreater(q18_report["spill_count"], 0)
+            self.assertGreater(q18_report["spilled_bytes"], 0)
+            self.assertGreater(q18_report["spilled_rows"], 0)

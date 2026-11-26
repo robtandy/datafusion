@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io;
@@ -11,6 +13,9 @@ use std::sync::Arc;
 use arrow::ipc::writer::StreamWriter;
 use datafusion::common::config::MorselMode;
 use datafusion::common::instant::Instant;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::morsel::MorselMetrics;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
@@ -26,6 +31,37 @@ fn env_bool(name: &str, default: bool) -> bool {
         Some("0" | "false" | "FALSE") => false,
         _ => default,
     }
+}
+
+fn memory_limit_bytes() -> Result<Option<usize>, Box<dyn Error>> {
+    if let Ok(raw) = std::env::var("MORSEL_MEMORY_LIMIT_BYTES") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let bytes: usize = trimmed.parse().map_err(|err| {
+                format!("invalid MORSEL_MEMORY_LIMIT_BYTES '{trimmed}': {err}")
+            })?;
+            if bytes == 0 {
+                return Err("MORSEL_MEMORY_LIMIT_BYTES must be positive".into());
+            }
+            return Ok(Some(bytes));
+        }
+    }
+    if let Ok(raw) = std::env::var("MORSEL_MEMORY_LIMIT_MB") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let mb: usize = trimmed.parse().map_err(|err| {
+                format!("invalid MORSEL_MEMORY_LIMIT_MB '{trimmed}': {err}")
+            })?;
+            if mb == 0 {
+                return Err("MORSEL_MEMORY_LIMIT_MB must be positive".into());
+            }
+            let bytes = mb
+                .checked_mul(1024 * 1024)
+                .ok_or("MORSEL_MEMORY_LIMIT_MB overflow")?;
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -219,12 +255,19 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
     let collect_metrics =
         matches!(operation, Operation::Measure) && env_bool("MORSEL_METRICS", true);
     let metrics = collect_metrics.then(|| Arc::new(MorselMetrics::default()));
-    let ctx = SessionContext::new_with_config(build_config(
-        mode,
-        profile,
-        workers,
-        metrics.clone(),
-    ));
+    let config = build_config(mode, profile, workers, metrics.clone());
+    let mem_limit = memory_limit_bytes()?;
+    let ctx = if let Some(limit_bytes) = mem_limit {
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(limit_bytes)))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+            )
+            .build_arc()?;
+        SessionContext::new_with_config_rt(config, runtime_env)
+    } else {
+        SessionContext::new_with_config(config)
+    };
 
     if matches!(operation, Operation::Plan) {
         register_tables(&ctx, data_dir, tables).await?;
@@ -371,9 +414,15 @@ async fn run(req: RunRequest<'_>) -> Result<(), Box<dyn Error>> {
             "join_build_finalizations": metric(plan.as_ref(), "join_build_finalizations"),
             "join_empty_build_short_circuits": metric(plan.as_ref(), "join_empty_build_short_circuits"),
             "join_null_aware_short_circuits": metric(plan.as_ref(), "join_null_aware_short_circuits"),
+            "join_dynamic_filters_pushed": metric(plan.as_ref(), "join_dynamic_filters_pushed"),
+            "join_dynamic_filter_short_circuits": metric(plan.as_ref(), "join_dynamic_filter_short_circuits"),
             "sort_finalizations": metric(plan.as_ref(), "sort_finalizations"),
             "topn_finalizations": metric(plan.as_ref(), "topn_finalizations"),
             "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
+            "memory_limit_bytes": mem_limit,
+            "spill_count": spill_metric(plan.as_ref(), |m| m.spill_count()),
+            "spilled_bytes": spill_metric(plan.as_ref(), |m| m.spilled_bytes()),
+            "spilled_rows": spill_metric(plan.as_ref(), |m| m.spilled_rows()),
             "worker_claims": native.as_ref().map(|r| &r.claims),
             "worker_completions": native.as_ref().map(|r| &r.completions),
             "morsel_decode_work_ms": native.as_ref().map(|r| r.decode_ms),
@@ -671,5 +720,20 @@ fn metric(plan: &dyn ExecutionPlan, name: &str) -> usize {
         .children()
         .iter()
         .map(|child| metric(child.as_ref(), name))
+        .sum::<usize>()
+}
+
+fn spill_metric<F>(plan: &dyn ExecutionPlan, extract: F) -> usize
+where
+    F: Fn(&MetricsSet) -> Option<usize> + Copy,
+{
+    let own = plan
+        .metrics()
+        .and_then(|metrics| extract(&metrics))
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .iter()
+        .map(|child| spill_metric(child.as_ref(), extract))
         .sum::<usize>()
 }
