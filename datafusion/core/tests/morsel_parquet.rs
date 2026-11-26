@@ -3780,3 +3780,125 @@ async fn radix_probe_compacted_sparse_batch_view_parity() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_row_filter_fallible_trailing_guard_parity_across_all_modes()
+-> Result<()> {
+    // Regression test: when an infallible conjunct (`a < 10`) appears *after*
+    // a fallible conjunct (`100 / b > 3`) and shares a column with an earlier
+    // conjunct (`a > 1`), RowFilter grouping must NOT move `a < 10` ahead of
+    // `100 / b > 3`. Confining the `b = 0` rows (where `a >= 10`) to a single
+    // row group *after* the probe window verifies that ForceRowFilter,
+    // ForceBulk, AlternateForTest, and Adaptive (committing either RowFilter
+    // or BulkDecode) all agree deterministically on the exact same outcome.
+    let dir = TempDir::new()?;
+    let rg_rows = 200usize;
+    let num_rgs = 16usize;
+    let total = rg_rows * num_rgs;
+    let mut ids = Vec::with_capacity(total);
+    let mut a_vals = Vec::with_capacity(total);
+    let mut b_vals = Vec::with_capacity(total);
+    let mut p_vals = Vec::with_capacity(total);
+    for rg in 0..num_rgs {
+        for r in 0..rg_rows {
+            let i = rg * rg_rows + r;
+            ids.push(i as i32);
+            let is_zero_row = rg == num_rgs - 1 && r < 20;
+            let a = if is_zero_row {
+                12
+            } else {
+                2 + (r % 7) as i32 // strictly in 2..9 (satisfies `a > 1 AND a < 10`)
+            };
+            let b = if is_zero_row { 0 } else { 5 };
+            a_vals.push(a);
+            b_vals.push(b);
+            p_vals.push(format!("payload-{i:06}"));
+        }
+    }
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(ids)) as _),
+        ("a", Arc::new(Int32Array::from(a_vals)) as _),
+        ("b", Arc::new(Int32Array::from(b_vals)) as _),
+        ("p", Arc::new(StringArray::from(p_vals)) as _),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rg_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("trailing_guard.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let sql = "SELECT id, p FROM t WHERE a > 1 AND 100 / b > 3 AND a < 10";
+
+    let configs = [
+        (
+            "ForceRowFilter",
+            AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::ForceRowFilter,
+                ..Default::default()
+            },
+        ),
+        (
+            "ForceBulk",
+            AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::ForceBulk,
+                ..Default::default()
+            },
+        ),
+        (
+            "AlternateForTest",
+            AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::AlternateForTest,
+                ..Default::default()
+            },
+        ),
+        (
+            "Adaptive(prefer RowFilter)",
+            AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::Adaptive,
+                probe_rgs_per_mode: 2,
+                reprobe_interval: 0,
+                test_mode_costs_ns_per_row: Some((10, 100)),
+            },
+        ),
+        (
+            "Adaptive(prefer BulkDecode)",
+            AdaptiveRowFilterConfig {
+                mode: AdaptiveRowFilterMode::Adaptive,
+                probe_rgs_per_mode: 2,
+                reprobe_interval: 0,
+                test_mode_costs_ns_per_row: Some((100, 10)),
+            },
+        ),
+    ];
+
+    let mut baseline_outcome: Option<std::result::Result<String, String>> = None;
+    for (label, cfg) in configs {
+        let ctx = adaptive_context(&dir, "t", "required", true, Some(cfg)).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let outcome = match collect(plan, ctx.task_ctx()).await {
+            Ok(batches) => Ok(batches_to_sort_string(&batches)),
+            Err(err) => Err(err.to_string()),
+        };
+        // Every mode must fail consistently with division by zero because
+        // `a < 10` comes after `100 / b > 3` and is not moved ahead of it.
+        assert!(
+            matches!(&outcome, Err(msg) if msg.contains("Divide by zero")),
+            "{label}: expected Divide by zero, got {outcome:?}"
+        );
+        match &baseline_outcome {
+            None => baseline_outcome = Some(outcome),
+            Some(expected) => assert_eq!(
+                outcome.is_ok(),
+                expected.is_ok(),
+                "{label}: outcome kind diverged from baseline"
+            ),
+        }
+    }
+
+    Ok(())
+}

@@ -716,33 +716,42 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
 
     let candidates = if group_same_column && candidates.len() > 1 {
         let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
+        let mut last_fallible_idx: Option<usize> = None;
         for mut cand in candidates {
+            let cand_infallible = cand.last_is_infallible;
             let same_leaves = |g: &FilterCandidate, c: &FilterCandidate| {
                 !c.leaf_indices.is_empty()
                     && g.leaf_indices == c.leaf_indices
                     && g.read_plan.projected_schema == c.read_plan.projected_schema
             };
-            // Only merge into an earlier non-adjacent group when `cand` is
-            // infallible; never move a potentially-fallible conjunct (e.g.
-            // `CAST`, division, or dynamic expression key) ahead of an
-            // intervening guard on another column.
-            let target = if cand.last_is_infallible {
-                grouped.iter_mut().find(|g| same_leaves(g, &cand))
+            // Never cross a fallible barrier in either direction:
+            // - A potentially-fallible conjunct only merges into the immediately
+            //   preceding group (never jumps ahead of an intervening guard).
+            // - A later infallible conjunct only searches groups *after* the
+            //   most recent fallible candidate so Mode A (RowFilter) and Mode B
+            //   (BulkDecode) evaluate the exact same conjuncts before every
+            //   fallible expression.
+            let target = if cand_infallible {
+                let start = last_fallible_idx.map_or(0, |i| i + 1);
+                grouped[start..].iter_mut().find(|g| same_leaves(g, &cand))
             } else {
                 grouped.last_mut().filter(|g| same_leaves(g, &cand))
             };
             if let Some(existing) = target {
                 let next_expr = cand.exprs.pop().expect("non-empty candidate exprs");
-                if existing.last_is_infallible && cand.last_is_infallible {
+                if existing.last_is_infallible && cand_infallible {
                     let tail =
                         existing.exprs.last_mut().expect("non-empty grouped exprs");
                     *tail = conjunction([Arc::clone(tail), next_expr]);
                 } else {
                     existing.exprs.push(next_expr);
-                    existing.last_is_infallible = cand.last_is_infallible;
+                    existing.last_is_infallible = cand_infallible;
                 }
             } else {
                 grouped.push(cand);
+            }
+            if !cand_infallible {
+                last_fallible_idx = Some(grouped.len() - 1);
             }
         }
         grouped

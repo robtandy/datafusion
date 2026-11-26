@@ -1909,6 +1909,11 @@ impl Pipeline {
             let (mut reader, rg_handle) =
                 worker.decode(|| capture_rg_handle(|| morsel.into_stream()));
             let is_bulk = rg_handle.as_ref().is_some_and(RgProbeHandle::is_bulk);
+            if is_bulk && bulk_plan.is_none() {
+                return internal_err!(
+                    "BulkDecode Parquet morsel received without a BulkFilterPlan"
+                );
+            }
             let track_cpu = rg_handle
                 .as_ref()
                 .is_some_and(RgProbeHandle::needs_worker_timing);
@@ -1927,25 +1932,26 @@ impl Pipeline {
                 let batch = batch?;
                 let proc_start = track_cpu.then(Instant::now);
                 let view = if is_bulk {
-                    if let Some(plan) = &bulk_plan {
-                        worker.process(|| -> Result<BatchView> {
-                            let mut view = BatchView::all(batch);
-                            if let (Some(compiled), Some(adaptive)) =
-                                (&plan.compiled_filter, bulk_adaptive.as_mut())
-                            {
-                                view = compiled.evaluate_view(view, adaptive)?;
-                            }
-                            if let Some(cols) = &plan.bulk_to_output {
-                                view = view.project_columns_with_schema(
-                                    cols,
-                                    Arc::clone(&plan.output_schema),
-                                )?;
-                            }
-                            Ok(view)
-                        })?
-                    } else {
-                        BatchView::all(batch)
-                    }
+                    let Some(plan) = &bulk_plan else {
+                        return internal_err!(
+                            "BulkDecode Parquet morsel received without a BulkFilterPlan"
+                        );
+                    };
+                    worker.process(|| -> Result<BatchView> {
+                        let mut view = BatchView::all(batch);
+                        if let (Some(compiled), Some(adaptive)) =
+                            (&plan.compiled_filter, bulk_adaptive.as_mut())
+                        {
+                            view = compiled.evaluate_view(view, adaptive)?;
+                        }
+                        if let Some(cols) = &plan.bulk_to_output {
+                            view = view.project_columns_with_schema(
+                                cols,
+                                Arc::clone(&plan.output_schema),
+                            )?;
+                        }
+                        Ok(view)
+                    })?
                 } else {
                     BatchView::all(batch)
                 };
