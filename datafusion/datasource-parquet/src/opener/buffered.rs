@@ -278,10 +278,10 @@ fn build_file_row_filter_plan(
         costs.push(cand_cost);
     }
     let mut initial_order: Vec<usize> = (0..n).collect();
-    // Sort by heuristic cost, breaking ties by original plan/join order (`idx`)
-    // rather than compressed bytes so selective earlier join filters (e.g.
-    // filtered `part` before unfiltered `supplier`) stay first.
-    initial_order.sort_by_key(|&idx| (costs[idx], idx));
+    // Sort by decoded column size (`required_bytes`) first so narrow columns
+    // (e.g. Date32 `l_shipdate`) always decode before wide join keys, breaking
+    // ties by expression heuristic cost and original plan/join order (`idx`).
+    initial_order.sort_by_key(|&idx| (candidates[idx].required_bytes(), costs[idx], idx));
     FileRowFilterPlan::Adaptive {
         signature: candidate_list_signature(candidates),
         initial_order,
@@ -340,6 +340,10 @@ impl RowFilterOrderBandit {
         self.rng_state = x;
         let mixed = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
         ((mixed >> 32) as u32) % upper_exclusive
+    }
+
+    fn peek_order(&self) -> Vec<usize> {
+        self.permutation.clone()
     }
 
     fn current_order(&mut self) -> (Vec<usize>, Option<u64>) {
@@ -684,6 +688,20 @@ impl AdaptiveRowFilterContext {
             track_mode_epoch,
             rf_order_key: None,
             finished: false,
+        }
+    }
+
+    fn peek_row_filter_order(&self, plan: &FileRowFilterPlan) -> Vec<usize> {
+        match plan {
+            FileRowFilterPlan::FixedIdentity(identity) => identity.clone(),
+            FileRowFilterPlan::Adaptive {
+                signature,
+                initial_order,
+            } => self
+                .rf_orders
+                .lock()
+                .get(signature)
+                .map_or_else(|| initial_order.clone(), RowFilterOrderBandit::peek_order),
         }
     }
 
@@ -4486,11 +4504,16 @@ impl FilteredBufferedReaders {
             let row_filter = if let (Some(adaptive), Some(rf_plan)) =
                 (&self.adaptive_context, &self.file_rf_plan)
             {
-                let (order, order_key) = adaptive.row_filter_order(rf_plan);
                 if let Some(handle) = rg_handle.as_mut() {
+                    let (order, order_key) = adaptive.row_filter_order(rf_plan);
                     handle.set_rf_order_key(order_key);
+                    self.row_filter_context.build_row_filter_with_order(&order)
+                } else {
+                    // Untracked callers (e.g. split RG slices) must read the
+                    // current incumbent order without consuming bandit trials.
+                    let order = adaptive.peek_row_filter_order(rf_plan);
+                    self.row_filter_context.build_row_filter_with_order(&order)
                 }
-                self.row_filter_context.build_row_filter_with_order(&order)
             } else {
                 self.row_filter_context.build_row_filter()
             };
@@ -7333,9 +7356,16 @@ mod tests {
             bandit.report(epoch.unwrap(), 100.0);
         }
 
-        // Now in observe mode: strictly RF_BANDIT_OBSERVE_INTERVAL (2) dispatches
-        // receive the trial order [1, 0]; concurrent callers get incumbent [0, 1] untracked.
+        // Now in observe mode: peeking (as split RG slices do without a handle)
+        // must return the incumbent order without consuming trial dispatches.
+        assert_eq!(bandit.peek_order(), vec![0, 1]);
+        assert_eq!(bandit.trial_dispatched, 0);
+
+        // Strictly RF_BANDIT_OBSERVE_INTERVAL (2) dispatches receive the trial
+        // order [1, 0]; concurrent callers get incumbent [0, 1] untracked.
         let (t0, e0) = bandit.current_order();
+        assert_eq!(bandit.peek_order(), vec![0, 1]);
+        assert_eq!(bandit.trial_dispatched, 1);
         let (t1, e1) = bandit.current_order();
         let (overflow, e_overflow) = bandit.current_order();
         assert_eq!(t0, vec![1, 0]);
