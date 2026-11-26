@@ -16,7 +16,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::common::test_util::batches_to_sort_string;
-use datafusion::datasource::physical_plan::parquet::ParquetSplitConfig;
+use datafusion::datasource::physical_plan::parquet::{
+    AdaptiveRowFilterConfig, AdaptiveRowFilterMode, ParquetSplitConfig,
+};
 use datafusion::error::Result;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -588,7 +590,14 @@ async fn pushdown_filters_parity_across_selectivities_nulls_and_count() -> Resul
                             && !display.contains("Filter["),
                         "{display}"
                     );
-                    assert!(metric(actual_plan.as_ref(), "pushdown_rows_pruned") > 0);
+                    assert!(
+                        metric(actual_plan.as_ref(), "pushdown_rows_pruned") > 0
+                            || metric(
+                                actual_plan.as_ref(),
+                                "adaptive_fast_path_bulk_rgs"
+                            ) > 0,
+                        "expected RowFilter pruning or adaptive fast-path BulkDecode on COUNT(*)"
+                    );
                 }
             }
         }
@@ -3013,6 +3022,485 @@ async fn row_filter_elision_preserves_float_nan_and_cross_column_guards() -> Res
             "reorder={reorder}: {sql_wide}"
         );
     }
+
+    Ok(())
+}
+
+async fn adaptive_context(
+    dir: &TempDir,
+    table_name: &str,
+    morsel_mode: &str,
+    pushdown: bool,
+    adaptive_cfg: Option<AdaptiveRowFilterConfig>,
+) -> Result<SessionContext> {
+    let mut cfg = SessionConfig::new().with_target_partitions(4);
+    cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+    cfg.options_mut().execution.collect_statistics = false;
+    if let Some(adaptive) = adaptive_cfg {
+        cfg = cfg.with_extension(Arc::new(adaptive));
+    }
+    let ctx = SessionContext::new_with_config(cfg);
+    ctx.register_parquet(
+        table_name,
+        dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.sql(&format!(
+        "SET datafusion.execution.morsel_mode = '{morsel_mode}'"
+    ))
+    .await?;
+    Ok(ctx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_row_filter_alternating_mode_parity_nulls_residual_count_and_joins()
+-> Result<()> {
+    let fact_dir = TempDir::new()?;
+    let dim_dir = TempDir::new()?;
+
+    // Multi-RG fact table with NULLs, an all-filtered RG (rg 0: k=0..99, gate=-10),
+    // a fully-matched RG (rg 1: gate=500..599), mixed RGs with NULLs, and a zero-value
+    // column `x` for guarded division `x <> 0 AND 100 / x > 3`.
+    let rg_rows = 200usize;
+    let num_rgs = 12usize;
+    let total = rg_rows * num_rgs;
+    let mut ids = Vec::with_capacity(total);
+    let mut keys = Vec::with_capacity(total);
+    let mut gates = Vec::with_capacity(total);
+    let mut xs = Vec::with_capacity(total);
+    let mut payloads = Vec::with_capacity(total);
+    for rg in 0..num_rgs {
+        for r in 0..rg_rows {
+            let i = rg * rg_rows + r;
+            ids.push(i as i32);
+            keys.push((i % 50) as i32);
+            let gate = match rg {
+                0 => Some(-10),              // all filtered for gate > 10
+                1 => Some(500 + (r as i32)), // fully matched for gate > 10
+                _ if r % 11 == 0 => None,    // NULLs
+                _ => Some((i % 30) as i32),  // mixed
+            };
+            gates.push(gate);
+            xs.push(if r % 5 == 0 { 0 } else { (r % 40) as i32 });
+            payloads.push(if r % 13 == 0 {
+                None
+            } else {
+                Some(format!("val-{i:05}"))
+            });
+        }
+    }
+    let fact_batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(ids)) as _),
+        ("k", Arc::new(Int32Array::from(keys)) as _),
+        ("gate", Arc::new(Int32Array::from(gates)) as _),
+        ("x", Arc::new(Int32Array::from(xs)) as _),
+        ("payload", Arc::new(StringArray::from(payloads)) as _),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rg_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(fact_dir.path().join("fact.parquet"))?,
+        fact_batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&fact_batch)?;
+    writer.close()?;
+
+    let dim_batch = RecordBatch::try_from_iter([
+        ("dk", Arc::new(Int32Array::from(vec![3, 7, 19, 41])) as _),
+        (
+            "dtag",
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as _,
+        ),
+    ])?;
+    let mut dwriter = ArrowWriter::try_new(
+        File::create(dim_dir.path().join("dim.parquet"))?,
+        dim_batch.schema(),
+        None,
+    )?;
+    dwriter.write(&dim_batch)?;
+    dwriter.close()?;
+
+    // Volatile UDF forces a residual Operator::Filter above the pushed Parquet predicate.
+    let volatile_keep = create_udf(
+        "volatile_keep_even",
+        vec![DataType::Int32],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(|args: &[ColumnarValue]| match &args[0] {
+            ColumnarValue::Array(arr) => {
+                let ints = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                let mask: BooleanArray =
+                    ints.iter().map(|v| v.map(|n| n % 2 == 0)).collect();
+                Ok(ColumnarValue::Array(Arc::new(mask)))
+            }
+            ColumnarValue::Scalar(_) => unreachable!(),
+        }),
+    );
+
+    let queries = [
+        // Basic projection + NULLs + all-filtered + fully-matched RGs
+        "SELECT id, payload FROM fact WHERE gate > 10 AND k < 25",
+        // Narrowed output (predicate column `gate` dropped from output)
+        "SELECT id, payload FROM fact WHERE gate > 10",
+        // COUNT(*) (0 output columns)
+        "SELECT COUNT(*) FROM fact WHERE gate > 10 AND k < 25",
+        // GROUP BY aggregate
+        "SELECT k, COUNT(*), SUM(id) FROM fact WHERE gate > 10 GROUP BY k",
+        // Residual non-pushable volatile predicate alongside pushed predicate
+        "SELECT id, payload FROM fact WHERE gate > 10 AND volatile_keep_even(id)",
+        // Guarded fallible division (`x <> 0 AND 100 / x > 3`)
+        "SELECT COUNT(*), SUM(id) FROM fact WHERE x <> 0 AND 100 / x > 3",
+        // Dynamic join filter (inner join)
+        "SELECT f.id, f.payload, d.dtag FROM fact f JOIN dim d ON f.k = d.dk WHERE f.gate > 10",
+        // Dynamic join filter with empty build side short-circuit
+        "SELECT f.id, f.payload FROM fact f JOIN dim d ON f.k = d.dk WHERE d.dk > 1000",
+    ];
+
+    let stock = adaptive_context(&fact_dir, "fact", "off", true, None).await?;
+    stock
+        .register_parquet(
+            "dim",
+            dim_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    stock.register_udf(volatile_keep.clone());
+
+    let modes = [
+        AdaptiveRowFilterMode::ForceRowFilter,
+        AdaptiveRowFilterMode::ForceBulk,
+        AdaptiveRowFilterMode::AlternateForTest,
+        AdaptiveRowFilterMode::Adaptive,
+    ];
+
+    for mode in modes {
+        let cfg = AdaptiveRowFilterConfig {
+            mode,
+            probe_rgs_per_mode: 2,
+            reprobe_interval: 4,
+        };
+        let native =
+            adaptive_context(&fact_dir, "fact", "required", true, Some(cfg)).await?;
+        native
+            .register_parquet(
+                "dim",
+                dim_dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        native.register_udf(volatile_keep.clone());
+
+        for sql in queries {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            assert!(
+                displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string()
+                    .contains("MorselExec"),
+                "mode={mode:?}: {sql}"
+            );
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(
+                batches_to_sort_string(&actual),
+                batches_to_sort_string(&expected),
+                "parity mismatch for mode={mode:?}, sql={sql}"
+            );
+            if mode == AdaptiveRowFilterMode::AlternateForTest
+                && sql == "SELECT id, payload FROM fact WHERE gate > 10 AND k < 25"
+            {
+                assert!(
+                    metric(plan.as_ref(), "adaptive_row_filter_rgs") > 0
+                        && metric(plan.as_ref(), "adaptive_bulk_decode_rgs") > 0,
+                    "AlternateForTest must exercise both RowFilter and BulkDecode"
+                );
+            }
+        }
+    }
+
+    // Verify pushdown_filters = false strictly uses BulkDecode (no RowFilter / adaptive controller).
+    let no_pd = adaptive_context(&fact_dir, "fact", "required", false, None).await?;
+    let plan = no_pd
+        .sql("SELECT id, payload FROM fact WHERE gate > 10 AND k < 25")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let expected = stock
+        .sql("SELECT id, payload FROM fact WHERE gate > 10 AND k < 25")
+        .await?
+        .collect()
+        .await?;
+    let actual = collect(Arc::clone(&plan), no_pd.task_ctx()).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected)
+    );
+    assert_eq!(metric(plan.as_ref(), "pushdown_rows_pruned"), 0);
+    assert_eq!(metric(plan.as_ref(), "adaptive_row_filter_rgs"), 0);
+
+    // Verify stream drop (early LIMIT cancellation) and error cancellation across alternating modes.
+    let alt_cfg = AdaptiveRowFilterConfig {
+        mode: AdaptiveRowFilterMode::AlternateForTest,
+        ..Default::default()
+    };
+    let native_alt =
+        adaptive_context(&fact_dir, "fact", "required", true, Some(alt_cfg)).await?;
+    let limit_plan = native_alt
+        .sql("SELECT id, payload FROM fact WHERE gate > 10 LIMIT 5")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let mut stream = execute_stream(limit_plan, native_alt.task_ctx())?;
+    let first = stream.next().await.transpose()?;
+    assert!(first.is_some());
+    drop(stream);
+
+    // Mid-scan error (unguarded division by zero when x = 0 survives `gate > 10`).
+    let err_plan = native_alt
+        .sql("SELECT id, 100 / x FROM fact WHERE gate > 10")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let err = collect(err_plan, native_alt.task_ctx()).await;
+    assert!(
+        err.is_err(),
+        "expected division-by-zero error to propagate cleanly"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_row_filter_fast_path_gate_zero_payload_columns() -> Result<()> {
+    let dir = TempDir::new()?;
+    let rg_rows = 256usize;
+    let total = rg_rows * 8;
+    let batch = RecordBatch::try_from_iter([
+        (
+            "a",
+            Arc::new(Int32Array::from_iter_values(0..total as i32)) as _,
+        ),
+        (
+            "b",
+            Arc::new(Int32Array::from_iter_values(
+                (0..total as i32).map(|v| v % 17),
+            )) as _,
+        ),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rg_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("narrow.parquet"))?,
+        batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let native = adaptive_context(&dir, "t", "required", true, None).await?;
+    let stock = adaptive_context(&dir, "t", "off", true, None).await?;
+
+    // Single predicate column `b`, zero non-predicate output columns (`SELECT b` and `COUNT(*)`).
+    for sql in [
+        "SELECT b FROM t WHERE b % 17 = 3",
+        "SELECT COUNT(*) FROM t WHERE b % 17 = 3",
+    ] {
+        let expected = stock.sql(sql).await?.collect().await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected)
+        );
+        assert_eq!(
+            metric(plan.as_ref(), "adaptive_row_filter_rgs"),
+            0,
+            "fast-path gate must skip RowFilter when zero columns can be skipped: {sql}"
+        );
+        assert_eq!(
+            metric(plan.as_ref(), "adaptive_fast_path_bulk_rgs"),
+            8,
+            "all 8 RGs must hit the fast-path metadata gate: {sql}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wide_selective()
+-> Result<()> {
+    // 1. Wide + highly selective scan (both static predicate and dynamic join filter):
+    // 6 wide string payload columns + 0.25% selectivity -> RowFilter skips 99.75% of
+    // payload decoding and bytes, so controller MUST converge to RowFilter.
+    let wide_dir = TempDir::new()?;
+    let dim_dir = TempDir::new()?;
+    let wide_rg_rows = 4096usize;
+    let wide_rgs = 20usize;
+    let wide_total = wide_rg_rows * wide_rgs;
+    let keys: Vec<i32> = (0..wide_total).map(|i| (i % 400) as i32).collect();
+    let pad = "p".repeat(96);
+    let make_str_col = |tag: &str| {
+        Arc::new(StringArray::from_iter_values(
+            (0..wide_total).map(|i| format!("{tag}-{i:07}-{pad}")),
+        )) as _
+    };
+    let wide_batch = RecordBatch::try_from_iter([
+        ("k", Arc::new(Int32Array::from(keys)) as _),
+        ("p1", make_str_col("a")),
+        ("p2", make_str_col("b")),
+        ("p3", make_str_col("c")),
+        ("p4", make_str_col("d")),
+        ("p5", make_str_col("e")),
+        ("p6", make_str_col("f")),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(wide_rg_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(wide_dir.path().join("wide.parquet"))?,
+        wide_batch.schema(),
+        Some(props),
+    )?;
+    writer.write(&wide_batch)?;
+    writer.close()?;
+
+    let dim_batch = RecordBatch::try_from_iter([
+        ("dk", Arc::new(Int32Array::from(vec![77i32])) as _),
+        ("dlabel", Arc::new(StringArray::from(vec!["match"])) as _),
+    ])?;
+    let mut dwriter = ArrowWriter::try_new(
+        File::create(dim_dir.path().join("dim.parquet"))?,
+        dim_batch.schema(),
+        None,
+    )?;
+    dwriter.write(&dim_batch)?;
+    dwriter.close()?;
+
+    let adaptive_cfg = AdaptiveRowFilterConfig {
+        mode: AdaptiveRowFilterMode::Adaptive,
+        probe_rgs_per_mode: 2,
+        reprobe_interval: 0,
+    };
+    let wide_ctx = adaptive_context(
+        &wide_dir,
+        "wide",
+        "required",
+        true,
+        Some(adaptive_cfg.clone()),
+    )
+    .await?;
+    wide_ctx
+        .register_parquet(
+            "dim",
+            dim_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    let wide_stock = adaptive_context(&wide_dir, "wide", "off", true, None).await?;
+    wide_stock
+        .register_parquet(
+            "dim",
+            dim_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+
+    // Static selective scan on wide table
+    let wide_sql = "SELECT k, p1, p2, p3, p4, p5, p6 FROM wide WHERE k = 77";
+    let expected = wide_stock.sql(wide_sql).await?.collect().await?;
+    let plan = wide_ctx.sql(wide_sql).await?.create_physical_plan().await?;
+    let actual = collect(Arc::clone(&plan), wide_ctx.task_ctx()).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual),
+        batches_to_sort_string(&expected)
+    );
+    let rf_rgs = metric(plan.as_ref(), "adaptive_row_filter_rgs");
+    let bulk_rgs = metric(plan.as_ref(), "adaptive_bulk_decode_rgs");
+    assert!(
+        rf_rgs > bulk_rgs,
+        "expected convergence to RowFilter on wide/selective scan (rf={rf_rgs}, bulk={bulk_rgs})"
+    );
+    assert!(metric(plan.as_ref(), "adaptive_mode_switches") >= 1);
+
+    // Dynamic join selective scan on wide table
+    let join_sql = "SELECT w.k, w.p1, w.p2, w.p3, w.p4, w.p5, w.p6, d.dlabel FROM wide w JOIN dim d ON w.k = d.dk";
+    let expected_join = wide_stock.sql(join_sql).await?.collect().await?;
+    let join_plan = wide_ctx.sql(join_sql).await?.create_physical_plan().await?;
+    let actual_join = collect(Arc::clone(&join_plan), wide_ctx.task_ctx()).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual_join),
+        batches_to_sort_string(&expected_join)
+    );
+    let join_rf = metric(join_plan.as_ref(), "adaptive_row_filter_rgs");
+    let join_bulk = metric(join_plan.as_ref(), "adaptive_bulk_decode_rgs");
+    assert!(
+        join_rf > join_bulk,
+        "expected convergence to RowFilter on wide/selective dynamic join (rf={join_rf}, bulk={join_bulk})"
+    );
+
+    // 2. Narrow Q6-like scan: 3 predicate columns + 1 numeric payload column,
+    // moderate uniform selectivity across every page -> single-phase BulkDecode +
+    // BatchView beats 3-phase RowFilter, so controller MUST converge to BulkDecode.
+    let q6_dir = TempDir::new()?;
+    let q6_rg_rows = 8192usize;
+    let q6_rgs = 24usize;
+    let q6_total = q6_rg_rows * q6_rgs;
+    let mut shipdate = Vec::with_capacity(q6_total);
+    let mut discount = Vec::with_capacity(q6_total);
+    let mut quantity = Vec::with_capacity(q6_total);
+    let mut price = Vec::with_capacity(q6_total);
+    for i in 0..q6_total {
+        // Uniformly scattered across every page so RowFilter cannot skip pages:
+        // ~40% pass shipdate, ~50% pass discount, ~50% pass quantity (~10% overall).
+        shipdate.push(((i * 37) % 100) as i32);
+        discount.push(((i * 19) % 10) as i32);
+        quantity.push(((i * 13) % 50) as i32);
+        price.push((1000 + (i % 5000)) as i64);
+    }
+    let q6_batch = RecordBatch::try_from_iter([
+        ("shipdate", Arc::new(Int32Array::from(shipdate)) as _),
+        ("discount", Arc::new(Int32Array::from(discount)) as _),
+        ("quantity", Arc::new(Int32Array::from(quantity)) as _),
+        ("price", Arc::new(Int64Array::from(price)) as _),
+    ])?;
+    let q6_props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(q6_rg_rows))
+        .build();
+    let mut q6_writer = ArrowWriter::try_new(
+        File::create(q6_dir.path().join("q6.parquet"))?,
+        q6_batch.schema(),
+        Some(q6_props),
+    )?;
+    q6_writer.write(&q6_batch)?;
+    q6_writer.close()?;
+
+    let q6_ctx =
+        adaptive_context(&q6_dir, "q6", "required", true, Some(adaptive_cfg)).await?;
+    let q6_stock = adaptive_context(&q6_dir, "q6", "off", true, None).await?;
+    let q6_sql = "SELECT SUM(price * CAST(discount AS BIGINT)) \
+                  FROM q6 \
+                  WHERE shipdate >= 20 AND shipdate < 60 \
+                    AND discount >= 3 AND discount <= 7 \
+                    AND quantity < 25";
+    let expected_q6 = q6_stock.sql(q6_sql).await?.collect().await?;
+    let q6_plan = q6_ctx.sql(q6_sql).await?.create_physical_plan().await?;
+    let actual_q6 = collect(Arc::clone(&q6_plan), q6_ctx.task_ctx()).await?;
+    assert_eq!(
+        batches_to_sort_string(&actual_q6),
+        batches_to_sort_string(&expected_q6)
+    );
+    let q6_rf = metric(q6_plan.as_ref(), "adaptive_row_filter_rgs");
+    let q6_bulk = metric(q6_plan.as_ref(), "adaptive_bulk_decode_rgs");
+    assert!(
+        q6_bulk > q6_rf,
+        "expected convergence to BulkDecode on narrow Q6-like scan (rf={q6_rf}, bulk={q6_bulk})"
+    );
+    assert!(metric(q6_plan.as_ref(), "adaptive_mode_switches") >= 1);
 
     Ok(())
 }
