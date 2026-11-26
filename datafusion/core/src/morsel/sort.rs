@@ -2795,6 +2795,11 @@ impl SortSink {
         &self.ordering
     }
 
+    #[cfg(feature = "parquet")]
+    pub(super) fn has_skip_or_fetch(&self) -> bool {
+        self.skip > 0 || self.fetch.is_some()
+    }
+
     pub(super) fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,

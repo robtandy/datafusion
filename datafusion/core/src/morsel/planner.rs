@@ -50,7 +50,7 @@ use super::hash_join::{
     HashJoinProbeConfig, JoinOutputCol, ProbeJoinKind, is_supported_join_key_type,
 };
 #[cfg(feature = "parquet")]
-use super::parquet::{ParquetScan, bind_pipeline_dynamic_join_filters};
+use super::parquet::{ParquetScan, bind_dag_dynamic_join_filters};
 use super::sort::{SortSink, TopNSink};
 use super::{
     BoxFuture, Lowering, MemorySource, MorselExec, MorselQueryPlanner, Operator,
@@ -208,6 +208,24 @@ impl MorselQueryPlanner {
                 results,
             )))
         };
+
+        #[cfg(feature = "parquet")]
+        let mut pipeline = pipeline;
+        #[cfg(feature = "parquet")]
+        {
+            let opt = &session.config_options().optimizer;
+            if opt.enable_dynamic_filter_pushdown
+                && opt.enable_join_dynamic_filter_pushdown
+            {
+                bind_dag_dynamic_join_filters(
+                    &mut builder.stages,
+                    scalar_subqueries.as_deref(),
+                    &mut pipeline,
+                    opt.hash_join_inlist_pushdown_max_distinct_values,
+                    opt.hash_join_inlist_pushdown_max_size,
+                )?;
+            }
+        }
 
         Ok(Lowering::Native(MorselExec::try_new_dag(
             builder.stages,
@@ -680,27 +698,10 @@ impl DagBuilder<'_> {
 
     fn finalize_pipeline_joins(
         &mut self,
-        source: &mut Source,
+        _source: &mut Source,
         operators: &mut [Operator],
     ) -> Result<()> {
-        assign_join_build_ids(operators, &mut self.next_filter_id)?;
-        #[cfg(not(feature = "parquet"))]
-        let _ = source;
-        #[cfg(feature = "parquet")]
-        {
-            let opt = &self.session.config_options().optimizer;
-            if opt.enable_dynamic_filter_pushdown
-                && opt.enable_join_dynamic_filter_pushdown
-            {
-                bind_pipeline_dynamic_join_filters(
-                    source,
-                    operators,
-                    opt.hash_join_inlist_pushdown_max_distinct_values,
-                    opt.hash_join_inlist_pushdown_max_size,
-                )?;
-            }
-        }
-        Ok(())
+        assign_join_build_ids(operators, &mut self.next_filter_id)
     }
 
     fn optimize_open_pipeline(
@@ -1682,6 +1683,8 @@ impl DagBuilder<'_> {
             choose_build_side(
                 estimate_join_side_size(&left_source, &left_ops, &self.stages),
                 estimate_join_side_size(&right_source, &right_ops, &self.stages),
+                matches!(left_source, Source::Stage(_)),
+                matches!(right_source, Source::Stage(_)),
             )
         };
         let kind = ProbeJoinKind::from_logical(

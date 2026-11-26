@@ -4,7 +4,7 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::spill_file::SpillFile;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::{Expr, LogicalPlan};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_expr::{Expr, LogicalPlan, Operator as ExprOperator};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 #[cfg(test)]
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
@@ -75,10 +75,11 @@ mod spill;
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
+#[cfg(test)]
+use dag::StageId;
 use dag::{
-    DagRuntime, MaterializedStage, ScalarSubqueryState, StageId, StageSource, StageSpec,
-    bind_stage_dependencies, collect_pipeline_stage_deps, collect_stage_seed_buffers,
-    validate_dag,
+    DagRuntime, MaterializedStage, ScalarSubqueryState, StageSource, StageSpec,
+    collect_stage_seed_buffers, ensure_stage, validate_dag,
 };
 #[cfg(test)]
 use group_count::IntKeyType;
@@ -228,25 +229,23 @@ fn estimate_side_size(
     SideEstimate { is_empty, ..base }
 }
 
-/// Join-specific cardinality estimate used only by [`choose_build_side`].
-///
-/// Counts distinct referenced column sets across conjunctive predicates on
-/// non-`Stage` inputs so range pairs on the same column (e.g. `l_shipdate >= a
-/// AND l_shipdate <= b` in TPC-H Q7) count as one filter group rather than two,
-/// and `StageSource` estimates (which already carry aggregate reduction) are
-/// never double-discounted (TPC-H Q20), while heavily multi-predicate scans
-/// (e.g. TPC-H Q12 `lineitem` vs unfiltered `orders`) still place the smaller
-/// filtered side on build.
-fn estimate_join_side_size(
-    source: &Source,
-    operators: &[Operator],
-    stages: &[StageSpec],
-) -> SideEstimate {
-    let base = estimate_side_size(source, operators, stages);
-    if base.is_empty || matches!(source, Source::Stage(_)) {
-        return base;
+fn is_equality_with_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let Some(bin) = expr.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    if *bin.op() != ExprOperator::Eq {
+        return false;
     }
-    let mut distinct_groups: BTreeSet<Vec<String>> = BTreeSet::new();
+    let left_cols = collect_columns(bin.left()).len();
+    let right_cols = collect_columns(bin.right()).len();
+    (left_cols == 1 && right_cols == 0) || (left_cols == 0 && right_cols == 1)
+}
+
+fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
+    if matches!(source, Source::Stage(_)) {
+        return 0;
+    }
+    let mut distinct_groups: BTreeMap<Vec<String>, u32> = BTreeMap::new();
     let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
         for conjunct in split_conjunction(pred) {
             let mut cols: Vec<String> = collect_columns(conjunct)
@@ -256,7 +255,15 @@ fn estimate_join_side_size(
             cols.sort_unstable();
             cols.dedup();
             if !cols.is_empty() {
-                distinct_groups.insert(cols);
+                let weight = if is_equality_with_constant(conjunct) {
+                    2
+                } else {
+                    1
+                };
+                distinct_groups
+                    .entry(cols)
+                    .and_modify(|w| *w = (*w).max(weight))
+                    .or_insert(weight);
             }
         }
     };
@@ -266,25 +273,84 @@ fn estimate_join_side_size(
     {
         record_predicate(&pred);
     }
+    let mut join_shift = 0u32;
     for op in operators {
-        if let Operator::Filter { predicate, .. } = op {
-            record_predicate(predicate);
+        match op {
+            Operator::Filter { predicate, .. } => record_predicate(predicate),
+            Operator::HashProbe(probe)
+                if matches!(
+                    probe.kind,
+                    hash_join::ProbeJoinKind::Inner | hash_join::ProbeJoinKind::ProbeSemi
+                ) =>
+            {
+                join_shift = join_shift.saturating_add(pipeline_filter_shift(
+                    &probe.build_pipeline.source,
+                    &probe.build_pipeline.operators,
+                ));
+            }
+            _ => {}
         }
     }
-    let shift = (distinct_groups.len() as u32).min(4);
-    if shift == 0 {
-        return base;
-    }
-    let approx_bytes = (base.approx_bytes >> shift).max(1);
-    let mem_rows = base.mem_rows.map(|rows| (rows >> shift).max(1));
-    SideEstimate {
-        is_empty: base.is_empty,
-        mem_rows,
-        approx_bytes,
-    }
+    let own_shift: u32 = distinct_groups.values().copied().sum();
+    own_shift.saturating_add(join_shift).min(6)
 }
 
-fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::BuildSide {
+/// Join-specific cardinality estimate used only by [`choose_build_side`].
+///
+/// Counts distinct referenced column sets across conjunctive predicates on
+/// non-`Stage` inputs (giving equality predicates stronger weight than range
+/// predicates) and propagates filter selectivity across probe-filtering joins
+/// (`Inner`/`ProbeSemi`) while bounding `BuildSemi`/`BuildAnti` outputs by
+/// their build side. `StageSource` estimates (which already carry aggregate
+/// reduction) are never double-discounted.
+fn estimate_join_side_size(
+    source: &Source,
+    operators: &[Operator],
+    stages: &[StageSpec],
+) -> SideEstimate {
+    let base = estimate_side_size(source, operators, stages);
+    if base.is_empty {
+        return base;
+    }
+    let shift = pipeline_filter_shift(source, operators);
+    let mut est = if shift == 0 {
+        base
+    } else {
+        SideEstimate {
+            is_empty: base.is_empty,
+            mem_rows: base.mem_rows.map(|rows| (rows >> shift).max(1)),
+            approx_bytes: (base.approx_bytes >> shift).max(1),
+        }
+    };
+    for op in operators {
+        if let Operator::HashProbe(probe) = op
+            && matches!(
+                probe.kind,
+                hash_join::ProbeJoinKind::BuildSemi | hash_join::ProbeJoinKind::BuildAnti
+            )
+        {
+            let build_est = estimate_join_side_size(
+                &probe.build_pipeline.source,
+                &probe.build_pipeline.operators,
+                stages,
+            );
+            est.approx_bytes = est.approx_bytes.min(build_est.approx_bytes);
+            est.mem_rows = match (est.mem_rows, build_est.mem_rows) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (None, Some(b)) => Some(b),
+                (a, None) => a,
+            };
+        }
+    }
+    est
+}
+
+fn choose_build_side(
+    left: SideEstimate,
+    right: SideEstimate,
+    left_is_stage: bool,
+    right_is_stage: bool,
+) -> hash_join::BuildSide {
     use hash_join::BuildSide;
     if left.is_empty && !right.is_empty {
         return BuildSide::Left;
@@ -292,17 +358,22 @@ fn choose_build_side(left: SideEstimate, right: SideEstimate) -> hash_join::Buil
     if right.is_empty && !left.is_empty {
         return BuildSide::Right;
     }
-    if let (Some(l_rows), Some(r_rows)) = (left.mem_rows, right.mem_rows) {
-        return if l_rows < r_rows {
-            BuildSide::Left
-        } else {
-            BuildSide::Right
-        };
-    }
-    if left.approx_bytes < right.approx_bytes {
+    let tie_side = if !left_is_stage && right_is_stage {
         BuildSide::Left
     } else {
         BuildSide::Right
+    };
+    if let (Some(l_rows), Some(r_rows)) = (left.mem_rows, right.mem_rows) {
+        return match l_rows.cmp(&r_rows) {
+            std::cmp::Ordering::Less => BuildSide::Left,
+            std::cmp::Ordering::Greater => BuildSide::Right,
+            std::cmp::Ordering::Equal => tie_side,
+        };
+    }
+    match left.approx_bytes.cmp(&right.approx_bytes) {
+        std::cmp::Ordering::Less => BuildSide::Left,
+        std::cmp::Ordering::Greater => BuildSide::Right,
+        std::cmp::Ordering::Equal => tie_side,
     }
 }
 
@@ -2196,7 +2267,7 @@ impl Pipeline {
     fn run_build_pipelines<'a>(
         &'a self,
         label_prefix: Option<&'a str>,
-        stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        dag: &'a mut DagRuntime,
         published_filters: &'a mut HashMap<usize, Arc<DynamicJoinFilterData>>,
         context: &'a Arc<TaskContext>,
         plan_metrics: &'a ExecutionPlanMetricsSet,
@@ -2230,6 +2301,9 @@ impl Pipeline {
             for idx in (0..probes.len()).rev() {
                 let (op_idx, probe) = probes[idx];
                 if tx.is_closed() {
+                    for &(_, remaining_probe) in &probes[..=idx] {
+                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    }
                     return Ok(BuildRunOutcome::Cancelled);
                 }
                 let build_label = match (label_prefix, multi) {
@@ -2241,7 +2315,7 @@ impl Pipeline {
                 let Some(table) = Box::pin(Self::run_single_build_pipeline(
                     &probe.build_pipeline,
                     &build_label,
-                    stage_inputs,
+                    dag,
                     published_filters,
                     context,
                     plan_metrics,
@@ -2250,6 +2324,9 @@ impl Pipeline {
                 ))
                 .await?
                 else {
+                    for &(_, remaining_probe) in &probes[..idx] {
+                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    }
                     return Ok(BuildRunOutcome::Cancelled);
                 };
                 #[cfg(feature = "parquet")]
@@ -2270,6 +2347,9 @@ impl Pipeline {
                         .iter()
                         .any(|(_, p)| p.needs_build_emission());
                     if !has_later_build_emission {
+                        for &(_, remaining_probe) in &probes[..idx] {
+                            dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                        }
                         drop(table);
                         drop(slots);
                         return Ok(BuildRunOutcome::ShortCircuitAll);
@@ -3054,8 +3134,8 @@ impl Pipeline {
             let emit_label = match (label_prefix, multi) {
                 (None, false) => "build_emit".to_owned(),
                 (None, true) => format!("build_emit_{}", probe.build_id),
-                (Some(prefix), false) => format!("{prefix}_emit"),
-                (Some(prefix), true) => format!("{prefix}_emit_{}", probe.build_id),
+                (Some(prefix), false) => format!("{prefix}_build_emit"),
+                (Some(prefix), true) => format!("{prefix}_build_emit_{}", probe.build_id),
             };
 
             match &table.kind {
@@ -3308,7 +3388,7 @@ impl Pipeline {
     async fn run_single_build_pipeline(
         build_pipeline: &Arc<Pipeline>,
         build_label: &str,
-        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        dag: &mut DagRuntime,
         published_filters: &mut HashMap<usize, Arc<DynamicJoinFilterData>>,
         context: &Arc<TaskContext>,
         plan_metrics: &ExecutionPlanMetricsSet,
@@ -3323,7 +3403,7 @@ impl Pipeline {
             match build_pipeline
                 .run_build_pipelines(
                     Some(build_label),
-                    stage_inputs,
+                    dag,
                     published_filters,
                     context,
                     plan_metrics,
@@ -3336,8 +3416,12 @@ impl Pipeline {
                     tables,
                     short_circuit_op,
                 } => (Some(tables), short_circuit_op),
-                BuildRunOutcome::Cancelled => return Ok(None),
+                BuildRunOutcome::Cancelled => {
+                    dag.release_source_ref(&build_pipeline.source);
+                    return Ok(None);
+                }
                 BuildRunOutcome::ShortCircuitAll => {
+                    dag.release_source_ref(&build_pipeline.source);
                     let empty_res = MemoryConsumer::new("MorselHashJoinBuild")
                         .register(context.memory_pool());
                     let empty_state =
@@ -3362,6 +3446,32 @@ impl Pipeline {
             }
         } else {
             (None, None)
+        };
+
+        let build_stage_input = if nested_short_circuit_op.is_none() {
+            if let Source::Stage(stage_src) = &build_pipeline.source {
+                let Some(stage) = ensure_stage(
+                    stage_src.stage_id,
+                    dag,
+                    published_filters,
+                    context,
+                    plan_metrics,
+                    measurement,
+                    tx,
+                )
+                .await?
+                else {
+                    dag.release_consumer(stage_src.stage_id);
+                    return Ok(None);
+                };
+                dag.release_consumer(stage_src.stage_id);
+                Some(stage)
+            } else {
+                None
+            }
+        } else {
+            dag.release_source_ref(&build_pipeline.source);
+            None
         };
 
         let build_spill = build_sink
@@ -3464,11 +3574,11 @@ impl Pipeline {
                         });
                     }
                 }
-                Source::Stage(stage_src) => {
+                Source::Stage(_) => {
                     let stage_data = Arc::clone(
-                        stage_inputs
-                            .get(&stage_src.stage_id)
-                            .expect("bound upstream stage artifact"),
+                        build_stage_input
+                            .as_ref()
+                            .expect("bound upstream build stage artifact"),
                     );
                     let next = Arc::new(AtomicUsize::new(0));
                     let morsels = stage_data.batches.len().div_ceil(BATCHES_PER_MORSEL);
@@ -3582,6 +3692,7 @@ impl Pipeline {
                 }
             }
         }
+        drop(build_stage_input);
 
         if let Some(tables) = &nested_tables {
             if nested_any_spilled {
@@ -4032,11 +4143,103 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Phase 1 + 1.5: execute join build pipelines (publishing dynamic join
+    /// filters before opening upstream probe stages), then materialize any
+    /// `StageSource` required by `self.source` unless short-circuited.
     #[expect(clippy::too_many_arguments)]
-    pub(super) fn run_pipeline_to_tx<'a>(
+    pub(super) fn prepare_execution<'a>(
+        self: &'a Arc<Self>,
+        label_prefix: Option<&'a str>,
+        dag: &'a mut DagRuntime,
+        published_filters: &'a mut HashMap<usize, Arc<DynamicJoinFilterData>>,
+        context: &'a Arc<TaskContext>,
+        metrics: &'a ExecutionPlanMetricsSet,
+        measurement: Option<&'a Arc<RunMetrics>>,
+        cancel_tx: &'a mpsc::Sender<RecordBatch>,
+    ) -> BoxFuture<'a, Result<Option<PreparedPipeline>>> {
+        Box::pin(async move {
+            if cancel_tx.is_closed() {
+                dag.release_pipeline_refs(self);
+                return Ok(None);
+            }
+            if matches!(self.sink, Sink::Limit { fetch: Some(0), .. }) {
+                dag.release_pipeline_refs(self);
+                return Ok(Some(PreparedPipeline {
+                    finalized_tables: None,
+                    short_circuit_op: None,
+                    skip_all: true,
+                    probe_stage_input: None,
+                    published_filters: HashMap::new(),
+                }));
+            }
+
+            let (finalized_tables, short_circuit_op, skip_all) = if self.has_join() {
+                match self
+                    .run_build_pipelines(
+                        label_prefix,
+                        dag,
+                        published_filters,
+                        context,
+                        metrics,
+                        measurement,
+                        cancel_tx,
+                    )
+                    .await?
+                {
+                    BuildRunOutcome::Ready {
+                        tables,
+                        short_circuit_op,
+                    } => (Some(tables), short_circuit_op, false),
+                    BuildRunOutcome::ShortCircuitAll => (None, None, true),
+                    BuildRunOutcome::Cancelled => {
+                        dag.release_source_ref(&self.source);
+                        return Ok(None);
+                    }
+                }
+            } else {
+                (None, None, false)
+            };
+
+            let skip_probe = skip_all || short_circuit_op.is_some();
+            let probe_stage_input = if skip_probe {
+                dag.release_source_ref(&self.source);
+                None
+            } else if let Source::Stage(stage_src) = &self.source {
+                let Some(stage) = ensure_stage(
+                    stage_src.stage_id,
+                    dag,
+                    published_filters,
+                    context,
+                    metrics,
+                    measurement,
+                    cancel_tx,
+                )
+                .await?
+                else {
+                    dag.release_consumer(stage_src.stage_id);
+                    return Ok(None);
+                };
+                dag.release_consumer(stage_src.stage_id);
+                Some(stage)
+            } else {
+                None
+            };
+
+            Ok(Some(PreparedPipeline {
+                finalized_tables,
+                short_circuit_op,
+                skip_all,
+                probe_stage_input,
+                published_filters: published_filters.clone(),
+            }))
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn run_prepared_to_tx<'a>(
         self: Arc<Self>,
         label_prefix: Option<&'a str>,
-        stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        prepared: PreparedPipeline,
         context: &'a Arc<TaskContext>,
         metrics: &'a ExecutionPlanMetricsSet,
         measurement: Option<&'a Arc<RunMetrics>>,
@@ -4058,16 +4261,15 @@ impl Pipeline {
                 let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
                 {
                     let pipeline = Arc::clone(&self);
-                    let stage_inputs = Arc::clone(stage_inputs);
                     let ctx = Arc::clone(context);
                     let metrics = metrics.clone();
                     let meas = measurement.cloned();
                     let label = label_prefix.map(str::to_owned);
                     let cancel = cancel_tx.clone();
                     inner_tasks.spawn(async move {
-                        Box::pin(pipeline.run_pipeline_body_to_tx(
+                        Box::pin(pipeline.run_prepared_body_to_tx(
                             label.as_deref(),
-                            &stage_inputs,
+                            prepared,
                             &ctx,
                             &metrics,
                             meas.as_ref(),
@@ -4196,9 +4398,9 @@ impl Pipeline {
                 return Ok(());
             }
 
-            Box::pin(self.run_pipeline_body_to_tx(
+            Box::pin(self.run_prepared_body_to_tx(
                 label_prefix,
-                stage_inputs,
+                prepared,
                 context,
                 metrics,
                 measurement,
@@ -4210,10 +4412,10 @@ impl Pipeline {
     }
 
     #[expect(clippy::too_many_arguments)]
-    async fn run_pipeline_body_to_tx(
+    async fn run_prepared_body_to_tx(
         self: Arc<Self>,
         label_prefix: Option<&str>,
-        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        prepared: PreparedPipeline,
         context: &Arc<TaskContext>,
         metrics: &ExecutionPlanMetricsSet,
         measurement: Option<&Arc<RunMetrics>>,
@@ -4231,33 +4433,15 @@ impl Pipeline {
             return Ok(());
         }
 
-        // Phase 1: execute all join build pipelines and finalize hash tables
-        // strictly before any probe work begins.
-        let mut published_filters: HashMap<usize, Arc<DynamicJoinFilterData>> =
-            HashMap::new();
-        let (finalized_tables, short_circuit_op, skip_all) = if has_join {
-            match self
-                .run_build_pipelines(
-                    label_prefix,
-                    stage_inputs,
-                    &mut published_filters,
-                    context,
-                    metrics,
-                    measurement,
-                    &cancel_tx,
-                )
-                .await?
-            {
-                BuildRunOutcome::Ready {
-                    tables,
-                    short_circuit_op,
-                } => (Some(tables), short_circuit_op, false),
-                BuildRunOutcome::ShortCircuitAll => (None, None, true),
-                BuildRunOutcome::Cancelled => return Ok(()),
-            }
-        } else {
-            (None, None, false)
-        };
+        let PreparedPipeline {
+            finalized_tables,
+            short_circuit_op,
+            skip_all,
+            probe_stage_input,
+            published_filters,
+        } = prepared;
+        #[cfg(not(feature = "parquet"))]
+        let _ = &published_filters;
 
         let sink_spill = match &self.sink {
             Sink::GroupCount { sink, .. } => {
@@ -4420,8 +4604,8 @@ impl Pipeline {
                 }
                 Source::Stage(stage_src) => {
                     let stage_data = Arc::clone(
-                        stage_inputs
-                            .get(&stage_src.stage_id)
+                        probe_stage_input
+                            .as_ref()
                             .expect("bound upstream stage artifact"),
                     );
                     let sequential = stage_src.ordered
@@ -4604,6 +4788,7 @@ impl Pipeline {
                 }
             }
         }
+        drop(probe_stage_input);
 
         // Phase 3: run dependent build-side emission child pipelines (RIGHT/FULL
         // OUTER unmatched build rows, RIGHT/LEFT SEMI matched build rows, ANTI
@@ -4869,21 +5054,6 @@ impl Pipeline {
         let worker_measurement = measurement.clone();
         let supervisor = SpawnedTask::spawn(async move {
             let measurement = worker_measurement;
-            if stages.is_empty() && scalar_subqueries.is_none() {
-                let empty_deps = Arc::new(HashMap::new());
-                let cancel_tx = tx.clone();
-                return self
-                    .run_pipeline_to_tx(
-                        None,
-                        &empty_deps,
-                        &context,
-                        &metrics,
-                        measurement.as_ref(),
-                        tx,
-                        cancel_tx,
-                    )
-                    .await;
-            }
             let _sq_guard = scalar_subqueries
                 .as_ref()
                 .map(ScalarSubqueryState::acquire_run);
@@ -4903,30 +5073,27 @@ impl Pipeline {
                 }
             }
 
-            let root_deps = collect_pipeline_stage_deps(&self);
-            let bound_deps = if root_deps.is_empty() {
-                Arc::new(HashMap::new())
-            } else {
-                let Some(deps) = bind_stage_dependencies(
-                    &root_deps,
+            let mut published_filters = HashMap::new();
+            let Some(prepared) = self
+                .prepare_execution(
+                    None,
                     &mut dag,
+                    &mut published_filters,
                     &context,
                     &metrics,
                     measurement.as_ref(),
                     &tx,
                 )
                 .await?
-                else {
-                    return Ok(());
-                };
-                deps
+            else {
+                return Ok(());
             };
             drop(dag);
 
             let cancel_tx = tx.clone();
-            self.run_pipeline_to_tx(
+            self.run_prepared_to_tx(
                 None,
-                &bound_deps,
+                prepared,
                 &context,
                 &metrics,
                 measurement.as_ref(),
@@ -4941,6 +5108,14 @@ impl Pipeline {
             measurement,
         }
     }
+}
+
+pub(super) struct PreparedPipeline {
+    finalized_tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+    short_circuit_op: Option<usize>,
+    skip_all: bool,
+    probe_stage_input: Option<Arc<MaterializedStage>>,
+    published_filters: HashMap<usize, Arc<DynamicJoinFilterData>>,
 }
 
 struct SortFinalizeCtx<'a> {

@@ -24,6 +24,7 @@ use indexmap::IndexSet;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use super::join_filter::DynamicJoinFilterData;
 use super::metrics::RunMetrics;
 use super::{BoxFuture, Operator, Pipeline, SideEstimate, Source, abort_and_drain};
 
@@ -109,9 +110,11 @@ impl ScalarSubqueryState {
                 dag.release_consumer(spec.stage_id);
                 continue;
             }
+            let empty_filters = HashMap::new();
             let Some(stage) = ensure_stage(
                 spec.stage_id,
                 dag,
+                &empty_filters,
                 context,
                 plan_metrics,
                 measurement,
@@ -358,6 +361,7 @@ impl Drop for MaterializedStage {
 pub(super) struct DagRuntime {
     stages: Arc<Vec<StageSpec>>,
     outputs: Vec<Option<Arc<MaterializedStage>>>,
+    executed: Vec<bool>,
     remaining_consumers: Vec<usize>,
     memory: Option<Arc<SharedStageMemory>>,
 }
@@ -374,6 +378,7 @@ impl DagRuntime {
         Self {
             stages,
             outputs: vec![None; n],
+            executed: vec![false; n],
             remaining_consumers: consumer_counts,
             memory,
         }
@@ -384,12 +389,36 @@ impl DagRuntime {
         *rem = rem.saturating_sub(1);
         if *rem == 0 {
             self.outputs[stage_id.0] = None;
+            if !self.executed[stage_id.0] {
+                let mut ref_ids = Vec::new();
+                collect_pipeline_stage_ref_ids(
+                    &self.stages[stage_id.0].pipeline,
+                    &mut ref_ids,
+                );
+                for dep in ref_ids {
+                    self.release_consumer(dep);
+                }
+            }
+        }
+    }
+
+    pub(super) fn release_source_ref(&mut self, source: &Source) {
+        if let Source::Stage(src) = source {
+            self.release_consumer(src.stage_id);
+        }
+    }
+
+    pub(super) fn release_pipeline_refs(&mut self, pipeline: &Pipeline) {
+        let mut ref_ids = Vec::new();
+        collect_pipeline_stage_ref_ids(pipeline, &mut ref_ids);
+        for dep in ref_ids {
+            self.release_consumer(dep);
         }
     }
 }
 
 /// Collect all `StageSource` references inside `pipeline` and its nested join
-/// build pipelines.
+/// build pipelines (preserving duplicates for exact per-reference counting).
 pub(super) fn collect_pipeline_stage_refs(
     pipeline: &Pipeline,
     out: &mut Vec<(StageId, SchemaRef)>,
@@ -404,18 +433,70 @@ pub(super) fn collect_pipeline_stage_refs(
     }
 }
 
+/// Collect all referenced `StageId`s inside `pipeline` and its nested join
+/// build pipelines (preserving duplicates for exact per-reference counting).
+pub(super) fn collect_pipeline_stage_ref_ids(
+    pipeline: &Pipeline,
+    out: &mut Vec<StageId>,
+) {
+    if let Source::Stage(src) = &pipeline.source {
+        out.push(src.stage_id);
+    }
+    for op in &pipeline.operators {
+        if let Operator::HashProbe(probe) = op {
+            collect_pipeline_stage_ref_ids(&probe.build_pipeline, out);
+        }
+    }
+}
+
 /// Collect deduplicated sorted upstream `StageId`s referenced by `pipeline`.
 pub(super) fn collect_pipeline_stage_deps(pipeline: &Pipeline) -> Vec<StageId> {
-    let mut refs = Vec::new();
-    collect_pipeline_stage_refs(pipeline, &mut refs);
-    let mut deps: Vec<StageId> = refs.into_iter().map(|(id, _)| id).collect();
+    let mut deps = Vec::new();
+    collect_pipeline_stage_ref_ids(pipeline, &mut deps);
     deps.sort_unstable();
     deps.dedup();
     deps
 }
 
+/// Count exact (non-deduplicated) `StageSource` and scalar-subquery references
+/// per stage across the entire DAG. A count of `1` proves the stage has a single
+/// consumer and cannot create a dependency cycle with its consumer's join builds.
+#[cfg(feature = "parquet")]
+pub(super) fn count_dag_stage_refs(
+    stages: &[StageSpec],
+    scalar_subqueries: Option<&ScalarSubqueryState>,
+    root_pipeline: &Pipeline,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; stages.len()];
+    let mut ids = Vec::new();
+    for stage in stages {
+        ids.clear();
+        collect_pipeline_stage_ref_ids(&stage.pipeline, &mut ids);
+        for id in &ids {
+            if id.0 < counts.len() {
+                counts[id.0] += 1;
+            }
+        }
+    }
+    ids.clear();
+    collect_pipeline_stage_ref_ids(root_pipeline, &mut ids);
+    for id in &ids {
+        if id.0 < counts.len() {
+            counts[id.0] += 1;
+        }
+    }
+    if let Some(sq_state) = scalar_subqueries {
+        for spec in &sq_state.specs {
+            if spec.stage_id.0 < counts.len() {
+                counts[spec.stage_id.0] += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Validate DAG topology (strict topological indices, zero cycles, schema
-/// compatibility) and compute per-stage consumer counts.
+/// compatibility) and compute per-stage reference counts.
 pub(super) fn validate_dag(
     stages: &[StageSpec],
     scalar_subqueries: Option<&ScalarSubqueryState>,
@@ -446,6 +527,7 @@ pub(super) fn validate_dag(
                     dep.0
                 );
             }
+            consumer_counts[dep.0] += 1;
         }
         for dep in &stage.dependencies {
             if dep.0 >= idx {
@@ -453,7 +535,6 @@ pub(super) fn validate_dag(
                     "Morsel DAG invalid dependency {dep:?} on stage {idx}"
                 );
             }
-            consumer_counts[dep.0] += 1;
         }
     }
 
@@ -472,8 +553,6 @@ pub(super) fn validate_dag(
                 dep.0
             );
         }
-    }
-    for dep in collect_pipeline_stage_deps(root_pipeline) {
         consumer_counts[dep.0] += 1;
     }
 
@@ -536,37 +615,13 @@ fn collect_scalar_subqueries_rec(
     .expect("infallible");
 }
 
-/// Bind all direct upstream stages required by `deps`, returning an immutable
-/// lookup map and decrementing supervisor-side consumer counts.
-pub(super) async fn bind_stage_dependencies(
-    deps: &[StageId],
-    dag: &mut DagRuntime,
-    context: &Arc<TaskContext>,
-    plan_metrics: &ExecutionPlanMetricsSet,
-    measurement: Option<&Arc<RunMetrics>>,
-    cancel_tx: &mpsc::Sender<RecordBatch>,
-) -> Result<Option<Arc<HashMap<StageId, Arc<MaterializedStage>>>>> {
-    let mut bound = HashMap::with_capacity(deps.len());
-    for &dep in deps {
-        let Some(artifact) =
-            ensure_stage(dep, dag, context, plan_metrics, measurement, cancel_tx).await?
-        else {
-            return Ok(None);
-        };
-        bound.insert(dep, artifact);
-    }
-    for &dep in deps {
-        dag.release_consumer(dep);
-    }
-    Ok(Some(Arc::new(bound)))
-}
-
 /// Ensure `stage_id` has been executed and materialized into `dag.outputs`,
-/// strictly executing upstream dependencies first and tracking materialized
-/// batch bytes in the run's `MemoryPool`.
+/// propagating any already-published dynamic join filters from the consumer
+/// and tracking materialized batch bytes in the run's `MemoryPool`.
 pub(super) fn ensure_stage<'a>(
     stage_id: StageId,
     dag: &'a mut DagRuntime,
+    published_filters: &'a HashMap<usize, Arc<DynamicJoinFilterData>>,
     context: &'a Arc<TaskContext>,
     plan_metrics: &'a ExecutionPlanMetricsSet,
     measurement: Option<&'a Arc<RunMetrics>>,
@@ -580,22 +635,28 @@ pub(super) fn ensure_stage<'a>(
             return Ok(Some(Arc::clone(existing)));
         }
 
-        let deps = dag.stages[stage_id.0].dependencies.clone();
-        let Some(bound_deps) = bind_stage_dependencies(
-            &deps,
-            dag,
-            context,
-            plan_metrics,
-            measurement,
-            cancel_tx,
-        )
-        .await?
+        dag.executed[stage_id.0] = true;
+        let stage_pipeline = Arc::clone(&dag.stages[stage_id.0].pipeline);
+        let stage_label = dag.stages[stage_id.0].label.clone();
+
+        // Phase 1: run any join build pipelines and ensure upstream stage
+        // dependencies before spawning the streaming producer task.
+        let mut stage_filters = published_filters.clone();
+        let Some(prepared) = stage_pipeline
+            .prepare_execution(
+                Some(&stage_label),
+                dag,
+                &mut stage_filters,
+                context,
+                plan_metrics,
+                measurement,
+                cancel_tx,
+            )
+            .await?
         else {
             return Ok(None);
         };
 
-        let stage_pipeline = Arc::clone(&dag.stages[stage_id.0].pipeline);
-        let stage_label = dag.stages[stage_id.0].label.clone();
         let channel_cap = stage_pipeline.sink_capacity.max(4);
         let (stage_tx, mut stage_rx) = mpsc::channel(channel_cap);
 
@@ -607,9 +668,9 @@ pub(super) fn ensure_stage<'a>(
             let cancel = cancel_tx.clone();
             stage_tasks.spawn(async move {
                 stage_pipeline
-                    .run_pipeline_to_tx(
+                    .run_prepared_to_tx(
                         Some(&stage_label),
-                        &bound_deps,
+                        prepared,
                         &ctx,
                         &metrics,
                         meas.as_ref(),

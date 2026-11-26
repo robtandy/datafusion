@@ -3029,3 +3029,659 @@ async fn dynamic_join_filter_preserves_cross_column_guards_on_cast_join_key() ->
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_aggregate_dynamic_join_filter_q17_and_q20_patterns_prune_before_aggregate()
+-> Result<()> {
+    // 16 sorted row groups of 10,000 rows each:
+    // l_partkey in 0..16_000 (10 rows per partkey, clustered by RG: RG r holds partkeys [r*1000..(r+1)*1000)),
+    // l_suppkey in (l_partkey % 200), l_quantity in 1..=20, l_extendedprice = 100..
+    let li_schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int64, false),
+        Field::new("l_suppkey", DataType::Int64, false),
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Int64, false),
+        Field::new("l_comment", DataType::Utf8, false),
+    ]));
+    let mut li_batches = Vec::with_capacity(16);
+    for rg in 0..16i64 {
+        let mut pks = Vec::with_capacity(10_000);
+        let mut sks = Vec::with_capacity(10_000);
+        let mut qtys = Vec::with_capacity(10_000);
+        let mut prices = Vec::with_capacity(10_000);
+        let mut comments = Vec::with_capacity(10_000);
+        for i in 0..10_000i64 {
+            let pk = rg * 1_000 + (i / 10);
+            let sk = (pk % 200) + (i % 2);
+            let qty = (i % 20) + 1;
+            pks.push(pk);
+            sks.push(sk);
+            qtys.push(qty);
+            prices.push(qty * 100 + (pk % 17));
+            comments.push(format!("comment-{rg:02}-{i:05}-padding-wide-payload"));
+        }
+        li_batches.push(RecordBatch::try_new(
+            Arc::clone(&li_schema),
+            vec![
+                Arc::new(Int64Array::from(pks)),
+                Arc::new(Int64Array::from(sks)),
+                Arc::new(Int64Array::from(qtys)),
+                Arc::new(Int64Array::from(prices)),
+                Arc::new(StringArray::from(comments)),
+            ],
+        )?);
+    }
+    let li_dir = write_parquet_files(&li_batches, 4, 10_000)?;
+
+    // Part table: 16,000 parts, with only 120 parts inside RG 5 (partkeys 5_000..5_120)
+    // matching p_brand = 'Brand#23' AND p_container = 'MED BOX'.
+    let part_schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_brand", DataType::Utf8, false),
+        Field::new("p_container", DataType::Utf8, false),
+    ]));
+    let part_batch = RecordBatch::try_new(
+        Arc::clone(&part_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..16_000i64)),
+            Arc::new(StringArray::from_iter_values((0..16_000i64).map(|k| {
+                if (5_000..5_120).contains(&k) {
+                    "Brand#23"
+                } else {
+                    "Brand#99"
+                }
+            }))),
+            Arc::new(StringArray::from_iter_values((0..16_000i64).map(|k| {
+                if (5_000..5_120).contains(&k) {
+                    "MED BOX"
+                } else {
+                    "LG CASE"
+                }
+            }))),
+        ],
+    )?;
+    let part_dir = write_parquet_files(&[part_batch], 1, 16_000)?;
+
+    // Partsupp table: 2 suppliers per part, for all 16,000 parts (32,000 rows).
+    let ps_schema = Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, false),
+        Field::new("ps_suppkey", DataType::Int64, false),
+        Field::new("ps_availqty", DataType::Int64, false),
+    ]));
+    let mut ps_pk = Vec::with_capacity(32_000);
+    let mut ps_sk = Vec::with_capacity(32_000);
+    let mut ps_avail = Vec::with_capacity(32_000);
+    for pk in 0..16_000i64 {
+        for j in 0..2i64 {
+            ps_pk.push(pk);
+            ps_sk.push((pk % 200) + j);
+            ps_avail.push(30 + ((pk + j) % 40));
+        }
+    }
+    let ps_batch = RecordBatch::try_new(
+        Arc::clone(&ps_schema),
+        vec![
+            Arc::new(Int64Array::from(ps_pk)),
+            Arc::new(Int64Array::from(ps_sk)),
+            Arc::new(Int64Array::from(ps_avail)),
+        ],
+    )?;
+    let ps_dir = write_parquet_files(&[ps_batch], 1, 16_000)?;
+
+    let make_ctx = |mode: &str, pushdown: bool, dyn_join: bool| {
+        let li_path = li_dir.path().to_str().unwrap().to_owned();
+        let part_path = part_dir.path().to_str().unwrap().to_owned();
+        let ps_path = ps_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            cfg.options_mut()
+                .optimizer
+                .enable_join_dynamic_filter_pushdown = dyn_join;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("lineitem", &li_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("part", &part_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("partsupp", &ps_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    // 1. Q20 pattern: multi-key GROUP BY (l_partkey, l_suppkey) feeding LeftSemi join
+    //    against partsupp semi-joined with selective filtered part.
+    let q20_sql = "SELECT ps.ps_partkey, ps.ps_suppkey \
+                   FROM partsupp ps \
+                   WHERE ps.ps_partkey IN ( \
+                       SELECT p.p_partkey FROM part p \
+                       WHERE p.p_brand = 'Brand#23' AND p.p_container = 'MED BOX' \
+                   ) \
+                   AND ps.ps_availqty > ( \
+                       SELECT 0.5 * SUM(l.l_quantity) \
+                       FROM lineitem l \
+                       WHERE l.l_partkey = ps.ps_partkey AND l.l_suppkey = ps.ps_suppkey \
+                   ) \
+                   ORDER BY ps.ps_partkey, ps.ps_suppkey";
+
+    // 2. Q17 pattern: single-key GROUP BY l_partkey scalar subquery joined with
+    //    lineitem INNER JOIN selective part.
+    let q17_sql = "SELECT SUM(l.l_extendedprice) AS total_price \
+                   FROM lineitem l, part p \
+                   WHERE p.p_partkey = l.l_partkey \
+                     AND p.p_brand = 'Brand#23' \
+                     AND p.p_container = 'MED BOX' \
+                     AND l.l_quantity < ( \
+                         SELECT 0.5 * AVG(l2.l_quantity) \
+                         FROM lineitem l2 \
+                         WHERE l2.l_partkey = p.p_partkey \
+                     )";
+
+    // 3. GroupCountSink pattern: single-key GROUP BY l_partkey COUNT(*) joined with part.
+    let group_count_sql = "SELECT p.p_partkey, g.cnt \
+                           FROM part p \
+                           INNER JOIN ( \
+                               SELECT l_partkey, COUNT(*) AS cnt \
+                               FROM lineitem \
+                               GROUP BY l_partkey \
+                           ) g ON p.p_partkey = g.l_partkey \
+                           WHERE p.p_brand = 'Brand#23' AND p.p_container = 'MED BOX' \
+                           ORDER BY p.p_partkey";
+
+    for (label, sql) in [
+        ("q20", q20_sql),
+        ("q17", q17_sql),
+        ("group_count", group_count_sql),
+    ] {
+        for pushdown in [false, true] {
+            let stock = make_ctx("off", pushdown, true).await?;
+            let native_off = make_ctx("required", pushdown, false).await?;
+            let native_on = make_ctx("required", pushdown, true).await?;
+
+            let (plan_off, _) = assert_native_parity(&stock, &native_off, sql).await?;
+            let (plan_on, _) = assert_native_parity(&stock, &native_on, sql).await?;
+
+            let bytes_off = metric(plan_off.as_ref(), "bytes_scanned");
+            let bytes_on = metric(plan_on.as_ref(), "bytes_scanned");
+            let morsels_off = metric(plan_off.as_ref(), "parquet_morsels_claimed");
+            let morsels_on = metric(plan_on.as_ref(), "parquet_morsels_claimed");
+            // `part` itself is scanned in both arms (~157 KB), while `lineitem`
+            // has 16 row groups (15 of which must be pruned).
+            assert!(
+                bytes_on < (bytes_off * 2) / 3,
+                "{label} pushdown={pushdown}: expected cross-Aggregate dynamic pushdown \
+                 to slash bytes_scanned (on={bytes_on}, off={bytes_off})"
+            );
+            assert!(
+                morsels_on < morsels_off / 2,
+                "{label} pushdown={pushdown}: expected cross-Aggregate dynamic pushdown \
+                 to prune lineitem row groups (on={morsels_on}, off={morsels_off})"
+            );
+            assert!(
+                metric(plan_on.as_ref(), "join_dynamic_filters_pushed") > 0,
+                "{label} pushdown={pushdown}: expected join_dynamic_filters_pushed > 0"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_aggregate_dynamic_join_filter_empty_build_short_circuits_stage()
+-> Result<()> {
+    let li_schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int64, false),
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Int64, false),
+    ]));
+    let mut li_batches = Vec::with_capacity(8);
+    for rg in 0..8i64 {
+        let base = rg * 1_000;
+        li_batches.push(RecordBatch::try_new(
+            Arc::clone(&li_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..4_000i64).map(|i| base + (i % 1_000)),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..4_000i64).map(|i| (i % 10) + 1),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..4_000i64).map(|i| (i % 50) * 10),
+                )),
+            ],
+        )?);
+    }
+    let li_dir = write_parquet_files(&li_batches, 2, 4_000)?;
+
+    let part_schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_brand", DataType::Utf8, false),
+    ]));
+    let part_batch = RecordBatch::try_new(
+        part_schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..500i64)),
+            Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                "Brand#11", 500,
+            ))),
+        ],
+    )?;
+    let part_dir = write_parquet_files(&[part_batch], 1, 500)?;
+
+    let make_ctx = |mode: &str| {
+        let li_path = li_dir.path().to_str().unwrap().to_owned();
+        let part_path = part_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("lineitem", &li_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("part", &part_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    // Build side `part WHERE p_brand = 'NO_MATCH'` is empty -> must short-circuit
+    // the grouped Aggregate(lineitem) stage completely without scanning lineitem!
+    let inner_sql = "SELECT p.p_partkey, a.total_qty \
+                     FROM part p \
+                     INNER JOIN ( \
+                         SELECT l_partkey, SUM(l_quantity) AS total_qty \
+                         FROM lineitem GROUP BY l_partkey \
+                     ) a ON p.p_partkey = a.l_partkey \
+                     WHERE p.p_brand = 'NO_MATCH'";
+
+    let q17_empty_sql = "SELECT SUM(l.l_extendedprice) AS total_price \
+                         FROM lineitem l, part p \
+                         WHERE p.p_partkey = l.l_partkey \
+                           AND p.p_brand = 'NO_MATCH' \
+                           AND l.l_quantity < ( \
+                               SELECT 0.5 * AVG(l2.l_quantity) \
+                               FROM lineitem l2 \
+                               WHERE l2.l_partkey = p.p_partkey \
+                           )";
+
+    for (label, sql, expected_agg_finalizations) in [
+        ("inner_empty", inner_sql, 0usize),
+        ("q17_empty", q17_empty_sql, 1usize), // outer ungrouped SUM still emits 1 NULL row; inner stage_0 skipped!
+    ] {
+        let stock = make_ctx("off").await?;
+        let native = make_ctx("required").await?;
+        let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+        assert!(
+            metric(plan.as_ref(), "join_empty_build_short_circuits") > 0,
+            "{label}: expected join_empty_build_short_circuits > 0"
+        );
+        // `lineitem` has 8 row groups; if stage_0 was skipped, total claimed morsels
+        // can be at most `part`'s 1 RG (0 if `part` itself was pruned by row-group stats).
+        assert!(
+            metric(plan.as_ref(), "parquet_morsels_claimed") <= 1,
+            "{label}: expected empty build to skip scanning lineitem stage (claimed={})",
+            metric(plan.as_ref(), "parquet_morsels_claimed")
+        );
+        assert_eq!(
+            metric(plan.as_ref(), "aggregate_finalizations"),
+            expected_agg_finalizations,
+            "{label}: expected grouped stage_0 aggregate to be skipped"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards()
+-> Result<()> {
+    // Fact table with 8 row groups, unique `id`, NULL keys, and duplicates.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("k1", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(8);
+    for rg in 0..8i64 {
+        let mut ids = Vec::with_capacity(500);
+        let mut k1s = Vec::with_capacity(500);
+        let mut k2s = Vec::with_capacity(500);
+        let mut vals = Vec::with_capacity(500);
+        for i in 0..500i64 {
+            let k1 = if i % 50 == 0 {
+                None
+            } else {
+                Some(rg * 100 + (i % 100))
+            };
+            let k2 = if i % 75 == 0 {
+                None
+            } else {
+                Some((rg * 100 + (i % 100)) % 30)
+            };
+            ids.push(rg * 500 + i);
+            k1s.push(k1);
+            k2s.push(k2);
+            vals.push((i % 25) + 1);
+        }
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(k1s)),
+                Arc::new(Int64Array::from(k2s)),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 2, 500)?;
+
+    // Dim1: small table with keys in RG 3 (300..315) PLUS a NULL key AND a non-matching key (9999).
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk1", DataType::Int64, true),
+        Field::new("dk2", DataType::Int64, true),
+        Field::new("tag", DataType::Int64, false),
+    ]));
+    let mut dk1 = vec![None, Some(9999)];
+    let mut dk2 = vec![None, Some(1)];
+    let mut tag = vec![0, 99];
+    for k in 300..315i64 {
+        dk1.push(Some(k));
+        dk2.push(Some(k % 30));
+        tag.push(k);
+    }
+    let dim1_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from(dk1)),
+            Arc::new(Int64Array::from(dk2)),
+            Arc::new(Int64Array::from(tag)),
+        ],
+    )?;
+    let dim1_dir = write_parquet_files(&[dim1_batch], 1, 100)?;
+
+    // Dim2: disjoint keys in RG 6 (600..615) for multi-consumer CTE guard testing.
+    let dim2_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(600..615i64)),
+            Arc::new(Int64Array::from_iter_values((600..615i64).map(|k| k % 30))),
+            Arc::new(Int64Array::from_iter_values(600..615i64)),
+        ],
+    )?;
+    let dim2_dir = write_parquet_files(&[dim2_batch], 1, 100)?;
+
+    let make_ctx = |mode: &str, pushdown: bool, pg_dialect: bool| {
+        let fact_path = fact_dir.path().to_str().unwrap().to_owned();
+        let dim1_path = dim1_dir.path().to_str().unwrap().to_owned();
+        let dim2_path = dim2_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(cfg);
+            if pg_dialect {
+                ctx.sql("SET datafusion.sql_parser.dialect = 'PostgreSQL'")
+                    .await?
+                    .collect()
+                    .await?;
+            }
+            ctx.register_parquet("fact", &fact_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim1", &dim1_path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim2", &dim2_path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    // (label, sql, expect_pushed, cte_mat)
+    let cases = [
+        // Safe: NULL keys with `=` (NULL group discarded cleanly).
+        (
+            "inner_nulls_eq",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            true,
+            false,
+        ),
+        // Safe: NULL keys with `IS NOT DISTINCT FROM` (NULL group preserved!).
+        (
+            "inner_nulls_indf",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             ON d.dk1 IS NOT DISTINCT FROM a.k1 ORDER BY d.dk1",
+            true,
+            false,
+        ),
+        // Safe: multi-key GROUP BY with NULLs and IS NOT DISTINCT FROM.
+        (
+            "multi_key_nulls_indf",
+            "SELECT d.dk1, d.dk2, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, k2, SUM(val) AS s FROM fact GROUP BY k1, k2) a \
+             ON d.dk1 IS NOT DISTINCT FROM a.k1 AND d.dk2 IS NOT DISTINCT FROM a.k2 \
+             ORDER BY d.dk1, d.dk2",
+            true,
+            false,
+        ),
+        // Safe: BuildOuter (dim1 LEFT JOIN agg -> dim1 is build, agg is probe).
+        (
+            "build_outer",
+            "SELECT d.dk1, d.tag, a.s FROM dim1 d \
+             LEFT JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             ON d.dk1 = a.k1 ORDER BY d.tag",
+            true,
+            false,
+        ),
+        // Safe: BuildAnti (dim1 LEFT ANTI JOIN agg -> dim1 is build, agg is probe).
+        (
+            "build_anti",
+            "SELECT d.dk1, d.tag FROM dim1 d \
+             LEFT ANTI JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             ON d.dk1 = a.k1 ORDER BY d.tag",
+            true,
+            false,
+        ),
+        // Unsafe (must preserve all agg rows): ProbeOuter (agg LEFT JOIN dim1).
+        (
+            "probe_outer_no_push",
+            "SELECT a.k1, a.s, d.tag FROM (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             LEFT JOIN dim1 d ON a.k1 = d.dk1 ORDER BY a.k1",
+            false,
+            false,
+        ),
+        // Unsafe (must preserve all agg rows): FullOuter.
+        (
+            "full_outer_no_push",
+            "SELECT a.k1, a.s, d.tag FROM (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             FULL OUTER JOIN dim1 d ON a.k1 = d.dk1 ORDER BY a.k1, d.tag",
+            false,
+            false,
+        ),
+        // Unsafe (must preserve unmatched agg rows): ProbeAnti (agg LEFT ANTI JOIN dim1).
+        (
+            "probe_anti_no_push",
+            "SELECT a.k1, a.s FROM (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             LEFT ANTI JOIN dim1 d ON a.k1 = d.dk1 ORDER BY a.k1",
+            false,
+            false,
+        ),
+        // Safe: HAVING on aggregate value with unmodified GROUP BY key column.
+        (
+            "having_unmodified_key",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1 HAVING SUM(val) > 50) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            true,
+            false,
+        ),
+        // Guard: HAVING + altered key expression (CASE depending on SUM(val)) MUST NOT push.
+        (
+            "having_altered_key_no_push",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN ( \
+                 SELECT CASE WHEN SUM(val) > 50 THEN k1 ELSE 305 END AS ak, SUM(val) AS s \
+                 FROM fact GROUP BY k1 HAVING SUM(val) > 10 \
+             ) a ON d.dk1 = a.ak ORDER BY d.dk1, a.s",
+            false,
+            false,
+        ),
+        // Guard: ungrouped aggregate MUST NOT push (filtering input rows would change SUM(val)!).
+        // Use a tiny VALUES build side so the ungrouped Aggregate stage sits on the probe side,
+        // directly exercising the ungrouped-aggregate non-pushdown guard.
+        (
+            "ungrouped_agg_no_push",
+            "SELECT d.dk1, a.total FROM (VALUES (305)) AS d(dk1) \
+             INNER JOIN (SELECT SUM(val) - 51000 + 305 AS total FROM fact) a \
+             ON d.dk1 = a.total ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: TopN / LIMIT over grouped aggregate MUST NOT push (would change top-K membership!).
+        // Use a tiny VALUES build side so the TopN stage sits on the probe side.
+        (
+            "topn_agg_no_push",
+            "SELECT d.dk1, a.s FROM (VALUES (305), (306)) AS d(dk1) \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1 ORDER BY s DESC, k1 ASC LIMIT 5) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: Sort with OFFSET MUST NOT push (filtering before Sort changes which rows OFFSET skips!).
+        // `dim1` keys live in RG 3 (k1 in 300..315, id in 1500..2000), so OFFSET 250 skips RG 0 rows
+        // and keeps all matching rows; a pushed filter would prune RG 0..2 and skip the matching rows.
+        (
+            "sort_offset_no_push",
+            "SELECT d.dk1, a.id FROM dim1 d \
+             INNER JOIN (SELECT id, k1 FROM fact ORDER BY id OFFSET 250) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1, a.id",
+            false,
+            false,
+        ),
+        // Guard: Grouped Aggregate + ORDER BY + OFFSET (PostSort::Sort with skip > 0) MUST NOT push.
+        // Without pushdown, OFFSET 250 skips k1 in 0..249 and keeps all 15 groups in 300..314;
+        // pushing dim1's filter before Aggregate would leave <= 15 groups and OFFSET 250 would return 0 rows!
+        (
+            "agg_sort_offset_no_push",
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1 ORDER BY k1 OFFSET 250) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: GroupCount + ORDER BY + OFFSET (PostSort::Sort with skip > 0) MUST NOT push.
+        (
+            "group_count_sort_offset_no_push",
+            "SELECT d.dk1, a.cnt FROM dim1 d \
+             INNER JOIN (SELECT k1, COUNT(*) AS cnt FROM fact GROUP BY k1 ORDER BY k1 OFFSET 250) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+            false,
+            false,
+        ),
+        // Guard: multi-consumer materialized CTE with disjoint build sets MUST NOT push
+        // dim1's filter into the shared CTE (which would starve dim2!).
+        (
+            "multi_consumer_cte_no_push",
+            "WITH agg AS MATERIALIZED (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) \
+             SELECT t1.k1 AS k1_a, t1.s AS s_a, t2.k1 AS k1_b, t2.s AS s_b \
+             FROM (SELECT a.k1, a.s FROM agg a INNER JOIN dim1 d ON a.k1 = d.dk1) t1 \
+             INNER JOIN (SELECT a.k1, a.s FROM agg a INNER JOIN dim2 d ON a.k1 = d.dk1) t2 \
+             ON (t1.k1 % 10) = (t2.k1 % 10) \
+             ORDER BY k1_a, k1_b",
+            false,
+            true,
+        ),
+    ];
+
+    for (label, sql, expect_pushed, cte_mat) in cases {
+        for pushdown in [false, true] {
+            let stock = make_ctx("off", pushdown, cte_mat).await?;
+            let native = make_ctx("required", pushdown, cte_mat).await?;
+            let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+            let pushed = metric(plan.as_ref(), "join_dynamic_filters_pushed");
+            if expect_pushed {
+                assert!(
+                    pushed > 0,
+                    "{label} pushdown={pushdown}: expected join_dynamic_filters_pushed > 0, got 0"
+                );
+            } else {
+                assert_eq!(
+                    pushed, 0,
+                    "{label} pushdown={pushdown}: expected join_dynamic_filters_pushed == 0, got {pushed}"
+                );
+            }
+        }
+    }
+
+    // Concurrent & repeated execution of the same compiled cross-Aggregate plan
+    // must be immutable and leak zero MemoryPool bytes.
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()?;
+    let mut cfg = SessionConfig::new().with_target_partitions(4);
+    cfg.options_mut().execution.parquet.pushdown_filters = true;
+    cfg.options_mut().execution.parquet.pruning = true;
+    cfg.options_mut().execution.collect_statistics = false;
+    let ctx = SessionContext::new_with_config_rt(cfg, runtime);
+    ctx.register_parquet(
+        "fact",
+        fact_dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.register_parquet(
+        "dim1",
+        dim1_dir.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+    ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    let plan = ctx
+        .sql(
+            "SELECT d.dk1, a.s FROM dim1 d \
+             INNER JOIN (SELECT k1, SUM(val) AS s FROM fact GROUP BY k1) a \
+             ON d.dk1 = a.k1 ORDER BY d.dk1",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    let first = sorted_rows(&collect(Arc::clone(&plan), ctx.task_ctx()).await?)?;
+    let futs = (0..4).map(|_| {
+        let p = Arc::clone(&plan);
+        let tc = ctx.task_ctx();
+        async move {
+            let batches = collect(p, tc).await?;
+            sorted_rows(&batches)
+        }
+    });
+    for got in futures::future::try_join_all(futs).await? {
+        assert_eq!(got, first, "concurrent cross-Aggregate execution mismatch");
+    }
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "MemoryPool must have 0 reserved bytes after concurrent cross-Aggregate runs"
+    );
+
+    Ok(())
+}
