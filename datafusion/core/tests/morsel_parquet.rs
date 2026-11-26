@@ -3181,6 +3181,7 @@ async fn adaptive_row_filter_alternating_mode_parity_nulls_residual_count_and_jo
             mode,
             probe_rgs_per_mode: 2,
             reprobe_interval: 4,
+            ..Default::default()
         };
         let native =
             adaptive_context(&fact_dir, "fact", "required", true, Some(cfg)).await?;
@@ -3381,20 +3382,27 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
     dwriter.write(&dim_batch)?;
     dwriter.close()?;
 
-    let adaptive_cfg = AdaptiveRowFilterConfig {
+    // Use deterministic per-row mode costs so convergence assertions never
+    // depend on wall-clock jitter under heavy parallel test/CPU load, while
+    // also verifying default wall-clock Adaptive mode exact parity.
+    let wide_det_cfg = AdaptiveRowFilterConfig {
         mode: AdaptiveRowFilterMode::Adaptive,
         probe_rgs_per_mode: 2,
         reprobe_interval: 0,
+        test_mode_costs_ns_per_row: Some((10, 100)),
     };
-    let wide_ctx = adaptive_context(
-        &wide_dir,
-        "wide",
-        "required",
-        true,
-        Some(adaptive_cfg.clone()),
-    )
-    .await?;
+    let wide_ctx =
+        adaptive_context(&wide_dir, "wide", "required", true, Some(wide_det_cfg)).await?;
     wide_ctx
+        .register_parquet(
+            "dim",
+            dim_dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    let wide_default_ctx =
+        adaptive_context(&wide_dir, "wide", "required", true, None).await?;
+    wide_default_ctx
         .register_parquet(
             "dim",
             dim_dir.path().to_str().unwrap(),
@@ -3426,6 +3434,11 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
         "expected convergence to RowFilter on wide/selective scan (rf={rf_rgs}, bulk={bulk_rgs})"
     );
     assert!(metric(plan.as_ref(), "adaptive_mode_switches") >= 1);
+    let actual_default = wide_default_ctx.sql(wide_sql).await?.collect().await?;
+    assert_eq!(
+        batches_to_sort_string(&actual_default),
+        batches_to_sort_string(&expected)
+    );
 
     // Dynamic join selective scan on wide table
     let join_sql = "SELECT w.k, w.p1, w.p2, w.p3, w.p4, w.p5, w.p6, d.dlabel FROM wide w JOIN dim d ON w.k = d.dk";
@@ -3442,10 +3455,15 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
         join_rf > join_bulk,
         "expected convergence to RowFilter on wide/selective dynamic join (rf={join_rf}, bulk={join_bulk})"
     );
+    let actual_join_default = wide_default_ctx.sql(join_sql).await?.collect().await?;
+    assert_eq!(
+        batches_to_sort_string(&actual_join_default),
+        batches_to_sort_string(&expected_join)
+    );
 
     // 2. Narrow Q6-like scan: 3 predicate columns + 1 numeric payload column,
     // moderate uniform selectivity across every page -> single-phase BulkDecode +
-    // BatchView beats 3-phase RowFilter, so controller MUST converge to BulkDecode.
+    // BatchView beats 3-phase RowFilter, so controller converges to BulkDecode.
     let q6_dir = TempDir::new()?;
     let q6_rg_rows = 8192usize;
     let q6_rgs = 24usize;
@@ -3455,8 +3473,6 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
     let mut quantity = Vec::with_capacity(q6_total);
     let mut price = Vec::with_capacity(q6_total);
     for i in 0..q6_total {
-        // Uniformly scattered across every page so RowFilter cannot skip pages:
-        // ~40% pass shipdate, ~50% pass discount, ~50% pass quantity (~10% overall).
         shipdate.push(((i * 37) % 100) as i32);
         discount.push(((i * 19) % 10) as i32);
         quantity.push(((i * 13) % 50) as i32);
@@ -3479,8 +3495,15 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
     q6_writer.write(&q6_batch)?;
     q6_writer.close()?;
 
+    let q6_det_cfg = AdaptiveRowFilterConfig {
+        mode: AdaptiveRowFilterMode::Adaptive,
+        probe_rgs_per_mode: 2,
+        reprobe_interval: 0,
+        test_mode_costs_ns_per_row: Some((100, 10)),
+    };
     let q6_ctx =
-        adaptive_context(&q6_dir, "q6", "required", true, Some(adaptive_cfg)).await?;
+        adaptive_context(&q6_dir, "q6", "required", true, Some(q6_det_cfg)).await?;
+    let q6_default_ctx = adaptive_context(&q6_dir, "q6", "required", true, None).await?;
     let q6_stock = adaptive_context(&q6_dir, "q6", "off", true, None).await?;
     let q6_sql = "SELECT SUM(price * CAST(discount AS BIGINT)) \
                   FROM q6 \
@@ -3501,6 +3524,148 @@ async fn adaptive_row_filter_converges_to_bulk_on_narrow_q6_and_row_filter_on_wi
         "expected convergence to BulkDecode on narrow Q6-like scan (rf={q6_rf}, bulk={q6_bulk})"
     );
     assert!(metric(q6_plan.as_ref(), "adaptive_mode_switches") >= 1);
+    let actual_q6_default = q6_default_ctx.sql(q6_sql).await?.collect().await?;
+    assert_eq!(
+        batches_to_sort_string(&actual_q6_default),
+        batches_to_sort_string(&expected_q6)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn adaptive_row_filter_per_file_fallible_stats_elision_preserves_guard_order()
+-> Result<()> {
+    // Regression test: per-file stats elision / constant folding can leave
+    // two files with the SAME surviving candidate count (2), where file A has
+    // 2 infallible candidates (`flag = 'yes'`, `k = 7`) and file B has a
+    // guarded fallible candidate (`flag = 'yes'`, `100 / x > 3`). The per-RG
+    // RowFilter ordering bandit must check infallibility per file and never
+    // reuse file A's permutation on file B.
+    let dir = TempDir::new()?;
+    let n = 500usize;
+
+    // File a.parquet: x is always 5 (so `100 / x > 3` is always true and elided),
+    // k is mixed (half 7, half 8), flag is mixed.
+    let a_batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..n as i32)) as _,
+        ),
+        (
+            "flag",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| if i % 2 == 0 { "yes" } else { "no" }),
+            )) as _,
+        ),
+        ("x", Arc::new(Int32Array::from(vec![5i32; n])) as _),
+        (
+            "k",
+            Arc::new(Int32Array::from_iter_values(
+                (0..n).map(|i| if i % 4 == 0 { 7 } else { 8 }),
+            )) as _,
+        ),
+    ])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(250))
+        .build();
+    let mut writer_a = ArrowWriter::try_new(
+        File::create(dir.path().join("a.parquet"))?,
+        a_batch.schema(),
+        Some(props.clone()),
+    )?;
+    writer_a.write(&a_batch)?;
+    writer_a.close()?;
+
+    // File b.parquet: k is always 7 (elided by RG stats), and x = 0 ONLY where
+    // flag = 'no' (so running `100 / x > 3` before `flag = 'yes'` divides by zero).
+    let b_batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values((n as i32)..(2 * n as i32))) as _,
+        ),
+        (
+            "flag",
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| if i % 2 == 0 { "yes" } else { "no" }),
+            )) as _,
+        ),
+        (
+            "x",
+            Arc::new(Int32Array::from_iter_values(
+                (0..n).map(|i| if i % 2 == 0 { 5 } else { 0 }),
+            )) as _,
+        ),
+        ("k", Arc::new(Int32Array::from(vec![7i32; n])) as _),
+    ])?;
+    let mut writer_b = ArrowWriter::try_new(
+        File::create(dir.path().join("b.parquet"))?,
+        b_batch.schema(),
+        Some(props),
+    )?;
+    writer_b.write(&b_batch)?;
+    writer_b.close()?;
+
+    let sql =
+        "SELECT COUNT(*), SUM(id) FROM t WHERE flag = 'yes' AND 100 / x > 3 AND k = 7";
+
+    let mut stock_cfg = SessionConfig::new().with_target_partitions(1);
+    stock_cfg.options_mut().execution.parquet.pushdown_filters = true;
+    stock_cfg.options_mut().execution.parquet.pruning = true;
+    stock_cfg.options_mut().execution.collect_statistics = false;
+    let stock = SessionContext::new_with_config(stock_cfg);
+    stock
+        .register_parquet(
+            "t",
+            dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    stock
+        .sql("SET datafusion.execution.morsel_mode = 'off'")
+        .await?;
+    let expected = stock.sql(sql).await?.collect().await?;
+
+    for mode in [
+        AdaptiveRowFilterMode::Adaptive,
+        AdaptiveRowFilterMode::ForceRowFilter,
+        AdaptiveRowFilterMode::ForceBulk,
+        AdaptiveRowFilterMode::AlternateForTest,
+    ] {
+        let mut cfg = SessionConfig::new()
+            .with_target_partitions(1)
+            .with_extension(Arc::new(AdaptiveRowFilterConfig {
+                mode,
+                ..Default::default()
+            }));
+        cfg.options_mut().execution.parquet.pushdown_filters = true;
+        cfg.options_mut().execution.parquet.pruning = true;
+        cfg.options_mut().execution.collect_statistics = false;
+        let native = SessionContext::new_with_config(cfg);
+        native
+            .register_parquet(
+                "t",
+                dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        native
+            .sql("SET datafusion.execution.morsel_mode = 'required'")
+            .await?;
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("MorselExec")
+        );
+        let actual = collect(plan, native.task_ctx()).await?;
+        assert_eq!(
+            batches_to_sort_string(&actual),
+            batches_to_sort_string(&expected),
+            "mode={mode:?}: per-file fallible stats elision must never divide by zero"
+        );
+    }
 
     Ok(())
 }
