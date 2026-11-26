@@ -203,6 +203,18 @@ impl WorkerMetrics {
         time(self.run.as_ref().map(|_| &mut self.process), f)
     }
 
+    pub(super) async fn process_async<T>(
+        &mut self,
+        future: impl Future<Output = T>,
+    ) -> T {
+        let start = self.run.as_ref().map(|_| Instant::now());
+        let result = future.await;
+        if let Some(start) = start {
+            self.process += start.elapsed();
+        }
+        result
+    }
+
     #[cfg(feature = "parquet")]
     pub(super) fn decode<T>(&mut self, f: impl FnOnce() -> T) -> T {
         time(self.run.as_ref().map(|_| &mut self.decode), f)

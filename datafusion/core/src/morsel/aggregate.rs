@@ -12,12 +12,12 @@ use arrow::array::types::{
 };
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, Float64Array, Int32Array, Int64Array,
-    NullBufferBuilder, PrimitiveArray, RecordBatch,
+    NullBufferBuilder, PrimitiveArray, RecordBatch, UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{HashMap, Result, ScalarValue, internal_err};
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_common::{DataFusionError, HashMap, Result, ScalarValue, internal_err};
+use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
 use datafusion_expr::expr::{AggregateFunctionParams, physical_name};
 use datafusion_expr::logical_plan::Aggregate;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -45,8 +45,15 @@ use super::batch::{
     BatchView, Selection, collect_expr_column_indices, remap_expr_columns,
 };
 use super::count::count_overflow;
-use super::group_count::IntKeyType;
+use super::group_count::{IntKeyHash, IntKeyType, hash_int_key_array};
 use super::metrics::{self, RunMetrics};
+use super::radix_agg::{
+    NULL_GROUP_HASH, PREAGG_FLUSH_BYTES, PREAGG_FLUSH_GROUPS, RADIX_TRANSITION_GROUPS,
+    RadixFinalizeConfig, RadixGroupMerger, RadixPartitionStore, ResultOpsRef,
+    emit_finalized_batch, finalize_and_emit_radix, has_float_group_type,
+    hash_group_columns,
+};
+use super::spill::SpillContext;
 use super::{Operator, apply_operators, supported_expr};
 
 const MERGE_CHUNK_SIZE: usize = 4096;
@@ -310,10 +317,42 @@ fn try_build_direct_grouped_spec(
     })
 }
 
+fn direct_grouped_partial_schema(spec: &DirectGroupedSpec) -> SchemaRef {
+    let mut fields = Vec::with_capacity(1 + spec.aggs.len() * 2);
+    fields.push(Field::new("k", spec.key_type.data_type(), true));
+    for (idx, agg) in spec.aggs.iter().enumerate() {
+        match agg {
+            DirectAggSpec::CountStar | DirectAggSpec::CountCol(_) => {
+                fields.push(Field::new(format!("c_{idx}"), DataType::Int64, false));
+            }
+            DirectAggSpec::SumInt64(_) | DirectAggSpec::SumInt32(_) => {
+                fields.push(Field::new(format!("s_{idx}"), DataType::Int64, true));
+            }
+            DirectAggSpec::SumFloat64(_) => {
+                fields.push(Field::new(format!("s_{idx}"), DataType::Float64, true));
+            }
+            DirectAggSpec::AvgFloat64(_) => {
+                fields.push(Field::new(format!("s_{idx}"), DataType::Float64, false));
+                fields.push(Field::new(format!("n_{idx}"), DataType::UInt64, false));
+            }
+            DirectAggSpec::MinInt64(_) | DirectAggSpec::MaxInt64(_) => {
+                fields.push(Field::new(format!("m_{idx}"), DataType::Int64, true));
+            }
+            DirectAggSpec::MinInt32(_) | DirectAggSpec::MaxInt32(_) => {
+                fields.push(Field::new(format!("m_{idx}"), DataType::Int32, true));
+            }
+        }
+    }
+    Arc::new(Schema::new(fields))
+}
+
 #[derive(Debug)]
 pub(super) struct AggregateSink {
     schema: SchemaRef,
     group_schema: Option<SchemaRef>,
+    partial_schema: Option<SchemaRef>,
+    state_col_counts: Vec<usize>,
+    has_float_keys: bool,
     group_exprs: Vec<Arc<dyn PhysicalExpr>>,
     group_names: Vec<String>,
     aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
@@ -444,10 +483,34 @@ impl AggregateSink {
             .collect::<Result<Vec<_>>>()?;
         let direct_grouped =
             try_build_direct_grouped_spec(&group_exprs, &aggr_exprs, input_schema);
+        let has_float_keys = group_schema.as_ref().is_some_and(has_float_group_type);
+        let (partial_schema, state_col_counts) = if let Some(spec) = &direct_grouped {
+            (Some(direct_grouped_partial_schema(spec)), Vec::new())
+        } else if let Some(gs) = &group_schema {
+            let mut fields: Vec<Arc<Field>> = gs
+                .fields()
+                .iter()
+                .map(|f| Arc::new((**f).clone().with_nullable(true)))
+                .collect();
+            let mut counts = Vec::with_capacity(aggr_exprs.len());
+            for aggr in &aggr_exprs {
+                let sf = aggr.state_fields()?;
+                counts.push(sf.len());
+                for f in sf {
+                    fields.push(Arc::new((*f).clone().with_nullable(true)));
+                }
+            }
+            (Some(Arc::new(Schema::new(fields))), counts)
+        } else {
+            (None, Vec::new())
+        };
 
         Ok(Ok(Self {
             schema,
             group_schema,
+            partial_schema,
+            state_col_counts,
+            has_float_keys,
             group_exprs,
             group_names,
             aggr_exprs,
@@ -485,9 +548,23 @@ impl AggregateSink {
         let rebound_group_exprs = group_exprs.clone();
         let direct_grouped =
             try_build_direct_grouped_spec(&group_exprs, &[], input_schema);
+        let has_float_keys = has_float_group_type(input_schema);
+        let partial_schema = if let Some(spec) = &direct_grouped {
+            Some(direct_grouped_partial_schema(spec))
+        } else {
+            let fields: Vec<Arc<Field>> = input_schema
+                .fields()
+                .iter()
+                .map(|f| Arc::new((**f).clone().with_nullable(true)))
+                .collect();
+            Some(Arc::new(Schema::new(fields)))
+        };
         Ok(Ok(Self {
             schema: Arc::clone(input_schema),
             group_schema: Some(Arc::clone(input_schema)),
+            partial_schema,
+            state_col_counts: Vec::new(),
+            has_float_keys,
             group_exprs,
             group_names,
             aggr_exprs: Vec::new(),
@@ -508,14 +585,34 @@ impl AggregateSink {
         &self.schema
     }
 
+    pub(super) fn partial_schema(&self) -> Option<&SchemaRef> {
+        self.partial_schema.as_ref()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new_state(
         &self,
         reservation: MemoryReservation,
     ) -> Result<AggregateState> {
+        self.new_state_with_spill(reservation, None)
+    }
+
+    pub(super) fn new_state_with_spill(
+        &self,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+    ) -> Result<AggregateState> {
         if let Some(spec) = &self.direct_grouped {
+            let partial_schema = Arc::clone(
+                self.partial_schema
+                    .as_ref()
+                    .expect("direct grouped partial schema"),
+            );
             return Ok(AggregateState::DirectGrouped(DirectGroupedState::new(
                 spec,
+                partial_schema,
                 reservation,
+                spill,
             )));
         }
 
@@ -571,8 +668,14 @@ impl AggregateSink {
                     .iter()
                     .map(|aggr| create_groups_accumulator(aggr, false))
                     .collect::<Result<Vec<_>>>()?;
+                let partial_schema = Arc::clone(
+                    self.partial_schema
+                        .as_ref()
+                        .expect("grouped partial schema"),
+                );
                 Ok(AggregateState::Grouped(GroupedState {
                     group_values,
+                    group_schema: Arc::clone(group_schema),
                     group_exprs,
                     rebound_group_exprs,
                     accumulators,
@@ -580,6 +683,12 @@ impl AggregateSink {
                     rebound_aggr_args,
                     needed_columns: self.needed_columns.clone(),
                     group_indices: Vec::new(),
+                    partial_schema,
+                    has_float_keys: self.has_float_keys,
+                    table_tracked_bytes: 0,
+                    radix: None,
+                    spill,
+                    hash_buf: Vec::new(),
                     reservation,
                 }))
             }
@@ -589,6 +698,11 @@ impl AggregateSink {
     pub(super) fn finalize(&self, combined: AggregateState) -> FinalizedAggregate {
         FinalizedAggregate {
             schema: Arc::clone(&self.schema),
+            group_schema: self.group_schema.clone(),
+            aggr_exprs: self.aggr_exprs.clone(),
+            state_col_counts: self.state_col_counts.clone(),
+            has_float_keys: self.has_float_keys,
+            direct_grouped: self.direct_grouped.clone(),
             state: combined,
         }
     }
@@ -634,6 +748,7 @@ pub(super) enum AggregateState {
 }
 
 impl AggregateState {
+    #[cfg(test)]
     pub(super) fn add_view(&mut self, view: &BatchView) -> Result<()> {
         if view.is_empty() {
             return Ok(());
@@ -642,6 +757,21 @@ impl AggregateState {
             Self::Ungrouped(state) => state.add_view(view),
             Self::Grouped(state) => state.add_view(view),
             Self::DirectGrouped(state) => state.add_view(view),
+        }
+    }
+
+    pub(super) fn add_view_spillable(
+        &mut self,
+        view: &BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Ungrouped(state) => state.add_view(view),
+            Self::Grouped(state) => state.add_view_spillable(view, tx),
+            Self::DirectGrouped(state) => state.add_view_spillable(view, tx),
         }
     }
 
@@ -781,6 +911,7 @@ impl UngroupedState {
 
 pub(super) struct GroupedState {
     group_values: Box<dyn GroupValues>,
+    group_schema: SchemaRef,
     group_exprs: Vec<ArgEvaluator>,
     rebound_group_exprs: Vec<ArgEvaluator>,
     accumulators: Vec<Box<dyn GroupsAccumulator>>,
@@ -788,6 +919,12 @@ pub(super) struct GroupedState {
     rebound_aggr_args: Vec<Vec<ArgEvaluator>>,
     needed_columns: Vec<usize>,
     group_indices: Vec<usize>,
+    partial_schema: SchemaRef,
+    has_float_keys: bool,
+    table_tracked_bytes: usize,
+    radix: Option<RadixPartitionStore>,
+    spill: Option<SpillContext>,
+    hash_buf: Vec<u64>,
     reservation: MemoryReservation,
 }
 
@@ -808,60 +945,215 @@ impl GroupedState {
 
     fn update_reservation(&mut self) -> Result<()> {
         let bytes = self.tracked_bytes();
-        if bytes != self.reservation.size() {
-            self.reservation.try_resize(bytes)?;
+        if bytes > self.table_tracked_bytes {
+            self.reservation
+                .try_grow(bytes - self.table_tracked_bytes)?;
+        } else if bytes < self.table_tracked_bytes {
+            self.reservation.shrink(self.table_tracked_bytes - bytes);
+        }
+        self.table_tracked_bytes = bytes;
+        Ok(())
+    }
+
+    fn sync_reservation_unconditional(&mut self) {
+        let bytes = self.tracked_bytes();
+        if bytes > self.table_tracked_bytes {
+            self.reservation.grow(bytes - self.table_tracked_bytes);
+        } else if bytes < self.table_tracked_bytes {
+            self.reservation.shrink(self.table_tracked_bytes - bytes);
+        }
+        self.table_tracked_bytes = bytes;
+    }
+
+    fn estimate_batch_delta(&self, num_rows: usize, key_arrays: &[ArrayRef]) -> usize {
+        let key_bytes = arrays_memory_size(key_arrays);
+        let per_row = 24usize.saturating_add(self.accumulators.len().saturating_mul(24));
+        key_bytes.saturating_add(num_rows.saturating_mul(per_row))
+    }
+
+    fn check_batch_headroom(&self, est_bytes: usize) -> bool {
+        if est_bytes == 0 {
+            return true;
+        }
+        let probe = self.reservation.new_empty();
+        probe.try_grow(est_bytes).is_ok()
+    }
+
+    fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        if self.group_values.is_empty() {
+            return Ok(());
+        }
+        let group_arrays = self.group_values.emit(EmitTo::All)?;
+        // Reset `group_values` cleanly after `EmitTo::All`: `GroupValuesColumn`
+        // (multi-column GROUP BY) replaces its value vectors without clearing
+        // its internal hash table unless rebuilt/cleared.
+        self.group_values =
+            new_group_values(Arc::clone(&self.group_schema), &GroupClustering::None)?;
+        hash_group_columns(&group_arrays, self.has_float_keys, &mut self.hash_buf)?;
+        let mut cols = group_arrays;
+        for acc in &mut self.accumulators {
+            cols.extend(acc.state(EmitTo::All)?);
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&self.partial_schema), cols)?;
+        self.sync_reservation_unconditional();
+
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        radix.push_partial_batch(
+            batch,
+            &self.hash_buf,
+            self.table_tracked_bytes,
+            &self.reservation,
+            self.spill.as_ref(),
+            tx,
+        )
+    }
+
+    fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        let Some(spill_ctx) = self.spill.clone() else {
+            return Err(DataFusionError::ResourcesExhausted(
+                "GroupedAggregate spilling is disabled".into(),
+            ));
+        };
+        spill_ctx.mark_spilled();
+        if !self.group_values.is_empty() {
+            self.flush_to_radix(tx)?;
+        }
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        radix.spill_all_mem(
+            self.table_tracked_bytes,
+            &self.reservation,
+            &spill_ctx,
+            tx,
+        )?;
+        Ok(())
+    }
+
+    fn maybe_flush_preagg(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        let len = self.group_values.len();
+        let should_flush = if self.radix.is_some() {
+            len >= PREAGG_FLUSH_GROUPS || self.table_tracked_bytes >= PREAGG_FLUSH_BYTES
+        } else {
+            len >= RADIX_TRANSITION_GROUPS
+        };
+        if should_flush {
+            self.flush_to_radix(tx)?;
         }
         Ok(())
     }
 
-    fn add_view(&mut self, view: &BatchView) -> Result<()> {
-        if view.is_all() {
-            return self.add_batch(view.batch());
-        }
-        let compact = view.materialize_columns(&self.needed_columns)?;
-        let group_arrays = self
-            .rebound_group_exprs
-            .iter_mut()
-            .map(|expr| expr.evaluate(&compact))
-            .collect::<Result<Vec<_>>>()?;
-        self.group_values
-            .intern(&group_arrays, &mut self.group_indices)?;
-        let total_num_groups = self.group_values.len();
-        self.update_reservation()?;
-
-        for (acc, args) in self
-            .accumulators
-            .iter_mut()
-            .zip(&mut self.rebound_aggr_args)
-        {
-            let arrays = args
+    fn eval_group_exprs(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+    ) -> Result<Vec<ArrayRef>> {
+        if rebound {
+            self.rebound_group_exprs
                 .iter_mut()
-                .map(|arg| arg.evaluate(&compact))
-                .collect::<Result<Vec<_>>>()?;
-            acc.update_batch(&arrays, &self.group_indices, None, total_num_groups)?;
+                .map(|expr| expr.evaluate(batch))
+                .collect()
+        } else {
+            self.group_exprs
+                .iter_mut()
+                .map(|expr| expr.evaluate(batch))
+                .collect()
         }
-        self.update_reservation()
     }
 
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let group_arrays = self
-            .group_exprs
-            .iter_mut()
-            .map(|expr| expr.evaluate(batch))
-            .collect::<Result<Vec<_>>>()?;
+    fn ingest_dense_with_group_arrays(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+        group_arrays: &[ArrayRef],
+    ) -> Result<()> {
         self.group_values
-            .intern(&group_arrays, &mut self.group_indices)?;
+            .intern(group_arrays, &mut self.group_indices)?;
         let total_num_groups = self.group_values.len();
-        self.update_reservation()?;
 
-        for (acc, args) in self.accumulators.iter_mut().zip(&mut self.aggr_args) {
+        let args_iter = if rebound {
+            &mut self.rebound_aggr_args
+        } else {
+            &mut self.aggr_args
+        };
+        for (acc, args) in self.accumulators.iter_mut().zip(args_iter.iter_mut()) {
             let arrays = args
                 .iter_mut()
                 .map(|arg| arg.evaluate(batch))
                 .collect::<Result<Vec<_>>>()?;
             acc.update_batch(&arrays, &self.group_indices, None, total_num_groups)?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn ingest_dense_unchecked(
+        &mut self,
+        batch: &RecordBatch,
+        rebound: bool,
+    ) -> Result<()> {
+        let group_arrays = self.eval_group_exprs(batch, rebound)?;
+        self.ingest_dense_with_group_arrays(batch, rebound, &group_arrays)
+    }
+
+    #[cfg(test)]
+    fn add_view(&mut self, view: &BatchView) -> Result<()> {
+        if view.is_all() {
+            return self.add_batch(view.batch());
+        }
+        let compact = view.materialize_columns(&self.needed_columns)?;
+        self.ingest_dense_unchecked(&compact, true)?;
         self.update_reservation()
+    }
+
+    #[cfg(test)]
+    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.ingest_dense_unchecked(batch, false)?;
+        self.update_reservation()
+    }
+
+    fn add_view_spillable(
+        &mut self,
+        view: &BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        let (batch, rebound) = if view.is_all() {
+            (view.batch().clone(), false)
+        } else {
+            (view.materialize_columns(&self.needed_columns)?, true)
+        };
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let group_arrays = self.eval_group_exprs(&batch, rebound)?;
+
+        // If spilling is enabled and we already hold groups, pre-check whether
+        // this batch might exceed the pool; flush consistent state first so we
+        // stay well within budget.
+        if self.spill.is_some() && !self.group_values.is_empty() {
+            let est = self.estimate_batch_delta(batch.num_rows(), &group_arrays);
+            if !self.check_batch_headroom(est) {
+                self.spill_on_oom(tx)?;
+            }
+        }
+
+        self.ingest_dense_with_group_arrays(&batch, rebound, &group_arrays)?;
+        if let Err(err) = self.update_reservation() {
+            if matches!(err, DataFusionError::ResourcesExhausted(_))
+                && self.spill.is_some()
+            {
+                // Both `group_values` and `accumulators` already include `batch`
+                // and are 100% consistent: spill them cleanly now and verify
+                // minimum headroom.
+                self.spill_on_oom(tx)?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+        self.maybe_flush_preagg(tx)
     }
 
     async fn merge_from(
@@ -869,6 +1161,30 @@ impl GroupedState {
         mut other: Self,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<bool> {
+        if self.radix.is_some()
+            || other.radix.is_some()
+            || self
+                .group_values
+                .len()
+                .saturating_add(other.group_values.len())
+                >= RADIX_TRANSITION_GROUPS
+        {
+            self.flush_to_radix(tx)?;
+            other.flush_to_radix(tx)?;
+            if tx.is_closed() {
+                return Ok(false);
+            }
+            if let Some(other_radix) = other.radix.take() {
+                let radix = self
+                    .radix
+                    .get_or_insert_with(RadixPartitionStore::new_default);
+                let transferred = other.reservation.free();
+                self.reservation.grow(transferred);
+                radix.combine_from(other_radix);
+            }
+            return Ok(true);
+        }
+
         if other.group_values.is_empty() {
             return Ok(true);
         }
@@ -913,7 +1229,6 @@ impl GroupedState {
             self.group_values
                 .intern(&chunk_keys, &mut self.group_indices)?;
             let total_num_groups = self.group_values.len();
-            self.update_reservation()?;
 
             for (acc, states) in self.accumulators.iter_mut().zip(&state_arrays) {
                 let chunk_states: Vec<ArrayRef> = states
@@ -946,7 +1261,6 @@ impl GroupedState {
         if self.group_values.is_empty() || tx.is_closed() {
             return Ok(());
         }
-        let batch_size = batch_size.max(1);
         let mut columns = self.group_values.emit(EmitTo::All)?;
         for acc in &mut self.accumulators {
             columns.push(acc.evaluate(EmitTo::All)?);
@@ -956,29 +1270,8 @@ impl GroupedState {
         let batch_reservation = self.reservation.new_empty();
         drop(self);
         batch_reservation.try_grow(batch_bytes)?;
-
-        let total_rows = batch.num_rows();
-        let mut offset = 0usize;
-        while offset < total_rows && !tx.is_closed() {
-            let len = (total_rows - offset).min(batch_size);
-            let slice = batch.slice(offset, len);
-            let out = apply_operators(result_operators, slice)?;
-            if out.num_rows() > 0 {
-                let sent = if let Some(run) = measurement {
-                    metrics::send(run, None, tx, out).await
-                } else {
-                    tx.send(out).await.is_ok()
-                };
-                if !sent {
-                    break;
-                }
-            }
-            offset += len;
-            if offset < total_rows {
-                tokio::task::yield_now().await;
-            }
-        }
-        drop(batch);
+        emit_finalized_batch(batch, result_operators, batch_size, tx, measurement)
+            .await?;
         drop(batch_reservation);
         Ok(())
     }
@@ -1591,6 +1884,300 @@ impl DirectAggState {
         Ok(())
     }
 
+    fn drain_to_partial_arrays(&mut self, out: &mut Vec<ArrayRef>) {
+        match self {
+            Self::CountStar(c) | Self::CountCol { counts: c, .. } => {
+                let vals = std::mem::take(c);
+                out.push(Arc::new(Int64Array::from(vals)));
+            }
+            Self::SumInt64 { sums, has_val, .. }
+            | Self::SumInt32 { sums, has_val, .. } => {
+                let vals = std::mem::take(sums);
+                let hv = std::mem::take(has_val);
+                let mut nulls = NullBufferBuilder::new(hv.len());
+                for v in hv {
+                    nulls.append(v);
+                }
+                out.push(Arc::new(Int64Array::new(vals.into(), nulls.finish())));
+            }
+            Self::SumFloat64 { sums, has_val, .. } => {
+                let vals = std::mem::take(sums);
+                let hv = std::mem::take(has_val);
+                let mut nulls = NullBufferBuilder::new(hv.len());
+                for v in hv {
+                    nulls.append(v);
+                }
+                out.push(Arc::new(Float64Array::new(vals.into(), nulls.finish())));
+            }
+            Self::AvgFloat64 { sums, counts, .. } => {
+                let s = std::mem::take(sums);
+                let c = std::mem::take(counts);
+                out.push(Arc::new(Float64Array::from(s)));
+                out.push(Arc::new(UInt64Array::from(c)));
+            }
+            Self::MinInt64 { vals, has_val, .. }
+            | Self::MaxInt64 { vals, has_val, .. } => {
+                let v = std::mem::take(vals);
+                let hv = std::mem::take(has_val);
+                let mut nulls = NullBufferBuilder::new(hv.len());
+                for b in hv {
+                    nulls.append(b);
+                }
+                out.push(Arc::new(Int64Array::new(v.into(), nulls.finish())));
+            }
+            Self::MinInt32 { vals, has_val, .. }
+            | Self::MaxInt32 { vals, has_val, .. } => {
+                let v = std::mem::take(vals);
+                let hv = std::mem::take(has_val);
+                let mut nulls = NullBufferBuilder::new(hv.len());
+                for b in hv {
+                    nulls.append(b);
+                }
+                out.push(Arc::new(Int32Array::new(v.into(), nulls.finish())));
+            }
+        }
+    }
+
+    fn merge_partial_columns(
+        &mut self,
+        batch: &RecordBatch,
+        col_offset: &mut usize,
+        group_indices: &[usize],
+    ) -> Result<()> {
+        match self {
+            Self::CountStar(counts) | Self::CountCol { counts, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 partial count column"
+                        )
+                    })?;
+                *col_offset += 1;
+                for (&c, &gid) in arr.values().iter().zip(group_indices.iter()) {
+                    counts[gid] =
+                        counts[gid].checked_add(c).ok_or_else(count_overflow)?;
+                }
+            }
+            Self::SumInt64 { sums, has_val, .. }
+            | Self::SumInt32 { sums, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 partial sum column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let vals = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in vals.iter().zip(group_indices.iter()) {
+                        sums[gid] = sums[gid].wrapping_add(v);
+                        has_val[gid] = true;
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        vals.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) {
+                            sums[gid] = sums[gid].wrapping_add(v);
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+            Self::SumFloat64 { sums, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Float64 partial sum column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let vals = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in vals.iter().zip(group_indices.iter()) {
+                        sums[gid] += v;
+                        has_val[gid] = true;
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        vals.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) {
+                            sums[gid] += v;
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+            Self::AvgFloat64 { sums, counts, .. } => {
+                let s_arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Float64 partial avg sum column"
+                        )
+                    })?;
+                let c_arr = batch
+                    .column(*col_offset + 1)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected UInt64 partial avg count column"
+                        )
+                    })?;
+                *col_offset += 2;
+                for ((&s, &c), &gid) in s_arr
+                    .values()
+                    .iter()
+                    .zip(c_arr.values().iter())
+                    .zip(group_indices.iter())
+                {
+                    sums[gid] += s;
+                    counts[gid] += c;
+                }
+            }
+            Self::MinInt64 { vals, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 partial min column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let src = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in src.iter().zip(group_indices.iter()) {
+                        if !has_val[gid] || v < vals[gid] {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        src.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) && (!has_val[gid] || v < vals[gid]) {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+            Self::MinInt32 { vals, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 partial min column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let src = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in src.iter().zip(group_indices.iter()) {
+                        if !has_val[gid] || v < vals[gid] {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        src.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) && (!has_val[gid] || v < vals[gid]) {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+            Self::MaxInt64 { vals, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 partial max column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let src = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in src.iter().zip(group_indices.iter()) {
+                        if !has_val[gid] || v > vals[gid] {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        src.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) && (!has_val[gid] || v > vals[gid]) {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+            Self::MaxInt32 { vals, has_val, .. } => {
+                let arr = batch
+                    .column(*col_offset)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 partial max column"
+                        )
+                    })?;
+                *col_offset += 1;
+                let src = arr.values();
+                if arr.null_count() == 0 {
+                    for (&v, &gid) in src.iter().zip(group_indices.iter()) {
+                        if !has_val[gid] || v > vals[gid] {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    for (i, (&v, &gid)) in
+                        src.iter().zip(group_indices.iter()).enumerate()
+                    {
+                        if nulls.is_valid(i) && (!has_val[gid] || v > vals[gid]) {
+                            vals[gid] = v;
+                            has_val[gid] = true;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn evaluate_range(&self, start: usize, len: usize) -> ArrayRef {
         let end = start + len;
         match self {
@@ -1658,9 +2245,99 @@ impl DirectAggState {
     }
 }
 
+fn build_direct_raw_partial_batch(
+    view: &BatchView,
+    spec: &DirectGroupedSpec,
+    partial_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let batch = if view.is_all() {
+        view.batch().clone()
+    } else {
+        view.clone().materialize()?
+    };
+    let n = batch.num_rows();
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(partial_schema.fields().len());
+    cols.push(Arc::clone(batch.column(spec.key_index)));
+    for agg in &spec.aggs {
+        match *agg {
+            DirectAggSpec::CountStar => {
+                cols.push(Arc::new(Int64Array::from(vec![1i64; n])));
+            }
+            DirectAggSpec::CountCol(col) => {
+                let arr = batch.column(col);
+                if matches!(arr.data_type(), DataType::Null) {
+                    cols.push(Arc::new(Int64Array::from(vec![0i64; n])));
+                } else if let Some(nulls) = arr.logical_nulls() {
+                    if nulls.null_count() == 0 {
+                        cols.push(Arc::new(Int64Array::from(vec![1i64; n])));
+                    } else {
+                        let counts: Vec<i64> =
+                            (0..n).map(|i| i64::from(nulls.is_valid(i))).collect();
+                        cols.push(Arc::new(Int64Array::from(counts)));
+                    }
+                } else {
+                    cols.push(Arc::new(Int64Array::from(vec![1i64; n])));
+                }
+            }
+            DirectAggSpec::SumInt64(col)
+            | DirectAggSpec::MinInt64(col)
+            | DirectAggSpec::MaxInt64(col)
+            | DirectAggSpec::SumFloat64(col)
+            | DirectAggSpec::MinInt32(col)
+            | DirectAggSpec::MaxInt32(col) => {
+                cols.push(Arc::clone(batch.column(col)));
+            }
+            DirectAggSpec::SumInt32(col) => {
+                let arr = batch
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 column for SUM"
+                        )
+                    })?;
+                let vals: Vec<i64> = arr.values().iter().map(|&v| v as i64).collect();
+                cols.push(Arc::new(Int64Array::new(vals.into(), arr.nulls().cloned())));
+            }
+            DirectAggSpec::AvgFloat64(col) => {
+                let arr = batch
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Float64 column for AVG"
+                        )
+                    })?;
+                if arr.null_count() == 0 {
+                    cols.push(Arc::new(Float64Array::from(arr.values().to_vec())));
+                    cols.push(Arc::new(UInt64Array::from(vec![1u64; n])));
+                } else {
+                    let nulls = arr.nulls().unwrap();
+                    let mut sums = Vec::with_capacity(n);
+                    let mut counts = Vec::with_capacity(n);
+                    for (i, &v) in arr.values().iter().enumerate() {
+                        if nulls.is_valid(i) {
+                            sums.push(v);
+                            counts.push(1u64);
+                        } else {
+                            sums.push(0.0);
+                            counts.push(0u64);
+                        }
+                    }
+                    cols.push(Arc::new(Float64Array::from(sums)));
+                    cols.push(Arc::new(UInt64Array::from(counts)));
+                }
+            }
+        }
+    }
+    Ok(RecordBatch::try_new(Arc::clone(partial_schema), cols)?)
+}
+
 struct DirectIntGroupMap<T: ArrowPrimitiveType>
 where
-    T::Native: Eq + Hash,
+    T::Native: Eq + Hash + IntKeyHash,
 {
     key_index: usize,
     map: HashMap<T::Native, usize>,
@@ -1668,12 +2345,13 @@ where
     keys: Vec<Option<T::Native>>,
     aggs: Vec<DirectAggState>,
     group_indices: Vec<usize>,
+    table_tracked_bytes: usize,
     reservation: MemoryReservation,
 }
 
 impl<T: ArrowPrimitiveType> DirectIntGroupMap<T>
 where
-    T::Native: Eq + Hash,
+    T::Native: Eq + Hash + IntKeyHash,
 {
     fn new(
         key_index: usize,
@@ -1691,6 +2369,7 @@ where
                 .map(DirectAggState::from_spec)
                 .collect(),
             group_indices: Vec::new(),
+            table_tracked_bytes: 0,
             reservation,
         }
     }
@@ -1718,10 +2397,120 @@ where
 
     fn update_reservation(&mut self) -> Result<()> {
         let bytes = self.tracked_bytes();
-        if bytes != self.reservation.size() {
-            self.reservation.try_resize(bytes)?;
+        if bytes > self.table_tracked_bytes {
+            self.reservation
+                .try_grow(bytes - self.table_tracked_bytes)?;
+        } else if bytes < self.table_tracked_bytes {
+            self.reservation.shrink(self.table_tracked_bytes - bytes);
         }
+        self.table_tracked_bytes = bytes;
         Ok(())
+    }
+
+    fn sync_reservation_unconditional(&mut self) {
+        let bytes = self.tracked_bytes();
+        if bytes > self.table_tracked_bytes {
+            self.reservation.grow(bytes - self.table_tracked_bytes);
+        } else if bytes < self.table_tracked_bytes {
+            self.reservation.shrink(self.table_tracked_bytes - bytes);
+        }
+        self.table_tracked_bytes = bytes;
+    }
+
+    fn drain_to_partial_batch(
+        &mut self,
+        partial_schema: &SchemaRef,
+    ) -> Result<(RecordBatch, Vec<u64>)> {
+        let total = self.keys.len();
+        let mut key_vals = Vec::with_capacity(total);
+        let mut hashes = Vec::with_capacity(total);
+        let mut key_nulls = NullBufferBuilder::new(total);
+        for key in self.keys.drain(..) {
+            match key {
+                Some(k) => {
+                    key_vals.push(k);
+                    hashes.push(k.hash_group_key());
+                    key_nulls.append_non_null();
+                }
+                None => {
+                    key_vals.push(T::Native::default());
+                    hashes.push(NULL_GROUP_HASH);
+                    key_nulls.append_null();
+                }
+            }
+        }
+        self.map = HashMap::new();
+        self.null_gid = None;
+        self.group_indices.clear();
+        let mut cols = Vec::with_capacity(partial_schema.fields().len());
+        cols.push(Arc::new(PrimitiveArray::<T>::new(
+            key_vals.into(),
+            key_nulls.finish(),
+        )) as ArrayRef);
+        for agg in &mut self.aggs {
+            agg.drain_to_partial_arrays(&mut cols);
+        }
+        self.sync_reservation_unconditional();
+        let batch = RecordBatch::try_new(Arc::clone(partial_schema), cols)?;
+        Ok((batch, hashes))
+    }
+
+    fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let key_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .ok_or_else(|| {
+                datafusion_common::internal_datafusion_err!(
+                    "DirectGrouped partial key array type mismatch"
+                )
+            })?;
+        let values = key_arr.values();
+        self.group_indices.clear();
+        self.group_indices.try_reserve(values.len()).map_err(|e| {
+            datafusion_common::exec_datafusion_err!(
+                "Morsel DirectGrouped index buffer allocation failed: {e}"
+            )
+        })?;
+        if key_arr.null_count() == 0 {
+            for &k in values.iter() {
+                let gid = self.intern_key_unchecked(k);
+                self.group_indices.push(gid);
+            }
+        } else {
+            let nulls = key_arr.nulls().unwrap();
+            for (i, &k) in values.iter().enumerate() {
+                let gid = if nulls.is_valid(i) {
+                    self.intern_key_unchecked(k)
+                } else {
+                    self.intern_null()
+                };
+                self.group_indices.push(gid);
+            }
+        }
+        let num_groups = self.keys.len();
+        for agg in &mut self.aggs {
+            agg.resize(num_groups);
+        }
+        let mut col_offset = 1usize;
+        for agg in &mut self.aggs {
+            agg.merge_partial_columns(batch, &mut col_offset, &self.group_indices)?;
+        }
+        self.update_reservation()
+    }
+
+    #[inline]
+    fn intern_key_unchecked(&mut self, key: T::Native) -> usize {
+        if let Some(&gid) = self.map.get(&key) {
+            return gid;
+        }
+        let gid = self.keys.len();
+        self.map.insert(key, gid);
+        self.keys.push(Some(key));
+        gid
     }
 
     #[inline]
@@ -1738,6 +2527,12 @@ where
             let min_alloc = 8 * (size_of::<(T::Native, usize)>() + 1) + 32;
             let next_bytes = self.map.allocation_size().saturating_mul(2).max(min_alloc);
             self.reservation.try_grow(next_bytes)?;
+            let gid = self.keys.len();
+            self.map.insert(key, gid);
+            self.keys.push(Some(key));
+            self.reservation.shrink(next_bytes);
+            self.update_reservation()?;
+            return Ok(gid);
         }
         let gid = self.keys.len();
         self.map.insert(key, gid);
@@ -1756,7 +2551,7 @@ where
         gid
     }
 
-    fn add_view(&mut self, view: &BatchView) -> Result<()> {
+    fn add_view_unchecked(&mut self, view: &BatchView) -> Result<()> {
         let key_col = view.batch().column(self.key_index);
         let key_arr = key_col
             .as_any()
@@ -1782,7 +2577,7 @@ where
             Selection::All => {
                 if null_count == 0 {
                     for &k in values.iter() {
-                        let gid = self.intern_key(k)?;
+                        let gid = self.intern_key_unchecked(k);
                         self.group_indices.push(gid);
                     }
                 } else if null_count == key_arr.len() {
@@ -1792,7 +2587,7 @@ where
                     let nulls = key_arr.nulls().unwrap();
                     for (i, &k) in values.iter().enumerate() {
                         let gid = if nulls.is_valid(i) {
-                            self.intern_key(k)?
+                            self.intern_key_unchecked(k)
                         } else {
                             self.intern_null()
                         };
@@ -1803,7 +2598,7 @@ where
             Selection::Mask { bits, .. } => {
                 if null_count == 0 {
                     for i in bits.set_indices() {
-                        let gid = self.intern_key(values[i])?;
+                        let gid = self.intern_key_unchecked(values[i]);
                         self.group_indices.push(gid);
                     }
                 } else if null_count == key_arr.len() {
@@ -1813,7 +2608,7 @@ where
                     let nulls = key_arr.nulls().unwrap();
                     for i in bits.set_indices() {
                         let gid = if nulls.is_valid(i) {
-                            self.intern_key(values[i])?
+                            self.intern_key_unchecked(values[i])
                         } else {
                             self.intern_null()
                         };
@@ -1824,7 +2619,7 @@ where
             Selection::Indices(indices) => {
                 if null_count == 0 {
                     for &idx in indices.values() {
-                        let gid = self.intern_key(values[idx as usize])?;
+                        let gid = self.intern_key_unchecked(values[idx as usize]);
                         self.group_indices.push(gid);
                     }
                 } else if null_count == key_arr.len() {
@@ -1835,7 +2630,7 @@ where
                     for &idx in indices.values() {
                         let i = idx as usize;
                         let gid = if nulls.is_valid(i) {
-                            self.intern_key(values[i])?
+                            self.intern_key_unchecked(values[i])
                         } else {
                             self.intern_null()
                         };
@@ -1849,12 +2644,16 @@ where
         for agg in &mut self.aggs {
             agg.resize(num_groups);
         }
-        self.update_reservation()?;
-
         for agg in &mut self.aggs {
             agg.update_from_view(view, &self.group_indices)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn add_view(&mut self, view: &BatchView) -> Result<()> {
+        self.add_view_unchecked(view)?;
+        self.update_reservation()
     }
 
     async fn merge_from(
@@ -1974,73 +2773,290 @@ enum DirectGroupedKind {
     UInt64(DirectIntGroupMap<UInt64Type>),
 }
 
-pub(super) struct DirectGroupedState(DirectGroupedKind);
+macro_rules! dispatch_direct_kind {
+    ($kind:expr, $m:ident => $body:expr) => {
+        match $kind {
+            DirectGroupedKind::Int8($m) => $body,
+            DirectGroupedKind::Int16($m) => $body,
+            DirectGroupedKind::Int32($m) => $body,
+            DirectGroupedKind::Int64($m) => $body,
+            DirectGroupedKind::UInt8($m) => $body,
+            DirectGroupedKind::UInt16($m) => $body,
+            DirectGroupedKind::UInt32($m) => $body,
+            DirectGroupedKind::UInt64($m) => $body,
+        }
+    };
+}
 
-impl DirectGroupedState {
+impl DirectGroupedKind {
     fn new(spec: &DirectGroupedSpec, reservation: MemoryReservation) -> Self {
-        Self(match spec.key_type {
-            IntKeyType::Int8 => DirectGroupedKind::Int8(DirectIntGroupMap::new(
+        match spec.key_type {
+            IntKeyType::Int8 => Self::Int8(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::Int16 => DirectGroupedKind::Int16(DirectIntGroupMap::new(
+            IntKeyType::Int16 => Self::Int16(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::Int32 => DirectGroupedKind::Int32(DirectIntGroupMap::new(
+            IntKeyType::Int32 => Self::Int32(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::Int64 => DirectGroupedKind::Int64(DirectIntGroupMap::new(
+            IntKeyType::Int64 => Self::Int64(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::UInt8 => DirectGroupedKind::UInt8(DirectIntGroupMap::new(
+            IntKeyType::UInt8 => Self::UInt8(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::UInt16 => DirectGroupedKind::UInt16(DirectIntGroupMap::new(
+            IntKeyType::UInt16 => Self::UInt16(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::UInt32 => DirectGroupedKind::UInt32(DirectIntGroupMap::new(
+            IntKeyType::UInt32 => Self::UInt32(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-            IntKeyType::UInt64 => DirectGroupedKind::UInt64(DirectIntGroupMap::new(
+            IntKeyType::UInt64 => Self::UInt64(DirectIntGroupMap::new(
                 spec.key_index,
                 &spec.aggs,
                 reservation,
             )),
-        })
+        }
     }
 
-    fn add_view(&mut self, view: &BatchView) -> Result<()> {
-        match &mut self.0 {
-            DirectGroupedKind::Int8(m) => m.add_view(view),
-            DirectGroupedKind::Int16(m) => m.add_view(view),
-            DirectGroupedKind::Int32(m) => m.add_view(view),
-            DirectGroupedKind::Int64(m) => m.add_view(view),
-            DirectGroupedKind::UInt8(m) => m.add_view(view),
-            DirectGroupedKind::UInt16(m) => m.add_view(view),
-            DirectGroupedKind::UInt32(m) => m.add_view(view),
-            DirectGroupedKind::UInt64(m) => m.add_view(view),
+    fn len(&self) -> usize {
+        dispatch_direct_kind!(self, m => m.keys.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        dispatch_direct_kind!(self, m => m.keys.is_empty())
+    }
+
+    fn table_tracked_bytes(&self) -> usize {
+        dispatch_direct_kind!(self, m => m.table_tracked_bytes)
+    }
+
+    fn reservation(&self) -> &MemoryReservation {
+        dispatch_direct_kind!(self, m => &m.reservation)
+    }
+
+    fn into_reservation(self) -> MemoryReservation {
+        dispatch_direct_kind!(self, m => m.reservation)
+    }
+
+    fn update_reservation(&mut self) -> Result<()> {
+        dispatch_direct_kind!(self, m => m.update_reservation())
+    }
+
+    fn drain_to_partial_batch(
+        &mut self,
+        partial_schema: &SchemaRef,
+    ) -> Result<(RecordBatch, Vec<u64>)> {
+        dispatch_direct_kind!(self, m => m.drain_to_partial_batch(partial_schema))
+    }
+
+    fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        dispatch_direct_kind!(self, m => m.merge_partial_batch(batch))
+    }
+
+    fn add_view_unchecked(&mut self, view: &BatchView) -> Result<()> {
+        dispatch_direct_kind!(self, m => m.add_view_unchecked(view))
+    }
+
+    async fn emit(
+        self,
+        schema: &SchemaRef,
+        result_operators: &[Operator],
+        batch_size: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+        measurement: Option<&RunMetrics>,
+    ) -> Result<()> {
+        dispatch_direct_kind!(self, m => {
+            m.emit(schema, result_operators, batch_size, tx, measurement).await
+        })
+    }
+}
+
+pub(super) struct DirectGroupedState {
+    kind: DirectGroupedKind,
+    spec: DirectGroupedSpec,
+    partial_schema: SchemaRef,
+    radix: Option<RadixPartitionStore>,
+    spill: Option<SpillContext>,
+    direct_scatter: bool,
+    rows_since_flush: usize,
+    hash_buf: Vec<u64>,
+}
+
+impl DirectGroupedState {
+    fn new(
+        spec: &DirectGroupedSpec,
+        partial_schema: SchemaRef,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+    ) -> Self {
+        Self {
+            kind: DirectGroupedKind::new(spec, reservation),
+            spec: spec.clone(),
+            partial_schema,
+            radix: None,
+            spill,
+            direct_scatter: false,
+            rows_since_flush: 0,
+            hash_buf: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn add_view(&mut self, view: &BatchView) -> Result<()> {
+        dispatch_direct_kind!(&mut self.kind, m => m.add_view(view))
+    }
+
+    fn flush_to_radix(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        if self.kind.is_empty() {
+            return Ok(());
+        }
+        let (partial, hashes) = self.kind.drain_to_partial_batch(&self.partial_schema)?;
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        let extra = self.kind.table_tracked_bytes();
+        let res = self.kind.reservation();
+        radix.push_partial_batch(partial, &hashes, extra, res, self.spill.as_ref(), tx)
+    }
+
+    fn spill_on_oom(&mut self, tx: &mpsc::Sender<RecordBatch>) -> Result<()> {
+        let Some(spill_ctx) = self.spill.clone() else {
+            return Err(DataFusionError::ResourcesExhausted(
+                "DirectGrouped spilling is disabled".into(),
+            ));
+        };
+        spill_ctx.mark_spilled();
+        if !self.kind.is_empty() {
+            self.flush_to_radix(tx)?;
+        }
+        let radix = self
+            .radix
+            .get_or_insert_with(RadixPartitionStore::new_default);
+        let extra = self.kind.table_tracked_bytes();
+        let res = self.kind.reservation();
+        radix.spill_all_mem(extra, res, &spill_ctx, tx)?;
+        Ok(())
+    }
+
+    fn add_view_spillable(
+        &mut self,
+        view: &BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        // Adaptive direct radix scatter for low-reduction high-cardinality
+        // integer GROUP BY (e.g. TPC-H Q13: 750K distinct c_custkey over 7.5M rows).
+        if self.direct_scatter {
+            let partial =
+                build_direct_raw_partial_batch(view, &self.spec, &self.partial_schema)?;
+            hash_int_key_array(
+                partial.column(0),
+                self.spec.key_type,
+                &mut self.hash_buf,
+            )?;
+            let radix = self
+                .radix
+                .get_or_insert_with(RadixPartitionStore::new_default);
+            let extra = self.kind.table_tracked_bytes();
+            let res = self.kind.reservation();
+            return radix.push_partial_batch(
+                partial,
+                &self.hash_buf,
+                extra,
+                res,
+                self.spill.as_ref(),
+                tx,
+            );
+        }
+
+        // Pre-check memory before mutating `kind` when spilling is enabled and
+        // groups are already buffered.
+        if self.spill.is_some() && !self.kind.is_empty() {
+            let per_row = 32usize.saturating_add(self.spec.aggs.len().saturating_mul(16));
+            let est = view.num_rows().saturating_mul(per_row);
+            let probe = self.kind.reservation().new_empty();
+            if probe.try_grow(est).is_err() {
+                drop(probe);
+                self.spill_on_oom(tx)?;
+            }
+        }
+
+        self.kind.add_view_unchecked(view)?;
+        self.rows_since_flush = self.rows_since_flush.saturating_add(view.num_rows());
+        if let Err(err) = self.kind.update_reservation() {
+            if matches!(err, DataFusionError::ResourcesExhausted(_))
+                && self.spill.is_some()
+            {
+                self.spill_on_oom(tx)?;
+                self.rows_since_flush = 0;
+                return Ok(());
+            }
+            return Err(err);
+        }
+
+        let groups = self.kind.len();
+        let should_flush = if self.radix.is_some() {
+            groups >= PREAGG_FLUSH_GROUPS
+                || self.kind.table_tracked_bytes() >= PREAGG_FLUSH_BYTES
+        } else {
+            groups >= RADIX_TRANSITION_GROUPS
+        };
+        if should_flush {
+            let rows = self.rows_since_flush.max(1);
+            // Switch to direct radix scatter if pre-aggregation achieves <30% reduction.
+            if groups.saturating_mul(10) > rows.saturating_mul(7) {
+                self.direct_scatter = true;
+            }
+            self.rows_since_flush = 0;
+            self.flush_to_radix(tx)?;
+        }
+        Ok(())
     }
 
     async fn merge_from(
         &mut self,
-        other: Self,
+        mut other: Self,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<bool> {
-        match (&mut self.0, other.0) {
+        if self.radix.is_some()
+            || other.radix.is_some()
+            || self.kind.len().saturating_add(other.kind.len()) >= RADIX_TRANSITION_GROUPS
+        {
+            self.flush_to_radix(tx)?;
+            other.flush_to_radix(tx)?;
+            if tx.is_closed() {
+                return Ok(false);
+            }
+            if let Some(other_radix) = other.radix.take() {
+                let radix = self
+                    .radix
+                    .get_or_insert_with(RadixPartitionStore::new_default);
+                let transferred = other.kind.reservation().free();
+                self.kind.reservation().grow(transferred);
+                radix.combine_from(other_radix);
+            }
+            return Ok(true);
+        }
+
+        match (&mut self.kind, other.kind) {
             (DirectGroupedKind::Int8(a), DirectGroupedKind::Int8(b)) => {
                 a.merge_from(b, tx).await
             }
@@ -2068,79 +3084,310 @@ impl DirectGroupedState {
             _ => internal_err!("Morsel DirectGrouped worker state key type mismatch"),
         }
     }
+}
 
-    async fn emit(
-        self,
-        schema: &SchemaRef,
-        result_operators: &[Operator],
-        batch_size: usize,
-        tx: &mpsc::Sender<RecordBatch>,
-        measurement: Option<&RunMetrics>,
+struct GroupedPartitionTable {
+    group_values: Box<dyn GroupValues>,
+    accumulators: Vec<Box<dyn GroupsAccumulator>>,
+    group_indices: Vec<usize>,
+    reservation: MemoryReservation,
+}
+
+impl GroupedPartitionTable {
+    fn tracked_bytes(&self) -> usize {
+        let gv = self.group_values.size();
+        let accs = self
+            .accumulators
+            .iter()
+            .map(|a| a.size())
+            .fold(0usize, usize::saturating_add);
+        let idx = self
+            .group_indices
+            .capacity()
+            .saturating_mul(size_of::<usize>());
+        gv.saturating_add(accs).saturating_add(idx)
+    }
+}
+
+struct GroupedRadixMerger {
+    schema: SchemaRef,
+    group_schema: SchemaRef,
+    partial_schema: SchemaRef,
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+    state_col_counts: Vec<usize>,
+    has_float_keys: bool,
+}
+
+impl RadixGroupMerger for GroupedRadixMerger {
+    type Table = GroupedPartitionTable;
+
+    fn partial_schema(&self) -> &SchemaRef {
+        &self.partial_schema
+    }
+
+    fn num_group_cols(&self) -> usize {
+        self.group_schema.fields().len()
+    }
+
+    fn new_table(&self, reservation: MemoryReservation) -> Result<Self::Table> {
+        let group_values =
+            new_group_values(Arc::clone(&self.group_schema), &GroupClustering::None)?;
+        let accumulators = self
+            .aggr_exprs
+            .iter()
+            .map(|aggr| create_groups_accumulator(aggr, false))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(GroupedPartitionTable {
+            group_values,
+            accumulators,
+            group_indices: Vec::new(),
+            reservation,
+        })
+    }
+
+    fn merge_partial_batch(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
     ) -> Result<()> {
-        match self.0 {
-            DirectGroupedKind::Int8(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::Int16(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::Int32(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::Int64(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::UInt8(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::UInt16(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::UInt32(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
-            DirectGroupedKind::UInt64(m) => {
-                m.emit(schema, result_operators, batch_size, tx, measurement)
-                    .await
-            }
+        if batch.num_rows() == 0 {
+            return Ok(());
         }
+        let n_keys = self.num_group_cols();
+        let key_cols = &batch.columns()[..n_keys];
+        table
+            .group_values
+            .intern(key_cols, &mut table.group_indices)?;
+        let total_groups = table.group_values.len();
+        let mut offset = n_keys;
+        for (acc, &n_state) in table.accumulators.iter_mut().zip(&self.state_col_counts) {
+            let state_cols = &batch.columns()[offset..offset + n_state];
+            acc.merge_batch(state_cols, &table.group_indices, total_groups)?;
+            offset += n_state;
+        }
+        let bytes = table.tracked_bytes();
+        table.reservation.try_resize(bytes)?;
+        Ok(())
+    }
+
+    fn hash_partial_batch(
+        &self,
+        batch: &RecordBatch,
+        hashes: &mut Vec<u64>,
+    ) -> Result<()> {
+        let n_keys = self.num_group_cols();
+        hash_group_columns(&batch.columns()[..n_keys], self.has_float_keys, hashes)
+    }
+
+    fn table_is_empty(&self, table: &Self::Table) -> bool {
+        table.group_values.is_empty()
+    }
+
+    fn emit_table<'a>(
+        &'a self,
+        mut table: Self::Table,
+        result_operators: &'a [Operator],
+        batch_size: usize,
+        tx: &'a mpsc::Sender<RecordBatch>,
+        measurement: Option<&'a RunMetrics>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if table.group_values.is_empty() || tx.is_closed() {
+                return Ok(());
+            }
+            let mut columns = table.group_values.emit(EmitTo::All)?;
+            for acc in &mut table.accumulators {
+                columns.push(acc.evaluate(EmitTo::All)?);
+            }
+            let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
+            drop(table);
+            emit_finalized_batch(batch, result_operators, batch_size, tx, measurement)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+struct DirectGroupedRadixMerger {
+    schema: SchemaRef,
+    partial_schema: SchemaRef,
+    spec: DirectGroupedSpec,
+}
+
+impl RadixGroupMerger for DirectGroupedRadixMerger {
+    type Table = DirectGroupedKind;
+
+    fn partial_schema(&self) -> &SchemaRef {
+        &self.partial_schema
+    }
+
+    fn num_group_cols(&self) -> usize {
+        1
+    }
+
+    fn new_table(&self, reservation: MemoryReservation) -> Result<Self::Table> {
+        Ok(DirectGroupedKind::new(&self.spec, reservation))
+    }
+
+    fn merge_partial_batch(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        table.merge_partial_batch(batch)
+    }
+
+    fn hash_partial_batch(
+        &self,
+        batch: &RecordBatch,
+        hashes: &mut Vec<u64>,
+    ) -> Result<()> {
+        hash_int_key_array(batch.column(0), self.spec.key_type, hashes)
+    }
+
+    fn table_is_empty(&self, table: &Self::Table) -> bool {
+        table.is_empty()
+    }
+
+    fn emit_table<'a>(
+        &'a self,
+        table: Self::Table,
+        result_operators: &'a [Operator],
+        batch_size: usize,
+        tx: &'a mpsc::Sender<RecordBatch>,
+        measurement: Option<&'a RunMetrics>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            table
+                .emit(&self.schema, result_operators, batch_size, tx, measurement)
+                .await
+        })
     }
 }
 
 pub(super) struct FinalizedAggregate {
     schema: SchemaRef,
+    group_schema: Option<SchemaRef>,
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+    state_col_counts: Vec<usize>,
+    has_float_keys: bool,
+    direct_grouped: Option<DirectGroupedSpec>,
     state: AggregateState,
 }
 
 impl FinalizedAggregate {
+    pub(super) fn has_spilled(&self) -> bool {
+        match &self.state {
+            AggregateState::Ungrouped(_) => false,
+            AggregateState::Grouped(s) => s.radix.as_ref().is_some_and(|r| r.spilled),
+            AggregateState::DirectGrouped(s) => {
+                s.radix.as_ref().is_some_and(|r| r.spilled)
+            }
+        }
+    }
+
     pub(super) async fn emit(
         self,
-        result_operators: &[Operator],
+        result_operators: ResultOpsRef,
+        workers: usize,
         batch_size: usize,
+        memory_pool: &Arc<dyn MemoryPool>,
         tx: mpsc::Sender<RecordBatch>,
-        measurement: Option<&RunMetrics>,
+        measurement: Option<Arc<RunMetrics>>,
     ) -> Result<()> {
         match self.state {
             AggregateState::Ungrouped(state) => {
                 state
-                    .emit(&self.schema, result_operators, &tx, measurement)
+                    .emit(
+                        &self.schema,
+                        result_operators.ops(),
+                        &tx,
+                        measurement.as_deref(),
+                    )
                     .await
             }
-            AggregateState::Grouped(state) => {
+            AggregateState::Grouped(mut state) => {
+                if state.radix.is_some() {
+                    state.flush_to_radix(&tx)?;
+                    let store = state.radix.take().expect("radix store");
+                    let spill = state.spill.take();
+                    let partial_schema = state.partial_schema;
+                    let input_res = state.reservation;
+                    let merger = Arc::new(GroupedRadixMerger {
+                        schema: self.schema,
+                        group_schema: self
+                            .group_schema
+                            .expect("grouped aggregate group_schema"),
+                        partial_schema,
+                        aggr_exprs: self.aggr_exprs,
+                        state_col_counts: self.state_col_counts,
+                        has_float_keys: self.has_float_keys,
+                    });
+                    return finalize_and_emit_radix(
+                        merger,
+                        store,
+                        input_res,
+                        RadixFinalizeConfig {
+                            workers,
+                            batch_size,
+                            memory_pool,
+                            spill,
+                            consumer_name: "MorselAggregateFinalize",
+                            result_operators,
+                            measurement,
+                        },
+                        tx,
+                    )
+                    .await;
+                }
                 state
-                    .emit(&self.schema, result_operators, batch_size, &tx, measurement)
+                    .emit(
+                        &self.schema,
+                        result_operators.ops(),
+                        batch_size,
+                        &tx,
+                        measurement.as_deref(),
+                    )
                     .await
             }
-            AggregateState::DirectGrouped(state) => {
+            AggregateState::DirectGrouped(mut state) => {
+                if state.radix.is_some() {
+                    state.flush_to_radix(&tx)?;
+                    let store = state.radix.take().expect("radix store");
+                    let spill = state.spill.take();
+                    let partial_schema = state.partial_schema;
+                    let input_res = state.kind.into_reservation();
+                    let merger = Arc::new(DirectGroupedRadixMerger {
+                        schema: self.schema,
+                        partial_schema,
+                        spec: self.direct_grouped.expect("direct grouped spec"),
+                    });
+                    return finalize_and_emit_radix(
+                        merger,
+                        store,
+                        input_res,
+                        RadixFinalizeConfig {
+                            workers,
+                            batch_size,
+                            memory_pool,
+                            spill,
+                            consumer_name: "MorselAggregateFinalize",
+                            result_operators,
+                            measurement,
+                        },
+                        tx,
+                    )
+                    .await;
+                }
                 state
-                    .emit(&self.schema, result_operators, batch_size, &tx, measurement)
+                    .kind
+                    .emit(
+                        &self.schema,
+                        result_operators.ops(),
+                        batch_size,
+                        &tx,
+                        measurement.as_deref(),
+                    )
                     .await
             }
         }
@@ -2226,10 +3473,7 @@ mod tests {
             let mut state = sink.new_state(test_reservation(&tight))?;
             let err = state.add_batch(&make_batch(0, 1024)?).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "expected ResourcesExhausted, got: {err}"
             );
         }
@@ -2249,10 +3493,7 @@ mod tests {
             assert_eq!(merge_pool.reserved(), 2 * one_worker_bytes);
             let err = a.merge_from(b, &tx).await.unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "expected ResourcesExhausted at merge peak, got: {err}"
             );
         }
@@ -2269,8 +3510,12 @@ mod tests {
         assert!(a.merge_from(b, &tx).await?);
         assert!(ample.reserved() > 0);
         let finalized = sink.finalize(a);
-        let emit =
-            SpawnedTask::spawn(async move { finalized.emit(&[], 64, tx, None).await });
+        let emit_pool = Arc::clone(&ample);
+        let emit = SpawnedTask::spawn(async move {
+            finalized
+                .emit(ResultOpsRef::Empty, 1, 64, &emit_pool, tx, None)
+                .await
+        });
         let mut total_rows = 0;
         while let Some(batch) = rx.recv().await {
             assert!(batch.num_rows() <= 64);
@@ -2375,8 +3620,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         assert!(s_mask.merge_from(s_idx, &tx).await?);
         let finalized = sink.finalize(s_mask);
-        let emit =
-            SpawnedTask::spawn(async move { finalized.emit(&[], 2, tx, None).await });
+        let emit_pool = Arc::clone(&pool);
+        let emit = SpawnedTask::spawn(async move {
+            finalized
+                .emit(ResultOpsRef::Empty, 1, 2, &emit_pool, tx, None)
+                .await
+        });
         let mut results = std::collections::BTreeMap::new();
         while let Some(batch) = rx.recv().await {
             let ks = batch
@@ -2456,10 +3705,7 @@ mod tests {
             let mut state = sink.new_state(test_reservation(&tight))?;
             let err = state.add_view(&BatchView::all(big)).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    datafusion_common::DataFusionError::ResourcesExhausted(_)
-                ),
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
                 "{err}"
             );
         }
@@ -2529,10 +3775,12 @@ mod tests {
             state.add_view(&view)?;
             let (tx, mut rx) = mpsc::channel(4);
             let finalized = sink.finalize(state);
-            let emit =
-                SpawnedTask::spawn(
-                    async move { finalized.emit(&[], 16, tx, None).await },
-                );
+            let emit_pool = Arc::clone(&pool);
+            let emit = SpawnedTask::spawn(async move {
+                finalized
+                    .emit(ResultOpsRef::Empty, 1, 16, &emit_pool, tx, None)
+                    .await
+            });
             let mut map = std::collections::BTreeMap::new();
             while let Some(b) = rx.recv().await {
                 let ks = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

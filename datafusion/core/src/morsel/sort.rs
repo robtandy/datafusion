@@ -11,7 +11,8 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 
 use arrow::array::{
@@ -33,25 +34,31 @@ use arrow::datatypes::{
     UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::row::{RowConverter, SortField};
-use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::{
     RecordBatchMemoryCounter, RecordBatchMemoryTracker,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_common::{DataFusionError, Result};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::execution_plan::apply_expression_roots;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
-use datafusion_physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
+use datafusion_physical_plan::sorts::streaming_merge::{
+    SortedSpillFile, StreamingMergeBuilder,
+};
+use datafusion_physical_plan::spill::SpillManager;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::batch::{BatchView, Selection};
 use super::metrics::{self, RunMetrics};
+use super::spill::{SpillContext, SyncSpillWriter};
 use super::{Operator, apply_operators};
 
 /// Maximum incremental buffered bytes (after the first batch's shared buffers)
@@ -59,6 +66,12 @@ use super::{Operator, apply_operators};
 /// temporary memory on huge single-worker sorts while keeping ~1 run per worker
 /// even when batches inherit large shared view buffers (e.g. from a hash join).
 const MAX_LOCAL_SORT_RUN_BYTES: usize = 64 * 1024 * 1024;
+/// Smaller flush threshold once any sort worker has transitioned into spill mode
+/// so workers stream sorted runs to disk instead of competing for tight RAM.
+const MAX_SPILLED_LOCAL_SORT_RUN_BYTES: usize = 256 * 1024;
+/// Maximum number of per-worker spilled runs before compacting them into one
+/// merged run, bounding peak open spill file descriptors to `O(workers)`.
+const MAX_WORKER_SPILLED_RUNS: usize = 16;
 const MAX_INLINE_VIEW_LEN: u32 = 12;
 
 pub(super) fn is_supported_sort_key_type(dt: &DataType) -> bool {
@@ -399,7 +412,7 @@ fn concat_view_arrays<T: ByteViewType>(
     }
 }
 
-fn concat_batches_compact_views(
+pub(super) fn concat_batches_compact_views(
     schema: &SchemaRef,
     batches: &[RecordBatch],
 ) -> Result<RecordBatch> {
@@ -467,6 +480,7 @@ struct SharedSortMemoryInner {
 /// of once per batch or per worker.
 pub(super) struct SharedSortMemory {
     inner: Mutex<SharedSortMemoryInner>,
+    spilled: AtomicBool,
 }
 
 impl SharedSortMemory {
@@ -477,7 +491,16 @@ impl SharedSortMemory {
                 extra_bytes: 0,
                 reservation,
             }),
+            spilled: AtomicBool::new(false),
         })
+    }
+
+    pub(super) fn mark_spilled(&self) {
+        self.spilled.store(true, AtomicOrdering::Release);
+    }
+
+    fn is_spilled(&self) -> bool {
+        self.spilled.load(AtomicOrdering::Acquire)
     }
 
     fn count_batch(&self, batch: &RecordBatch) -> Result<()> {
@@ -568,6 +591,7 @@ struct TrackedBatches {
 }
 
 impl TrackedBatches {
+    #[cfg(test)]
     fn take_single(mut self) -> RecordBatch {
         debug_assert_eq!(self.batches.len(), 1);
         self.batches.pop().unwrap()
@@ -640,6 +664,253 @@ pub(super) enum SortedRun {
     Indexed(IndexedRun),
     /// Already-materialized sorted chunks (used by TopN).
     Batches(Box<BatchedRun>),
+    /// Sorted run spilled to disk via `SpillManager`.
+    Spilled(SortedSpillFile),
+}
+
+async fn spill_sorted_indexed_run(
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+    chunk_size: usize,
+    spill_manager: &SpillManager,
+    tx: &mpsc::Sender<RecordBatch>,
+) -> Result<Option<SortedSpillFile>> {
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let chunk_size = chunk_size.max(1);
+    let mut file = spill_manager.create_in_progress_file("MorselSortSpill")?;
+    let mut max_record_batch_memory = 0usize;
+    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+        async {
+            let mut offset = 0usize;
+            while offset < indices.len() {
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let take_len = (indices.len() - offset).min(chunk_size);
+                let slice = indices.slice(offset, take_len);
+                offset += take_len;
+                let columns = take_arrays(batch.columns(), &slice, None)?;
+                let options = RecordBatchOptions::new().with_row_count(Some(take_len));
+                let chunk =
+                    RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+                let mem = file.append_batch_async(&chunk).await?;
+                max_record_batch_memory = max_record_batch_memory.max(mem);
+            }
+            if tx.is_closed() {
+                return Ok(None);
+            }
+            file.finish_async().await
+        }
+        .await;
+
+    match res {
+        Ok(Some(finished)) => Ok(Some(SortedSpillFile {
+            file: finished,
+            max_record_batch_memory,
+        })),
+        Ok(None) => {
+            let _ = file.abort_async().await;
+            Ok(None)
+        }
+        Err(err) => {
+            let _ = file.abort_async().await;
+            Err(err)
+        }
+    }
+}
+
+async fn spill_batched_run(
+    mut run: Box<BatchedRun>,
+    spill_manager: &SpillManager,
+    tx: &mpsc::Sender<RecordBatch>,
+) -> Result<Option<SortedSpillFile>> {
+    let mut file = spill_manager.create_in_progress_file("MorselSortSpill")?;
+    let mut max_record_batch_memory = 0usize;
+    let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+        async {
+            while let Some(batch) = run.pop_front() {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let mem = file.append_batch_async(&batch).await?;
+                max_record_batch_memory = max_record_batch_memory.max(mem);
+            }
+            if tx.is_closed() {
+                return Ok(None);
+            }
+            file.finish_async().await
+        }
+        .await;
+    run.release();
+
+    match res {
+        Ok(Some(finished)) => Ok(Some(SortedSpillFile {
+            file: finished,
+            max_record_batch_memory,
+        })),
+        Ok(None) => {
+            let _ = file.abort_async().await;
+            Ok(None)
+        }
+        Err(err) => {
+            let _ = file.abort_async().await;
+            Err(err)
+        }
+    }
+}
+
+async fn spill_batches_sorted(
+    schema: &SchemaRef,
+    ordering: &LexOrdering,
+    batches: &[RecordBatch],
+    chunk_size: usize,
+    limit: Option<usize>,
+    spill_manager: &SpillManager,
+    tx: &mpsc::Sender<RecordBatch>,
+) -> Result<Option<SortedSpillFile>> {
+    if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) || limit == Some(0)
+    {
+        return Ok(None);
+    }
+    let merged = if batches.len() == 1 {
+        batches[0].clone()
+    } else {
+        concat_batches_compact_views(schema, batches)?
+    };
+    let sort_columns = ordering
+        .iter()
+        .map(|e| e.evaluate_to_sort_column(&merged))
+        .collect::<Result<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&sort_columns, limit)?;
+    drop(sort_columns);
+    spill_sorted_indexed_run(&merged, &indices, chunk_size, spill_manager, tx).await
+}
+
+/// Opportunistically compact a worker's spilled runs into one merged
+/// `SortedSpillFile` once the count reaches `compact_threshold`, keeping peak
+/// open spill file descriptors bounded to `O(workers)`. For `TopN`
+/// (`limit.is_some()`), also returns the `limit`-th (last) row when the merged
+/// run reached `limit` rows so `FirstColFastPath` can prune all future input!
+#[expect(clippy::too_many_arguments)]
+async fn compact_spilled_runs_if_needed(
+    runs: &mut Vec<SortedRun>,
+    schema: &SchemaRef,
+    ordering: &LexOrdering,
+    batch_size: usize,
+    limit: Option<usize>,
+    compact_threshold: usize,
+    spill_ctx: &SpillContext,
+    tx: &mpsc::Sender<RecordBatch>,
+) -> Result<Option<RecordBatch>> {
+    let spilled_count = runs
+        .iter()
+        .filter(|r| matches!(r, SortedRun::Spilled(_)))
+        .count();
+    if spilled_count < compact_threshold || tx.is_closed() {
+        return Ok(None);
+    }
+    let mut to_merge = Vec::with_capacity(spilled_count);
+    let mut kept = Vec::with_capacity(runs.len() - spilled_count + 1);
+    for run in std::mem::take(runs) {
+        match run {
+            SortedRun::Spilled(sf) => to_merge.push(sf),
+            other => kept.push(other),
+        }
+    }
+    // Keep clones of the Arc<dyn SpillFile> handles only if compaction hits
+    // transient OOM from sibling workers; normally they drop right after merge.
+    let backup: Vec<SortedSpillFile> = to_merge
+        .iter()
+        .map(|sf| SortedSpillFile {
+            file: Arc::clone(&sf.file),
+            max_record_batch_memory: sf.max_record_batch_memory,
+        })
+        .collect();
+
+    let merge_metrics = ExecutionPlanMetricsSet::new();
+    let merge_res = MemoryConsumer::new("MorselSortCompact")
+        .with_can_spill(true)
+        .register(&spill_ctx.memory_pool);
+    let merged_res = StreamingMergeBuilder::new()
+        .with_sorted_spill_files(to_merge)
+        .with_spill_manager(spill_ctx.manager.clone())
+        .with_schema(Arc::clone(schema))
+        .with_expressions(ordering)
+        .with_metrics(BaselineMetrics::new(&merge_metrics, 0))
+        .with_batch_size(batch_size.max(1))
+        .with_fetch(limit)
+        .with_reservation(merge_res)
+        .build();
+
+    let mut merged = match merged_res {
+        Ok(s) => s,
+        Err(DataFusionError::ResourcesExhausted(_)) => {
+            kept.extend(backup.into_iter().map(SortedRun::Spilled));
+            *runs = kept;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut writer =
+        SyncSpillWriter::try_new(&spill_ctx.manager, "MorselSortCompactSpill")?;
+    let mut compact_oom = false;
+    let mut emitted_rows = 0usize;
+    let mut last_row_batch: Option<RecordBatch> = None;
+    while let Some(batch_res) = merged.next().await {
+        if tx.is_closed() {
+            drop(writer);
+            drop(merged);
+            *runs = kept;
+            return Ok(None);
+        }
+        match batch_res {
+            Ok(batch) => {
+                if batch.num_rows() > 0 {
+                    emitted_rows += batch.num_rows();
+                    if limit.is_some() {
+                        last_row_batch = Some(batch.slice(batch.num_rows() - 1, 1));
+                    }
+                    writer.append_batch(&batch)?;
+                }
+            }
+            Err(DataFusionError::ResourcesExhausted(_)) => {
+                compact_oom = true;
+                break;
+            }
+            Err(err) => {
+                drop(writer);
+                drop(merged);
+                return Err(err);
+            }
+        }
+    }
+    drop(merged);
+    if compact_oom {
+        drop(writer);
+        kept.extend(backup.into_iter().map(SortedRun::Spilled));
+        *runs = kept;
+        return Ok(None);
+    }
+    drop(backup);
+    if let Some((file, max_record_batch_memory)) = writer.finish()? {
+        kept.push(SortedRun::Spilled(SortedSpillFile {
+            file,
+            max_record_batch_memory,
+        }));
+    }
+    *runs = kept;
+    let threshold_row = if limit.is_some_and(|l| emitted_rows >= l) {
+        last_row_batch
+    } else {
+        None
+    };
+    Ok(threshold_row)
 }
 
 pub(super) struct IndexedRun {
@@ -722,6 +993,9 @@ impl SortedRunStream {
                 batch_size: batch_size.max(1),
             },
             SortedRun::Batches(run) => SortedRunStreamState::Batches { run },
+            SortedRun::Spilled(_) => {
+                unreachable!("spilled runs must merge through StreamingMergeBuilder")
+            }
         };
         Self { schema, state }
     }
@@ -802,6 +1076,7 @@ struct EmitSortedRunsConfig<'a> {
     batch_size: usize,
     memory_pool: &'a Arc<dyn MemoryPool>,
     consumer_name: &'a str,
+    spill: Option<SpillContext>,
 }
 
 async fn emit_sorted_runs(
@@ -819,6 +1094,7 @@ async fn emit_sorted_runs(
         batch_size,
         memory_pool,
         consumer_name,
+        spill,
     } = cfg;
     if tx.is_closed() || runs.is_empty() || fetch == Some(0) {
         return Ok(());
@@ -897,32 +1173,128 @@ async fn emit_sorted_runs(
                 run.release();
                 return Ok(());
             }
+            SortedRun::Spilled(sf) => {
+                let Some(spill_ctx) = spill else {
+                    return datafusion_common::internal_err!(
+                        "Spilled sorted run requires SpillContext"
+                    );
+                };
+                let mut stream = spill_ctx.manager.read_spill_as_stream_unbuffered(
+                    sf.file,
+                    Some(sf.max_record_batch_memory),
+                )?;
+                let mut remaining_skip = skip;
+                let mut remaining_fetch = fetch;
+                while let Some(batch) = stream.next().await {
+                    if tx.is_closed() || remaining_fetch == Some(0) {
+                        break;
+                    }
+                    let batch = batch?;
+                    let Some(sliced) = slice_skip_fetch(
+                        batch,
+                        &mut remaining_skip,
+                        &mut remaining_fetch,
+                    ) else {
+                        continue;
+                    };
+                    let projected = apply_operators(result_operators, sliced)?;
+                    if projected.num_rows() > 0
+                        && !send_batch(&tx, projected, measurement).await
+                    {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
         }
     }
 
-    let streams: Vec<SendableRecordBatchStream> = runs
-        .into_iter()
-        .map(|run| {
-            Box::pin(SortedRunStream::from_run(
-                run,
-                Arc::clone(&schema),
-                batch_size,
-            )) as SendableRecordBatchStream
-        })
-        .collect();
-
     let merge_fetch = fetch.and_then(|f| skip.checked_add(f));
     let merge_metrics = ExecutionPlanMetricsSet::new();
-    let merge_reservation = MemoryConsumer::new(consumer_name).register(memory_pool);
-    let mut merged = StreamingMergeBuilder::new()
-        .with_streams(streams)
-        .with_schema(schema)
-        .with_expressions(ordering)
-        .with_metrics(BaselineMetrics::new(&merge_metrics, 0))
-        .with_batch_size(batch_size.max(1))
-        .with_fetch(merge_fetch)
-        .with_reservation(merge_reservation)
-        .build()?;
+    let any_spilled = runs.iter().any(|r| matches!(r, SortedRun::Spilled(_)));
+
+    let mut merged = if any_spilled {
+        let Some(spill_ctx) = spill else {
+            return datafusion_common::internal_err!(
+                "Spilled sorted runs require SpillContext"
+            );
+        };
+        // Spill any straggler in-memory runs so 100% of MemoryPool is available
+        // for MultiLevelMergeBuilder's bounded-fan-in external merge.
+        let mut spilled_files = Vec::with_capacity(runs.len());
+        for run in runs {
+            if tx.is_closed() {
+                return Ok(());
+            }
+            match run {
+                SortedRun::Spilled(sf) => spilled_files.push(sf),
+                SortedRun::Indexed(mut ir) => {
+                    let sf = if let Some(backing) = ir.batch.as_ref() {
+                        spill_sorted_indexed_run(
+                            backing,
+                            &ir.indices,
+                            batch_size,
+                            &spill_ctx.manager,
+                            &tx,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    ir.release();
+                    if let Some(sf) = sf {
+                        spilled_files.push(sf);
+                    }
+                }
+                SortedRun::Batches(br) => {
+                    if let Some(sf) =
+                        spill_batched_run(br, &spill_ctx.manager, &tx).await?
+                    {
+                        spilled_files.push(sf);
+                    }
+                }
+            }
+        }
+        if tx.is_closed() || spilled_files.is_empty() {
+            return Ok(());
+        }
+        let merge_reservation = MemoryConsumer::new(consumer_name)
+            .with_can_spill(true)
+            .register(memory_pool);
+        StreamingMergeBuilder::new()
+            .with_sorted_spill_files(spilled_files)
+            .with_spill_manager(spill_ctx.manager)
+            .with_schema(schema)
+            .with_expressions(ordering)
+            .with_metrics(BaselineMetrics::new(&merge_metrics, 0))
+            .with_batch_size(batch_size.max(1))
+            .with_fetch(merge_fetch)
+            .with_reservation(merge_reservation)
+            .build()?
+    } else {
+        let streams: Vec<SendableRecordBatchStream> = runs
+            .into_iter()
+            .map(|run| {
+                Box::pin(SortedRunStream::from_run(
+                    run,
+                    Arc::clone(&schema),
+                    batch_size,
+                )) as SendableRecordBatchStream
+            })
+            .collect();
+        let merge_reservation = MemoryConsumer::new(consumer_name)
+            .with_can_spill(spill.is_some())
+            .register(memory_pool);
+        StreamingMergeBuilder::new()
+            .with_streams(streams)
+            .with_schema(schema)
+            .with_expressions(ordering)
+            .with_metrics(BaselineMetrics::new(&merge_metrics, 0))
+            .with_batch_size(batch_size.max(1))
+            .with_fetch(merge_fetch)
+            .with_reservation(merge_reservation)
+            .build()?
+    };
 
     let mut remaining_skip = skip;
     let mut remaining_fetch = fetch;
@@ -946,6 +1318,10 @@ async fn emit_sorted_runs(
         if remaining_fetch == Some(0) {
             break;
         }
+    }
+    drop(merged);
+    if any_spilled {
+        tokio::task::yield_now().await;
     }
     Ok(())
 }
@@ -1076,10 +1452,21 @@ impl TopNSink {
         write!(f, "]")
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new_state(&self, reservation: MemoryReservation) -> Result<TopNState> {
+        self.new_state_with_spill(reservation, None, 8192)
+    }
+
+    pub(super) fn new_state_with_spill(
+        &self,
+        reservation: MemoryReservation,
+        spill: Option<SpillContext>,
+        batch_size: usize,
+    ) -> Result<TopNState> {
         let row_converter = RowConverter::new(self.sort_fields.clone())?;
         let first_col_fast = FirstColFastPath::try_new(&self.ordering, &self.schema);
         Ok(TopNState {
+            schema: Arc::clone(&self.schema),
             ordering: self.ordering.clone(),
             row_converter,
             limit: self.heap_limit,
@@ -1090,6 +1477,9 @@ impl TopNSink {
             row_map_bytes: 0,
             key_bytes: 0,
             first_col_fast,
+            spilled_runs: Vec::new(),
+            spill,
+            batch_size: batch_size.max(1),
             reservation,
             #[cfg(test)]
             peak_retained_rows: Arc::clone(&self.peak_retained_rows),
@@ -1100,12 +1490,14 @@ impl TopNSink {
         })
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn finalize_and_emit(
         &self,
         runs: Vec<SortedRun>,
         result_operators: &[Operator],
         batch_size: usize,
         memory_pool: &Arc<dyn MemoryPool>,
+        spill: Option<SpillContext>,
         tx: mpsc::Sender<RecordBatch>,
         measurement: Option<&RunMetrics>,
     ) -> Result<()> {
@@ -1120,6 +1512,7 @@ impl TopNSink {
                 batch_size,
                 memory_pool,
                 consumer_name: "MorselTopNMerge",
+                spill,
             },
             tx,
             measurement,
@@ -1796,6 +2189,7 @@ impl RetainedBatch {
 }
 
 pub(super) struct TopNState {
+    schema: SchemaRef,
     ordering: LexOrdering,
     row_converter: RowConverter,
     limit: usize,
@@ -1806,6 +2200,9 @@ pub(super) struct TopNState {
     row_map_bytes: usize,
     key_bytes: usize,
     first_col_fast: Option<FirstColFastPath>,
+    spilled_runs: Vec<SortedRun>,
+    spill: Option<SpillContext>,
+    batch_size: usize,
     reservation: MemoryReservation,
     #[cfg(test)]
     peak_retained_rows: Arc<AtomicUsize>,
@@ -1847,8 +2244,8 @@ impl TopNState {
         if self.limit == 0 || view.is_empty() {
             return Ok(());
         }
-        if self.heap.len() == self.limit
-            && let Some(fast) = &self.first_col_fast
+        if let Some(fast) = &self.first_col_fast
+            && fast.threshold.is_some()
             && let Some(candidates) = fast.filter_candidates(view)
         {
             if candidates.is_empty() {
@@ -1866,6 +2263,207 @@ impl TopNState {
             let materialized = view.clone().materialize()?;
             self.ingest_dense_batch(&materialized)
         }
+    }
+
+    async fn spill_heap_to_disk(
+        &mut self,
+        spill_manager: &SpillManager,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.heap.is_empty() {
+            for old in &self.batches {
+                self.batch_memory.uncount_batch(&old.batch);
+            }
+            self.batches.clear();
+            self.retained_rows = 0;
+            self.row_map_bytes = 0;
+            self.key_bytes = 0;
+            self.reservation.resize(0);
+            return Ok(());
+        }
+        if self.heap.len() == self.limit {
+            self.refresh_threshold();
+        }
+        let mut sorted_entries = std::mem::take(&mut self.heap).into_sorted_vec();
+        sorted_entries.truncate(self.limit);
+        let indices: Vec<(usize, usize)> = sorted_entries
+            .iter()
+            .map(|e| {
+                let b_idx = e.batch_idx as usize;
+                let dense_row = self.batches[b_idx].resolve_row(e.row_idx);
+                (b_idx, dense_row)
+            })
+            .collect();
+        drop(sorted_entries);
+        let batch_refs: Vec<&RecordBatch> =
+            self.batches.iter().map(|r| &r.batch).collect();
+        let chunk_size = self.batch_size.clamp(1, 128);
+        let mut file = spill_manager.create_in_progress_file("MorselTopNSpill")?;
+        let mut max_record_batch_memory = 0usize;
+        let res: Result<Option<Arc<dyn datafusion_execution::spill_file::SpillFile>>> =
+            async {
+                for slab in indices.chunks(chunk_size) {
+                    if tx.is_closed() {
+                        return Ok(None);
+                    }
+                    let out = interleave_record_batch(&batch_refs, slab)?;
+                    let mem = file.append_batch_async(&out).await?;
+                    max_record_batch_memory = max_record_batch_memory.max(mem);
+                }
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                file.finish_async().await
+            }
+            .await;
+
+        for old in &self.batches {
+            self.batch_memory.uncount_batch(&old.batch);
+        }
+        self.batches.clear();
+        self.retained_rows = 0;
+        self.row_map_bytes = 0;
+        self.key_bytes = 0;
+        self.reservation.resize(0);
+        // Preserve `first_col_fast.threshold` if already set (it is a valid
+        // global upper bound from >= `limit` rows already spilled!).
+
+        match res {
+            Ok(Some(finished)) => {
+                self.spilled_runs.push(SortedRun::Spilled(SortedSpillFile {
+                    file: finished,
+                    max_record_batch_memory,
+                }));
+                Ok(())
+            }
+            Ok(None) => {
+                let _ = file.abort_async().await;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = file.abort_async().await;
+                Err(err)
+            }
+        }
+    }
+
+    pub(super) async fn add_view_async(
+        &mut self,
+        view: &BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.limit == 0 || view.is_empty() {
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            return self.add_view(view);
+        }
+        let spill_ctx = self.spill.clone().unwrap();
+        // Apply `first_col_fast` BEFORE materializing or spilling so rejected
+        // rows are pruned immediately and never written to disk on OOM!
+        let batch = if let Some(fast) = &self.first_col_fast
+            && fast.threshold.is_some()
+            && let Some(candidates) = fast.filter_candidates(view)
+        {
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            if view.is_all() && candidates.len() == view.batch().num_rows() {
+                view.batch().clone()
+            } else {
+                take_record_batch(view.batch(), &UInt32Array::from(candidates))?
+            }
+        } else if view.is_all() {
+            view.batch().clone()
+        } else {
+            view.clone().materialize()?
+        };
+
+        // Always try the bounded in-memory TopN heap first so small `LIMIT`
+        // queries (e.g. `LIMIT 10` over wide view batches in a tight pool)
+        // stay in RAM and never spill full input batches to disk!
+        if let Err(err) = self.ingest_dense_batch(&batch) {
+            if matches!(err, DataFusionError::ResourcesExhausted(_)) {
+                spill_ctx.mark_spilled();
+                // If `ingest_dense_batch` failed during `compact()` (after
+                // pushing `retained`), `self.heap` already includes `batch`!
+                // Otherwise filter out-of-range batch_idx entries, spill the
+                // heap (`<= self.limit` rows), and spill `batch` truncated to
+                // `Some(self.limit)` rows!
+                let pending_pushed = self
+                    .heap
+                    .iter()
+                    .all(|e| (e.batch_idx as usize) < self.batches.len());
+                if pending_pushed {
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                } else {
+                    let max_idx = self.batches.len() as u32;
+                    let valid: Vec<TopNHeapEntry> = std::mem::take(&mut self.heap)
+                        .into_vec()
+                        .into_iter()
+                        .filter(|e| e.batch_idx < max_idx)
+                        .collect();
+                    self.heap = BinaryHeap::from(valid);
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                    if let Some(sf) = spill_batches_sorted(
+                        &self.schema,
+                        &self.ordering,
+                        std::slice::from_ref(&batch),
+                        self.batch_size.clamp(1, 128),
+                        Some(self.limit),
+                        &spill_ctx.manager,
+                        tx,
+                    )
+                    .await?
+                    {
+                        self.spilled_runs.push(SortedRun::Spilled(sf));
+                    }
+                }
+                if let Some(threshold_row) = compact_spilled_runs_if_needed(
+                    &mut self.spilled_runs,
+                    &self.schema,
+                    &self.ordering,
+                    self.batch_size.clamp(1, 128),
+                    Some(self.limit),
+                    3,
+                    &spill_ctx,
+                    tx,
+                )
+                .await?
+                    && let Some(fast) = &mut self.first_col_fast
+                {
+                    fast.update_from_batch(&threshold_row, 0);
+                }
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finish_async(
+        mut self,
+        batch_size: usize,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<Vec<SortedRun>> {
+        if self.spilled_runs.is_empty() {
+            match self.finish_in_memory(batch_size) {
+                Ok(run) => return Ok(run.into_iter().collect()),
+                Err(err)
+                    if matches!(err, DataFusionError::ResourcesExhausted(_))
+                        && let Some(spill_ctx) = self.spill.clone() =>
+                {
+                    spill_ctx.mark_spilled();
+                    self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+                    return Ok(std::mem::take(&mut self.spilled_runs));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(spill_ctx) = self.spill.clone() {
+            self.spill_heap_to_disk(&spill_ctx.manager, tx).await?;
+        }
+        Ok(std::mem::take(&mut self.spilled_runs))
     }
 
     fn ingest_dense_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -2010,14 +2608,14 @@ impl TopNState {
         #[cfg(test)]
         self.heap_rebuild_count
             .fetch_add(1, AtomicOrdering::Relaxed);
-        let mut entries = std::mem::take(&mut self.heap).into_vec();
-        let mut interleave_indices = Vec::with_capacity(entries.len());
-        for (new_idx, entry) in entries.iter_mut().enumerate() {
+        // Build `compacted` without mutating `self.heap` so an OOM error leaves
+        // `self.heap` and `self.batches` 100% intact for `TopNState::add_view_async`
+        // spill recovery.
+        let mut interleave_indices = Vec::with_capacity(self.heap.len());
+        for entry in self.heap.iter() {
             let b_idx = entry.batch_idx as usize;
             let dense_row = self.batches[b_idx].resolve_row(entry.row_idx);
             interleave_indices.push((b_idx, dense_row));
-            entry.batch_idx = 0;
-            entry.row_idx = new_idx as u32;
         }
         let batch_refs: Vec<&RecordBatch> =
             self.batches.iter().map(|r| &r.batch).collect();
@@ -2033,6 +2631,11 @@ impl TopNState {
             return Err(err);
         }
 
+        let mut entries = std::mem::take(&mut self.heap).into_vec();
+        for (new_idx, entry) in entries.iter_mut().enumerate() {
+            entry.batch_idx = 0;
+            entry.row_idx = new_idx as u32;
+        }
         // Uncount old batches *before* dropping them.
         for old in &self.batches {
             self.batch_memory.uncount_batch(&old.batch);
@@ -2049,13 +2652,18 @@ impl TopNState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish(mut self, batch_size: usize) -> Result<Option<SortedRun>> {
+        self.finish_in_memory(batch_size)
+    }
+
+    fn finish_in_memory(&mut self, batch_size: usize) -> Result<Option<SortedRun>> {
         if self.heap.is_empty() {
             self.reservation.free();
             return Ok(None);
         }
         // `BinaryHeap::into_sorted_vec` produces ascending order = exact SQL sort order.
-        let sorted_entries = self.heap.into_sorted_vec();
+        let sorted_entries = std::mem::take(&mut self.heap).into_sorted_vec();
         let indices: Vec<(usize, usize)> = sorted_entries
             .iter()
             .map(|e| {
@@ -2064,9 +2672,6 @@ impl TopNState {
                 (b_idx, dense_row)
             })
             .collect();
-        drop(sorted_entries);
-        self.key_bytes = 0;
-        self.row_map_bytes = 0;
 
         let batch_refs: Vec<&RecordBatch> =
             self.batches.iter().map(|r| &r.batch).collect();
@@ -2112,20 +2717,34 @@ impl TopNState {
                         self.batch_memory.uncount_batch(b);
                         out_tracker.uncount_batch(b);
                     }
+                    drop(out_batches);
+                    self.heap = BinaryHeap::from(sorted_entries);
+                    let prev_bytes = self
+                        .batch_memory
+                        .memory_usage()
+                        .saturating_add(self.key_bytes)
+                        .saturating_add(self.row_map_bytes);
+                    self.reservation.resize(prev_bytes);
                     return Err(err);
                 }
                 out_batches.push_back(out);
             }
         }
+        drop(sorted_entries);
         for old in &self.batches {
             self.batch_memory.uncount_batch(&old.batch);
         }
-        drop(self.batches);
-        self.reservation.resize(out_tracker.memory_usage());
+        self.batches.clear();
+        self.retained_rows = 0;
+        self.key_bytes = 0;
+        self.row_map_bytes = 0;
+        let empty_res = self.reservation.new_empty();
+        let run_res = std::mem::replace(&mut self.reservation, empty_res);
+        run_res.resize(out_tracker.memory_usage());
         Ok(Some(SortedRun::Batches(Box::new(BatchedRun {
             batches: out_batches,
             tracker: out_tracker,
-            reservation: self.reservation,
+            reservation: run_res,
         }))))
     }
 }
@@ -2194,7 +2813,17 @@ impl SortSink {
         write!(f, "]")
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new_state(&self, shared_memory: Arc<SharedSortMemory>) -> SortState {
+        self.new_state_with_spill(shared_memory, None, 8192)
+    }
+
+    pub(super) fn new_state_with_spill(
+        &self,
+        shared_memory: Arc<SharedSortMemory>,
+        spill: Option<SpillContext>,
+        batch_size: usize,
+    ) -> SortState {
         SortState {
             schema: Arc::clone(&self.schema),
             ordering: self.ordering.clone(),
@@ -2204,17 +2833,21 @@ impl SortSink {
             first_batch_bytes: None,
             completed_runs: Vec::new(),
             shared_memory,
+            spill,
+            batch_size: batch_size.max(1),
             #[cfg(test)]
             completed_run_count: Arc::clone(&self.completed_run_count),
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn finalize_and_emit(
         &self,
         runs: Vec<SortedRun>,
         result_operators: &[Operator],
         batch_size: usize,
         memory_pool: &Arc<dyn MemoryPool>,
+        spill: Option<SpillContext>,
         tx: mpsc::Sender<RecordBatch>,
         measurement: Option<&RunMetrics>,
     ) -> Result<()> {
@@ -2229,6 +2862,7 @@ impl SortSink {
                 batch_size,
                 memory_pool,
                 consumer_name: "MorselSortMerge",
+                spill,
             },
             tx,
             measurement,
@@ -2246,6 +2880,8 @@ pub(super) struct SortState {
     first_batch_bytes: Option<usize>,
     completed_runs: Vec<SortedRun>,
     shared_memory: Arc<SharedSortMemory>,
+    spill: Option<SpillContext>,
+    batch_size: usize,
     #[cfg(test)]
     completed_run_count: Arc<AtomicUsize>,
 }
@@ -2257,6 +2893,7 @@ impl Drop for SortState {
 }
 
 impl SortState {
+    #[cfg(test)]
     pub(super) fn add_view(&mut self, view: BatchView) -> Result<()> {
         if view.is_empty() {
             return Ok(());
@@ -2288,6 +2925,316 @@ impl SortState {
         Ok(())
     }
 
+    pub(super) async fn add_view_async(
+        &mut self,
+        view: BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if view.is_empty() {
+            return Ok(());
+        }
+        let batch = view.materialize()?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let incremental_bytes = self
+            .local_counter
+            .memory_usage()
+            .saturating_sub(self.first_batch_bytes.unwrap_or(0));
+        let flush_limit = if self.shared_memory.is_spilled() {
+            MAX_SPILLED_LOCAL_SORT_RUN_BYTES
+        } else {
+            MAX_LOCAL_SORT_RUN_BYTES
+        };
+        if !self.batches.is_empty()
+            && (incremental_bytes >= flush_limit
+                || self
+                    .buffered_rows
+                    .checked_add(batch.num_rows())
+                    .is_none_or(|n| n > u32::MAX as usize))
+        {
+            self.flush_current_batches_async(tx).await?;
+        }
+
+        if let Err(err) = self.shared_memory.count_batch(&batch) {
+            if matches!(err, DataFusionError::ResourcesExhausted(_))
+                && let Some(spill_ctx) = self.spill.clone()
+            {
+                self.shared_memory.mark_spilled();
+                self.spill_in_memory_completed_runs(&spill_ctx.manager, tx)
+                    .await?;
+                self.spill_current_batches(&spill_ctx.manager, tx).await?;
+                if tx.is_closed() {
+                    return Ok(());
+                }
+                if self.shared_memory.count_batch(&batch).is_ok() {
+                    self.local_counter.count_batch(&batch);
+                    if self.first_batch_bytes.is_none() {
+                        self.first_batch_bytes = Some(self.local_counter.memory_usage());
+                    }
+                    self.buffered_rows += batch.num_rows();
+                    self.batches.push(batch);
+                    return Ok(());
+                }
+                // Only fail fast when the pool's own finite limit is below
+                // `min_headroom_bytes`; transient pressure from sibling workers
+                // (e.g. concurrent `MorselSortCompact` merges or Parquet readers)
+                // must fall through to sorting and spilling this batch directly.
+                if let MemoryLimit::Finite(limit) = spill_ctx.memory_pool.memory_limit()
+                    && limit < spill_ctx.min_headroom_bytes
+                {
+                    return Err(err);
+                }
+                // Otherwise another worker currently holds memory or this single batch
+                // exceeds remaining RAM: sort and spill this batch directly.
+                if let Some(sf) = spill_batches_sorted(
+                    &self.schema,
+                    &self.ordering,
+                    std::slice::from_ref(&batch),
+                    self.batch_size,
+                    None,
+                    &spill_ctx.manager,
+                    tx,
+                )
+                .await?
+                {
+                    #[cfg(test)]
+                    self.completed_run_count
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.completed_runs.push(SortedRun::Spilled(sf));
+                    compact_spilled_runs_if_needed(
+                        &mut self.completed_runs,
+                        &self.schema,
+                        &self.ordering,
+                        self.batch_size,
+                        None,
+                        MAX_WORKER_SPILLED_RUNS,
+                        &spill_ctx,
+                        tx,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            return Err(err);
+        }
+
+        self.local_counter.count_batch(&batch);
+        if self.first_batch_bytes.is_none() {
+            self.first_batch_bytes = Some(self.local_counter.memory_usage());
+        }
+        self.buffered_rows += batch.num_rows();
+        self.batches.push(batch);
+        Ok(())
+    }
+
+    async fn spill_in_memory_completed_runs(
+        &mut self,
+        spill_manager: &SpillManager,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        let existing = std::mem::take(&mut self.completed_runs);
+        for run in existing {
+            if tx.is_closed() {
+                return Ok(());
+            }
+            match run {
+                SortedRun::Spilled(sf) => {
+                    self.completed_runs.push(SortedRun::Spilled(sf))
+                }
+                SortedRun::Indexed(mut ir) => {
+                    let sf = if let Some(backing) = ir.batch.as_ref() {
+                        spill_sorted_indexed_run(
+                            backing,
+                            &ir.indices,
+                            self.batch_size,
+                            spill_manager,
+                            tx,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    ir.release();
+                    if let Some(sf) = sf {
+                        self.completed_runs.push(SortedRun::Spilled(sf));
+                    }
+                }
+                SortedRun::Batches(br) => {
+                    if let Some(sf) = spill_batched_run(br, spill_manager, tx).await? {
+                        self.completed_runs.push(SortedRun::Spilled(sf));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn spill_current_batches(
+        &mut self,
+        spill_manager: &SpillManager,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+        let tracked = TrackedBatches {
+            batches: std::mem::take(&mut self.batches),
+            shared: Arc::clone(&self.shared_memory),
+        };
+        self.buffered_rows = 0;
+        self.local_counter = RecordBatchMemoryCounter::new();
+        self.first_batch_bytes = None;
+
+        let sf = spill_batches_sorted(
+            &self.schema,
+            &self.ordering,
+            &tracked.batches,
+            self.batch_size,
+            None,
+            spill_manager,
+            tx,
+        )
+        .await?;
+        drop(tracked);
+        if let Some(sf) = sf {
+            #[cfg(test)]
+            self.completed_run_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.completed_runs.push(SortedRun::Spilled(sf));
+            if let Some(spill_ctx) = self.spill.clone() {
+                compact_spilled_runs_if_needed(
+                    &mut self.completed_runs,
+                    &self.schema,
+                    &self.ordering,
+                    self.batch_size,
+                    None,
+                    MAX_WORKER_SPILLED_RUNS,
+                    &spill_ctx,
+                    tx,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_current_batches_async(
+        &mut self,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+        if self.shared_memory.is_spilled()
+            && let Some(spill_ctx) = self.spill.clone()
+        {
+            self.spill_in_memory_completed_runs(&spill_ctx.manager, tx)
+                .await?;
+            return self.spill_current_batches(&spill_ctx.manager, tx).await;
+        }
+        // Try in-memory flush; if OOM occurs during concat/lexsort and spilling is
+        // enabled, spill cleanly instead of failing.
+        let tracked = TrackedBatches {
+            batches: std::mem::take(&mut self.batches),
+            shared: Arc::clone(&self.shared_memory),
+        };
+        self.buffered_rows = 0;
+        self.local_counter = RecordBatchMemoryCounter::new();
+        self.first_batch_bytes = None;
+
+        match self.try_flush_tracked_in_memory(&tracked) {
+            Ok(run) => {
+                drop(tracked);
+                #[cfg(test)]
+                self.completed_run_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.completed_runs.push(run);
+                Ok(())
+            }
+            Err(err)
+                if matches!(err, DataFusionError::ResourcesExhausted(_))
+                    && self.spill.is_some() =>
+            {
+                let spill_ctx = self.spill.clone().unwrap();
+                self.shared_memory.mark_spilled();
+                self.spill_in_memory_completed_runs(&spill_ctx.manager, tx)
+                    .await?;
+                let sf = spill_batches_sorted(
+                    &self.schema,
+                    &self.ordering,
+                    &tracked.batches,
+                    self.batch_size,
+                    None,
+                    &spill_ctx.manager,
+                    tx,
+                )
+                .await?;
+                drop(tracked);
+                if let Some(sf) = sf {
+                    #[cfg(test)]
+                    self.completed_run_count
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.completed_runs.push(SortedRun::Spilled(sf));
+                    compact_spilled_runs_if_needed(
+                        &mut self.completed_runs,
+                        &self.schema,
+                        &self.ordering,
+                        self.batch_size,
+                        None,
+                        MAX_WORKER_SPILLED_RUNS,
+                        &spill_ctx,
+                        tx,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_flush_tracked_in_memory(&self, tracked: &TrackedBatches) -> Result<SortedRun> {
+        let merged_guard = if tracked.batches.len() == 1 {
+            let single = tracked.batches[0].clone();
+            self.shared_memory.count_batch(&single)?;
+            TrackedBatch {
+                batch: Some(single),
+                shared: Arc::clone(&self.shared_memory),
+            }
+        } else {
+            let merged = concat_batches_compact_views(&self.schema, &tracked.batches)?;
+            self.shared_memory.count_batch(&merged)?;
+            TrackedBatch {
+                batch: Some(merged),
+                shared: Arc::clone(&self.shared_memory),
+            }
+        };
+
+        let merged_ref = merged_guard.batch.as_ref().expect("merged batch");
+        let sort_columns = self
+            .ordering
+            .iter()
+            .map(|e| e.evaluate_to_sort_column(merged_ref))
+            .collect::<Result<Vec<_>>>()?;
+        let est_indices_bytes = merged_ref.num_rows().saturating_mul(size_of::<u32>());
+        let mut indices_guard =
+            TrackedExtra::try_new(Arc::clone(&self.shared_memory), est_indices_bytes)?;
+        let indices = lexsort_to_indices(&sort_columns, None)?;
+        drop(sort_columns);
+        indices_guard.try_resize(indices.get_array_memory_size())?;
+
+        let merged = merged_guard.into_inner();
+        let indices_bytes = indices_guard.into_bytes();
+        Ok(SortedRun::Indexed(IndexedRun {
+            batch: Some(merged),
+            indices,
+            indices_bytes,
+            shared: Arc::clone(&self.shared_memory),
+        }))
+    }
+
+    #[cfg(test)]
     fn flush_current_batches(&mut self) -> Result<()> {
         if self.batches.is_empty() {
             return Ok(());
@@ -2344,8 +3291,23 @@ impl SortState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish(mut self) -> Result<Vec<SortedRun>> {
         self.flush_current_batches()?;
+        Ok(std::mem::take(&mut self.completed_runs))
+    }
+
+    pub(super) async fn finish_async(
+        mut self,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<Vec<SortedRun>> {
+        self.flush_current_batches_async(tx).await?;
+        if self.shared_memory.is_spilled()
+            && let Some(spill_ctx) = self.spill.clone()
+        {
+            self.spill_in_memory_completed_runs(&spill_ctx.manager, tx)
+                .await?;
+        }
         Ok(std::mem::take(&mut self.completed_runs))
     }
 }
@@ -2712,10 +3674,7 @@ mod tests {
         )?;
         let err = state.add_view(BatchView::all(batch)).unwrap_err();
         assert!(
-            matches!(
-                err,
-                datafusion_common::DataFusionError::ResourcesExhausted(_)
-            ),
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
             "{err}"
         );
         drop(state);
@@ -2861,6 +3820,109 @@ mod tests {
             drop(run);
             assert_eq!(pool.reserved(), 0);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topn_finish_async_falls_back_to_spill_on_oom() -> Result<()> {
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("k", 0)),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        let sink = TopNSink::try_new(Arc::clone(&schema), ordering, 0, 128)?.unwrap();
+
+        let pool = test_pool(Some(512 * 1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+            )
+            .build_arc()?;
+        let task_ctx = TaskContext::default().with_runtime(runtime);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let spill_ctx = SpillContext::try_new(&task_ctx, &metrics, Arc::clone(&schema))
+            .expect("spill context viable under 512 KiB pool");
+
+        let mut state = sink.new_state_with_spill(
+            MemoryConsumer::new("test_topn_finish_oom")
+                .with_can_spill(true)
+                .register(&pool),
+            Some(spill_ctx.clone()),
+            128,
+        )?;
+
+        let ks: Vec<i32> = (0..512).rev().collect();
+        let vs: Vec<String> = ks
+            .iter()
+            .map(|&x| format!("val-{x:06}-padding-0123456789abcdef0123456789abcdef"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ks)),
+                Arc::new(StringArray::from(vs)),
+            ],
+        )?;
+        let (tx, _rx) = mpsc::channel(4);
+        state.add_view_async(&BatchView::all(batch), &tx).await?;
+        assert!(
+            state.spilled_runs.is_empty(),
+            "heap should still be in memory before finish_async"
+        );
+
+        // Simulate a sibling worker temporarily filling the remaining pool right
+        // before `finish_async`, forcing `finish_in_memory`'s `try_resize(peak)`
+        // to fail with `ResourcesExhausted`.
+        let sibling = MemoryConsumer::new("sibling").register(&pool);
+        let remaining = (512 * 1024usize).saturating_sub(pool.reserved());
+        sibling.grow(remaining);
+
+        let runs = state.finish_async(128, &tx).await?;
+        assert_eq!(runs.len(), 1);
+        let SortedRun::Spilled(sf) = &runs[0] else {
+            panic!("expected TopN finish_async to spill on OOM");
+        };
+
+        let mut stream = spill_ctx
+            .manager
+            .read_spill_as_stream(Arc::clone(&sf.file), Some(64))?;
+        let mut got_k = Vec::new();
+        let mut got_v = Vec::new();
+        while let Some(b) = stream.next().await {
+            let b = b?;
+            got_k.extend_from_slice(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+            );
+            let sv = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..sv.len() {
+                got_v.push(sv.value(i).to_string());
+            }
+        }
+        assert_eq!(got_k, (0..128).collect::<Vec<i32>>());
+        assert_eq!(
+            got_v,
+            (0..128)
+                .map(|x| format!("val-{x:06}-padding-0123456789abcdef0123456789abcdef"))
+                .collect::<Vec<_>>()
+        );
+
+        drop(stream);
+        drop(runs);
+        drop(sibling);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 }

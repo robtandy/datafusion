@@ -24,6 +24,7 @@ use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common::{Result, exec_datafusion_err, internal_err, plan_err};
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::spill_file::SpillFile;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_physical_expr::expressions::Column;
@@ -65,7 +66,11 @@ mod metrics;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod planner;
+mod radix;
+mod radix_agg;
+mod radix_join;
 mod sort;
+mod spill;
 
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
@@ -79,15 +84,20 @@ use dag::{
 use group_count::IntKeyType;
 use group_count::{FinalizedGroupCounts, GroupCountSink, GroupCountState};
 use hash_join::{
-    FinalizedHashTable, HashJoinBuildSink, HashJoinBuildState, HashJoinProbe,
-    OperatorStep, ProbeCursor, ProbeScratch,
+    FinalizedHashTable, FinalizedHashTableKind, HashJoinBuildSink, HashJoinBuildState,
+    HashJoinProbe, OperatorStep, ProbeCursor, ProbeScratch, RadixBuildMetadata,
+    ResidentRadixPartitions, SingleHashTable, build_single_table_from_packed_batches,
+    load_spilled_build_partition_sync_or_async,
 };
 use join_filter::DynamicJoinFilterData;
 pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
 use parquet::{ClaimedWork, ParquetScan, ReadyReaders};
+use radix_agg::ResultOpsRef;
+use radix_join::{LocalProbeSpill, ProbeSpillEnv, unpack_build_spill_batch};
 use sort::{SharedSortMemory, SortSink, SortState, SortedRun, TopNSink, TopNState};
+use spill::SpillContext;
 #[cfg(test)]
 mod tests;
 
@@ -1117,21 +1127,50 @@ impl Sink {
 
 enum WorkerSinkMemory {
     Reservation(MemoryReservation),
-    SharedSort(Arc<SharedSortMemory>),
+    SpillableReservation(MemoryReservation, Option<SpillContext>),
+    HashJoinBuild(
+        MemoryReservation,
+        Option<SpillContext>,
+        Option<SpillContext>,
+    ),
+    SharedSort(Arc<SharedSortMemory>, Option<SpillContext>),
 }
 
 impl WorkerSinkMemory {
-    fn into_reservation(self) -> MemoryReservation {
+    fn into_spillable_reservation(self) -> (MemoryReservation, Option<SpillContext>) {
         match self {
-            Self::Reservation(r) => r,
-            Self::SharedSort(_) => panic!("expected MemoryReservation"),
+            Self::SpillableReservation(r, spill) => (r, spill),
+            Self::Reservation(r) => (r, None),
+            Self::HashJoinBuild(..) | Self::SharedSort(..) => {
+                panic!("expected MemoryReservation")
+            }
         }
     }
 
-    fn into_shared_sort(self) -> Arc<SharedSortMemory> {
+    fn into_hash_join_build(
+        self,
+    ) -> (
+        MemoryReservation,
+        Option<SpillContext>,
+        Option<SpillContext>,
+    ) {
         match self {
-            Self::SharedSort(s) => s,
-            Self::Reservation(_) => panic!("expected SharedSortMemory"),
+            Self::HashJoinBuild(r, bs, nks) => (r, bs, nks),
+            Self::Reservation(r) => (r, None, None),
+            Self::SpillableReservation(..) | Self::SharedSort(..) => {
+                panic!("expected HashJoinBuild reservation")
+            }
+        }
+    }
+
+    fn into_shared_sort(self) -> (Arc<SharedSortMemory>, Option<SpillContext>) {
+        match self {
+            Self::SharedSort(s, spill) => (s, spill),
+            Self::Reservation(_)
+            | Self::SpillableReservation(..)
+            | Self::HashJoinBuild(..) => {
+                panic!("expected SharedSortMemory")
+            }
         }
     }
 }
@@ -1139,26 +1178,70 @@ impl WorkerSinkMemory {
 enum WorkerSink {
     Result(Box<ResultBuffer>),
     Count(CountState),
-    GroupCount(GroupCountState),
-    Aggregate(AggregateState),
-    TopN(TopNState),
-    Sort(SortState),
-    HashJoinBuild(HashJoinBuildState),
+    GroupCount(Box<GroupCountState>),
+    Aggregate(Box<AggregateState>),
+    TopN(Box<TopNState>),
+    Sort(Box<SortState>),
+    HashJoinBuild(Box<HashJoinBuildState>),
 }
 
 enum WorkerState {
     None,
     Count(CountState),
-    GroupCount(GroupCountState),
-    Aggregate(AggregateState),
+    GroupCount(Box<GroupCountState>),
+    Aggregate(Box<AggregateState>),
     SortedRuns(Vec<SortedRun>),
-    HashJoinBuild(HashJoinBuildState),
+    HashJoinBuild(Box<HashJoinBuildState>),
 }
 
 struct JoinWorkerState {
     tables: Arc<Vec<Arc<FinalizedHashTable>>>,
+    resident_tables: Vec<Option<Arc<ResidentRadixPartitions>>>,
+    local_probe_spills: Vec<Option<LocalProbeSpill>>,
+    probe_spill_env: Option<ProbeSpillEnv>,
     scratch: ProbeScratch,
     probe_reservation: MemoryReservation,
+}
+
+impl JoinWorkerState {
+    fn new(
+        tables: Arc<Vec<Arc<FinalizedHashTable>>>,
+        probe_reservation: MemoryReservation,
+        probe_spill_env: Option<ProbeSpillEnv>,
+    ) -> Self {
+        let resident_tables = tables.iter().map(|t| t.clone_resident()).collect();
+        let local_probe_spills = tables
+            .iter()
+            .map(|t| {
+                t.has_spilled_partitions()
+                    .then(|| LocalProbeSpill::new(t.num_radix_partitions()))
+            })
+            .collect();
+        Self {
+            tables,
+            resident_tables,
+            local_probe_spills,
+            probe_spill_env,
+            scratch: ProbeScratch::default(),
+            probe_reservation,
+        }
+    }
+
+    fn finish_probe_spills(&mut self) -> Result<()> {
+        for lps_opt in &mut self.local_probe_spills {
+            if let Some(lps) = lps_opt.take() {
+                lps.finish_into(&self.probe_reservation)?;
+            }
+        }
+        self.resident_tables.clear();
+        Ok(())
+    }
+}
+
+struct JoinContext {
+    tables: Arc<Vec<Arc<FinalizedHashTable>>>,
+    probe_reservation: MemoryReservation,
+    probe_spill_env: Option<ProbeSpillEnv>,
 }
 
 enum BuildRunOutcome {
@@ -1177,7 +1260,11 @@ struct BuildEmissionTargets<'a> {
     sorted_runs: Option<&'a mut Vec<SortedRun>>,
     combined_build: Option<&'a mut HashJoinBuildState>,
     sink_reservation: Option<&'a MemoryReservation>,
+    sink_spill: Option<&'a SpillContext>,
+    build_spill: Option<&'a SpillContext>,
+    null_key_spill: Option<&'a SpillContext>,
     shared_sort_memory: Option<&'a Arc<SharedSortMemory>>,
+    sort_spill: Option<&'a SpillContext>,
 }
 
 type WorkerTail = (Vec<RecordBatch>, WorkerMetrics);
@@ -1494,37 +1581,41 @@ impl Pipeline {
                 }
             }
             Sink::Count { .. } => WorkerSink::Count(CountState::default()),
-            Sink::GroupCount { sink, .. } => WorkerSink::GroupCount(
-                sink.new_state(
-                    sink_memory
-                        .expect("group count reservation")
-                        .into_reservation(),
-                ),
-            ),
-            Sink::Aggregate { sink, .. } => WorkerSink::Aggregate(
-                sink.new_state(
-                    sink_memory
-                        .expect("aggregate reservation")
-                        .into_reservation(),
-                )?,
-            ),
-            Sink::TopN { sink, .. } => {
-                WorkerSink::TopN(sink.new_state(
-                    sink_memory.expect("topn reservation").into_reservation(),
-                )?)
+            Sink::GroupCount { sink, .. } => {
+                let (res, spill) = sink_memory
+                    .expect("group count reservation")
+                    .into_spillable_reservation();
+                WorkerSink::GroupCount(Box::new(sink.new_state_with_spill(res, spill)))
             }
-            Sink::Sort { sink, .. } => {
-                WorkerSink::Sort(sink.new_state(
-                    sink_memory.expect("sort shared memory").into_shared_sort(),
+            Sink::Aggregate { sink, .. } => {
+                let (res, spill) = sink_memory
+                    .expect("aggregate reservation")
+                    .into_spillable_reservation();
+                WorkerSink::Aggregate(Box::new(sink.new_state_with_spill(res, spill)?))
+            }
+            Sink::TopN { sink, .. } => {
+                let (res, spill) = sink_memory
+                    .expect("topn reservation")
+                    .into_spillable_reservation();
+                WorkerSink::TopN(Box::new(
+                    sink.new_state_with_spill(res, spill, batch_size)?,
                 ))
             }
-            Sink::HashJoinBuild(sink) => WorkerSink::HashJoinBuild(
-                sink.new_state(
-                    sink_memory
-                        .expect("hash join build reservation")
-                        .into_reservation(),
-                ),
-            ),
+            Sink::Sort { sink, .. } => {
+                let (shared, spill) =
+                    sink_memory.expect("sort shared memory").into_shared_sort();
+                WorkerSink::Sort(Box::new(
+                    sink.new_state_with_spill(shared, spill, batch_size),
+                ))
+            }
+            Sink::HashJoinBuild(sink) => {
+                let (res, bs, nks) = sink_memory
+                    .expect("hash join build reservation")
+                    .into_hash_join_build();
+                WorkerSink::HashJoinBuild(Box::new(
+                    sink.new_state_with_spill(res, bs, nks),
+                ))
+            }
         })
     }
 
@@ -1534,16 +1625,13 @@ impl Pipeline {
         next: &AtomicUsize,
         output: WorkerOutput,
         sink_memory: Option<WorkerSinkMemory>,
-        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
+        join_context: Option<JoinContext>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
-        let mut join_state =
-            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
-                tables,
-                scratch: ProbeScratch::default(),
-                probe_reservation,
-            });
+        let mut join_state = join_context.map(|jc| {
+            JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
+        });
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -1579,7 +1667,11 @@ impl Pipeline {
                 tokio::task::yield_now().await;
             }
         }
-        self.finish_worker(sink, &output, worker)
+        if let Some(js) = join_state.as_mut() {
+            js.finish_probe_spills()?;
+        }
+        drop(join_state);
+        self.finish_worker(sink, &output, worker).await
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1590,16 +1682,13 @@ impl Pipeline {
         sequential: bool,
         output: WorkerOutput,
         sink_memory: Option<WorkerSinkMemory>,
-        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
+        join_context: Option<JoinContext>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
-        let mut join_state =
-            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
-                tables,
-                scratch: ProbeScratch::default(),
-                probe_reservation,
-            });
+        let mut join_state = join_context.map(|jc| {
+            JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
+        });
         let tx = &output.tx;
         let stride = if sequential {
             batches.len().max(1)
@@ -1640,7 +1729,11 @@ impl Pipeline {
                 tokio::task::yield_now().await;
             }
         }
-        self.finish_worker(sink, &output, worker)
+        if let Some(js) = join_state.as_mut() {
+            js.finish_probe_spills()?;
+        }
+        drop(join_state);
+        self.finish_worker(sink, &output, worker).await
     }
 
     #[cfg(feature = "parquet")]
@@ -1649,16 +1742,13 @@ impl Pipeline {
         ready: ReadyReaders,
         output: WorkerOutput,
         sink_memory: Option<WorkerSinkMemory>,
-        join_context: Option<(Arc<Vec<Arc<FinalizedHashTable>>>, MemoryReservation)>,
+        join_context: Option<JoinContext>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
-        let mut join_state =
-            join_context.map(|(tables, probe_reservation)| JoinWorkerState {
-                tables,
-                scratch: ProbeScratch::default(),
-                probe_reservation,
-            });
+        let mut join_state = join_context.map(|jc| {
+            JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
+        });
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
             if tx.is_closed() {
@@ -1733,7 +1823,11 @@ impl Pipeline {
             worker.complete();
             tokio::task::yield_now().await;
         }
-        self.finish_worker(sink, &output, worker)
+        if let Some(js) = join_state.as_mut() {
+            js.finish_probe_spills()?;
+        }
+        drop(join_state);
+        self.finish_worker(sink, &output, worker).await
     }
 
     fn advance_join_chain(
@@ -1765,10 +1859,17 @@ impl Pipeline {
                     }
                 }
                 Operator::HashProbe(probe) => {
-                    let table = &join_state.tables[probe.build_id];
-                    let Some(mut cursor) = probe.start_probe_view(
+                    let bid = probe.build_id;
+                    let table = &join_state.tables[bid];
+                    let resident = join_state.resident_tables[bid].as_ref();
+                    let lps = join_state.local_probe_spills[bid].as_mut();
+                    let env = join_state.probe_spill_env.as_ref();
+                    let Some(mut cursor) = probe.start_probe_view_with_spill(
                         view,
                         table,
+                        resident,
+                        lps,
+                        env,
                         &join_state.probe_reservation,
                     )?
                     else {
@@ -1816,24 +1917,26 @@ impl Pipeline {
                     unreachable!()
                 };
                 worker.process(|| {
-                    local.add_view(&view, sink.key_index)?;
+                    local.add_view_spillable(&view, sink.key_index, tx)?;
                     Ok(true)
                 })
             }
             WorkerSink::Aggregate(local) => worker.process(|| {
-                local.add_view(&view)?;
+                local.add_view_spillable(&view, tx)?;
                 Ok(true)
             }),
-            WorkerSink::TopN(local) => worker.process(|| {
-                local.add_view(&view)?;
+            WorkerSink::TopN(local) => {
+                worker
+                    .process_async(local.add_view_async(&view, tx))
+                    .await?;
                 Ok(true)
-            }),
-            WorkerSink::Sort(local) => worker.process(|| {
-                local.add_view(view)?;
+            }
+            WorkerSink::Sort(local) => {
+                worker.process_async(local.add_view_async(view, tx)).await?;
                 Ok(true)
-            }),
+            }
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
-                local.add_view(&view)?;
+                local.add_view_spillable(&view, tx)?;
                 Ok(true)
             }),
             WorkerSink::Result(buffer) => {
@@ -1967,13 +2070,15 @@ impl Pipeline {
                 worker.process(|| {
                     match self.group_count_strategy(sink.key_index) {
                         GroupCountStrategy::DirectColumn(col_index) => {
-                            local.add_column(batch.column(col_index))?;
+                            local.add_column_spillable(batch.column(col_index), tx)?;
                         }
                         GroupCountStrategy::DirectMask {
                             predicate,
                             key_index,
                         } => {
-                            local.add_filtered_batch(&batch, predicate, key_index)?;
+                            local.add_filtered_batch_spillable(
+                                &batch, predicate, key_index, tx,
+                            )?;
                         }
                         GroupCountStrategy::General(col_index) => {
                             let view = apply_operators_view(
@@ -1981,7 +2086,7 @@ impl Pipeline {
                                 BatchView::all(batch),
                             )?;
                             if !view.is_empty() {
-                                local.add_view(&view, col_index)?;
+                                local.add_view_spillable(&view, col_index, tx)?;
                             }
                         }
                     }
@@ -1991,28 +2096,34 @@ impl Pipeline {
             WorkerSink::Aggregate(local) => worker.process(|| {
                 let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
-                    local.add_view(&view)?;
+                    local.add_view_spillable(&view, tx)?;
                 }
                 Ok(true)
             }),
-            WorkerSink::TopN(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+            WorkerSink::TopN(local) => {
+                let view = worker.process(|| {
+                    apply_operators_view(&self.operators, BatchView::all(batch))
+                })?;
                 if !view.is_empty() {
-                    local.add_view(&view)?;
+                    worker
+                        .process_async(local.add_view_async(&view, tx))
+                        .await?;
                 }
                 Ok(true)
-            }),
-            WorkerSink::Sort(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+            }
+            WorkerSink::Sort(local) => {
+                let view = worker.process(|| {
+                    apply_operators_view(&self.operators, BatchView::all(batch))
+                })?;
                 if !view.is_empty() {
-                    local.add_view(view)?;
+                    worker.process_async(local.add_view_async(view, tx)).await?;
                 }
                 Ok(true)
-            }),
+            }
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
                 let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
                 if !view.is_empty() {
-                    local.add_view(&view)?;
+                    local.add_view_spillable(&view, tx)?;
                 }
                 Ok(true)
             }),
@@ -2032,7 +2143,7 @@ impl Pipeline {
         }
     }
 
-    fn finish_worker(
+    async fn finish_worker(
         &self,
         sink: WorkerSink,
         output: &WorkerOutput,
@@ -2046,14 +2157,16 @@ impl Pipeline {
                 if output.tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
-                let run = worker.process(|| local.finish(output.batch_size))?;
-                return Ok(WorkerState::SortedRuns(run.into_iter().collect()));
+                let runs = worker
+                    .process_async(local.finish_async(output.batch_size, &output.tx))
+                    .await?;
+                return Ok(WorkerState::SortedRuns(runs));
             }
             WorkerSink::Sort(local) => {
                 if output.tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
-                let runs = worker.process(|| local.finish())?;
+                let runs = worker.process_async(local.finish_async(&output.tx)).await?;
                 return Ok(WorkerState::SortedRuns(runs));
             }
             WorkerSink::HashJoinBuild(local) => {
@@ -2125,7 +2238,7 @@ impl Pipeline {
                     (Some(prefix), false) => format!("{prefix}_build"),
                     (Some(prefix), true) => format!("{prefix}_build_{idx}"),
                 };
-                let Some(table) = Self::run_single_build_pipeline(
+                let Some(table) = Box::pin(Self::run_single_build_pipeline(
                     &probe.build_pipeline,
                     &build_label,
                     stage_inputs,
@@ -2134,7 +2247,7 @@ impl Pipeline {
                     plan_metrics,
                     measurement,
                     tx,
-                )
+                ))
                 .await?
                 else {
                     return Ok(BuildRunOutcome::Cancelled);
@@ -2189,19 +2302,20 @@ impl Pipeline {
         sink_memory: Option<WorkerSinkMemory>,
         tables: Arc<Vec<Arc<FinalizedHashTable>>>,
         probe_reservation: MemoryReservation,
+        probe_spill_env: Option<ProbeSpillEnv>,
         mut worker: WorkerMetrics,
     ) -> Result<WorkerState> {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
-        let mut join_state = JoinWorkerState {
-            tables,
-            scratch: ProbeScratch::default(),
-            probe_reservation,
-        };
+        let mut join_state =
+            JoinWorkerState::new(tables, probe_reservation, probe_spill_env);
         let Operator::HashProbe(probe) = &self.operators[op_idx] else {
             unreachable!()
         };
         let table = Arc::clone(&join_state.tables[build_id]);
-        let num_rows = table.num_rows();
+        let FinalizedHashTableKind::Single(single) = &table.kind else {
+            return internal_err!("run_build_emission_worker expected SingleHashTable");
+        };
+        let num_rows = single.num_rows();
         let chunk_rows = output.batch_size.max(1);
         let tx = &output.tx;
         let mut indices = Vec::new();
@@ -2214,7 +2328,7 @@ impl Pipeline {
             let end = (start + chunk_rows).min(num_rows);
             worker.claim();
             let batch_opt = worker.process(|| -> Result<_> {
-                table.collect_build_emission_indices(
+                single.collect_build_emission_indices(
                     start,
                     end,
                     want_matched,
@@ -2223,9 +2337,9 @@ impl Pipeline {
                 if indices.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(
-                        probe.materialize_build_emission_batch(&table, &indices)?,
-                    ))
+                    Ok(Some(probe.materialize_single_build_emission_batch(
+                        single, &indices,
+                    )?))
                 }
             })?;
             if let Some(batch) = batch_opt {
@@ -2247,7 +2361,647 @@ impl Pipeline {
             worker.complete();
             tokio::task::yield_now().await;
         }
-        self.finish_worker(sink, &output, worker)
+        join_state.finish_probe_spills()?;
+        drop(join_state);
+        self.finish_worker(sink, &output, worker).await
+    }
+
+    async fn merge_worker_state_into_targets(
+        local: WorkerState,
+        targets: &mut BuildEmissionTargets<'_>,
+        tx: &mpsc::Sender<RecordBatch>,
+    ) -> Result<bool> {
+        match local {
+            WorkerState::None => Ok(true),
+            WorkerState::Count(local) => {
+                if let Some(combined) = targets.combined_count.as_deref_mut() {
+                    combined.combine(local)?;
+                }
+                Ok(!tx.is_closed())
+            }
+            WorkerState::GroupCount(local) => {
+                if let Some(Some(combined)) = targets.combined_group.as_deref_mut() {
+                    combined.merge_from(*local, tx).await
+                } else {
+                    Ok(!tx.is_closed())
+                }
+            }
+            WorkerState::Aggregate(local) => {
+                if let Some(Some(combined)) = targets.combined_agg.as_deref_mut() {
+                    combined.merge_from(*local, tx).await
+                } else {
+                    Ok(!tx.is_closed())
+                }
+            }
+            WorkerState::SortedRuns(runs) => {
+                if let Some(sorted_runs) = targets.sorted_runs.as_deref_mut() {
+                    sorted_runs.extend(runs);
+                }
+                Ok(!tx.is_closed())
+            }
+            WorkerState::HashJoinBuild(local) => {
+                if let Some(combined_build) = targets.combined_build.as_deref_mut() {
+                    combined_build.combine_spillable(*local, tx)?;
+                }
+                Ok(!tx.is_closed())
+            }
+        }
+    }
+
+    fn make_p2_sink_memory(
+        &self,
+        context: &Arc<TaskContext>,
+        targets: &BuildEmissionTargets<'_>,
+    ) -> Option<WorkerSinkMemory> {
+        if let Some(shared) = targets.shared_sort_memory {
+            Some(WorkerSinkMemory::SharedSort(
+                Arc::clone(shared),
+                targets.sort_spill.cloned(),
+            ))
+        } else if matches!(
+            self.sink,
+            Sink::Aggregate { .. } | Sink::GroupCount { .. } | Sink::TopN { .. }
+        ) {
+            let consumer_name = match self.sink {
+                Sink::GroupCount { .. } => "MorselGroupCount",
+                Sink::TopN { .. } => "MorselTopN",
+                _ => "MorselAggregate",
+            };
+            let res = MemoryConsumer::new(consumer_name)
+                .with_can_spill(targets.sink_spill.is_some())
+                .register(context.memory_pool());
+            Some(WorkerSinkMemory::SpillableReservation(
+                res,
+                targets.sink_spill.cloned(),
+            ))
+        } else if matches!(self.sink, Sink::HashJoinBuild(_)) {
+            let res = MemoryConsumer::new("MorselHashJoinBuild")
+                .with_can_spill(targets.build_spill.is_some())
+                .register(context.memory_pool());
+            Some(WorkerSinkMemory::HashJoinBuild(
+                res,
+                targets.build_spill.cloned(),
+                targets.null_key_spill.cloned(),
+            ))
+        } else {
+            targets
+                .sink_reservation
+                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn emit_single_table_build_rows(
+        &self,
+        op_idx: usize,
+        probe: &HashJoinProbe,
+        single: &SingleHashTable,
+        output: &WorkerOutput,
+        sink: &mut WorkerSink,
+        join_state: &mut JoinWorkerState,
+        worker: &mut WorkerMetrics,
+    ) -> Result<bool> {
+        if !probe.needs_build_emission() || single.num_rows() == 0 {
+            return Ok(true);
+        }
+        let want_matched = probe.kind.emit_matched_build();
+        let chunk_rows = output.batch_size.max(1);
+        let mut indices = Vec::new();
+        let mut start = 0usize;
+        while start < single.num_rows() {
+            if output.tx.is_closed() {
+                return Ok(false);
+            }
+            let end = (start + chunk_rows).min(single.num_rows());
+            single.collect_build_emission_indices(start, end, want_matched, &mut indices);
+            start = end;
+            if !indices.is_empty() {
+                let batch =
+                    probe.materialize_single_build_emission_batch(single, &indices)?;
+                let cont = self
+                    .consume_with_joins_from(
+                        op_idx + 1,
+                        batch,
+                        &output.tx,
+                        output.batch_size,
+                        sink,
+                        join_state,
+                        worker,
+                    )
+                    .await?;
+                if !cont {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn replay_spilled_join_partition<'a>(
+        &'a self,
+        op_idx: usize,
+        probe: &'a HashJoinProbe,
+        build_files: Vec<Arc<dyn SpillFile>>,
+        probe_files: Vec<Arc<dyn SpillFile>>,
+        build_mgr: &'a datafusion_physical_plan::spill::SpillManager,
+        probe_mgr: Option<&'a datafusion_physical_plan::spill::SpillManager>,
+        meta: &'a RadixBuildMetadata,
+        shift: u32,
+        depth: usize,
+        context: &'a Arc<TaskContext>,
+        output: &'a WorkerOutput,
+        sink: &'a mut WorkerSink,
+        join_state: &'a mut JoinWorkerState,
+        worker: &'a mut WorkerMetrics,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            if output.tx.is_closed() || build_files.is_empty() {
+                return Ok(!output.tx.is_closed());
+            }
+
+            // Probe-empty build partition: skip hash table construction completely.
+            if probe_files.is_empty() {
+                if probe.needs_build_emission() && !probe.kind.emit_matched_build() {
+                    let num_payload_cols = meta.num_payload_cols;
+                    let num_key_cols = meta.key_types.len();
+                    for sf in build_files {
+                        if output.tx.is_closed() {
+                            return Ok(false);
+                        }
+                        let mut stream =
+                            build_mgr.read_spill_as_stream_unbuffered(sf, None)?;
+                        while let Some(batch_res) = stream.next().await {
+                            if output.tx.is_closed() {
+                                return Ok(false);
+                            }
+                            let batch = batch_res?;
+                            if batch.num_rows() == 0 {
+                                continue;
+                            }
+                            let (payload_opt, _, _) = unpack_build_spill_batch(
+                                &batch,
+                                &meta.payload_schema,
+                                num_payload_cols,
+                                num_key_cols,
+                            )?;
+                            let payload = match payload_opt {
+                                Some(p) => p,
+                                None => RecordBatch::try_new_with_options(
+                                    Arc::clone(&meta.payload_schema),
+                                    vec![],
+                                    &arrow::array::RecordBatchOptions::new()
+                                        .with_row_count(Some(batch.num_rows())),
+                                )?,
+                            };
+                            let out = probe
+                                .materialize_unmatched_build_payload_batch(&payload)?;
+                            let cont = self
+                                .consume_with_joins_from(
+                                    op_idx + 1,
+                                    out,
+                                    &output.tx,
+                                    output.batch_size,
+                                    sink,
+                                    join_state,
+                                    worker,
+                                )
+                                .await?;
+                            if !cont {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+
+            let probe_mgr = probe_mgr.ok_or_else(|| {
+                datafusion_common::internal_datafusion_err!(
+                    "Missing probe SpillManager for non-empty probe spill files"
+                )
+            })?;
+
+            // Attempt to load the entire build partition into one SingleHashTable.
+            // If `sink` is holding buffered RAM from earlier P2 partitions, spill
+            // `sink` and retry once before falling back to recursive split / BNL.
+            let mut loaded_table = None;
+            for attempt in 0..2 {
+                let build_res = MemoryConsumer::new("MorselHashJoinSpillBuild")
+                    .with_can_spill(true)
+                    .register(context.memory_pool());
+                match load_spilled_build_partition_sync_or_async(
+                    &build_files,
+                    build_mgr,
+                    meta,
+                    build_res,
+                    &output.tx,
+                )
+                .await
+                {
+                    Ok(None) => return Ok(false),
+                    Ok(Some(single_table)) => {
+                        loaded_table = Some(single_table);
+                        break;
+                    }
+                    Err(datafusion_common::DataFusionError::ResourcesExhausted(_)) => {
+                        if attempt == 0
+                            && let WorkerSink::HashJoinBuild(b) = sink
+                            && b.spill_in_memory(&output.tx)?
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if let Some(single_table) = loaded_table {
+                // Release build spill files immediately before streaming probe!
+                drop(build_files);
+                let mut local_scratch = ProbeScratch::default();
+                let local_probe_res = MemoryConsumer::new("MorselHashJoinSpillProbe")
+                    .register(context.memory_pool());
+                for pf in probe_files {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    let mut stream =
+                        probe_mgr.read_spill_as_stream_unbuffered(pf, None)?;
+                    while let Some(batch_res) = stream.next().await {
+                        if output.tx.is_closed() {
+                            return Ok(false);
+                        }
+                        let batch = batch_res?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let Some(mut cursor) = probe.start_single_table_probe(
+                            BatchView::all(batch),
+                            &single_table,
+                            &local_probe_res,
+                        )?
+                        else {
+                            continue;
+                        };
+                        loop {
+                            match probe.next_chunk_single(
+                                &mut cursor,
+                                &single_table,
+                                output.batch_size,
+                                &mut local_scratch,
+                            )? {
+                                OperatorStep::NeedMoreInput(opt) => {
+                                    if let Some(out) = opt {
+                                        let cont = self
+                                            .consume_with_joins_from(
+                                                op_idx + 1,
+                                                out,
+                                                &output.tx,
+                                                output.batch_size,
+                                                sink,
+                                                join_state,
+                                                worker,
+                                            )
+                                            .await?;
+                                        if !cont {
+                                            return Ok(false);
+                                        }
+                                    }
+                                    break;
+                                }
+                                OperatorStep::HaveMoreOutput(out) => {
+                                    let cont = self
+                                        .consume_with_joins_from(
+                                            op_idx + 1,
+                                            out,
+                                            &output.tx,
+                                            output.batch_size,
+                                            sink,
+                                            join_state,
+                                            worker,
+                                        )
+                                        .await?;
+                                    if !cont {
+                                        return Ok(false);
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(local_probe_res);
+                let cont = self
+                    .emit_single_table_build_rows(
+                        op_idx,
+                        probe,
+                        &single_table,
+                        output,
+                        sink,
+                        join_state,
+                        worker,
+                    )
+                    .await?;
+                drop(single_table);
+                return Ok(cont);
+            }
+
+            // Recursive radix split on the next disjoint bit window.
+            if let Some((next_shift, sub_pairs)) = probe
+                .try_repartition_spilled_pair(
+                    &build_files,
+                    &probe_files,
+                    build_mgr,
+                    probe_mgr,
+                    meta,
+                    shift,
+                    depth,
+                    &output.tx,
+                )
+                .await?
+            {
+                // Unlink parent partition files immediately before recursing!
+                drop(build_files);
+                drop(probe_files);
+                for (sub_b, sub_p) in sub_pairs {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    if sub_b.is_empty() && sub_p.is_empty() {
+                        continue;
+                    }
+                    if sub_b.is_empty() {
+                        if probe.kind.emits_unmatched_probe() {
+                            for pf in sub_p {
+                                let mut stream = probe_mgr
+                                    .read_spill_as_stream_unbuffered(pf, None)?;
+                                while let Some(batch_res) = stream.next().await {
+                                    let batch = batch_res?;
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    let idxs: Vec<u32> =
+                                        (0..batch.num_rows() as u32).collect();
+                                    let out = probe
+                                        .materialize_unmatched_probe_indices_batch(
+                                            &batch, &idxs,
+                                        )?;
+                                    let cont = self
+                                        .consume_with_joins_from(
+                                            op_idx + 1,
+                                            out,
+                                            &output.tx,
+                                            output.batch_size,
+                                            sink,
+                                            join_state,
+                                            worker,
+                                        )
+                                        .await?;
+                                    if !cont {
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let cont = self
+                        .replay_spilled_join_partition(
+                            op_idx,
+                            probe,
+                            sub_b,
+                            sub_p,
+                            build_mgr,
+                            Some(probe_mgr),
+                            meta,
+                            next_shift,
+                            depth + 1,
+                            context,
+                            output,
+                            sink,
+                            join_state,
+                            worker,
+                        )
+                        .await?;
+                    if !cont {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+
+            // Unsplittable skew fallback (e.g. 100% duplicate keys): block-nested-loop
+            // hash sub-pass over memory-bounded build slices with cross-slice
+            // `probe_matched` bitset!
+            let mut probe_matched: Vec<u64> = Vec::new();
+            let mut slice_batches: Vec<RecordBatch> = Vec::new();
+            let mut slice_bytes: usize = 0;
+            let mut local_scratch = ProbeScratch::default();
+
+            let run_slice = async |slice_batches: Vec<RecordBatch>,
+                                   probe_matched: &mut Vec<u64>,
+                                   sink: &mut WorkerSink,
+                                   join_state: &mut JoinWorkerState,
+                                   worker: &mut WorkerMetrics,
+                                   local_scratch: &mut ProbeScratch|
+                   -> Result<bool> {
+                if slice_batches.is_empty() {
+                    return Ok(true);
+                }
+                let slice_res = MemoryConsumer::new("MorselHashJoinBnlSlice")
+                    .with_can_spill(true)
+                    .register(context.memory_pool());
+                let slice_table = build_single_table_from_packed_batches(
+                    &slice_batches,
+                    meta,
+                    None,
+                    slice_res,
+                )?;
+                drop(slice_batches);
+
+                let local_probe_res = MemoryConsumer::new("MorselHashJoinBnlProbe")
+                    .register(context.memory_pool());
+                let mut probe_row_offset = 0usize;
+                for pf in &probe_files {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    let mut stream = probe_mgr
+                        .read_spill_as_stream_unbuffered(Arc::clone(pf), None)?;
+                    while let Some(batch_res) = stream.next().await {
+                        if output.tx.is_closed() {
+                            return Ok(false);
+                        }
+                        let batch = batch_res?;
+                        let n = batch.num_rows();
+                        if n == 0 {
+                            continue;
+                        }
+                        let outs = probe.probe_bnl_slice_batch(
+                            &batch,
+                            &slice_table,
+                            probe_row_offset,
+                            probe_matched,
+                            output.batch_size,
+                            &local_probe_res,
+                            local_scratch,
+                        )?;
+                        probe_row_offset += n;
+                        for out in outs {
+                            let cont = self
+                                .consume_with_joins_from(
+                                    op_idx + 1,
+                                    out,
+                                    &output.tx,
+                                    output.batch_size,
+                                    sink,
+                                    join_state,
+                                    worker,
+                                )
+                                .await?;
+                            if !cont {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                drop(local_probe_res);
+                let cont = self
+                    .emit_single_table_build_rows(
+                        op_idx,
+                        probe,
+                        &slice_table,
+                        output,
+                        sink,
+                        join_state,
+                        worker,
+                    )
+                    .await?;
+                drop(slice_table);
+                Ok(cont)
+            };
+
+            // Stream build files in bounded slices (checking headroom for building
+            // the hash table over each slice!).
+            for bf in build_files {
+                if output.tx.is_closed() {
+                    return Ok(false);
+                }
+                let mut stream = build_mgr.read_spill_as_stream_unbuffered(bf, None)?;
+                while let Some(batch_res) = stream.next().await {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    let batch = batch_res?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    // Slice large batches down if needed so each BNL slice fits easily.
+                    let max_chunk = output.batch_size.max(256);
+                    let mut off = 0usize;
+                    while off < batch.num_rows() {
+                        let len = (batch.num_rows() - off).min(max_chunk);
+                        let sub = batch.slice(off, len);
+                        off += len;
+                        let b_bytes = get_record_batch_memory_size(&sub);
+                        let needed_est =
+                            slice_bytes.saturating_add(b_bytes).saturating_mul(4);
+                        let probe_res = MemoryConsumer::new("MorselHashJoinBnlCheck")
+                            .register(context.memory_pool());
+                        let fits = probe_res.try_grow(needed_est).is_ok();
+                        drop(probe_res);
+                        if !fits && !slice_batches.is_empty() {
+                            let to_run = std::mem::take(&mut slice_batches);
+                            slice_bytes = 0;
+                            if !run_slice(
+                                to_run,
+                                &mut probe_matched,
+                                sink,
+                                join_state,
+                                worker,
+                                &mut local_scratch,
+                            )
+                            .await?
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        slice_bytes = slice_bytes.saturating_add(b_bytes);
+                        slice_batches.push(sub);
+                    }
+                }
+            }
+            if !slice_batches.is_empty()
+                && !run_slice(
+                    std::mem::take(&mut slice_batches),
+                    &mut probe_matched,
+                    sink,
+                    join_state,
+                    worker,
+                    &mut local_scratch,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+
+            // Emit unmatched probe rows once after all build slices finish.
+            if probe.kind.emits_unmatched_probe() {
+                let mut probe_row_offset = 0usize;
+                let mut unmatched_idx = Vec::new();
+                for pf in probe_files {
+                    if output.tx.is_closed() {
+                        return Ok(false);
+                    }
+                    let mut stream =
+                        probe_mgr.read_spill_as_stream_unbuffered(pf, None)?;
+                    while let Some(batch_res) = stream.next().await {
+                        if output.tx.is_closed() {
+                            return Ok(false);
+                        }
+                        let batch = batch_res?;
+                        let n = batch.num_rows();
+                        if n == 0 {
+                            continue;
+                        }
+                        unmatched_idx.clear();
+                        for r in 0..n {
+                            let g = probe_row_offset + r;
+                            let word_idx = g >> 6;
+                            let matched = probe_matched
+                                .get(word_idx)
+                                .is_some_and(|w| (*w & (1u64 << (g & 63))) != 0);
+                            if !matched {
+                                unmatched_idx.push(r as u32);
+                            }
+                        }
+                        probe_row_offset += n;
+                        if !unmatched_idx.is_empty() {
+                            let out = probe.materialize_unmatched_probe_indices_batch(
+                                &batch,
+                                &unmatched_idx,
+                            )?;
+                            let cont = self
+                                .consume_with_joins_from(
+                                    op_idx + 1,
+                                    out,
+                                    &output.tx,
+                                    output.batch_size,
+                                    sink,
+                                    join_state,
+                                    worker,
+                                )
+                                .await?;
+                            if !cont {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -2263,18 +3017,23 @@ impl Pipeline {
         targets: &mut BuildEmissionTargets<'_>,
     ) -> Result<bool> {
         let multi = finalized_tables.len() > 1;
+        let any_spilled = finalized_tables.iter().any(|t| t.has_spilled_partitions());
+        let probe_spill_env =
+            any_spilled.then(|| ProbeSpillEnv::new(context, plan_metrics));
+
         for (op_idx, op) in self.operators.iter().enumerate() {
             let Operator::HashProbe(probe) = op else {
                 continue;
             };
-            if !probe.needs_build_emission() {
-                continue;
-            }
             if short_circuit_op.is_some_and(|sc| op_idx <= sc) {
                 continue;
             }
             let table = &finalized_tables[probe.build_id];
             if table.is_empty() {
+                continue;
+            }
+            let needs_p2 = probe.needs_build_emission() || table.has_spilled_partitions();
+            if !needs_p2 {
                 continue;
             }
             if output.tx.is_closed() {
@@ -2298,129 +3057,246 @@ impl Pipeline {
                 (Some(prefix), false) => format!("{prefix}_emit"),
                 (Some(prefix), true) => format!("{prefix}_emit_{}", probe.build_id),
             };
-            let chunk_rows = output.batch_size.max(1);
-            let num_chunks = table.num_rows().div_ceil(chunk_rows);
-            let worker_count = self.workers.get().min(num_chunks).max(1);
-            let next_row = Arc::new(AtomicUsize::new(0));
-            let want_matched = probe.kind.emit_matched_build();
-            let build_id = probe.build_id;
-            let probe_reservation = MemoryConsumer::new("MorselHashJoinProbe")
-                .register(context.memory_pool());
 
-            let mut tasks = JoinSet::new();
-            for id in 0..worker_count {
-                let pipeline = Arc::clone(self);
-                let next_row = Arc::clone(&next_row);
-                let out = output.clone();
-                let tables = Arc::clone(finalized_tables);
-                let probe_res = probe_reservation.new_empty();
-                let sink_memory = if let Some(shared) = targets.shared_sort_memory {
-                    Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                } else {
-                    targets
-                        .sink_reservation
-                        .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
-                };
-                let worker =
-                    WorkerMetrics::for_pipeline(measurement.cloned(), id, &emit_label);
-                tasks.spawn(async move {
-                    pipeline
-                        .run_build_emission_worker(
-                            op_idx,
-                            build_id,
-                            want_matched,
-                            &next_row,
-                            out,
-                            sink_memory,
-                            tables,
-                            probe_res,
-                            worker,
+            match &table.kind {
+                FinalizedHashTableKind::Single(_) => {
+                    let chunk_rows = output.batch_size.max(1);
+                    let num_chunks = table.num_rows().div_ceil(chunk_rows);
+                    let worker_count = self.workers.get().min(num_chunks).max(1);
+                    let next_row = Arc::new(AtomicUsize::new(0));
+                    let want_matched = probe.kind.emit_matched_build();
+                    let build_id = probe.build_id;
+                    let probe_reservation = MemoryConsumer::new("MorselHashJoinProbe")
+                        .register(context.memory_pool());
+
+                    let mut tasks = JoinSet::new();
+                    for id in 0..worker_count {
+                        let pipeline = Arc::clone(self);
+                        let next_row = Arc::clone(&next_row);
+                        let out = output.clone();
+                        let tables = Arc::clone(finalized_tables);
+                        let probe_res = probe_reservation.new_empty();
+                        let sink_memory = self.make_p2_sink_memory(context, targets);
+                        let env = probe_spill_env.clone();
+                        let worker = WorkerMetrics::for_pipeline(
+                            measurement.cloned(),
+                            id,
+                            &emit_label,
+                        );
+                        tasks.spawn(async move {
+                            pipeline
+                                .run_build_emission_worker(
+                                    op_idx,
+                                    build_id,
+                                    want_matched,
+                                    &next_row,
+                                    out,
+                                    sink_memory,
+                                    tables,
+                                    probe_res,
+                                    env,
+                                    worker,
+                                )
+                                .await
+                        });
+                    }
+                    drop(probe_reservation);
+
+                    while let Some(result) = tasks.join_next().await {
+                        let local = match result {
+                            Ok(Ok(local)) => local,
+                            Ok(Err(err)) => {
+                                abort_and_drain(&mut tasks).await;
+                                return Err(err);
+                            }
+                            Err(err) if err.is_panic() => {
+                                abort_and_drain(&mut tasks).await;
+                                std::panic::resume_unwind(err.into_panic())
+                            }
+                            Err(err) => {
+                                abort_and_drain(&mut tasks).await;
+                                return Err(exec_datafusion_err!(
+                                    "Morsel join build-emission task failed: {err}"
+                                ));
+                            }
+                        };
+                        if !Self::merge_worker_state_into_targets(
+                            local, targets, &output.tx,
                         )
-                        .await
-                });
-            }
-            drop(probe_reservation);
+                        .await?
+                        {
+                            abort_and_drain(&mut tasks).await;
+                            return Ok(false);
+                        }
+                    }
+                }
+                FinalizedHashTableKind::Radix(radix) => {
+                    let sink_memory = self.make_p2_sink_memory(context, targets);
+                    let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
+                    let probe_res = MemoryConsumer::new("MorselHashJoinProbe")
+                        .with_can_spill(any_spilled)
+                        .register(context.memory_pool());
+                    // Downstream JoinWorkerState (for op_idx + 1..); clear this
+                    // join's own resident clone so `table.take_resident()` drops
+                    // the last strong Arc<ResidentRadixPartitions> immediately!
+                    let mut join_state = JoinWorkerState::new(
+                        Arc::clone(finalized_tables),
+                        probe_res,
+                        probe_spill_env.clone(),
+                    );
+                    join_state.resident_tables[probe.build_id] = None;
+                    let mut worker =
+                        WorkerMetrics::for_pipeline(measurement.cloned(), 0, &emit_label);
 
-            while let Some(result) = tasks.join_next().await {
-                let local = match result {
-                    Ok(Ok(local)) => local,
-                    Ok(Err(err)) => {
-                        abort_and_drain(&mut tasks).await;
-                        return Err(err);
-                    }
-                    Err(err) if err.is_panic() => {
-                        abort_and_drain(&mut tasks).await;
-                        std::panic::resume_unwind(err.into_panic())
-                    }
-                    Err(err) => {
-                        abort_and_drain(&mut tasks).await;
-                        return Err(exec_datafusion_err!(
-                            "Morsel join build-emission task failed: {err}"
-                        ));
-                    }
-                };
-                match local {
-                    WorkerState::None => {}
-                    WorkerState::Count(local) => {
-                        if let Some(combined) = targets.combined_count.as_deref_mut()
-                            && let Err(err) = combined.combine(local)
-                        {
-                            abort_and_drain(&mut tasks).await;
-                            return Err(err);
-                        }
-                    }
-                    WorkerState::GroupCount(local) => {
-                        if let Some(Some(combined)) =
-                            targets.combined_group.as_deref_mut()
-                        {
-                            match combined.merge_from(local, &output.tx).await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    abort_and_drain(&mut tasks).await;
+                    // Step 2a: Resident M build emission + NULL-key build rows,
+                    // then drop M immediately to free 100% of M's RAM before S!
+                    let resident_opt = table.take_resident();
+                    if probe.needs_build_emission() {
+                        if let Some(resident) = &resident_opt {
+                            for part_opt in &resident.partitions {
+                                let Some(pt) = part_opt.as_ref() else {
+                                    continue;
+                                };
+                                if !self
+                                    .emit_single_table_build_rows(
+                                        op_idx,
+                                        probe,
+                                        pt,
+                                        output,
+                                        &mut sink,
+                                        &mut join_state,
+                                        &mut worker,
+                                    )
+                                    .await?
+                                {
                                     return Ok(false);
                                 }
-                                Err(err) => {
-                                    abort_and_drain(&mut tasks).await;
-                                    return Err(err);
+                            }
+                        }
+                        if !probe.kind.emit_matched_build() {
+                            let nk_opt = radix.null_key_build.lock().take();
+                            if let Some(nk) = nk_opt {
+                                for batch in nk.mem_batches {
+                                    if output.tx.is_closed() {
+                                        return Ok(false);
+                                    }
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    let out = probe
+                                        .materialize_unmatched_build_payload_batch(
+                                            &batch,
+                                        )?;
+                                    if !self
+                                        .consume_with_joins_from(
+                                            op_idx + 1,
+                                            out,
+                                            &output.tx,
+                                            output.batch_size,
+                                            &mut sink,
+                                            &mut join_state,
+                                            &mut worker,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(false);
+                                    }
+                                }
+                                if !nk.spill_files.is_empty()
+                                    && let Some(nk_mgr) =
+                                        radix.null_key_spill_manager.as_ref()
+                                {
+                                    for sf in nk.spill_files {
+                                        if output.tx.is_closed() {
+                                            return Ok(false);
+                                        }
+                                        let mut stream = nk_mgr
+                                            .read_spill_as_stream_unbuffered(sf, None)?;
+                                        while let Some(batch_res) = stream.next().await {
+                                            let batch = batch_res?;
+                                            if batch.num_rows() == 0 {
+                                                continue;
+                                            }
+                                            let out = probe
+                                                .materialize_unmatched_build_payload_batch(
+                                                    &batch,
+                                                )?;
+                                            if !self
+                                                .consume_with_joins_from(
+                                                    op_idx + 1,
+                                                    out,
+                                                    &output.tx,
+                                                    output.batch_size,
+                                                    &mut sink,
+                                                    &mut join_state,
+                                                    &mut worker,
+                                                )
+                                                .await?
+                                            {
+                                                return Ok(false);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    WorkerState::Aggregate(local) => {
-                        if let Some(Some(combined)) = targets.combined_agg.as_deref_mut()
-                        {
-                            match combined.merge_from(local, &output.tx).await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    abort_and_drain(&mut tasks).await;
-                                    return Ok(false);
-                                }
-                                Err(err) => {
-                                    abort_and_drain(&mut tasks).await;
-                                    return Err(err);
-                                }
+                    // Drop resident M NOW so 100% of MemoryPool is available for S!
+                    drop(resident_opt);
+
+                    // Step 2b: Process spilled partition pairs p ∈ S one at a time.
+                    if radix.spilled_build_mask != 0 {
+                        let (probe_mgr, mut probe_files_by_part) =
+                            radix.probe_spill_manifest.lock().finish_all()?;
+                        let build_mgr = radix
+                            .build_spill_manager
+                            .as_ref()
+                            .expect("build spill manager for spilled join");
+                        let num_parts = radix.spilled_build.len();
+                        for p in 0..num_parts {
+                            if output.tx.is_closed() {
+                                return Ok(false);
+                            }
+                            let Some(build_part) = radix.spilled_build[p].lock().take()
+                            else {
+                                continue;
+                            };
+                            let probe_files = if p < probe_files_by_part.len() {
+                                std::mem::take(&mut probe_files_by_part[p])
+                            } else {
+                                Vec::new()
+                            };
+                            if !self
+                                .replay_spilled_join_partition(
+                                    op_idx,
+                                    probe,
+                                    build_part.files,
+                                    probe_files,
+                                    build_mgr,
+                                    probe_mgr.as_ref(),
+                                    &radix.meta,
+                                    radix.shift,
+                                    0,
+                                    context,
+                                    output,
+                                    &mut sink,
+                                    &mut join_state,
+                                    &mut worker,
+                                )
+                                .await?
+                            {
+                                return Ok(false);
                             }
                         }
                     }
-                    WorkerState::SortedRuns(runs) => {
-                        if let Some(sorted_runs) = targets.sorted_runs.as_deref_mut() {
-                            sorted_runs.extend(runs);
-                        }
-                        if output.tx.is_closed() {
-                            abort_and_drain(&mut tasks).await;
-                            return Ok(false);
-                        }
-                    }
-                    WorkerState::HashJoinBuild(local) => {
-                        if let Some(combined_build) =
-                            targets.combined_build.as_deref_mut()
-                        {
-                            combined_build.combine(local);
-                        }
-                        if output.tx.is_closed() {
-                            abort_and_drain(&mut tasks).await;
-                            return Ok(false);
-                        }
+
+                    join_state.finish_probe_spills()?;
+                    drop(join_state);
+                    let local = self.finish_worker(sink, output, worker).await?;
+                    if !Self::merge_worker_state_into_targets(local, targets, &output.tx)
+                        .await?
+                    {
+                        return Ok(false);
                     }
                 }
             }
@@ -2464,8 +3340,18 @@ impl Pipeline {
                 BuildRunOutcome::ShortCircuitAll => {
                     let empty_res = MemoryConsumer::new("MorselHashJoinBuild")
                         .register(context.memory_pool());
-                    let empty_state = build_sink.new_state(empty_res);
-                    let finalized = build_sink.finalize(empty_state, tx).await?;
+                    let empty_state =
+                        build_sink.new_state_with_spill(empty_res, None, None);
+                    let finalized = build_sink
+                        .finalize_with_spill(
+                            empty_state,
+                            build_pipeline.workers.get(),
+                            context.memory_pool(),
+                            None,
+                            None,
+                            tx,
+                        )
+                        .await?;
                     if finalized.is_some() {
                         MetricBuilder::new(plan_metrics)
                             .counter("join_build_finalizations", 0)
@@ -2478,16 +3364,64 @@ impl Pipeline {
             (None, None)
         };
 
-        let build_reservation =
-            MemoryConsumer::new("MorselHashJoinBuild").register(context.memory_pool());
-        let nested_probe_reservation = nested_tables.as_ref().map(|_| {
-            MemoryConsumer::new("MorselHashJoinProbe").register(context.memory_pool())
+        let build_spill = build_sink
+            .can_radix_spill()
+            .then(|| {
+                SpillContext::try_new(
+                    context,
+                    plan_metrics,
+                    Arc::clone(build_sink.build_spill_schema()),
+                )
+            })
+            .flatten();
+        let null_key_spill = build_spill.as_ref().and_then(|_| {
+            SpillContext::try_new(
+                context,
+                plan_metrics,
+                Arc::clone(build_sink.payload_schema()),
+            )
         });
-        let mut combined_build = build_sink.new_state(build_reservation.new_empty());
+        let can_spill = build_spill.is_some();
+
+        let build_reservation = MemoryConsumer::new("MorselHashJoinBuild")
+            .with_can_spill(can_spill)
+            .register(context.memory_pool());
+        let nested_any_spilled = nested_tables
+            .as_ref()
+            .is_some_and(|ts| ts.iter().any(|t| t.has_spilled_partitions()));
+        let nested_probe_env =
+            nested_any_spilled.then(|| ProbeSpillEnv::new(context, plan_metrics));
+        let mut combined_build = build_sink.new_state_with_spill(
+            MemoryConsumer::new("MorselHashJoinBuild")
+                .with_can_spill(can_spill)
+                .register(context.memory_pool()),
+            build_spill.clone(),
+            null_key_spill.clone(),
+        );
         let build_output = WorkerOutput {
             tx: tx.clone(),
             batch_size: context.session_config().batch_size(),
             tails: Arc::default(),
+        };
+
+        let make_build_worker_mem = || {
+            let res = MemoryConsumer::new("MorselHashJoinBuild")
+                .with_can_spill(can_spill)
+                .register(context.memory_pool());
+            Some(WorkerSinkMemory::HashJoinBuild(
+                res,
+                build_spill.clone(),
+                null_key_spill.clone(),
+            ))
+        };
+        let make_nested_join_ctx = || {
+            nested_tables.as_ref().map(|t| JoinContext {
+                tables: Arc::clone(t),
+                probe_reservation: MemoryConsumer::new("MorselHashJoinProbe")
+                    .with_can_spill(nested_any_spilled)
+                    .register(context.memory_pool()),
+                probe_spill_env: nested_probe_env.clone(),
+            })
         };
 
         let mut combine_duration = std::time::Duration::ZERO;
@@ -2503,18 +3437,8 @@ impl Pipeline {
                             Arc::clone(&next),
                             build_output.clone(),
                         );
-                        let reservation = Some(WorkerSinkMemory::Reservation(
-                            build_reservation.new_empty(),
-                        ));
-                        let join_ctx = nested_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                nested_probe_reservation
-                                    .as_ref()
-                                    .expect("nested probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let reservation = make_build_worker_mem();
+                        let join_ctx = make_nested_join_ctx();
                         let worker = WorkerMetrics::for_pipeline(
                             measurement.cloned(),
                             id,
@@ -2555,18 +3479,8 @@ impl Pipeline {
                             Arc::clone(&next),
                             build_output.clone(),
                         );
-                        let reservation = Some(WorkerSinkMemory::Reservation(
-                            build_reservation.new_empty(),
-                        ));
-                        let join_ctx = nested_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                nested_probe_reservation
-                                    .as_ref()
-                                    .expect("nested probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let reservation = make_build_worker_mem();
+                        let join_ctx = make_nested_join_ctx();
                         let worker = WorkerMetrics::for_pipeline(
                             measurement.cloned(),
                             id,
@@ -2602,18 +3516,8 @@ impl Pipeline {
                             ready.clone(),
                             build_output.clone(),
                         );
-                        let reservation = Some(WorkerSinkMemory::Reservation(
-                            build_reservation.new_empty(),
-                        ));
-                        let join_ctx = nested_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                nested_probe_reservation
-                                    .as_ref()
-                                    .expect("nested probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let reservation = make_build_worker_mem();
+                        let join_ctx = make_nested_join_ctx();
                         let worker = WorkerMetrics::for_pipeline(
                             measurement.cloned(),
                             id,
@@ -2633,7 +3537,6 @@ impl Pipeline {
                     }
                 }
             }
-            drop(nested_probe_reservation);
 
             while let Some(result) = tasks.join_next().await {
                 let local = match result {
@@ -2661,7 +3564,12 @@ impl Pipeline {
                 };
                 if let WorkerState::HashJoinBuild(local) = local {
                     let start = measurement.map(|_| Instant::now());
-                    combined_build.combine(local);
+                    if let Err(err) = combined_build.combine_spillable(*local, tx) {
+                        drop(combined_build);
+                        abort_and_drain(&mut tasks).await;
+                        drop(nested_tables);
+                        return Err(err);
+                    }
                     if let Some(start) = start {
                         combine_duration += start.elapsed();
                     }
@@ -2673,11 +3581,14 @@ impl Pipeline {
                     return Ok(None);
                 }
             }
-        } else {
-            drop(nested_probe_reservation);
         }
 
         if let Some(tables) = &nested_tables {
+            if nested_any_spilled {
+                // Free memory held by P1 build rows before P2 replays spilled
+                // nested join partitions.
+                let _ = combined_build.spill_in_memory(tx)?;
+            }
             let mut targets = BuildEmissionTargets {
                 combined_count: None,
                 combined_group: None,
@@ -2685,20 +3596,23 @@ impl Pipeline {
                 sorted_runs: None,
                 combined_build: Some(&mut combined_build),
                 sink_reservation: Some(&build_reservation),
+                sink_spill: None,
+                build_spill: build_spill.as_ref(),
+                null_key_spill: null_key_spill.as_ref(),
                 shared_sort_memory: None,
+                sort_spill: None,
             };
-            let cont = build_pipeline
-                .run_build_emission_pipelines(
-                    tables,
-                    nested_short_circuit_op,
-                    Some(build_label),
-                    &build_output,
-                    context,
-                    plan_metrics,
-                    measurement,
-                    &mut targets,
-                )
-                .await;
+            let cont = Box::pin(build_pipeline.run_build_emission_pipelines(
+                tables,
+                nested_short_circuit_op,
+                Some(build_label),
+                &build_output,
+                context,
+                plan_metrics,
+                measurement,
+                &mut targets,
+            ))
+            .await;
             match cont {
                 Ok(true) => {}
                 Ok(false) => {
@@ -2730,7 +3644,16 @@ impl Pipeline {
         }
 
         let finalize_start = measurement.map(|_| Instant::now());
-        let finalized = build_sink.finalize(combined_build, tx).await?;
+        let finalized = build_sink
+            .finalize_with_spill(
+                combined_build,
+                build_pipeline.workers.get(),
+                context.memory_pool(),
+                build_spill,
+                null_key_spill,
+                tx,
+            )
+            .await?;
         if let Some(run) = measurement {
             run.record_pipeline_time(
                 build_label,
@@ -2792,6 +3715,7 @@ impl Pipeline {
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
+            fin.spill,
             tx,
             fin.measurement,
         )
@@ -2832,6 +3756,7 @@ impl Pipeline {
             result_operators,
             fin.batch_size,
             fin.context.memory_pool(),
+            fin.spill,
             tx,
             fin.measurement,
         )
@@ -2865,10 +3790,19 @@ impl Pipeline {
             PostSort::TopN { .. } => ("MorselTopN", "topn"),
             PostSort::Sort { .. } => ("MorselSort", "sort"),
         };
+        let agg_spilled = match &finalized_agg {
+            FinalizedAggOutput::Count(_) => false,
+            FinalizedAggOutput::GroupCount(f) => f.has_spilled(),
+            FinalizedAggOutput::Aggregate(f) => f.has_spilled(),
+        };
         let sort_workers = match &finalized_agg {
             FinalizedAggOutput::Count(_) => 1,
             FinalizedAggOutput::GroupCount(_) | FinalizedAggOutput::Aggregate(_) => {
-                self.workers.get()
+                if agg_spilled {
+                    1
+                } else {
+                    self.workers.get()
+                }
             }
         };
 
@@ -2879,6 +3813,8 @@ impl Pipeline {
         // Producer task: streams finalized aggregate output through agg_result_operators.
         {
             let pipeline = Arc::clone(self);
+            let pool = Arc::clone(context.memory_pool());
+            let agg_workers = self.workers.get();
             tasks.spawn(async move {
                 match finalized_agg {
                     FinalizedAggOutput::Count(finalized) => {
@@ -2892,25 +3828,27 @@ impl Pipeline {
                             .await?;
                     }
                     FinalizedAggOutput::GroupCount(finalized) => {
-                        let Sink::GroupCount {
-                            result_operators, ..
-                        } = &pipeline.sink
-                        else {
-                            unreachable!()
-                        };
                         finalized
-                            .emit(result_operators, batch_size, agg_tx, None)
+                            .emit(
+                                ResultOpsRef::Pipeline(Arc::clone(&pipeline)),
+                                agg_workers,
+                                batch_size,
+                                &pool,
+                                agg_tx,
+                                None,
+                            )
                             .await?;
                     }
                     FinalizedAggOutput::Aggregate(finalized) => {
-                        let Sink::Aggregate {
-                            result_operators, ..
-                        } = &pipeline.sink
-                        else {
-                            unreachable!()
-                        };
                         finalized
-                            .emit(result_operators, batch_size, agg_tx, None)
+                            .emit(
+                                ResultOpsRef::Pipeline(Arc::clone(&pipeline)),
+                                agg_workers,
+                                batch_size,
+                                &pool,
+                                agg_tx,
+                                None,
+                            )
                             .await?;
                     }
                 }
@@ -2919,16 +3857,33 @@ impl Pipeline {
         }
 
         // Consumer tasks: dynamically claim finalized aggregate batches and feed local TopN / Sort.
-        let stage_reservation =
-            MemoryConsumer::new(consumer_name).register(context.memory_pool());
-        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. })
-            .then(|| SharedSortMemory::new(stage_reservation.new_empty()));
+        let stage_reservation = MemoryConsumer::new(consumer_name)
+            .with_can_spill(true)
+            .register(context.memory_pool());
+        let shared_sort_memory = matches!(post_sort, PostSort::Sort { .. }).then(|| {
+            let s = SharedSortMemory::new(stage_reservation.new_empty());
+            if agg_spilled {
+                s.mark_spilled();
+            }
+            s
+        });
+        let post_sort_spill = match post_sort {
+            PostSort::Sort { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
+            PostSort::TopN { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
+        };
         for id in 0..sort_workers {
             let pipeline = Arc::clone(self);
             let agg_rx = Arc::clone(&agg_rx);
             let output_tx = tx.clone();
-            let reservation = stage_reservation.new_empty();
+            let reservation = MemoryConsumer::new(consumer_name)
+                .with_can_spill(post_sort_spill.is_some())
+                .register(context.memory_pool());
             let shared_sort = shared_sort_memory.as_ref().map(Arc::clone);
+            let spill_ctx = post_sort_spill.clone();
             let mut worker =
                 WorkerMetrics::for_pipeline(measurement.cloned(), id, stage_label);
             tasks.spawn(async move {
@@ -2940,12 +3895,16 @@ impl Pipeline {
                     Sort(SortState),
                 }
                 let mut local = match ps {
-                    PostSort::TopN { sink, .. } => {
-                        LocalPostState::TopN(sink.new_state(reservation)?)
-                    }
-                    PostSort::Sort { sink, .. } => LocalPostState::Sort(
-                        sink.new_state(shared_sort.expect("shared sort memory")),
+                    PostSort::TopN { sink, .. } => LocalPostState::TopN(
+                        sink.new_state_with_spill(reservation, spill_ctx, batch_size)?,
                     ),
+                    PostSort::Sort { sink, .. } => {
+                        LocalPostState::Sort(sink.new_state_with_spill(
+                            shared_sort.expect("shared sort memory"),
+                            spill_ctx,
+                            batch_size,
+                        ))
+                    }
                 };
                 loop {
                     let maybe_batch = tokio::select! {
@@ -2960,22 +3919,38 @@ impl Pipeline {
                         return Ok(Vec::new());
                     }
                     worker.claim();
-                    worker.process(|| match &mut local {
-                        LocalPostState::TopN(s) => s.add_view(&BatchView::all(batch)),
-                        LocalPostState::Sort(s) => s.add_view(BatchView::all(batch)),
-                    })?;
+                    match &mut local {
+                        LocalPostState::TopN(s) => {
+                            worker
+                                .process_async(
+                                    s.add_view_async(&BatchView::all(batch), &output_tx),
+                                )
+                                .await?;
+                        }
+                        LocalPostState::Sort(s) => {
+                            worker
+                                .process_async(
+                                    s.add_view_async(BatchView::all(batch), &output_tx),
+                                )
+                                .await?;
+                        }
+                    }
                     worker.complete();
                     tokio::task::yield_now().await;
                 }
                 if output_tx.is_closed() {
                     return Ok(Vec::new());
                 }
-                let runs = worker.process(|| match local {
+                let runs = match local {
                     LocalPostState::TopN(s) => {
-                        Ok(s.finish(batch_size)?.into_iter().collect())
+                        worker
+                            .process_async(s.finish_async(batch_size, &output_tx))
+                            .await?
                     }
-                    LocalPostState::Sort(s) => s.finish(),
-                })?;
+                    LocalPostState::Sort(s) => {
+                        worker.process_async(s.finish_async(&output_tx)).await?
+                    }
+                };
                 Ok(runs)
             });
         }
@@ -3017,6 +3992,7 @@ impl Pipeline {
             batch_size,
             context,
             metrics,
+            spill: post_sort_spill,
             measurement: measurement.map(Arc::as_ref),
         };
         match post_sort {
@@ -3057,38 +4033,39 @@ impl Pipeline {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(super) async fn run_pipeline_to_tx(
+    pub(super) fn run_pipeline_to_tx<'a>(
         self: Arc<Self>,
-        label_prefix: Option<&str>,
-        stage_inputs: &Arc<HashMap<StageId, Arc<MaterializedStage>>>,
-        context: &Arc<TaskContext>,
-        metrics: &ExecutionPlanMetricsSet,
-        measurement: Option<&Arc<RunMetrics>>,
+        label_prefix: Option<&'a str>,
+        stage_inputs: &'a Arc<HashMap<StageId, Arc<MaterializedStage>>>,
+        context: &'a Arc<TaskContext>,
+        metrics: &'a ExecutionPlanMetricsSet,
+        measurement: Option<&'a Arc<RunMetrics>>,
         tx: mpsc::Sender<RecordBatch>,
         cancel_tx: mpsc::Sender<RecordBatch>,
-    ) -> Result<()> {
-        if let Sink::Limit {
-            skip,
-            fetch,
-            result_operators,
-        } = &self.sink
-        {
-            if *fetch == Some(0) || cancel_tx.is_closed() || tx.is_closed() {
-                return Ok(());
-            }
-            let (limit_tx, mut limit_rx) = mpsc::channel(result_capacity(self.workers));
-            let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Sink::Limit {
+                skip,
+                fetch,
+                result_operators,
+            } = &self.sink
             {
-                let pipeline = Arc::clone(&self);
-                let stage_inputs = Arc::clone(stage_inputs);
-                let ctx = Arc::clone(context);
-                let metrics = metrics.clone();
-                let meas = measurement.cloned();
-                let label = label_prefix.map(str::to_owned);
-                let cancel = cancel_tx.clone();
-                inner_tasks.spawn(async move {
-                    pipeline
-                        .run_pipeline_body_to_tx(
+                if *fetch == Some(0) || cancel_tx.is_closed() || tx.is_closed() {
+                    return Ok(());
+                }
+                let (limit_tx, mut limit_rx) =
+                    mpsc::channel(result_capacity(self.workers));
+                let mut inner_tasks: JoinSet<Result<()>> = JoinSet::new();
+                {
+                    let pipeline = Arc::clone(&self);
+                    let stage_inputs = Arc::clone(stage_inputs);
+                    let ctx = Arc::clone(context);
+                    let metrics = metrics.clone();
+                    let meas = measurement.cloned();
+                    let label = label_prefix.map(str::to_owned);
+                    let cancel = cancel_tx.clone();
+                    inner_tasks.spawn(async move {
+                        Box::pin(pipeline.run_pipeline_body_to_tx(
                             label.as_deref(),
                             &stage_inputs,
                             &ctx,
@@ -3096,139 +4073,140 @@ impl Pipeline {
                             meas.as_ref(),
                             limit_tx,
                             cancel,
-                        )
+                        ))
                         .await
-                });
-            }
+                    });
+                }
 
-            let mut remaining_skip = *skip;
-            let mut remaining_fetch = *fetch;
-            let mut inner_done = false;
+                let mut remaining_skip = *skip;
+                let mut remaining_fetch = *fetch;
+                let mut inner_done = false;
 
-            loop {
-                let maybe_batch = if !inner_done {
-                    tokio::select! {
-                        biased;
-                        _ = cancel_tx.closed() => {
+                loop {
+                    let maybe_batch = if !inner_done {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_tx.closed() => {
+                                drop(limit_rx);
+                                abort_and_drain(&mut inner_tasks).await;
+                                return Ok(());
+                            }
+                            result = inner_tasks.join_next() => {
+                                inner_done = true;
+                                match result {
+                                    Some(Ok(Ok(()))) | None => continue,
+                                    Some(Ok(Err(err))) => {
+                                        drop(limit_rx);
+                                        return Err(err);
+                                    }
+                                    Some(Err(err)) if err.is_panic() => {
+                                        drop(limit_rx);
+                                        std::panic::resume_unwind(err.into_panic())
+                                    }
+                                    Some(Err(err)) => {
+                                        drop(limit_rx);
+                                        return Err(exec_datafusion_err!(
+                                            "Morsel limit task failed: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            batch = limit_rx.recv() => batch,
+                        }
+                    } else {
+                        limit_rx.recv().await
+                    };
+
+                    let Some(mut batch) = maybe_batch else {
+                        break;
+                    };
+                    if cancel_tx.is_closed() || tx.is_closed() {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                    let orig_rows = batch.num_rows();
+                    if orig_rows == 0 {
+                        continue;
+                    }
+                    if remaining_skip >= orig_rows {
+                        remaining_skip -= orig_rows;
+                        continue;
+                    }
+                    if remaining_skip > 0 {
+                        batch = batch.slice(remaining_skip, orig_rows - remaining_skip);
+                        remaining_skip = 0;
+                    }
+                    if let Some(rem) = remaining_fetch.as_mut() {
+                        if *rem == 0 {
                             drop(limit_rx);
                             abort_and_drain(&mut inner_tasks).await;
                             return Ok(());
                         }
-                        result = inner_tasks.join_next() => {
-                            inner_done = true;
-                            match result {
-                                Some(Ok(Ok(()))) | None => continue,
-                                Some(Ok(Err(err))) => {
-                                    drop(limit_rx);
-                                    return Err(err);
-                                }
-                                Some(Err(err)) if err.is_panic() => {
-                                    drop(limit_rx);
-                                    std::panic::resume_unwind(err.into_panic())
-                                }
-                                Some(Err(err)) => {
-                                    drop(limit_rx);
-                                    return Err(exec_datafusion_err!(
-                                        "Morsel limit task failed: {err}"
-                                    ));
-                                }
+                        if batch.num_rows() > *rem {
+                            batch = batch.slice(0, *rem);
+                        }
+                        *rem -= batch.num_rows();
+                    }
+                    if batch.num_columns() > 0
+                        && batch.num_rows().saturating_mul(2) < orig_rows
+                        && u32::try_from(batch.num_rows()).is_ok()
+                    {
+                        let indices =
+                            UInt32Array::from_iter_values(0..batch.num_rows() as u32);
+                        let compacted = take_record_batch(&batch, &indices)?;
+                        batch = sort::gc_view_batch(&compacted)?;
+                    }
+                    let out = apply_operators(result_operators, batch)?;
+                    if out.num_rows() > 0 {
+                        let sent = if let Some(run) = measurement {
+                            metrics::send(run, None, &tx, out).await
+                        } else {
+                            tx.send(out).await.is_ok()
+                        };
+                        if !sent {
+                            drop(limit_rx);
+                            abort_and_drain(&mut inner_tasks).await;
+                            return Ok(());
+                        }
+                    }
+                    if remaining_fetch == Some(0) {
+                        drop(limit_rx);
+                        abort_and_drain(&mut inner_tasks).await;
+                        return Ok(());
+                    }
+                }
+
+                if !inner_done {
+                    while let Some(result) = inner_tasks.join_next().await {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => return Err(err),
+                            Err(err) if err.is_panic() => {
+                                std::panic::resume_unwind(err.into_panic())
+                            }
+                            Err(err) => {
+                                return Err(exec_datafusion_err!(
+                                    "Morsel limit task failed: {err}"
+                                ));
                             }
                         }
-                        batch = limit_rx.recv() => batch,
-                    }
-                } else {
-                    limit_rx.recv().await
-                };
-
-                let Some(mut batch) = maybe_batch else {
-                    break;
-                };
-                if cancel_tx.is_closed() || tx.is_closed() {
-                    drop(limit_rx);
-                    abort_and_drain(&mut inner_tasks).await;
-                    return Ok(());
-                }
-                let orig_rows = batch.num_rows();
-                if orig_rows == 0 {
-                    continue;
-                }
-                if remaining_skip >= orig_rows {
-                    remaining_skip -= orig_rows;
-                    continue;
-                }
-                if remaining_skip > 0 {
-                    batch = batch.slice(remaining_skip, orig_rows - remaining_skip);
-                    remaining_skip = 0;
-                }
-                if let Some(rem) = remaining_fetch.as_mut() {
-                    if *rem == 0 {
-                        drop(limit_rx);
-                        abort_and_drain(&mut inner_tasks).await;
-                        return Ok(());
-                    }
-                    if batch.num_rows() > *rem {
-                        batch = batch.slice(0, *rem);
-                    }
-                    *rem -= batch.num_rows();
-                }
-                if batch.num_columns() > 0
-                    && batch.num_rows().saturating_mul(2) < orig_rows
-                    && u32::try_from(batch.num_rows()).is_ok()
-                {
-                    let indices =
-                        UInt32Array::from_iter_values(0..batch.num_rows() as u32);
-                    let compacted = take_record_batch(&batch, &indices)?;
-                    batch = sort::gc_view_batch(&compacted)?;
-                }
-                let out = apply_operators(result_operators, batch)?;
-                if out.num_rows() > 0 {
-                    let sent = if let Some(run) = measurement {
-                        metrics::send(run, None, &tx, out).await
-                    } else {
-                        tx.send(out).await.is_ok()
-                    };
-                    if !sent {
-                        drop(limit_rx);
-                        abort_and_drain(&mut inner_tasks).await;
-                        return Ok(());
                     }
                 }
-                if remaining_fetch == Some(0) {
-                    drop(limit_rx);
-                    abort_and_drain(&mut inner_tasks).await;
-                    return Ok(());
-                }
+                return Ok(());
             }
 
-            if !inner_done {
-                while let Some(result) = inner_tasks.join_next().await {
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => return Err(err),
-                        Err(err) if err.is_panic() => {
-                            std::panic::resume_unwind(err.into_panic())
-                        }
-                        Err(err) => {
-                            return Err(exec_datafusion_err!(
-                                "Morsel limit task failed: {err}"
-                            ));
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        self.run_pipeline_body_to_tx(
-            label_prefix,
-            stage_inputs,
-            context,
-            metrics,
-            measurement,
-            tx,
-            cancel_tx,
-        )
-        .await
+            Box::pin(self.run_pipeline_body_to_tx(
+                label_prefix,
+                stage_inputs,
+                context,
+                metrics,
+                measurement,
+                tx,
+                cancel_tx,
+            ))
+            .await
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -3281,16 +4259,34 @@ impl Pipeline {
             (None, None, false)
         };
 
+        let sink_spill = match &self.sink {
+            Sink::GroupCount { sink, .. } => {
+                SpillContext::try_new(context, metrics, sink.partial_schema())
+            }
+            Sink::Aggregate { sink, .. } => sink
+                .partial_schema()
+                .and_then(|s| SpillContext::try_new(context, metrics, Arc::clone(s))),
+            Sink::TopN { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
+            }
+            _ => None,
+        };
         let sink_reservation = match &self.sink {
             Sink::GroupCount { .. } => Some(
-                MemoryConsumer::new("MorselGroupCount").register(context.memory_pool()),
+                MemoryConsumer::new("MorselGroupCount")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool()),
             ),
             Sink::Aggregate { .. } => Some(
-                MemoryConsumer::new("MorselAggregate").register(context.memory_pool()),
+                MemoryConsumer::new("MorselAggregate")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool()),
             ),
-            Sink::TopN { .. } => {
-                Some(MemoryConsumer::new("MorselTopN").register(context.memory_pool()))
-            }
+            Sink::TopN { .. } => Some(
+                MemoryConsumer::new("MorselTopN")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool()),
+            ),
             Sink::Sort { .. } => None,
             Sink::Result
             | Sink::Count { .. }
@@ -3299,18 +4295,32 @@ impl Pipeline {
         };
         let shared_sort_memory = matches!(&self.sink, Sink::Sort { .. }).then(|| {
             SharedSortMemory::new(
-                MemoryConsumer::new("MorselSort").register(context.memory_pool()),
+                MemoryConsumer::new("MorselSort")
+                    .with_can_spill(true)
+                    .register(context.memory_pool()),
             )
         });
-        let mut combined_group = match (&self.sink, &sink_reservation) {
-            (Sink::GroupCount { sink, .. }, Some(reservation)) => {
-                Some(sink.new_state(reservation.new_empty()))
+        let sort_spill = match &self.sink {
+            Sink::Sort { sink, .. } => {
+                SpillContext::try_new(context, metrics, Arc::clone(sink.input_schema()))
             }
             _ => None,
         };
-        let mut combined_agg = match (&self.sink, &sink_reservation) {
-            (Sink::Aggregate { sink, .. }, Some(reservation)) => {
-                Some(sink.new_state(reservation.new_empty())?)
+        let mut combined_group = match &self.sink {
+            Sink::GroupCount { sink, .. } => {
+                let res = MemoryConsumer::new("MorselGroupCount")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool());
+                Some(sink.new_state_with_spill(res, sink_spill.clone()))
+            }
+            _ => None,
+        };
+        let mut combined_agg = match &self.sink {
+            Sink::Aggregate { sink, .. } => {
+                let res = MemoryConsumer::new("MorselAggregate")
+                    .with_can_spill(sink_spill.is_some())
+                    .register(context.memory_pool());
+                Some(sink.new_state_with_spill(res, sink_spill.clone())?)
             }
             _ => None,
         };
@@ -3321,9 +4331,20 @@ impl Pipeline {
         // empty or null-aware build table.
         let skip_probe = skip_all || short_circuit_op.is_some();
         if !skip_probe {
-            let probe_reservation = finalized_tables.as_ref().map(|_| {
-                MemoryConsumer::new("MorselHashJoinProbe").register(context.memory_pool())
-            });
+            let any_spilled = finalized_tables
+                .as_ref()
+                .is_some_and(|ts| ts.iter().any(|t| t.has_spilled_partitions()));
+            let probe_spill_env =
+                any_spilled.then(|| ProbeSpillEnv::new(context, metrics));
+            let make_join_ctx = || {
+                finalized_tables.as_ref().map(|t| JoinContext {
+                    tables: Arc::clone(t),
+                    probe_reservation: MemoryConsumer::new("MorselHashJoinProbe")
+                        .with_can_spill(any_spilled)
+                        .register(context.memory_pool()),
+                    probe_spill_env: probe_spill_env.clone(),
+                })
+            };
             let mut tasks = JoinSet::new();
             let make_worker_metrics = |id: usize| match (label_prefix, has_join) {
                 (Some(prefix), true) => WorkerMetrics::for_pipeline(
@@ -3339,6 +4360,34 @@ impl Pipeline {
                 }
                 (None, false) => WorkerMetrics::new(measurement.cloned(), id),
             };
+            let make_sink_memory = || -> Option<WorkerSinkMemory> {
+                if let Some(shared) = &shared_sort_memory {
+                    Some(WorkerSinkMemory::SharedSort(
+                        Arc::clone(shared),
+                        sort_spill.clone(),
+                    ))
+                } else if matches!(
+                    self.sink,
+                    Sink::Aggregate { .. } | Sink::GroupCount { .. } | Sink::TopN { .. }
+                ) {
+                    let consumer_name = match self.sink {
+                        Sink::GroupCount { .. } => "MorselGroupCount",
+                        Sink::TopN { .. } => "MorselTopN",
+                        _ => "MorselAggregate",
+                    };
+                    let res = MemoryConsumer::new(consumer_name)
+                        .with_can_spill(sink_spill.is_some())
+                        .register(context.memory_pool());
+                    Some(WorkerSinkMemory::SpillableReservation(
+                        res,
+                        sink_spill.clone(),
+                    ))
+                } else {
+                    sink_reservation
+                        .as_ref()
+                        .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
+                }
+            };
             match &self.source {
                 Source::Memory(source) => {
                     let next = Arc::new(AtomicUsize::new(0));
@@ -3346,22 +4395,8 @@ impl Pipeline {
                     for id in 0..self.workers.get().min(morsels) {
                         let (pipeline, next, output) =
                             (Arc::clone(&self), Arc::clone(&next), output.clone());
-                        let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                        } else {
-                            sink_reservation
-                                .as_ref()
-                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
-                        };
-                        let join_ctx = finalized_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                probe_reservation
-                                    .as_ref()
-                                    .expect("probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let sink_memory = make_sink_memory();
+                        let join_ctx = make_join_ctx();
                         let worker = make_worker_metrics(id);
                         tasks.spawn(async move {
                             let source = match &pipeline.source {
@@ -3406,22 +4441,8 @@ impl Pipeline {
                             Arc::clone(&next),
                             output.clone(),
                         );
-                        let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                        } else {
-                            sink_reservation
-                                .as_ref()
-                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
-                        };
-                        let join_ctx = finalized_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                probe_reservation
-                                    .as_ref()
-                                    .expect("probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let sink_memory = make_sink_memory();
+                        let join_ctx = make_join_ctx();
                         let worker = make_worker_metrics(id);
                         tasks.spawn(async move {
                             pipeline
@@ -3450,22 +4471,8 @@ impl Pipeline {
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =
                             (Arc::clone(&self), ready.clone(), output.clone());
-                        let sink_memory = if let Some(shared) = &shared_sort_memory {
-                            Some(WorkerSinkMemory::SharedSort(Arc::clone(shared)))
-                        } else {
-                            sink_reservation
-                                .as_ref()
-                                .map(|r| WorkerSinkMemory::Reservation(r.new_empty()))
-                        };
-                        let join_ctx = finalized_tables.as_ref().map(|t| {
-                            (
-                                Arc::clone(t),
-                                probe_reservation
-                                    .as_ref()
-                                    .expect("probe reservation")
-                                    .new_empty(),
-                            )
-                        });
+                        let sink_memory = make_sink_memory();
+                        let join_ctx = make_join_ctx();
                         let worker = make_worker_metrics(id);
                         tasks.spawn(async move {
                             pipeline
@@ -3481,7 +4488,6 @@ impl Pipeline {
                     }
                 }
             }
-            drop(probe_reservation);
             while let Some(result) = tasks.join_next().await {
                 let local = match result {
                     Ok(Ok(local)) => local,
@@ -3532,7 +4538,7 @@ impl Pipeline {
                     }
                     WorkerState::GroupCount(local) => {
                         if let Some(combined) = combined_group.as_mut() {
-                            match combined.merge_from(local, &cancel_tx).await {
+                            match combined.merge_from(*local, &cancel_tx).await {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     drop(combined_group);
@@ -3559,7 +4565,7 @@ impl Pipeline {
                     }
                     WorkerState::Aggregate(local) => {
                         if let Some(combined) = combined_agg.as_mut() {
-                            match combined.merge_from(local, &cancel_tx).await {
+                            match combined.merge_from(*local, &cancel_tx).await {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     drop(combined_group);
@@ -3610,20 +4616,23 @@ impl Pipeline {
                 sorted_runs: Some(&mut sorted_runs),
                 combined_build: None,
                 sink_reservation: sink_reservation.as_ref(),
+                sink_spill: sink_spill.as_ref(),
+                build_spill: None,
+                null_key_spill: None,
                 shared_sort_memory: shared_sort_memory.as_ref(),
+                sort_spill: sort_spill.as_ref(),
             };
-            match self
-                .run_build_emission_pipelines(
-                    tables,
-                    short_circuit_op,
-                    label_prefix,
-                    &output,
-                    context,
-                    metrics,
-                    measurement,
-                    &mut targets,
-                )
-                .await
+            match Box::pin(self.run_build_emission_pipelines(
+                tables,
+                short_circuit_op,
+                label_prefix,
+                &output,
+                context,
+                metrics,
+                measurement,
+                &mut targets,
+            ))
+            .await
             {
                 Ok(true) => {}
                 Ok(false) => {
@@ -3704,9 +4713,7 @@ impl Pipeline {
                 }
             }
             Sink::GroupCount {
-                sink,
-                result_operators,
-                post_sort,
+                sink, post_sort, ..
             } => {
                 if !tx.is_closed() && !cancel_tx.is_closed() {
                     #[cfg(test)]
@@ -3723,7 +4730,7 @@ impl Pipeline {
                             .add(1);
                         if post_sort.is_some() {
                             self.run_post_sort_stage(
-                                FinalizedAggOutput::GroupCount(finalized),
+                                FinalizedAggOutput::GroupCount(Box::new(finalized)),
                                 output.batch_size,
                                 context,
                                 metrics,
@@ -3734,10 +4741,12 @@ impl Pipeline {
                         } else {
                             finalized
                                 .emit(
-                                    result_operators,
+                                    ResultOpsRef::Pipeline(Arc::clone(&self)),
+                                    self.workers.get(),
                                     output.batch_size,
+                                    context.memory_pool(),
                                     tx,
-                                    measurement.map(Arc::as_ref),
+                                    measurement.cloned(),
                                 )
                                 .await?;
                         }
@@ -3745,9 +4754,7 @@ impl Pipeline {
                 }
             }
             Sink::Aggregate {
-                sink,
-                result_operators,
-                post_sort,
+                sink, post_sort, ..
             } => {
                 if !tx.is_closed() && !cancel_tx.is_closed() {
                     #[cfg(test)]
@@ -3764,7 +4771,7 @@ impl Pipeline {
                             .add(1);
                         if post_sort.is_some() {
                             self.run_post_sort_stage(
-                                FinalizedAggOutput::Aggregate(finalized),
+                                FinalizedAggOutput::Aggregate(Box::new(finalized)),
                                 output.batch_size,
                                 context,
                                 metrics,
@@ -3775,10 +4782,12 @@ impl Pipeline {
                         } else {
                             finalized
                                 .emit(
-                                    result_operators,
+                                    ResultOpsRef::Pipeline(Arc::clone(&self)),
+                                    self.workers.get(),
                                     output.batch_size,
+                                    context.memory_pool(),
                                     tx,
-                                    measurement.map(Arc::as_ref),
+                                    measurement.cloned(),
                                 )
                                 .await?;
                         }
@@ -3797,6 +4806,7 @@ impl Pipeline {
                         batch_size: output.batch_size,
                         context,
                         metrics,
+                        spill: sink_spill,
                         measurement: measurement.map(Arc::as_ref),
                     },
                     tx,
@@ -3815,6 +4825,7 @@ impl Pipeline {
                         batch_size: output.batch_size,
                         context,
                         metrics,
+                        spill: sort_spill,
                         measurement: measurement.map(Arc::as_ref),
                     },
                     tx,
@@ -3936,13 +4947,14 @@ struct SortFinalizeCtx<'a> {
     batch_size: usize,
     context: &'a Arc<TaskContext>,
     metrics: &'a ExecutionPlanMetricsSet,
+    spill: Option<SpillContext>,
     measurement: Option<&'a RunMetrics>,
 }
 
 enum FinalizedAggOutput {
     Count(FinalizedCount),
-    GroupCount(FinalizedGroupCounts),
-    Aggregate(FinalizedAggregate),
+    GroupCount(Box<FinalizedGroupCounts>),
+    Aggregate(Box<FinalizedAggregate>),
 }
 
 struct PipelineRun {
