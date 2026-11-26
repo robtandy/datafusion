@@ -36,13 +36,14 @@ use datafusion_session::Session;
 
 use crate::datasource::listing::ListingTable;
 
+use super::dag::{ScalarSubqueryState, StageSpec, count_dag_stage_refs};
 use super::hash_join::{JoinOutputCol, ProbeJoinKind};
 use super::join_filter::{
     BoundJoinPredicates, DynamicJoinFilterConfig, DynamicJoinFilterData,
     JoinFilterBinding,
 };
 use super::metrics::RunMetrics;
-use super::{Operator, Sink, Source, WorkerState, supported_expr};
+use super::{Operator, Pipeline, PostSort, Sink, Source, WorkerState, supported_expr};
 
 mod ready;
 #[cfg(test)]
@@ -564,12 +565,12 @@ fn source_schema(source: &Source) -> SchemaRef {
     }
 }
 
-fn compute_pipeline_schemas(
-    source: &Source,
+fn compute_operator_schemas(
+    base_schema: &SchemaRef,
     operators: &[Operator],
 ) -> Result<Vec<SchemaRef>> {
     let mut schemas = Vec::with_capacity(operators.len() + 1);
-    schemas.push(source_schema(source));
+    schemas.push(Arc::clone(base_schema));
     for op in operators {
         let prev = schemas.last().expect("non-empty schemas");
         let next = match op {
@@ -588,17 +589,77 @@ fn compute_pipeline_schemas(
     Ok(schemas)
 }
 
-/// Bind dynamic join filters from every eligible `HashProbe` in `operators`
-/// onto both `source` (if `Source::Parquet`) and any earlier `Inner` join's
-/// `build_pipeline` (recursively), enabling cascading pushdown across
-/// multi-join star schemas (e.g., TPC-H Q5 `region -> nation -> supplier ->
-/// customer -> orders -> lineitem`).
-pub(super) fn bind_pipeline_dynamic_join_filters(
-    source: &mut Source,
-    operators: &mut [Operator],
+fn compute_pipeline_schemas(
+    source: &Source,
+    operators: &[Operator],
+) -> Result<Vec<SchemaRef>> {
+    compute_operator_schemas(&source_schema(source), operators)
+}
+
+/// Bind dynamic join filters across the entire DAG (root pipeline, intermediate
+/// stages, and nested join build pipelines), pushing filters into both direct
+/// probe `ParquetScan`s, earlier `Inner`/`BuildSemi`/`BuildAnti` join build
+/// pipelines, and single-consumer upstream grouped-`Aggregate`/`GroupCount`/`Sort`
+/// stages.
+pub(super) fn bind_dag_dynamic_join_filters(
+    stages: &mut [StageSpec],
+    scalar_subqueries: Option<&ScalarSubqueryState>,
+    root_pipeline: &mut Pipeline,
     max_inlist_values: usize,
     max_inlist_bytes: usize,
 ) -> Result<()> {
+    let stage_ref_counts = count_dag_stage_refs(stages, scalar_subqueries, root_pipeline);
+
+    bind_pipeline_dynamic_join_filters_with_stages(
+        &mut root_pipeline.source,
+        &mut root_pipeline.operators,
+        stages,
+        &stage_ref_counts,
+        max_inlist_values,
+        max_inlist_bytes,
+    )?;
+
+    for idx in (0..stages.len()).rev() {
+        let (earlier_stages, rest) = stages.split_at_mut(idx);
+        if let Some(pipeline) = Arc::get_mut(&mut rest[0].pipeline) {
+            bind_pipeline_dynamic_join_filters_with_stages(
+                &mut pipeline.source,
+                &mut pipeline.operators,
+                earlier_stages,
+                &stage_ref_counts,
+                max_inlist_values,
+                max_inlist_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_pipeline_dynamic_join_filters_with_stages(
+    source: &mut Source,
+    operators: &mut [Operator],
+    stages_prefix: &mut [StageSpec],
+    stage_ref_counts: &[usize],
+    max_inlist_values: usize,
+    max_inlist_bytes: usize,
+) -> Result<()> {
+    // Bind joins inside nested build pipelines first.
+    for op in operators.iter_mut() {
+        if let Operator::HashProbe(probe_arc) = op
+            && let Some(probe) = Arc::get_mut(probe_arc)
+            && let Some(build_pipeline) = Arc::get_mut(&mut probe.build_pipeline)
+        {
+            bind_pipeline_dynamic_join_filters_with_stages(
+                &mut build_pipeline.source,
+                &mut build_pipeline.operators,
+                stages_prefix,
+                stage_ref_counts,
+                max_inlist_values,
+                max_inlist_bytes,
+            )?;
+        }
+    }
+
     let schemas = compute_pipeline_schemas(source, operators)?;
 
     for op_idx in 0..operators.len() {
@@ -620,6 +681,8 @@ pub(super) fn bind_pipeline_dynamic_join_filters(
             &schemas[..=op_idx],
             filter_id,
             &key_opts,
+            stages_prefix,
+            stage_ref_counts,
         )?;
         if bound_any
             && let Operator::HashProbe(probe_arc) = &mut operators[op_idx]
@@ -639,9 +702,11 @@ pub(super) fn bind_pipeline_dynamic_join_filters(
 }
 
 /// Push `key_exprs` (in `schemas[prefix_ops.len()]` coordinates) into:
-/// 1. `source` (if `Source::Parquet`), and
-/// 2. any `Inner` `HashProbe` inside `prefix_ops` (recursively into its
-///    `build_pipeline`) when no non-`Inner` join lies in between.
+/// 1. `source` (if `Source::Parquet`, or recursively across a single-consumer
+///    `Source::Stage` backed by a grouped `Aggregate`, `GroupCount`, `Sort`, or
+///    `Result` sink), and
+/// 2. any earlier `Inner`/`BuildSemi`/`BuildAnti` `HashProbe` inside `prefix_ops`
+///    (recursively into its `build_pipeline`).
 ///
 /// Returns `(bound_any, any_target_has_pushdown_filters)`.
 fn push_filter_into_prefix(
@@ -650,46 +715,98 @@ fn push_filter_into_prefix(
     schemas: &[SchemaRef],
     filter_id: usize,
     key_exprs: &[Option<Arc<dyn PhysicalExpr>>],
+    stages_prefix: &mut [StageSpec],
+    stage_ref_counts: &[usize],
 ) -> Result<(bool, bool)> {
     let mut bound_any = false;
     let mut any_pushdown = false;
 
-    // 1. Try pushing directly onto `source` (if Parquet).
-    if let Source::Parquet(pq) = source
-        && pq.config.is_some()
-        && !pq.files.is_empty()
-    {
-        let mut mapped_keys = Vec::with_capacity(key_exprs.len());
-        for expr_opt in key_exprs {
-            let mapped = match expr_opt {
-                Some(e) => remap_probe_key_to_scan(Arc::clone(e), prefix_ops, schemas)?,
-                None => None,
-            };
-            mapped_keys.push(mapped);
+    // 1. Try pushing directly onto `source` (Parquet or single-consumer Stage).
+    match source {
+        Source::Parquet(pq) if pq.config.is_some() && !pq.files.is_empty() => {
+            let mut mapped_keys = Vec::with_capacity(key_exprs.len());
+            for expr_opt in key_exprs {
+                let mapped = match expr_opt {
+                    Some(e) => {
+                        remap_probe_key_to_scan(Arc::clone(e), prefix_ops, schemas)?
+                    }
+                    None => None,
+                };
+                mapped_keys.push(mapped);
+            }
+            let all_keys_bound =
+                !mapped_keys.is_empty() && mapped_keys.iter().all(Option::is_some);
+            let any_key_bound = mapped_keys.iter().any(Option::is_some);
+            if any_key_bound {
+                pq.add_dynamic_join_filter(JoinFilterBinding {
+                    filter_id,
+                    probe_key_exprs: mapped_keys,
+                    all_keys_bound,
+                });
+                bound_any = true;
+                any_pushdown |= pq.pushdown_filters();
+            }
         }
-        let all_keys_bound =
-            !mapped_keys.is_empty() && mapped_keys.iter().all(Option::is_some);
-        let any_key_bound = mapped_keys.iter().any(Option::is_some);
-        if any_key_bound {
-            pq.add_dynamic_join_filter(JoinFilterBinding {
-                filter_id,
-                probe_key_exprs: mapped_keys,
-                all_keys_bound,
-            });
-            bound_any = true;
-            any_pushdown |= pq.pushdown_filters();
+        Source::Stage(stage_src)
+            if stage_src.stage_id.0 < stages_prefix.len()
+                && stage_ref_counts[stage_src.stage_id.0] == 1 =>
+        {
+            let mut stage_out_keys = Vec::with_capacity(key_exprs.len());
+            for expr_opt in key_exprs {
+                let mapped = match expr_opt {
+                    Some(e) => {
+                        remap_probe_key_to_scan(Arc::clone(e), prefix_ops, schemas)?
+                    }
+                    None => None,
+                };
+                stage_out_keys.push(mapped);
+            }
+            if stage_out_keys.iter().any(Option::is_some) {
+                let (earlier_stages, rest) =
+                    stages_prefix.split_at_mut(stage_src.stage_id.0);
+                let target_stage = &mut rest[0];
+                if let Some(target_pipeline) = Arc::get_mut(&mut target_stage.pipeline) {
+                    let target_schemas = compute_pipeline_schemas(
+                        &target_pipeline.source,
+                        &target_pipeline.operators,
+                    )?;
+                    let pre_sink_schema =
+                        target_schemas.last().expect("non-empty schemas");
+                    if let Some(pre_sink_keys) = remap_keys_through_stage_sink(
+                        &target_pipeline.sink,
+                        pre_sink_schema,
+                        &stage_out_keys,
+                    )? && pre_sink_keys.iter().any(Option::is_some)
+                    {
+                        let (sub_bound, sub_pushdown) = push_filter_into_prefix(
+                            &mut target_pipeline.source,
+                            &mut target_pipeline.operators,
+                            &target_schemas,
+                            filter_id,
+                            &pre_sink_keys,
+                            earlier_stages,
+                            stage_ref_counts,
+                        )?;
+                        bound_any |= sub_bound;
+                        any_pushdown |= sub_pushdown;
+                    }
+                }
+            }
         }
+        _ => {}
     }
 
-    // 2. Try pushing onto earlier `Inner` joins' build pipelines in `prefix_ops`.
-    // Walk backwards from the end of `prefix_ops`; stop as soon as we cross a
-    // non-`Inner` join (whose unmatched rows could be altered by build pruning).
+    // 2. Try pushing onto earlier `Inner`/`BuildSemi`/`BuildAnti` joins' build
+    // pipelines in `prefix_ops`. Stop as soon as we cross an incompatible join.
     for u in (0..prefix_ops.len()).rev() {
-        let is_inner = match &prefix_ops[u] {
-            Operator::HashProbe(p) => p.kind == ProbeJoinKind::Inner,
+        let kind = match &prefix_ops[u] {
+            Operator::HashProbe(p) => p.kind,
             _ => continue,
         };
-        if !is_inner {
+        if !matches!(
+            kind,
+            ProbeJoinKind::Inner | ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti
+        ) {
             break;
         }
         let mut build_key_opts: Vec<Option<Arc<dyn PhysicalExpr>>> =
@@ -746,13 +863,146 @@ fn push_filter_into_prefix(
                 &build_schemas,
                 filter_id,
                 &build_key_opts,
+                stages_prefix,
+                stage_ref_counts,
             )?;
             bound_any |= sub_bound;
             any_pushdown |= sub_pushdown;
         }
+        // BuildSemi/BuildAnti only emit build columns; earlier probe columns do not survive.
+        if kind != ProbeJoinKind::Inner {
+            break;
+        }
     }
 
     Ok((bound_any, any_pushdown))
+}
+
+type MappedKeyExprs = Vec<Option<Arc<dyn PhysicalExpr>>>;
+
+fn remap_keys_through_ops(
+    keys: &[Option<Arc<dyn PhysicalExpr>>],
+    ops: &[Operator],
+    base_schema: &SchemaRef,
+) -> Result<MappedKeyExprs> {
+    if ops.is_empty() {
+        return Ok(keys.to_vec());
+    }
+    let schemas = compute_operator_schemas(base_schema, ops)?;
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mapped = match key {
+            Some(e) => remap_probe_key_to_scan(Arc::clone(e), ops, &schemas)?,
+            None => None,
+        };
+        out.push(mapped);
+    }
+    Ok(out)
+}
+
+/// Remap join key expressions from a stage's final output schema backward
+/// through its `Sink` (and any post-sink `result_operators` / `Sort`) into the
+/// stage pipeline's pre-sink schema.
+///
+/// Only grouped `Aggregate` / `GroupCount` (direct pass-through `GROUP BY`
+/// column references, never ungrouped or `TopN`), `Sort`, and `Result` stages
+/// allow sound pushdown.
+fn remap_keys_through_stage_sink(
+    sink: &Sink,
+    pre_sink_schema: &SchemaRef,
+    stage_out_keys: &[Option<Arc<dyn PhysicalExpr>>],
+) -> Result<Option<MappedKeyExprs>> {
+    let remap_post_sort = |post_sort: &Option<PostSort>,
+                           keys: &[Option<Arc<dyn PhysicalExpr>>]|
+     -> Result<Option<MappedKeyExprs>> {
+        match post_sort {
+            None => Ok(Some(keys.to_vec())),
+            Some(PostSort::Sort {
+                sink: sort_sink,
+                result_operators,
+            }) => Ok(Some(remap_keys_through_ops(
+                keys,
+                result_operators,
+                sort_sink.input_schema(),
+            )?)),
+            Some(PostSort::TopN { .. }) => Ok(None),
+        }
+    };
+
+    match sink {
+        Sink::Aggregate {
+            sink: agg_sink,
+            result_operators,
+            post_sort,
+        } => {
+            if !agg_sink.is_grouped() {
+                return Ok(None);
+            }
+            let Some(after_agg_keys) = remap_post_sort(post_sort, stage_out_keys)? else {
+                return Ok(None);
+            };
+            let agg_out_keys = remap_keys_through_ops(
+                &after_agg_keys,
+                result_operators,
+                agg_sink.schema(),
+            )?;
+            let group_exprs = agg_sink.group_exprs();
+            let mut pre_sink_keys = Vec::with_capacity(agg_out_keys.len());
+            for key_opt in agg_out_keys {
+                let mapped = key_opt.and_then(|expr| {
+                    let out_col = expr.downcast_ref::<Column>()?;
+                    let group_expr = group_exprs.get(out_col.index())?;
+                    let in_col = group_expr.downcast_ref::<Column>()?;
+                    let field = pre_sink_schema.fields().get(in_col.index())?;
+                    Some(Arc::new(Column::new(field.name(), in_col.index()))
+                        as Arc<dyn PhysicalExpr>)
+                });
+                pre_sink_keys.push(mapped);
+            }
+            Ok(Some(pre_sink_keys))
+        }
+        Sink::GroupCount {
+            sink: gc_sink,
+            result_operators,
+            post_sort,
+        } => {
+            let Some(after_gc_keys) = remap_post_sort(post_sort, stage_out_keys)? else {
+                return Ok(None);
+            };
+            let gc_out_keys = remap_keys_through_ops(
+                &after_gc_keys,
+                result_operators,
+                gc_sink.schema(),
+            )?;
+            let mut pre_sink_keys = Vec::with_capacity(gc_out_keys.len());
+            for key_opt in gc_out_keys {
+                let mapped = key_opt.and_then(|expr| {
+                    let out_col = expr.downcast_ref::<Column>()?;
+                    if out_col.index() != 0 {
+                        return None;
+                    }
+                    let field = pre_sink_schema.fields().get(gc_sink.key_index)?;
+                    Some(Arc::new(Column::new(field.name(), gc_sink.key_index))
+                        as Arc<dyn PhysicalExpr>)
+                });
+                pre_sink_keys.push(mapped);
+            }
+            Ok(Some(pre_sink_keys))
+        }
+        Sink::Sort {
+            sink: sort_sink,
+            result_operators,
+        } => Ok(Some(remap_keys_through_ops(
+            stage_out_keys,
+            result_operators,
+            sort_sink.input_schema(),
+        )?)),
+        Sink::Result => Ok(Some(stage_out_keys.to_vec())),
+        Sink::Count { .. }
+        | Sink::TopN { .. }
+        | Sink::Limit { .. }
+        | Sink::HashJoinBuild(_) => Ok(None),
+    }
 }
 
 fn remap_expr_to_build_input(

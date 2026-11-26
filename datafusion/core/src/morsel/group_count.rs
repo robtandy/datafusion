@@ -1499,6 +1499,11 @@ impl GroupCountSink {
         }
     }
 
+    #[cfg(feature = "parquet")]
+    pub(super) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
     pub(super) fn partial_schema(&self) -> SchemaRef {
         group_count_partial_schema(self.key_type)
     }

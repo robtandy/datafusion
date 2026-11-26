@@ -581,6 +581,11 @@ impl AggregateSink {
         self.group_schema.is_some()
     }
 
+    #[cfg(feature = "parquet")]
+    pub(super) fn group_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.group_exprs
+    }
+
     pub(super) fn schema(&self) -> &SchemaRef {
         &self.schema
     }
