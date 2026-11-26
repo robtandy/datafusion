@@ -101,10 +101,13 @@ pub enum AdaptiveRowFilterMode {
 pub struct AdaptiveRowFilterConfig {
     /// Mode selection policy (default: [`AdaptiveRowFilterMode::Adaptive`]).
     pub mode: AdaptiveRowFilterMode,
-    /// Number of row groups probed per mode before committing (default: 3).
+    /// Number of row groups probed per mode before committing (default: 2).
     pub probe_rgs_per_mode: usize,
     /// Re-probe every N committed row groups (`0` disables re-probing; default: 64).
     pub reprobe_interval: usize,
+    /// Optional deterministic per-row cost override `(rf_ns_per_row, bulk_ns_per_row)`
+    /// for tests so convergence assertions never depend on noisy wall-clock timing.
+    pub test_mode_costs_ns_per_row: Option<(u64, u64)>,
 }
 
 impl Default for AdaptiveRowFilterConfig {
@@ -113,6 +116,7 @@ impl Default for AdaptiveRowFilterConfig {
             mode: AdaptiveRowFilterMode::Adaptive,
             probe_rgs_per_mode: DEFAULT_ADAPTIVE_PROBE_RGS_PER_MODE,
             reprobe_interval: DEFAULT_ADAPTIVE_REPROBE_INTERVAL,
+            test_mode_costs_ns_per_row: None,
         }
     }
 }
@@ -205,9 +209,86 @@ struct ControllerState {
     stats: ProbeWindowStats,
 }
 
+type CandidateSignature = Arc<Vec<String>>;
+type RowFilterOrderKey = (CandidateSignature, u64);
+
+/// Per-file pre-analyzed `RowFilter` ordering plan computed from that file's
+/// surviving candidates (after per-file stats elision and constant folding).
+enum FileRowFilterPlan {
+    /// Permutation disabled (`<= 1` candidate or at least one fallible/volatile
+    /// candidate in this file): always preserve exact left-to-right order.
+    FixedIdentity(Vec<usize>),
+    /// All `>= 2` candidates in this file are strictly infallible: share a
+    /// bandit keyed by the exact candidate signature across files with the same
+    /// surviving candidate list.
+    Adaptive {
+        signature: CandidateSignature,
+        initial_order: Vec<usize>,
+    },
+}
+
+fn candidate_list_signature(
+    candidates: &[PrebuiltRowFilterCandidate],
+) -> CandidateSignature {
+    let sig: Vec<String> = candidates
+        .iter()
+        .map(|cand| {
+            let schema = cand.projected_schema();
+            let cols: Vec<&str> =
+                schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let exprs: Vec<String> = cand
+                .physical_exprs()
+                .iter()
+                .map(|e| format!("{e}"))
+                .collect();
+            format!("cols=[{}];exprs=[{}]", cols.join(","), exprs.join(" AND "))
+        })
+        .collect();
+    Arc::new(sig)
+}
+
+fn build_file_row_filter_plan(
+    candidates: &[PrebuiltRowFilterCandidate],
+    analyzer: Option<&ConjunctAnalyzer>,
+) -> FileRowFilterPlan {
+    let n = candidates.len();
+    if n <= 1 {
+        return FileRowFilterPlan::FixedIdentity((0..n).collect());
+    }
+    let mut costs = Vec::with_capacity(n);
+    for cand in candidates {
+        let (cand_infallible, cand_cost) = if let Some(analyze) = analyzer {
+            let mut inf = true;
+            let mut min_cost = u64::MAX;
+            for expr in cand.physical_exprs() {
+                let (e_inf, e_cost) = analyze(expr, cand.projected_schema());
+                inf &= e_inf;
+                min_cost = min_cost.min(e_cost);
+            }
+            (inf, if min_cost == u64::MAX { 100 } else { min_cost })
+        } else {
+            (!cand.has_fallible(), cand.required_bytes() as u64)
+        };
+        if !cand_infallible {
+            // Exact DuckDB safety invariant: preserve left-to-right order
+            // whenever any surviving candidate in this file can throw or is
+            // volatile.
+            return FileRowFilterPlan::FixedIdentity((0..n).collect());
+        }
+        costs.push(cand_cost);
+    }
+    let mut initial_order: Vec<usize> = (0..n).collect();
+    // Sort by heuristic cost, breaking ties by original plan/join order (`idx`)
+    // rather than compressed bytes so selective earlier join filters (e.g.
+    // filtered `part` before unfiltered `supplier`) stay first.
+    initial_order.sort_by_key(|&idx| (costs[idx], idx));
+    FileRowFilterPlan::Adaptive {
+        signature: candidate_list_signature(candidates),
+        initial_order,
+    }
+}
+
 struct RowFilterOrderBandit {
-    initialized: bool,
-    num_candidates: usize,
     /// Incumbent candidate order used during warmup/execute and for concurrent
     /// RGs dispatched while a bounded trial swap is in flight.
     permutation: Vec<usize>,
@@ -229,20 +310,20 @@ struct RowFilterOrderBandit {
     rng_state: u64,
 }
 
-impl Default for RowFilterOrderBandit {
-    fn default() -> Self {
+impl RowFilterOrderBandit {
+    fn new(initial_order: Vec<usize>) -> Self {
+        let n = initial_order.len();
+        let pairs = n.saturating_sub(1);
         Self {
-            initialized: false,
-            num_candidates: 0,
-            permutation: Vec::new(),
+            permutation: initial_order,
             trial_permutation: Vec::new(),
             trial_dispatched: 0,
-            swap_likeliness: Vec::new(),
-            disable_permutations: true,
+            swap_likeliness: vec![RF_BANDIT_INITIAL_LIKELINESS; pairs],
+            disable_permutations: n <= 1,
             epoch: 1,
             iteration_count: 0,
             swap_idx: 0,
-            right_random_border: 0,
+            right_random_border: (RF_BANDIT_INITIAL_LIKELINESS as usize * pairs) as u32,
             runtime_sum: 0.0,
             prev_mean: 0.0,
             observe: false,
@@ -250,9 +331,7 @@ impl Default for RowFilterOrderBandit {
             rng_state: RF_BANDIT_SEED,
         }
     }
-}
 
-impl RowFilterOrderBandit {
     fn next_random_u32(&mut self, upper_exclusive: u32) -> u32 {
         let mut x = self.rng_state;
         x ^= x >> 12;
@@ -263,63 +342,7 @@ impl RowFilterOrderBandit {
         ((mixed >> 32) as u32) % upper_exclusive
     }
 
-    fn compute_initial_order(
-        candidates: &[PrebuiltRowFilterCandidate],
-        analyzer: Option<&ConjunctAnalyzer>,
-    ) -> (Vec<usize>, bool) {
-        let n = candidates.len();
-        if n <= 1 {
-            return ((0..n).collect(), true);
-        }
-        let mut all_infallible = true;
-        let mut costs = Vec::with_capacity(n);
-        for cand in candidates {
-            let (cand_infallible, cand_cost) = if let Some(analyze) = analyzer {
-                let mut inf = true;
-                let mut min_cost = u64::MAX;
-                for expr in cand.physical_exprs() {
-                    let (e_inf, e_cost) = analyze(expr, cand.projected_schema());
-                    inf &= e_inf;
-                    min_cost = min_cost.min(e_cost);
-                }
-                (inf, if min_cost == u64::MAX { 100 } else { min_cost })
-            } else {
-                (!cand.has_fallible(), cand.required_bytes() as u64)
-            };
-            all_infallible &= cand_infallible;
-            costs.push(cand_cost);
-        }
-        if !all_infallible {
-            // Exact DuckDB safety invariant: preserve left-to-right order
-            // whenever any conjunct can throw or is volatile.
-            return ((0..n).collect(), true);
-        }
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&idx| (costs[idx], candidates[idx].required_bytes(), idx));
-        (order, false)
-    }
-
-    fn current_order(
-        &mut self,
-        candidates: &[PrebuiltRowFilterCandidate],
-        analyzer: Option<&ConjunctAnalyzer>,
-    ) -> (Vec<usize>, Option<u64>) {
-        if !self.initialized {
-            let (order, disable) = Self::compute_initial_order(candidates, analyzer);
-            let n = order.len();
-            let pairs = n.saturating_sub(1);
-            self.num_candidates = n;
-            self.permutation = order;
-            self.disable_permutations = disable || n <= 1;
-            self.swap_likeliness = vec![RF_BANDIT_INITIAL_LIKELINESS; pairs];
-            self.right_random_border =
-                (RF_BANDIT_INITIAL_LIKELINESS as usize * pairs) as u32;
-            self.initialized = true;
-        }
-        if candidates.len() != self.num_candidates {
-            let (order, _) = Self::compute_initial_order(candidates, analyzer);
-            return (order, None);
-        }
+    fn current_order(&mut self) -> (Vec<usize>, Option<u64>) {
         if self.disable_permutations {
             return (self.permutation.clone(), None);
         }
@@ -413,7 +436,7 @@ pub struct AdaptiveRowFilterContext {
     analyzer: Option<ConjunctAnalyzer>,
     alt_seq: AtomicUsize,
     controller: Mutex<ControllerState>,
-    rf_order: Mutex<RowFilterOrderBandit>,
+    rf_orders: Mutex<HashMap<CandidateSignature, RowFilterOrderBandit>>,
     metrics: AdaptiveMetrics,
 }
 
@@ -462,9 +485,16 @@ impl AdaptiveRowFilterContext {
                 epoch: 1,
                 stats: ProbeWindowStats::default(),
             }),
-            rf_order: Mutex::new(RowFilterOrderBandit::default()),
+            rf_orders: Mutex::new(HashMap::new()),
             metrics,
         }
+    }
+
+    fn build_file_row_filter_plan(
+        &self,
+        candidates: &[PrebuiltRowFilterCandidate],
+    ) -> FileRowFilterPlan {
+        build_file_row_filter_plan(candidates, self.analyzer.as_ref())
     }
 
     pub(crate) fn bulk_projection(&self) -> Option<&(ProjectionExprs, SchemaRef)> {
@@ -652,18 +682,30 @@ impl AdaptiveRowFilterContext {
             cpu_ns: 0,
             bytes_fetched: 0,
             track_mode_epoch,
-            rf_order_epoch: None,
+            rf_order_key: None,
             finished: false,
         }
     }
 
     fn row_filter_order(
         &self,
-        candidates: &[PrebuiltRowFilterCandidate],
-    ) -> (Vec<usize>, Option<u64>) {
-        self.rf_order
-            .lock()
-            .current_order(candidates, self.analyzer.as_ref())
+        plan: &FileRowFilterPlan,
+    ) -> (Vec<usize>, Option<RowFilterOrderKey>) {
+        match plan {
+            FileRowFilterPlan::FixedIdentity(identity) => (identity.clone(), None),
+            FileRowFilterPlan::Adaptive {
+                signature,
+                initial_order,
+            } => {
+                let mut orders = self.rf_orders.lock();
+                let bandit = orders
+                    .entry(Arc::clone(signature))
+                    .or_insert_with(|| RowFilterOrderBandit::new(initial_order.clone()));
+                let (order, epoch) = bandit.current_order();
+                let key = epoch.map(|e| (Arc::clone(signature), e));
+                (order, key)
+            }
+        }
     }
 
     fn report_mode_sample(
@@ -680,7 +722,17 @@ impl AdaptiveRowFilterContext {
         // Account for both worker CPU (`decode + process + RowFilter`) and
         // compressed I/O bytes fetched (`0.5 ns/byte`), so page-index / column
         // skipping gets credited cleanly without distorting warm-cache CPU.
-        let cost_ns = (total_cpu_ns as u128).saturating_add((bytes_fetched as u128) / 2);
+        let cost_ns = if let Some((rf_per_row, bulk_per_row)) =
+            self.config.test_mode_costs_ns_per_row
+        {
+            let per_row = match mode {
+                RgFilterMode::RowFilter => rf_per_row,
+                RgFilterMode::BulkDecode => bulk_per_row,
+            };
+            (per_row as u128).saturating_mul(input_rows as u128)
+        } else {
+            (total_cpu_ns as u128).saturating_add((bytes_fetched as u128) / 2)
+        };
         let probe_target = self.config.probe_rgs_per_mode.max(1);
         let mut state = self.controller.lock();
         if epoch != state.epoch {
@@ -768,6 +820,7 @@ impl AdaptiveRowFilterContext {
 
     fn report_rf_order_sample(
         &self,
+        signature: &CandidateSignature,
         order_epoch: u64,
         input_rows: u64,
         total_cpu_ns: u64,
@@ -778,7 +831,9 @@ impl AdaptiveRowFilterContext {
         }
         let cost_ns = (total_cpu_ns as u128).saturating_add((bytes_fetched as u128) / 2);
         let cost_per_row = cost_ns as f64 / input_rows as f64;
-        self.rf_order.lock().report(order_epoch, cost_per_row);
+        if let Some(bandit) = self.rf_orders.lock().get_mut(signature) {
+            bandit.report(order_epoch, cost_per_row);
+        }
     }
 }
 
@@ -797,7 +852,7 @@ pub struct RgProbeHandle {
     cpu_ns: u64,
     bytes_fetched: u64,
     track_mode_epoch: Option<u64>,
-    rf_order_epoch: Option<u64>,
+    rf_order_key: Option<RowFilterOrderKey>,
     finished: bool,
 }
 
@@ -811,7 +866,7 @@ impl RgProbeHandle {
     }
 
     pub fn needs_worker_timing(&self) -> bool {
-        self.track_mode_epoch.is_some() || self.rf_order_epoch.is_some()
+        self.track_mode_epoch.is_some() || self.rf_order_key.is_some()
     }
 
     fn add_cpu_ns(&mut self, ns: u64) {
@@ -822,8 +877,8 @@ impl RgProbeHandle {
         self.bytes_fetched = self.bytes_fetched.saturating_add(bytes);
     }
 
-    fn set_rf_order_epoch(&mut self, epoch: Option<u64>) {
-        self.rf_order_epoch = epoch;
+    fn set_rf_order_key(&mut self, key: Option<RowFilterOrderKey>) {
+        self.rf_order_key = key;
     }
 
     /// Record final worker CPU (`decode + process`) for this row group and
@@ -843,8 +898,9 @@ impl RgProbeHandle {
                 self.bytes_fetched,
             );
         }
-        if let Some(order_epoch) = self.rf_order_epoch {
+        if let Some((sig, order_epoch)) = self.rf_order_key.take() {
             self.controller.report_rf_order_sample(
+                &sig,
                 order_epoch,
                 self.input_rows,
                 total_cpu_ns,
@@ -3367,6 +3423,7 @@ pub(super) struct FilteredBufferedReaders {
     handback_rx: Option<mpsc::UnboundedReceiver<HandbackRequest>>,
     split_context: Option<Arc<SplitContext>>,
     adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
+    file_rf_plan: Option<FileRowFilterPlan>,
 }
 
 impl BufferedReaders {
@@ -3500,6 +3557,9 @@ impl BufferedReaders {
             .collect();
 
         let file_surviving_rgs = pending.len();
+        let file_rf_plan = config.adaptive_context.as_ref().map(|adaptive| {
+            adaptive.build_file_row_filter_plan(config.row_filter_context.candidates())
+        });
         Self::Filtered(Box::new(FilteredBufferedReaders {
             pending,
             file_surviving_rgs,
@@ -3524,6 +3584,7 @@ impl BufferedReaders {
             handback_rx: None,
             split_context: config.split_context,
             adaptive_context: config.adaptive_context,
+            file_rf_plan,
         }))
     }
 }
@@ -4419,11 +4480,12 @@ impl FilteredBufferedReaders {
             builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
         }
         if install_filter {
-            let row_filter = if let Some(adaptive) = &self.adaptive_context {
-                let (order, order_epoch) =
-                    adaptive.row_filter_order(self.row_filter_context.candidates());
+            let row_filter = if let (Some(adaptive), Some(rf_plan)) =
+                (&self.adaptive_context, &self.file_rf_plan)
+            {
+                let (order, order_key) = adaptive.row_filter_order(rf_plan);
                 if let Some(handle) = rg_handle.as_mut() {
-                    handle.set_rf_order_epoch(order_epoch);
+                    handle.set_rf_order_key(order_key);
                 }
                 self.row_filter_context.build_row_filter_with_order(&order)
             } else {
@@ -7078,5 +7140,265 @@ mod tests {
         assert_eq!(split_ctx.budget.live_bytes(), 0);
         assert_eq!(pool.reserved(), 0);
         assert!(broker.state.lock().is_empty());
+    }
+
+    #[test]
+    fn adaptive_controller_probe_commit_reprobe_hysteresis_backoff_and_stale_epochs() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let cfg = AdaptiveRowFilterConfig {
+            mode: AdaptiveRowFilterMode::Adaptive,
+            probe_rgs_per_mode: 2,
+            reprobe_interval: 4,
+            test_mode_costs_ns_per_row: None,
+        };
+        let ctx = Arc::new(AdaptiveRowFilterContext::new(
+            cfg, 1, false, None, None, &metrics,
+        ));
+
+        // 1. Fast-path metadata gate (can_skip_columns = false) -> BulkDecode immediately.
+        let fast = ctx.assign_rg(false, 20, 1000);
+        assert_eq!(fast.mode(), RgFilterMode::BulkDecode);
+        assert!(!fast.needs_worker_timing());
+        fast.finish(500);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_fast_path_bulk_rgs")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+
+        // 2. Small-scan bypass (< MIN_RGS_FOR_ADAPTIVE_PROBE) -> RowFilter directly.
+        let small = ctx.assign_rg(true, 4, 1000);
+        assert_eq!(small.mode(), RgFilterMode::RowFilter);
+        assert!(!small.needs_worker_timing());
+        small.finish(500);
+
+        // 3. Initial probe dispatches exactly 2 RowFilter + 2 BulkDecode tracked handles.
+        let p0 = ctx.assign_rg(true, 40, 1000);
+        let p1 = ctx.assign_rg(true, 40, 1000);
+        let p2 = ctx.assign_rg(true, 40, 1000);
+        let p3 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(p0.mode(), RgFilterMode::RowFilter);
+        assert_eq!(p1.mode(), RgFilterMode::BulkDecode);
+        assert_eq!(p2.mode(), RgFilterMode::RowFilter);
+        assert_eq!(p3.mode(), RgFilterMode::BulkDecode);
+        assert!(p0.needs_worker_timing());
+        assert!(p1.needs_worker_timing());
+
+        // Extra concurrent RG while probes are in flight is NOT tracked (bounded probes).
+        let in_flight_extra = ctx.assign_rg(true, 40, 1000);
+        assert!(!in_flight_extra.needs_worker_timing());
+        assert_eq!(in_flight_extra.mode(), RgFilterMode::BulkDecode);
+
+        // BulkDecode is 1.2x cheaper (< 1.5x -> no backoff, reprobe_interval stays 4).
+        p0.finish(120_000);
+        p1.finish(100_000);
+        p2.finish(120_000);
+        p3.finish(100_000);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+
+        // Next 4 committed RGs run BulkDecode untracked.
+        for _ in 0..4 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::BulkDecode);
+            assert!(!h.needs_worker_timing());
+            h.finish(100_000);
+        }
+
+        // 4. Reprobe triggers after 4 committed RGs: 1 challenger (RowFilter) + 1 incumbent (BulkDecode).
+        let r0 = ctx.assign_rg(true, 40, 1000);
+        let r1 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(r0.mode(), RgFilterMode::RowFilter);
+        assert_eq!(r1.mode(), RgFilterMode::BulkDecode);
+        assert!(r0.needs_worker_timing());
+        assert!(r1.needs_worker_timing());
+
+        // Stale epoch sample (epoch 1) is ignored and must not corrupt epoch 2 reprobe.
+        ctx.report_mode_sample(RgFilterMode::RowFilter, 1, 1000, 1, 0);
+
+        // Hysteresis test: challenger only 3% faster (97k vs 100k, within 5% margin) -> keep BulkDecode.
+        r0.finish(97_000);
+        r1.finish(100_000);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+        for _ in 0..4 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::BulkDecode);
+            h.finish(100_000);
+        }
+
+        // 5. Reprobe where RowFilter wins by > 2.0x (including bytes_fetched credit):
+        // switches to RowFilter and triggers 4x exponential backoff (4 * 4 = 16 RGs).
+        let mut r2 = ctx.assign_rg(true, 40, 1000);
+        let mut r3 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(r2.mode(), RgFilterMode::RowFilter);
+        assert_eq!(r3.mode(), RgFilterMode::BulkDecode);
+        r2.add_bytes_fetched(10_000); // +5_000 ns
+        r3.add_bytes_fetched(400_000); // +200_000 ns
+        r2.finish(20_000); // total 25_000 ns
+        r3.finish(100_000); // total 300_000 ns -> 12x win -> 4x backoff = 16 RGs!
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            2
+        );
+        for _ in 0..16 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::RowFilter);
+            assert!(!h.needs_worker_timing());
+        }
+        // 17th RG starts the next reprobe (challenger = BulkDecode).
+        let next_reprobe = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(next_reprobe.mode(), RgFilterMode::BulkDecode);
+        assert!(next_reprobe.needs_worker_timing());
+    }
+
+    #[test]
+    fn adaptive_controller_forced_and_alternating_modes() {
+        for (mode, expected) in [
+            (
+                AdaptiveRowFilterMode::ForceRowFilter,
+                vec![RgFilterMode::RowFilter; 4],
+            ),
+            (
+                AdaptiveRowFilterMode::ForceBulk,
+                vec![RgFilterMode::BulkDecode; 4],
+            ),
+            (
+                AdaptiveRowFilterMode::AlternateForTest,
+                vec![
+                    RgFilterMode::RowFilter,
+                    RgFilterMode::BulkDecode,
+                    RgFilterMode::RowFilter,
+                    RgFilterMode::BulkDecode,
+                ],
+            ),
+        ] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let ctx = Arc::new(AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode,
+                    ..Default::default()
+                },
+                1,
+                false,
+                None,
+                None,
+                &metrics,
+            ));
+            let actual: Vec<_> = (0..4)
+                .map(|_| ctx.assign_rg(false, 2, 100).mode())
+                .collect();
+            assert_eq!(actual, expected, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn row_filter_order_bandit_bounded_trial_keep_revert_and_stale_epoch() {
+        let mut bandit = RowFilterOrderBandit::new(vec![0, 1]);
+
+        // Warmup (2 iterations) + execute (16 iterations) with cost 100.0 for [0, 1].
+        for _ in 0..(RF_BANDIT_WARMUP + RF_BANDIT_EXECUTE_INTERVAL) {
+            let (order, epoch) = bandit.current_order();
+            assert_eq!(order, vec![0, 1]);
+            bandit.report(epoch.unwrap(), 100.0);
+        }
+
+        // Now in observe mode: strictly RF_BANDIT_OBSERVE_INTERVAL (2) dispatches
+        // receive the trial order [1, 0]; concurrent callers get incumbent [0, 1] untracked.
+        let (t0, e0) = bandit.current_order();
+        let (t1, e1) = bandit.current_order();
+        let (overflow, e_overflow) = bandit.current_order();
+        assert_eq!(t0, vec![1, 0]);
+        assert_eq!(t1, vec![1, 0]);
+        assert!(e0.is_some() && e0 == e1);
+        assert_eq!(overflow, vec![0, 1]);
+        assert_eq!(e_overflow, None);
+
+        // Stale epoch report from before the swap must be ignored.
+        bandit.report(e0.unwrap() - 1, 1.0);
+        assert!(bandit.observe);
+
+        // Trial improves cost (20.0 < 100.0) -> keeps [1, 0] and keeps likeliness at 100.
+        bandit.report(e0.unwrap(), 20.0);
+        bandit.report(e1.unwrap(), 20.0);
+        assert!(!bandit.observe);
+        assert_eq!(bandit.permutation, vec![1, 0]);
+        assert_eq!(bandit.swap_likeliness, vec![RF_BANDIT_INITIAL_LIKELINESS]);
+
+        // Execute 16 iterations at cost 20.0 -> triggers next trial swap back to [0, 1].
+        for _ in 0..RF_BANDIT_EXECUTE_INTERVAL {
+            let (order, epoch) = bandit.current_order();
+            assert_eq!(order, vec![1, 0]);
+            bandit.report(epoch.unwrap(), 20.0);
+        }
+        let (b0, eb0) = bandit.current_order();
+        let (b1, eb1) = bandit.current_order();
+        assert_eq!(b0, vec![0, 1]);
+        assert_eq!(b1, vec![0, 1]);
+
+        // Regressing trial (100.0 >= 20.0) -> reverts to [1, 0] and halves likeliness (100 -> 50).
+        bandit.report(eb0.unwrap(), 100.0);
+        bandit.report(eb1.unwrap(), 100.0);
+        assert!(!bandit.observe);
+        assert_eq!(bandit.permutation, vec![1, 0]);
+        assert_eq!(
+            bandit.swap_likeliness,
+            vec![RF_BANDIT_INITIAL_LIKELINESS / 2]
+        );
+    }
+
+    #[test]
+    fn row_filter_order_per_signature_isolation_and_fixed_identity() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let ctx = AdaptiveRowFilterContext::new(
+            AdaptiveRowFilterConfig::default(),
+            2,
+            false,
+            None,
+            None,
+            &metrics,
+        );
+
+        let sig_a = Arc::new(vec!["a".to_owned(), "b".to_owned()]);
+        let sig_b = Arc::new(vec!["a".to_owned(), "c".to_owned()]);
+        let plan_a = FileRowFilterPlan::Adaptive {
+            signature: Arc::clone(&sig_a),
+            initial_order: vec![1, 0],
+        };
+        let plan_b = FileRowFilterPlan::Adaptive {
+            signature: Arc::clone(&sig_b),
+            initial_order: vec![0, 1],
+        };
+        let plan_fallible = FileRowFilterPlan::FixedIdentity(vec![0, 1]);
+
+        let (ord_a, key_a) = ctx.row_filter_order(&plan_a);
+        let (ord_b, key_b) = ctx.row_filter_order(&plan_b);
+        let (ord_f, key_f) = ctx.row_filter_order(&plan_fallible);
+
+        assert_eq!(ord_a, vec![1, 0]);
+        assert!(key_a.is_some());
+        assert_eq!(ord_b, vec![0, 1]);
+        assert!(key_b.is_some());
+        assert_eq!(ord_f, vec![0, 1]);
+        assert!(key_f.is_none());
     }
 }

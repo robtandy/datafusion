@@ -581,8 +581,6 @@ impl ParquetSource {
         None
     }
 
-    /// Open a morselizer that publishes buffered row-group readers, not file streams.
-    /// The caller must admit only unordered whole files with static predicates.
     /// Return the current projection expressions for this source.
     ///
     /// # Public Only for Internal Use:
@@ -594,6 +592,8 @@ impl ParquetSource {
         &self.projection
     }
 
+    /// Open a morselizer that publishes buffered row-group readers, not file streams.
+    /// The caller must admit only unordered whole files with static predicates.
     ///
     /// # Public Only for Internal Use:
     /// This is not a public API and is for internal use only; see [API policy] for details.
