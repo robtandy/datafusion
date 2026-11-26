@@ -18,7 +18,10 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
-use datafusion_datasource_parquet::{file_format::ParquetFormat, source::ParquetSource};
+use datafusion_datasource_parquet::{
+    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, file_format::ParquetFormat,
+    source::ParquetSource,
+};
 use datafusion_execution::TaskContext;
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -36,6 +39,7 @@ use datafusion_session::Session;
 
 use crate::datasource::listing::ListingTable;
 
+use super::adaptive_filter::{self, CompiledFilter};
 use super::dag::{ScalarSubqueryState, StageSpec, count_dag_stage_refs};
 use super::hash_join::{JoinOutputCol, ProbeJoinKind};
 use super::join_filter::{
@@ -54,6 +58,29 @@ use ready::{Phase2Queue, Phase2Task, Publisher};
 
 const MAX_READ_AHEAD: usize = 16;
 
+#[derive(Debug, Clone)]
+struct BulkScanPlan {
+    /// Wider file projection decoding both output columns and static predicate
+    /// columns when `pushdown_operators` narrowed the scan schema (`None` when
+    /// the output schema already contains all predicate columns).
+    bulk_projection: Option<ProjectionExprs>,
+    bulk_schema: SchemaRef,
+    /// Mapping from `bulk_schema` column indices to `ParquetScan.schema`
+    /// (`None` when identity).
+    bulk_to_output: Option<Vec<usize>>,
+    /// Exact static conjuncts pushed down (`PushedDown::Yes`), in
+    /// `bulk_schema` coordinates.
+    pushed_static_preds: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+/// Worker-side execution plan for Mode B (`BulkDecode + BatchView`) row groups.
+#[derive(Debug)]
+pub(in crate::morsel) struct BulkFilterPlan {
+    pub(in crate::morsel) compiled_filter: Option<CompiledFilter>,
+    pub(in crate::morsel) bulk_to_output: Option<Vec<usize>>,
+    pub(in crate::morsel) output_schema: SchemaRef,
+}
+
 #[derive(Debug)]
 pub(super) struct ParquetScan {
     pub(super) table: String,
@@ -62,6 +89,7 @@ pub(super) struct ParquetScan {
     config: Option<Box<FileScanConfig>>,
     files: Arc<[PartitionedFile]>,
     pushdown_filters: bool,
+    bulk_scan_plan: Option<BulkScanPlan>,
     dynamic_join_filters: Vec<JoinFilterBinding>,
     pub(super) metrics: ExecutionPlanMetricsSet,
 }
@@ -115,6 +143,7 @@ impl ParquetScan {
             config: None,
             files: Arc::default(),
             pushdown_filters: false,
+            bulk_scan_plan: None,
             dynamic_join_filters: Vec::new(),
             metrics: ExecutionPlanMetricsSet::new(),
         };
@@ -303,6 +332,7 @@ impl ParquetScan {
                 }
             }
         }
+        let mut pushed_static_preds = Vec::new();
         if !candidates.is_empty() {
             let mut pushdown_cfg = session.config_options().clone();
             pushdown_cfg.execution.parquet.pushdown_filters = true;
@@ -316,7 +346,9 @@ impl ParquetScan {
                 );
             }
             for (expr, pushed) in candidates.into_iter().zip(update.filters) {
-                if matches!(pushed, PushedDown::No) {
+                if matches!(pushed, PushedDown::Yes) {
+                    pushed_static_preds.push(expr);
+                } else {
                     residual.push(expr);
                 }
             }
@@ -360,10 +392,16 @@ impl ParquetScan {
                 Operator::HashProbe(_) => break,
             }
         }
+        let mut narrowed_for_bulk = false;
         if first_projection.is_some() || is_count_sink {
             needed_cols.sort_unstable();
             needed_cols.dedup();
             if needed_cols.len() < self.schema.fields().len() {
+                let pre_narrow_schema = Arc::clone(&self.schema);
+                let pre_narrow_projection = config
+                    .file_source()
+                    .downcast_ref::<ParquetSource>()
+                    .map(|p| p.projection_exprs().clone());
                 let narrow = ProjectionExprs::from_indices(&needed_cols, &self.schema);
                 if let Some(updated) = config.try_swapping_with_projection(&narrow)? {
                     let updated = updated
@@ -409,9 +447,71 @@ impl ParquetScan {
                         }
                         **config = updated;
                         self.schema = narrowed_schema;
+                        if !pushed_static_preds.is_empty()
+                            && let Some(pre_proj) = pre_narrow_projection
+                        {
+                            // Keep only columns needed by either output or
+                            // pushed static predicates in `bulk_schema`.
+                            let mut bulk_cols = needed_cols.clone();
+                            for expr in &pushed_static_preds {
+                                bulk_cols.extend(
+                                    collect_columns(expr).into_iter().map(|c| c.index()),
+                                );
+                            }
+                            bulk_cols.sort_unstable();
+                            bulk_cols.dedup();
+                            if bulk_cols.len() == pre_narrow_schema.fields().len() {
+                                self.bulk_scan_plan = Some(BulkScanPlan {
+                                    bulk_projection: Some(pre_proj),
+                                    bulk_schema: pre_narrow_schema,
+                                    bulk_to_output: Some(needed_cols.clone()),
+                                    pushed_static_preds: pushed_static_preds.clone(),
+                                });
+                            } else {
+                                let bulk_narrow = ProjectionExprs::from_indices(
+                                    &bulk_cols,
+                                    &pre_narrow_schema,
+                                );
+                                let remapped_preds = pushed_static_preds
+                                    .iter()
+                                    .map(|e| bulk_narrow.project_expr(e))
+                                    .collect::<Result<Vec<_>>>()?;
+                                let bulk_to_output: Vec<usize> = needed_cols
+                                    .iter()
+                                    .map(|col_idx| {
+                                        bulk_cols.binary_search(col_idx).expect(
+                                            "needed_cols is a subset of bulk_cols",
+                                        )
+                                    })
+                                    .collect();
+                                let selected_proj_exprs: Vec<_> = bulk_cols
+                                    .iter()
+                                    .map(|&idx| pre_proj.as_ref()[idx].clone())
+                                    .collect();
+                                let bulk_schema =
+                                    Arc::new(pre_narrow_schema.project(&bulk_cols)?);
+                                self.bulk_scan_plan = Some(BulkScanPlan {
+                                    bulk_projection: Some(ProjectionExprs::new(
+                                        selected_proj_exprs,
+                                    )),
+                                    bulk_schema,
+                                    bulk_to_output: Some(bulk_to_output),
+                                    pushed_static_preds: remapped_preds,
+                                });
+                            }
+                            narrowed_for_bulk = true;
+                        }
                     }
                 }
             }
+        }
+        if !narrowed_for_bulk && !pushed_static_preds.is_empty() {
+            self.bulk_scan_plan = Some(BulkScanPlan {
+                bulk_projection: None,
+                bulk_schema: Arc::clone(&self.schema),
+                bulk_to_output: None,
+                pushed_static_preds,
+            });
         }
 
         self.metrics = config.file_source().metrics().clone();
@@ -462,13 +562,34 @@ impl ParquetScan {
         published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
+        let bulk_filter_plan = self
+            .bulk_scan_plan
+            .as_ref()
+            .map(|plan| -> Result<Arc<BulkFilterPlan>> {
+                let compiled_filter = (!plan.pushed_static_preds.is_empty())
+                    .then(|| {
+                        CompiledFilter::try_new(
+                            conjunction(plan.pushed_static_preds.clone()),
+                            &plan.bulk_schema,
+                        )
+                    })
+                    .transpose()?;
+                Ok(Arc::new(BulkFilterPlan {
+                    compiled_filter,
+                    bulk_to_output: plan.bulk_to_output.clone(),
+                    output_schema: Arc::clone(&self.schema),
+                }))
+            })
+            .transpose()?;
         let (publish, phase2, ready) = ready::channel(
             read_ahead,
             measurement.cloned(),
             MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
+            bulk_filter_plan,
         );
         if let Some(base_config) = &self.config {
             let mut runtime_config_owned: Option<FileScanConfig> = None;
+            let mut pushed_dynamic_filter = false;
             if !self.dynamic_join_filters.is_empty() && !published_filters.is_empty() {
                 let mut dynamic_preds = Vec::new();
                 for binding in &self.dynamic_join_filters {
@@ -512,6 +633,7 @@ impl ParquetScan {
                         MetricBuilder::new(&self.metrics)
                             .counter("join_dynamic_filters_pushed", 0)
                             .add(pushed_count);
+                        pushed_dynamic_filter = true;
                         runtime_config_owned = Some(updated_cfg);
                     }
                 }
@@ -524,8 +646,35 @@ impl ParquetScan {
                     internal_datafusion_err!("Expected the admitted ParquetSource")
                 })?;
             let has_pushed_filter = parquet.exact_filter().is_some();
+            let can_adapt = has_pushed_filter
+                && self.pushdown_filters
+                && (self.bulk_scan_plan.is_some() || pushed_dynamic_filter);
+            let adaptive_ctx = can_adapt.then(|| {
+                let adaptive_cfg = context
+                    .session_config()
+                    .get_extension::<AdaptiveRowFilterConfig>()
+                    .map(|c| (*c).clone())
+                    .unwrap_or_default();
+                let bulk_proj = self.bulk_scan_plan.as_ref().and_then(|plan| {
+                    plan.bulk_projection
+                        .as_ref()
+                        .map(|proj| (proj.clone(), Arc::clone(&plan.bulk_schema)))
+                });
+                Arc::new(AdaptiveRowFilterContext::new(
+                    adaptive_cfg,
+                    self.files.len(),
+                    pushed_dynamic_filter,
+                    bulk_proj,
+                    Some(Arc::new(adaptive_filter::analyze_conjunct)),
+                    &self.metrics,
+                ))
+            });
             let work = Arc::new(FileWork {
-                morselizer: parquet.create_buffered_morselizer(config, context)?,
+                morselizer: parquet.create_adaptive_buffered_morselizer(
+                    config,
+                    context,
+                    adaptive_ctx,
+                )?,
                 files: Arc::clone(&self.files),
                 next: AtomicUsize::new(0),
                 publish,
