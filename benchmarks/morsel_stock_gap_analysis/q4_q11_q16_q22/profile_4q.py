@@ -84,6 +84,8 @@ ABLATION_SUITE: dict[str, list[tuple[str, str, dict[str, str]]]] = {
     ],
     "q16": [
         ("baseline_pushdown", "pushdown", {}),
+        ("stage_cap16", "pushdown", {"MORSEL_DIAG_STAGE_CAP": "16"}),
+        ("stage_cap32", "pushdown", {"MORSEL_DIAG_STAGE_CAP": "32"}),
         ("stage_cap64", "pushdown", {"MORSEL_DIAG_STAGE_CAP": "64"}),
         (
             "concurrent_builds",
@@ -111,6 +113,7 @@ ABLATION_SUITE: dict[str, list[tuple[str, str, dict[str, str]]]] = {
             "pushdown",
             {"MORSEL_DIAG_BLOOM_FAST": "1", "MORSEL_DIAG_FAST_BUILD_SEMI": "1"},
         ),
+        ("small_bulk", "pushdown", {"MORSEL_DIAG_SMALL_BULK": "1"}),
     ],
 }
 
