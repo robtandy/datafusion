@@ -4,11 +4,16 @@
 
 """Reproducible SF=5 profiler for TPC-H Q4, Q11, Q16, and Q22 (#216).
 
-Captures:
-- Physical plans (`plan`) and Stock `EXPLAIN ANALYZE` operator metrics
-- Arm PMUv3 hardware counters (`perf stat`)
-- Leaf CPU symbol attribution (`perf record` + `perf report`)
-- Summary tables from `benchmarks/morsel_tpch/harness.py` JSONL output
+Subcommands:
+- `plans`: capture physical plans (`plan`) across all 4 DataFusion arms plus
+  Stock `EXPLAIN ANALYZE` operator metrics (`row_pushdown_eval_time`,
+  `HashJoinExec`, `RepartitionExec`, `array_map_created_count`, `build_mem_used`).
+- `perf-stat`: Arm PMUv3 hardware counters (`cycles:u`, `instructions:u`,
+  `r17:u` L2d cache refills, IPC, MPKI).
+- `perf-record`: leaf CPU symbol attribution (`3,999 Hz cycles:u`).
+- `ablations`: counterbalanced scratch ablations + phase timelines + PyArrow
+  logical table parity check (requires a runner built with `ablations.patch`).
+- `summarize`: summary tables from `benchmarks/morsel_tpch/harness.py` JSONL.
 """
 
 import argparse
@@ -36,6 +41,79 @@ ARMS = (
 )
 PERF_EVENTS = "cycles:u,instructions:u,r17:u,task-clock,context-switches,cpu-migrations"
 
+ABLATION_SUITE: dict[str, list[tuple[str, str, dict[str, str]]]] = {
+    "q4": [
+        ("baseline_pushdown", "pushdown", {}),
+        ("bloom_fast_neon", "pushdown", {"MORSEL_DIAG_BLOOM_FAST": "1"}),
+        ("fast_build_semi", "pushdown", {"MORSEL_DIAG_FAST_BUILD_SEMI": "1"}),
+        (
+            "bloom_fast+fast_semi",
+            "pushdown",
+            {"MORSEL_DIAG_BLOOM_FAST": "1", "MORSEL_DIAG_FAST_BUILD_SEMI": "1"},
+        ),
+        (
+            "force_bulk+keep_dyn+bloom_fast+fast_semi",
+            "pushdown",
+            {
+                "MORSEL_DIAG_ADAPTIVE_MODE": "force_bulk",
+                "MORSEL_DIAG_KEEP_DYN_IN_BULK": "1",
+                "MORSEL_DIAG_BLOOM_FAST": "1",
+                "MORSEL_DIAG_FAST_BUILD_SEMI": "1",
+            },
+        ),
+        ("no_pushdown", "no_pushdown", {}),
+        (
+            "no_pushdown+fast_semi",
+            "no_pushdown",
+            {"MORSEL_DIAG_FAST_BUILD_SEMI": "1"},
+        ),
+    ],
+    "q11": [
+        ("baseline_pushdown", "pushdown", {}),
+        ("force_bulk", "pushdown", {"MORSEL_DIAG_ADAPTIVE_MODE": "force_bulk"}),
+        ("force_rf", "pushdown", {"MORSEL_DIAG_ADAPTIVE_MODE": "force_rf"}),
+        (
+            "force_bulk+keep_dyn+bloom_fast",
+            "pushdown",
+            {
+                "MORSEL_DIAG_ADAPTIVE_MODE": "force_bulk",
+                "MORSEL_DIAG_KEEP_DYN_IN_BULK": "1",
+                "MORSEL_DIAG_BLOOM_FAST": "1",
+            },
+        ),
+    ],
+    "q16": [
+        ("baseline_pushdown", "pushdown", {}),
+        ("stage_cap64", "pushdown", {"MORSEL_DIAG_STAGE_CAP": "64"}),
+        (
+            "concurrent_builds",
+            "pushdown",
+            {"MORSEL_DIAG_CONCURRENT_BUILDS": "1"},
+        ),
+        ("small_bulk", "pushdown", {"MORSEL_DIAG_SMALL_BULK": "1"}),
+        (
+            "concurrent+small_bulk+cap64+bloom_fast",
+            "pushdown",
+            {
+                "MORSEL_DIAG_CONCURRENT_BUILDS": "1",
+                "MORSEL_DIAG_SMALL_BULK": "1",
+                "MORSEL_DIAG_STAGE_CAP": "64",
+                "MORSEL_DIAG_BLOOM_FAST": "1",
+            },
+        ),
+    ],
+    "q22": [
+        ("baseline_pushdown", "pushdown", {}),
+        ("bloom_fast_neon", "pushdown", {"MORSEL_DIAG_BLOOM_FAST": "1"}),
+        ("fast_build_semi", "pushdown", {"MORSEL_DIAG_FAST_BUILD_SEMI": "1"}),
+        (
+            "bloom_fast+fast_semi",
+            "pushdown",
+            {"MORSEL_DIAG_BLOOM_FAST": "1", "MORSEL_DIAG_FAST_BUILD_SEMI": "1"},
+        ),
+    ],
+}
+
 
 def parse_perf_stat(text: str) -> dict[str, float]:
     metrics: dict[str, float] = {}
@@ -55,6 +133,242 @@ def parse_perf_stat(text: str) -> dict[str, float]:
         except ValueError:
             continue
     return metrics
+
+
+def cmd_plans(args: argparse.Namespace) -> None:
+    import pyarrow.ipc as ipc
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for q in QUERIES:
+        wl = harness.WORKLOADS[q]
+        sql = harness.render_workload_sql(wl, scale_factor=5.0)
+        tables = ",".join(wl.tables)
+        print(f"\n================ {q.upper()} ================")
+        for arm_name, mode, profile in ARMS:
+            proc = subprocess.run(
+                [
+                    args.runner,
+                    "plan",
+                    mode,
+                    profile,
+                    str(args.threads),
+                    args.data_dir,
+                    tables,
+                    sql,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            obj = json.loads(proc.stdout)
+            plan_txt = obj["plan"] or ""
+            (out_dir / f"{q}_{arm_name}_plan.txt").write_text(plan_txt)
+            print(f"  saved {q}_{arm_name}_plan.txt (admitted={obj['admitted']})")
+
+        for arm_name, mode, profile in (
+            ("stock_default", "off", "default"),
+            ("stock_pushdown", "off", "pushdown"),
+        ):
+            ea_sql = f"EXPLAIN ANALYZE {sql}"
+            proc = subprocess.run(
+                [
+                    "taskset",
+                    "-c",
+                    args.cpus,
+                    args.runner,
+                    "query",
+                    mode,
+                    profile,
+                    str(args.threads),
+                    args.data_dir,
+                    tables,
+                    ea_sql,
+                ],
+                capture_output=True,
+                check=True,
+            )
+            tbl = ipc.open_stream(proc.stdout).read_all()
+            chunks = []
+            for ptype, pstr in zip(
+                tbl.column(0).to_pylist(), tbl.column(1).to_pylist()
+            ):
+                chunks.append(f"--- {ptype} ---\n{pstr}")
+            full_txt = "\n".join(chunks) + "\n"
+            (out_dir / f"{q}_{arm_name}_explain_analyze.txt").write_text(full_txt)
+            print(f"  saved {q}_{arm_name}_explain_analyze.txt")
+            for line in full_txt.splitlines():
+                stripped = line.strip()
+                if any(
+                    tok in stripped
+                    for tok in (
+                        "HashJoinExec:",
+                        "RepartitionExec:",
+                        "DataSourceExec:",
+                        "FilterExec:",
+                        "SortPreservingMergeExec:",
+                    )
+                ):
+                    hits = []
+                    for pat in (
+                        r"elapsed_compute=[^,\]]+",
+                        r"repartition_time=[^,\]]+",
+                        r"row_pushdown_eval_time=[^,\]]+",
+                        r"array_map_created_count=[^,\]]+",
+                        r"build_mem_used=[^,\]]+",
+                        r"output_rows=[^,\]]+",
+                    ):
+                        m = re.search(pat, stripped)
+                        if m:
+                            hits.append(m.group(0))
+                    op_name = stripped.split(":", 1)[0]
+                    if hits:
+                        print(f"    [{arm_name}] {op_name}: {', '.join(hits)}")
+
+
+def cmd_ablations(args: argparse.Namespace) -> None:
+    import pyarrow.ipc as ipc
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    selected = (
+        tuple(q.strip() for q in args.queries.split(",") if q.strip())
+        if args.queries != "all"
+        else QUERIES
+    )
+
+    def read_table(profile: str, tables: str, sql: str, extra: dict[str, str]):
+        env = os.environ.copy()
+        env.update(extra)
+        proc = subprocess.run(
+            [
+                args.runner,
+                "query",
+                "required",
+                profile,
+                str(args.threads),
+                args.data_dir,
+                tables,
+                sql,
+            ],
+            env=env,
+            capture_output=True,
+            check=True,
+        )
+        return ipc.open_stream(proc.stdout).read_all()
+
+    results: dict[str, dict] = {}
+    for q in selected:
+        wl = harness.WORKLOADS[q]
+        sql = harness.render_workload_sql(wl, scale_factor=5.0)
+        tables = ",".join(wl.tables)
+        arms = ABLATION_SUITE[q]
+        ref_tbl = read_table("pushdown", tables, sql, {})
+
+        # 1. Verify exact logical Arrow table parity for every ablation toggle.
+        for name, profile, extra in arms:
+            got = read_table(profile, tables, sql, extra)
+            if not got.equals(ref_tbl):
+                raise AssertionError(
+                    f"Arrow table parity mismatch on {q} {name}: "
+                    f"{got.num_rows} vs {ref_tbl.num_rows} rows"
+                )
+
+        # 2. Capture one MORSEL_DIAG_PHASES=1 timeline per ablation toggle.
+        phases: dict[str, str] = {}
+        for name, profile, extra in arms:
+            env = os.environ.copy()
+            env.update(extra)
+            env["MORSEL_DIAG_PHASES"] = "1"
+            proc = subprocess.run(
+                [
+                    "taskset",
+                    "-c",
+                    args.cpus,
+                    args.runner,
+                    "measure",
+                    "required",
+                    profile,
+                    str(args.threads),
+                    args.data_dir,
+                    tables,
+                    sql,
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            phases[name] = proc.stderr.strip()
+
+        # 3. Run counterbalanced timed repeats without phase stderr logging.
+        per_arm: dict[str, list[dict]] = {name: [] for name, _, _ in arms}
+        for rd in range(args.repeats):
+            order = arms if rd % 2 == 0 else list(reversed(arms))
+            for name, profile, extra in order:
+                env = os.environ.copy()
+                env.update(extra)
+                proc = subprocess.run(
+                    [
+                        "taskset",
+                        "-c",
+                        args.cpus,
+                        args.runner,
+                        "measure",
+                        "required",
+                        profile,
+                        str(args.threads),
+                        args.data_dir,
+                        tables,
+                        sql,
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                per_arm[name].append(json.loads(proc.stdout))
+
+        base_exec = statistics.median(
+            t["exec_seconds"] * 1000.0 for t in per_arm["baseline_pushdown"]
+        )
+        base_cpu = statistics.median(
+            t["exec_cpu_seconds"] * 1000.0 for t in per_arm["baseline_pushdown"]
+        )
+        print(
+            f"\n=== {q.upper()} ABLATIONS "
+            f"({args.repeats} counterbalanced rounds, parity OK) ==="
+        )
+        q_out = {}
+        for name, _, _ in arms:
+            ts = per_arm[name]
+            execs = [t["exec_seconds"] * 1000.0 for t in ts]
+            cpus = [t["exec_cpu_seconds"] * 1000.0 for t in ts]
+            med_t = sorted(ts, key=lambda t: t["exec_seconds"])[len(ts) // 2]
+            me = statistics.median(execs)
+            mc = statistics.median(cpus)
+            print(
+                f"  {name:42s}: exec={me:5.1f}ms ({me - base_exec:+5.1f}) "
+                f"cpu={mc:6.1f}ms ({mc - base_cpu:+6.1f}) par={mc / me:4.2f}x "
+                f"wait={med_t.get('morsel_ready_wait_ms') or 0:5.1f} "
+                f"RF/Bk={med_t.get('adaptive_row_filter_rgs')}/"
+                f"{med_t.get('adaptive_bulk_decode_rgs')}"
+            )
+            q_out[name] = {
+                "exec_med_ms": round(me, 2),
+                "exec_delta_ms": round(me - base_exec, 2),
+                "cpu_med_ms": round(mc, 2),
+                "cpu_delta_ms": round(mc - base_cpu, 2),
+                "par": round(mc / me, 2),
+                "ready_wait_ms": round(med_t.get("morsel_ready_wait_ms") or 0.0, 2),
+                "rf_rgs": med_t.get("adaptive_row_filter_rgs"),
+                "bulk_rgs": med_t.get("adaptive_bulk_decode_rgs"),
+                "phases": phases[name].splitlines(),
+            }
+        results[q] = q_out
+    (out_dir / "ablations_summary.json").write_text(
+        json.dumps(results, indent=2) + "\n"
+    )
 
 
 def cmd_perf_stat(args: argparse.Namespace) -> None:
@@ -251,6 +565,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_plans = sub.add_parser("plans")
+    p_plans.add_argument("--runner", required=True)
+    p_plans.add_argument("--data-dir", required=True)
+    p_plans.add_argument("--out-dir", required=True)
+    p_plans.add_argument("--threads", type=int, default=8)
+    p_plans.add_argument("--cpus", default="0-7")
+
+    p_abl = sub.add_parser("ablations")
+    p_abl.add_argument("--runner", required=True)
+    p_abl.add_argument("--data-dir", required=True)
+    p_abl.add_argument("--out-dir", required=True)
+    p_abl.add_argument("--threads", type=int, default=8)
+    p_abl.add_argument("--cpus", default="0-7")
+    p_abl.add_argument("--repeats", type=int, default=5)
+    p_abl.add_argument("--queries", default="all")
+
     p_stat = sub.add_parser("perf-stat")
     p_stat.add_argument("--runner", required=True)
     p_stat.add_argument("--data-dir", required=True)
@@ -275,7 +605,11 @@ def main() -> None:
     p_sum.add_argument("jsonl")
 
     args = parser.parse_args()
-    if args.cmd == "perf-stat":
+    if args.cmd == "plans":
+        cmd_plans(args)
+    elif args.cmd == "ablations":
+        cmd_ablations(args)
+    elif args.cmd == "perf-stat":
         cmd_perf_stat(args)
     elif args.cmd == "perf-record":
         cmd_perf_record(args)

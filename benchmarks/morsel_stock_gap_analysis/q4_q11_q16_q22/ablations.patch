@@ -1,0 +1,653 @@
+diff --git a/datafusion/core/src/morsel.rs b/datafusion/core/src/morsel.rs
+index a6b96bfc4..c1af1e3d6 100644
+--- a/datafusion/core/src/morsel.rs
++++ b/datafusion/core/src/morsel.rs
+@@ -2446,6 +2446,106 @@ impl Pipeline {
+             let mut slots: Vec<Option<Arc<FinalizedHashTable>>> =
+                 vec![None; probes.len()];
+             let mut short_circuit_op = None;
++            let diag = std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1");
++            let conc_builds =
++                std::env::var("MORSEL_DIAG_CONCURRENT_BUILDS").as_deref() == Ok("1");
++            // Scratch ablation for 2 independent Parquet builds (e.g. q16 part + supplier):
++            if conc_builds && probes.len() == 2 {
++                let b0 = &probes[0].1.build_pipeline;
++                let b1 = &probes[1].1.build_pipeline;
++                let b0_uses_f1 = matches!(
++                    &b0.source,
++                    Source::Parquet(p) if !p.dynamic_join_filters_empty()
++                );
++                if !b0_uses_f1
++                    && matches!(&b0.source, Source::Parquet(_))
++                    && matches!(&b1.source, Source::Parquet(_))
++                    && b0
++                        .operators
++                        .iter()
++                        .all(|o| !matches!(o, Operator::HashProbe(_)))
++                    && b1
++                        .operators
++                        .iter()
++                        .all(|o| !matches!(o, Operator::HashProbe(_)))
++                {
++                    let l0 = match label_prefix {
++                        None => "build_0".to_owned(),
++                        Some(p) => format!("{p}_build_0"),
++                    };
++                    let l1 = match label_prefix {
++                        None => "build_1".to_owned(),
++                        Some(p) => format!("{p}_build_1"),
++                    };
++                    let t_both = Instant::now();
++                    let pf0 = published_filters.clone();
++                    let pf1 = published_filters.clone();
++                    let (t0, t1) = tokio::try_join!(
++                        async {
++                            let mut d0 = DagRuntime::new(
++                                Arc::new(Vec::new()),
++                                Vec::new(),
++                                None,
++                                context.memory_pool(),
++                            );
++                            let mut f0 = pf0;
++                            Self::run_single_build_pipeline(
++                                b0,
++                                &l0,
++                                &mut d0,
++                                &mut f0,
++                                context,
++                                plan_metrics,
++                                measurement,
++                                tx,
++                            )
++                            .await
++                        },
++                        async {
++                            let mut d1 = DagRuntime::new(
++                                Arc::new(Vec::new()),
++                                Vec::new(),
++                                None,
++                                context.memory_pool(),
++                            );
++                            let mut f1 = pf1;
++                            Self::run_single_build_pipeline(
++                                b1,
++                                &l1,
++                                &mut d1,
++                                &mut f1,
++                                context,
++                                plan_metrics,
++                                measurement,
++                                tx,
++                            )
++                            .await
++                        }
++                    )?;
++                    if diag {
++                        eprintln!(
++                            "[DIAG] concurrent_builds({l0}+{l1}) wall={:.2}ms",
++                            t_both.elapsed().as_secs_f64() * 1000.0
++                        );
++                    }
++                    let (Some(t0), Some(t1)) = (t0, t1) else {
++                        return Ok(BuildRunOutcome::Cancelled);
++                    };
++                    #[cfg(feature = "parquet")]
++                    {
++                        if let Some(df) = t1.dynamic_filter() {
++                            published_filters.insert(probes[1].1.filter_id, Arc::clone(df));
++                        }
++                        if let Some(df) = t0.dynamic_filter() {
++                            published_filters.insert(probes[0].1.filter_id, Arc::clone(df));
++                        }
++                    }
++                    return Ok(BuildRunOutcome::Ready {
++                        tables: Arc::new(vec![t0, t1]),
++                        short_circuit_op: None,
++                    });
++                }
++            }
+             // Execute builds in reverse probe order (`probes[N-1]` down to
+             // `probes[0]`) so downstream selective builds publish dynamic
+             // filters before earlier builds open their Parquet scans.
+@@ -2463,6 +2563,7 @@ impl Pipeline {
+                     (Some(prefix), false) => format!("{prefix}_build"),
+                     (Some(prefix), true) => format!("{prefix}_build_{idx}"),
+                 };
++                let t_build = Instant::now();
+                 let Some(table) = Box::pin(Self::run_single_build_pipeline(
+                     &probe.build_pipeline,
+                     &build_label,
+@@ -2480,6 +2581,14 @@ impl Pipeline {
+                     }
+                     return Ok(BuildRunOutcome::Cancelled);
+                 };
++                if diag {
++                    eprintln!(
++                        "[DIAG] build({build_label}) wall={:.2}ms rows={} has_dyn={}",
++                        t_build.elapsed().as_secs_f64() * 1000.0,
++                        table.num_rows(),
++                        table.dynamic_filter().is_some(),
++                    );
++                }
+                 #[cfg(feature = "parquet")]
+                 if let Some(df) = table.dynamic_filter() {
+                     published_filters.insert(probe.filter_id, Arc::clone(df));
+@@ -4797,13 +4906,16 @@ impl Pipeline {
+                 }
+                 #[cfg(feature = "parquet")]
+                 Source::Parquet(source) => {
++                    let keep_dyn = !self.has_join()
++                        || std::env::var("MORSEL_DIAG_KEEP_DYN_IN_BULK").as_deref()
++                            == Ok("1");
+                     let ready = source.start(
+                         context,
+                         &mut tasks,
+                         self.workers,
+                         measurement,
+                         &published_filters,
+-                        !self.has_join(),
++                        keep_dyn,
+                     )?;
+                     for id in 0..self.workers.get() {
+                         let (pipeline, ready, output) =
+@@ -4825,6 +4937,9 @@ impl Pipeline {
+                     }
+                 }
+             }
++            let diag = std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1");
++            let t_workers = Instant::now();
++            let mut merge_wall_ms = 0.0f64;
+             while let Some(result) = tasks.join_next().await {
+                 let local = match result {
+                     Ok(Ok(local)) => local,
+@@ -4902,7 +5017,10 @@ impl Pipeline {
+                     }
+                     WorkerState::Aggregate(local) => {
+                         if let Some(combined) = combined_agg.as_mut() {
+-                            match combined.merge_from(*local, &cancel_tx).await {
++                            let t_m = Instant::now();
++                            let mres = combined.merge_from(*local, &cancel_tx).await;
++                            merge_wall_ms += t_m.elapsed().as_secs_f64() * 1000.0;
++                            match mres {
+                                 Ok(true) => {}
+                                 Ok(false) => {
+                                     drop(combined_group);
+@@ -4940,6 +5058,14 @@ impl Pipeline {
+                     }
+                 }
+             }
++            if diag {
++                eprintln!(
++                    "[DIAG] pipeline({:?}) workers+merge wall={:.2}ms (supervisor merge_from={:.2}ms)",
++                    label_prefix,
++                    t_workers.elapsed().as_secs_f64() * 1000.0,
++                    merge_wall_ms,
++                );
++            }
+         }
+         drop(probe_stage_input);
+ 
+@@ -5103,6 +5229,9 @@ impl Pipeline {
+                         && !cancel_tx.is_closed()
+                         && let Some(combined) = combined_agg.take()
+                     {
++                        let diag =
++                            std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1");
++                        let t_fin = Instant::now();
+                         let finalized = sink.finalize(combined);
+                         MetricBuilder::new(metrics)
+                             .counter("aggregate_finalizations", 0)
+@@ -5117,6 +5246,13 @@ impl Pipeline {
+                                 measurement,
+                             )
+                             .await?;
++                            if diag {
++                                eprintln!(
++                                    "[DIAG] pipeline({:?}) agg_emit+post_sort wall={:.2}ms",
++                                    label_prefix,
++                                    t_fin.elapsed().as_secs_f64() * 1000.0,
++                                );
++                            }
+                         } else {
+                             finalized
+                                 .emit(
+@@ -5128,6 +5264,13 @@ impl Pipeline {
+                                     measurement.cloned(),
+                                 )
+                                 .await?;
++                            if diag {
++                                eprintln!(
++                                    "[DIAG] pipeline({:?}) agg_emit wall={:.2}ms",
++                                    label_prefix,
++                                    t_fin.elapsed().as_secs_f64() * 1000.0,
++                                );
++                            }
+                         }
+                     }
+                 }
+@@ -5218,9 +5361,16 @@ impl Pipeline {
+             );
+ 
+             if let Some(sq_state) = &scalar_subqueries {
++                let t_sq = Instant::now();
+                 let cont = sq_state
+                     .populate(&mut dag, &context, &metrics, measurement.as_ref(), &tx)
+                     .await?;
++                if std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1") {
++                    eprintln!(
++                        "[DIAG] scalar_subqueries wall={:.2}ms",
++                        t_sq.elapsed().as_secs_f64() * 1000.0
++                    );
++                }
+                 if !cont {
+                     return Ok(());
+                 }
+diff --git a/datafusion/core/src/morsel/dag.rs b/datafusion/core/src/morsel/dag.rs
+index 12d307d8a..a9a65ceeb 100644
+--- a/datafusion/core/src/morsel/dag.rs
++++ b/datafusion/core/src/morsel/dag.rs
+@@ -636,6 +636,8 @@ pub(super) fn ensure_stage<'a>(
+         }
+ 
+         dag.executed[stage_id.0] = true;
++        let diag = std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1");
++        let t_stage = std::time::Instant::now();
+         let stage_pipeline = Arc::clone(&dag.stages[stage_id.0].pipeline);
+         let stage_label = dag.stages[stage_id.0].label.clone();
+ 
+@@ -657,7 +659,10 @@ pub(super) fn ensure_stage<'a>(
+             return Ok(None);
+         };
+ 
+-        let channel_cap = stage_pipeline.sink_capacity.max(4);
++        let channel_cap = std::env::var("MORSEL_DIAG_STAGE_CAP")
++            .ok()
++            .and_then(|s| s.parse::<usize>().ok())
++            .unwrap_or_else(|| stage_pipeline.sink_capacity.max(4));
+         let (stage_tx, mut stage_rx) = mpsc::channel(channel_cap);
+ 
+         let mut stage_tasks: JoinSet<Result<()>> = JoinSet::new();
+@@ -666,10 +671,11 @@ pub(super) fn ensure_stage<'a>(
+             let metrics = plan_metrics.clone();
+             let meas = measurement.cloned();
+             let cancel = cancel_tx.clone();
++            let lbl = stage_label.clone();
+             stage_tasks.spawn(async move {
+                 stage_pipeline
+                     .run_prepared_to_tx(
+-                        Some(&stage_label),
++                        Some(&lbl),
+                         prepared,
+                         &ctx,
+                         &metrics,
+@@ -786,6 +792,14 @@ pub(super) fn ensure_stage<'a>(
+             return Ok(None);
+         }
+ 
++        if diag {
++            let total_rows: usize = stage.batches.iter().map(|b| b.num_rows()).sum();
++            eprintln!(
++                "[DIAG] ensure_stage({stage_label}) wall={:.2}ms batches={} rows={total_rows}",
++                t_stage.elapsed().as_secs_f64() * 1000.0,
++                stage.batches.len(),
++            );
++        }
+         let artifact = Arc::new(stage);
+         dag.outputs[stage_id.0] = Some(Arc::clone(&artifact));
+         Ok(Some(artifact))
+diff --git a/datafusion/core/src/morsel/hash_join.rs b/datafusion/core/src/morsel/hash_join.rs
+index f7f18df32..ae90f8dd9 100644
+--- a/datafusion/core/src/morsel/hash_join.rs
++++ b/datafusion/core/src/morsel/hash_join.rs
+@@ -4518,6 +4518,19 @@ impl HashJoinProbe {
+             self.kind,
+             ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti
+         ) {
++            let use_fast =
++                std::env::var("MORSEL_DIAG_FAST_BUILD_SEMI").as_deref() == Ok("1")
++                    && matches!(
++                        cursor.keys,
++                        ProbeKeys::Int32(_)
++                            | ProbeKeys::Int64(_)
++                            | ProbeKeys::UInt32(_)
++                            | ProbeKeys::UInt64(_)
++                    );
++            if use_fast {
++                probe_mark_radix_flat_int(cursor);
++                return Ok(OperatorStep::NeedMoreInput(None));
++            }
+             while !cursor.is_exhausted() {
+                 let Some((key_idx, _)) = probe_row_at(&cursor.rows, cursor.pos) else {
+                     cursor.pos += 1;
+@@ -6256,6 +6269,97 @@ fn transfer_to_resident_lease(
+ /// Batch-level specialized flat-integer radix probe for `Inner` / `BuildOuter`
+ /// joins: computes `mix_u64` once per row and probes `FlatIntTable<K>` inline
+ /// without per-row enum dispatch or intermediate candidate vectors.
++fn probe_mark_radix_flat_int(cursor: &mut RadixProbeCursor) {
++    let shift = cursor.shift;
++    let radix_bits = cursor.radix_bits;
++    let part_mask = (1u64 << radix_bits) - 1;
++    let resident_mask = cursor.resident_mask;
++    let partitions = cursor.resident.partitions.as_slice();
++    let valid_mask = cursor.valid_mask.as_ref();
++
++    macro_rules! run_mark {
++        ($p_arr:expr, $BuildVariant:ident, $hash_key:expr) => {{
++            let values = $p_arr.values();
++            macro_rules! mark_one {
++                ($key_idx:expr) => {{
++                    if !valid_mask.is_some_and(|v| !v.value($key_idx)) {
++                        let pk = unsafe { *values.get_unchecked($key_idx) };
++                        let h = $hash_key(pk);
++                        let p = ((h >> shift) & part_mask) as usize;
++                        if ((resident_mask >> p) & 1) != 0 {
++                            let pt = partitions[p].as_ref().unwrap();
++                            let BuildKeys::$BuildVariant(flat) = &pt.keys else {
++                                unreachable!();
++                            };
++                            let slots = flat.slots.as_slice();
++                            let mask = flat.mask;
++                            let mut slot_pos = (h as usize) & mask;
++                            loop {
++                                let slot = unsafe { slots.get_unchecked(slot_pos) };
++                                if slot.first_row == 0 {
++                                    break;
++                                }
++                                if slot.key == pk {
++                                    pt.mark_matched(slot.first_row - 1);
++                                    let mut entry = slot.dup_head;
++                                    while entry != 0 {
++                                        let b = entry - 1;
++                                        entry = flat.dup_next[b as usize];
++                                        pt.mark_matched(b);
++                                    }
++                                    break;
++                                }
++                                slot_pos = (slot_pos + 1) & mask;
++                            }
++                        }
++                    }
++                }};
++            }
++            match &cursor.rows {
++                ProbeRows::All { num_rows } => {
++                    let n = *num_rows;
++                    for i in cursor.pos..n {
++                        mark_one!(i);
++                    }
++                    cursor.pos = n;
++                }
++                ProbeRows::BackingIndices(indices) => {
++                    let vals = indices.values();
++                    let n = vals.len();
++                    for i in cursor.pos..n {
++                        mark_one!(vals[i] as usize);
++                    }
++                    cursor.pos = n;
++                }
++                ProbeRows::CompactedKeys { backing_rows } => {
++                    let n = backing_rows.len();
++                    for i in cursor.pos..n {
++                        mark_one!(i);
++                    }
++                    cursor.pos = n;
++                }
++                ProbeRows::Mask { bits, num_rows } => {
++                    let n = *num_rows;
++                    for i in cursor.pos..n {
++                        if bits.value(i) {
++                            mark_one!(i);
++                        }
++                    }
++                    cursor.pos = n;
++                }
++            }
++        }};
++    }
++
++    match &cursor.keys {
++        ProbeKeys::Int32(a) => run_mark!(a, Int32, |v: i32| mix_u64(v as u32 as u64)),
++        ProbeKeys::Int64(a) => run_mark!(a, Int64, |v: i64| mix_u64(v as u64)),
++        ProbeKeys::UInt32(a) => run_mark!(a, UInt32, |v: u32| mix_u64(v as u64)),
++        ProbeKeys::UInt64(a) => run_mark!(a, UInt64, mix_u64),
++        _ => unreachable!(),
++    }
++}
++
+ fn probe_collect_radix_flat_int(
+     cursor: &mut RadixProbeCursor,
+     mark_build: bool,
+diff --git a/datafusion/core/src/morsel/join_filter.rs b/datafusion/core/src/morsel/join_filter.rs
+index 88dfd845d..08d5e724e 100644
+--- a/datafusion/core/src/morsel/join_filter.rs
++++ b/datafusion/core/src/morsel/join_filter.rs
+@@ -95,9 +95,13 @@ pub(super) struct DynamicJoinFilterConfig {
+ /// Block selection uses the low bits of the 64-bit join hash, and the 8
+ /// intra-block bit positions are derived from the upper 32 bits via odd
+ /// multiplicative salts.
++#[derive(Debug, Clone, Copy)]
++#[repr(C, align(32))]
++struct BloomBlock([u32; 8]);
++
+ #[derive(Debug)]
+ pub(super) struct SplitBlockBloomFilter {
+-    blocks: Vec<[u32; 8]>,
++    blocks: Vec<BloomBlock>,
+     block_mask: usize,
+ }
+ 
+@@ -110,24 +114,24 @@ impl SplitBlockBloomFilter {
+         }
+         let needed_bits = entries.saturating_mul(MIN_BLOOM_BITS_PER_KEY);
+         let needed_blocks = needed_bits.div_ceil(256).max(1).next_power_of_two();
+-        let max_blocks = MAX_BLOOM_BYTES / size_of::<[u32; 8]>();
++        let max_blocks = MAX_BLOOM_BYTES / size_of::<BloomBlock>();
+         Some(needed_blocks.min(max_blocks))
+     }
+ 
+     pub(super) fn estimated_bytes(num_blocks: usize) -> usize {
+-        num_blocks.saturating_mul(size_of::<[u32; 8]>())
++        num_blocks.saturating_mul(size_of::<BloomBlock>())
+     }
+ 
+     pub(super) fn with_blocks(num_blocks: usize) -> Self {
+         debug_assert!(num_blocks.is_power_of_two());
+         Self {
+-            blocks: vec![[0u32; 8]; num_blocks],
++            blocks: vec![BloomBlock([0u32; 8]); num_blocks],
+             block_mask: num_blocks - 1,
+         }
+     }
+ 
+     pub(super) fn memory_bytes(&self) -> usize {
+-        self.blocks.capacity().saturating_mul(size_of::<[u32; 8]>())
++        self.blocks.capacity().saturating_mul(size_of::<BloomBlock>())
+     }
+ 
+     #[inline]
+@@ -147,7 +151,7 @@ impl SplitBlockBloomFilter {
+ 
+     #[inline]
+     pub(super) fn insert(&mut self, h: u64) {
+-        let block = &mut self.blocks[(h as usize) & self.block_mask];
++        let block = &mut self.blocks[(h as usize) & self.block_mask].0;
+         let mask = Self::intra_block_mask(h);
+         for (word, bit) in block.iter_mut().zip(mask) {
+             *word |= bit;
+@@ -157,7 +161,7 @@ impl SplitBlockBloomFilter {
+     #[cfg(any(feature = "parquet", test))]
+     #[inline]
+     pub(super) fn might_contain(&self, h: u64) -> bool {
+-        let block = &self.blocks[(h as usize) & self.block_mask];
++        let block = &self.blocks[(h as usize) & self.block_mask].0;
+         let mask = Self::intra_block_mask(h);
+         let mut all = true;
+         for (&word, bit) in block.iter().zip(mask) {
+@@ -165,6 +169,42 @@ impl SplitBlockBloomFilter {
+         }
+         all
+     }
++
++    #[cfg(any(feature = "parquet", test))]
++    #[inline]
++    pub(super) fn might_contain_fast(&self, h: u64) -> bool {
++        let block = unsafe { &self.blocks.get_unchecked((h as usize) & self.block_mask).0 };
++        let x = (h >> 32) as u32;
++        #[cfg(target_arch = "aarch64")]
++        unsafe {
++            use std::arch::aarch64::*;
++            let xv = vdupq_n_u32(x);
++            let one = vdupq_n_u32(1);
++            let s0 = vld1q_u32(SBBF_SALTS.as_ptr());
++            let b0 = vld1q_u32(block.as_ptr());
++            let sh0 = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(xv, s0), 27));
++            let m0 = vshlq_u32(one, sh0);
++            let t0 = vtstq_u32(b0, m0);
++            let s1 = vld1q_u32(SBBF_SALTS.as_ptr().add(4));
++            let b1 = vld1q_u32(block.as_ptr().add(4));
++            let sh1 = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(xv, s1), 27));
++            let m1 = vshlq_u32(one, sh1);
++            let t1 = vtstq_u32(b1, m1);
++            vminvq_u32(vandq_u32(t0, t1)) != 0
++        }
++        #[cfg(not(target_arch = "aarch64"))]
++        {
++            if (block[0] & (1u32 << (x.wrapping_mul(SBBF_SALTS[0]) >> 27))) == 0 {
++                return false;
++            }
++            for i in 1..8 {
++                if (block[i] & (1u32 << (x.wrapping_mul(SBBF_SALTS[i]) >> 27))) == 0 {
++                    return false;
++                }
++            }
++            true
++        }
++    }
+ }
+ 
+ /// Lock-free atomic builder for [`SplitBlockBloomFilter`], enabling parallel
+@@ -202,7 +242,7 @@ impl AtomicSplitBlockBloomFilter {
+         let blocks = self
+             .blocks
+             .into_iter()
+-            .map(|b| b.map(AtomicU32::into_inner))
++            .map(|b| BloomBlock(b.map(AtomicU32::into_inner)))
+             .collect();
+         SplitBlockBloomFilter {
+             blocks,
+@@ -770,10 +810,32 @@ impl PhysicalExpr for JoinBloomFilterExpr {
+                 let values = arr.values();
+                 let filter = self.filter.as_ref();
+                 let to_u64: fn(_) -> u64 = $to_u64;
++                let fast = std::env::var("MORSEL_DIAG_BLOOM_FAST").as_deref() == Ok("1");
+                 let buf = if arr.null_count() == 0 {
+-                    BooleanBuffer::collect_bool(num_rows, |i| {
+-                        filter.might_contain(mix_u64(to_u64(values[i])))
+-                    })
++                    if fast {
++                        let n = values.len();
++                        let mask = filter.block_mask;
++                        let ptr = filter.blocks.as_ptr();
++                        BooleanBuffer::collect_bool(num_rows, |i| {
++                            if i + 8 < n {
++                                let ph = mix_u64(to_u64(unsafe { *values.get_unchecked(i + 8) }));
++                                #[cfg(target_arch = "aarch64")]
++                                unsafe {
++                                    let p = ptr.add((ph as usize) & mask) as *const i8;
++                                    core::arch::asm!(
++                                        "prfm pldl1keep, [{p}]",
++                                        p = in(reg) p,
++                                        options(nostack, readonly, preserves_flags)
++                                    );
++                                }
++                            }
++                            filter.might_contain_fast(mix_u64(to_u64(unsafe { *values.get_unchecked(i) })))
++                        })
++                    } else {
++                        BooleanBuffer::collect_bool(num_rows, |i| {
++                            filter.might_contain(mix_u64(to_u64(values[i])))
++                        })
++                    }
+                 } else {
+                     let nulls = arr.nulls().unwrap();
+                     BooleanBuffer::collect_bool(num_rows, |i| {
+diff --git a/datafusion/core/src/morsel/parquet.rs b/datafusion/core/src/morsel/parquet.rs
+index ce692888b..b65b35e30 100644
+--- a/datafusion/core/src/morsel/parquet.rs
++++ b/datafusion/core/src/morsel/parquet.rs
+@@ -19,8 +19,8 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
+ use datafusion_datasource::morsel::Morselizer;
+ use datafusion_datasource::source::{DataSource, DataSourceExec};
+ use datafusion_datasource_parquet::{
+-    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, file_format::ParquetFormat,
+-    source::ParquetSource,
++    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
++    file_format::ParquetFormat, source::ParquetSource,
+ };
+ use datafusion_execution::TaskContext;
+ use datafusion_expr::expr_rewriter::unnormalize_cols;
+@@ -553,6 +553,10 @@ impl ParquetScan {
+         }
+     }
+ 
++    pub(super) fn dynamic_join_filters_empty(&self) -> bool {
++        self.dynamic_join_filters.is_empty()
++    }
++
+     pub(super) fn start(
+         &self,
+         context: &TaskContext,
+@@ -701,11 +705,18 @@ impl ParquetScan {
+         );
+ 
+         let adaptive_ctx = can_adapt.then(|| {
+-            let adaptive_cfg = context
++            let mut adaptive_cfg = context
+                 .session_config()
+                 .get_extension::<AdaptiveRowFilterConfig>()
+                 .map(|c| (*c).clone())
+                 .unwrap_or_default();
++            match std::env::var("MORSEL_DIAG_ADAPTIVE_MODE").ok().as_deref() {
++                Some("force_bulk") => adaptive_cfg.mode = AdaptiveRowFilterMode::ForceBulk,
++                Some("force_rf") => {
++                    adaptive_cfg.mode = AdaptiveRowFilterMode::ForceRowFilter
++                }
++                _ => {}
++            }
+             let bulk_proj = self.bulk_scan_plan.as_ref().and_then(|plan| {
+                 plan.bulk_projection
+                     .as_ref()
+diff --git a/datafusion/datasource-parquet/src/opener/buffered.rs b/datafusion/datasource-parquet/src/opener/buffered.rs
+index 0d59c114a..3d6ee0268 100644
+--- a/datafusion/datasource-parquet/src/opener/buffered.rs
++++ b/datafusion/datasource-parquet/src/opener/buffered.rs
+@@ -554,9 +554,13 @@ impl AdaptiveRowFilterContext {
+                     (RgFilterMode::BulkDecode, None)
+                 } else if estimated_scan_rgs < min_rgs_for_probe {
+                     // Tiny scan with too few row groups to amortize A/B probing:
+-                    // execute directly in RowFilter mode.
+-                    self.metrics.row_filter_rgs.add(1);
+-                    (RgFilterMode::RowFilter, None)
++                    if std::env::var("MORSEL_DIAG_SMALL_BULK").as_deref() == Ok("1") {
++                        self.metrics.bulk_decode_rgs.add(1);
++                        (RgFilterMode::BulkDecode, None)
++                    } else {
++                        self.metrics.row_filter_rgs.add(1);
++                        (RgFilterMode::RowFilter, None)
++                    }
+                 } else {
+                     let mut guard = self.controller.lock();
+                     let ControllerState {
+@@ -790,6 +794,12 @@ impl AdaptiveRowFilterContext {
+                         rgs_since_probe: 0,
+                         next_reprobe_interval,
+                     };
++                    if std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1") {
++                        eprintln!(
++                            "[DIAG_ADAPT] commit winner={winner:?} rf_ns/row={rf_cost:.2} bulk_ns/row={bulk_cost:.2} ratio={ratio:.2} num_files={} has_dyn={}",
++                            self.num_files, self.has_dynamic_join_filter
++                        );
++                    }
+                     self.metrics.mode_switches.add(1);
+                 }
+             }
