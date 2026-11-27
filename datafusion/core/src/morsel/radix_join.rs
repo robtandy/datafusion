@@ -26,19 +26,16 @@ use super::radix::{DEFAULT_RADIX_BITS, RadixChunk, level0_shift, radix_permute_i
 use super::spill::{SharedPartitionWriters, SpillContext};
 
 /// Switch from `R = 0` single-partition build to `R = 6` (64-way) radix build
-/// once non-integer (`Utf8`/`Rows`) build rows exceed this threshold.
+/// once non-dense build rows exceed this threshold.
 pub(super) const RADIX_JOIN_THRESHOLD_ROWS: usize = 16_384;
 
-/// Compact 2-key integer builds (`Int32Pair`/`Int64Pair`) stay on the contiguous
-/// `R = 0` `FlatIntTable` path up to this row count (L3-resident).
-pub(super) const RADIX_JOIN_INT_PAIR_THRESHOLD_ROWS: usize = 262_144;
+/// Dense single-column integer builds that qualify for [`DenseIntTable`] stay
+/// on the contiguous `R = 0` path up to this row count (e.g. 750K `customer`
+/// @ 3 MiB), while sparse integer builds switch to parallel radix at
+/// [`RADIX_JOIN_THRESHOLD_ROWS`].
+pub(super) const RADIX_JOIN_DENSE_INT_MAX_ROWS: usize = 1_048_576;
 
-/// Compact single-column integer builds stay on the contiguous `R = 0` path up
-/// to this row count so dense array-map tables (e.g. 750K `customer` @ 3 MiB)
-/// avoid 64-way radix overhead while wide builds still switch via bytes budget.
-pub(super) const RADIX_JOIN_SINGLE_INT_THRESHOLD_ROWS: usize = 1_048_576;
-
-/// Memory ceiling above which even a smaller-row-count build transitions to
+/// Memory ceiling above which even a dense integer build transitions to
 /// 64-way radix partitioning so wide-payload builds parallelize across workers.
 pub(super) const RADIX_JOIN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 

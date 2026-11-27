@@ -210,27 +210,36 @@ fn estimate_side_size(
         }
         #[cfg(feature = "parquet")]
         Source::Parquet(pq) => {
+            let col_width = |f: &Arc<arrow::datatypes::Field>| match f.data_type() {
+                DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView => 4u64,
+                DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 2u64,
+                _ => 1u64,
+            };
             let file_bytes = pq.total_file_bytes();
-            let col_weight: u64 = pq
-                .schema
+            let proj_width: u64 =
+                pq.schema.fields().iter().map(col_width).sum::<u64>().max(1);
+            let file_width: u64 = pq
+                .file_schema()
                 .fields()
                 .iter()
-                .map(|f| match f.data_type() {
-                    DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-                    | DataType::Binary
-                    | DataType::LargeBinary
-                    | DataType::BinaryView => 4,
-                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 2,
-                    _ => 1,
-                })
+                .map(col_width)
                 .sum::<u64>()
-                .max(4);
+                .max(proj_width);
+            let approx_bytes =
+                file_bytes.saturating_mul(4).saturating_mul(proj_width) / file_width;
             SideEstimate {
                 is_empty: pq.is_empty(),
                 mem_rows: None,
-                approx_bytes: file_bytes.saturating_mul(col_weight),
+                approx_bytes: if pq.is_empty() {
+                    0
+                } else {
+                    approx_bytes.max(1)
+                },
             }
         }
         Source::Stage(stage_src) => stages[stage_src.stage_id.0].estimate,
@@ -466,6 +475,22 @@ fn choose_build_side(
             std::cmp::Ordering::Greater => BuildSide::Right,
             std::cmp::Ordering::Equal => tie_side,
         };
+    }
+    // When one side is a materialized `Stage` (e.g. grouped aggregate) and the
+    // non-stage side is within 2x of the stage's byte estimate, keep the stage
+    // on the probe side so cross-stage dynamic filters and empty-build
+    // short-circuits can prune or skip the stage scan completely.
+    if !left_is_stage
+        && right_is_stage
+        && left.approx_bytes <= right.approx_bytes.saturating_mul(2)
+    {
+        return BuildSide::Left;
+    }
+    if left_is_stage
+        && !right_is_stage
+        && right.approx_bytes <= left.approx_bytes.saturating_mul(2)
+    {
+        return BuildSide::Right;
     }
     match left.approx_bytes.cmp(&right.approx_bytes) {
         std::cmp::Ordering::Less => BuildSide::Left,
@@ -2659,7 +2684,7 @@ impl Pipeline {
                         return Ok(BuildRunOutcome::ShortCircuitAll);
                     }
                     short_circuit_op =
-                        Some(short_circuit_op.map_or(op_idx, |prev| prev.min(op_idx)));
+                        Some(short_circuit_op.map_or(op_idx, |prev| prev.max(op_idx)));
                 }
                 slots[idx] = Some(table);
             }

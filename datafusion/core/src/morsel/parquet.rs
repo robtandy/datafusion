@@ -537,6 +537,12 @@ impl ParquetScan {
             .fold(0u64, u64::saturating_add)
     }
 
+    pub(super) fn file_schema(&self) -> &SchemaRef {
+        self.config
+            .as_ref()
+            .map_or(&self.schema, |c| c.file_schema())
+    }
+
     pub(super) fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,

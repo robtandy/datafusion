@@ -54,11 +54,10 @@ use super::radix::{
     next_level_shift, radix_partition, radix_permute_indices,
 };
 use super::radix_join::{
-    LocalProbeSpill, NullKeyBuildRows, ProbeSpillEnv, RADIX_JOIN_INT_PAIR_THRESHOLD_ROWS,
-    RADIX_JOIN_SINGLE_INT_THRESHOLD_ROWS, RADIX_JOIN_THRESHOLD_BYTES,
-    RADIX_JOIN_THRESHOLD_ROWS, RadixBuildStore, SpilledBuildPartition,
-    SpilledProbeManifest, build_join_spill_schema, pack_build_spill_batch,
-    unpack_build_spill_batch,
+    LocalProbeSpill, NullKeyBuildRows, ProbeSpillEnv, RADIX_JOIN_DENSE_INT_MAX_ROWS,
+    RADIX_JOIN_THRESHOLD_BYTES, RADIX_JOIN_THRESHOLD_ROWS, RadixBuildStore,
+    SpilledBuildPartition, SpilledProbeManifest, build_join_spill_schema,
+    pack_build_spill_batch, unpack_build_spill_batch,
 };
 use super::spill::{SpillContext, SyncSpillWriter};
 use super::{Pipeline, abort_and_drain};
@@ -72,23 +71,60 @@ const MAX_DENSE_INT_SPAN: usize = 4_194_304;
 const DENSE_INT_SMALL_BUILD_ROWS: usize = 1_024;
 const DENSE_INT_SMALL_BUILD_MAX_SPAN: usize = 65_536;
 
+/// Returns `true` when an `R = 0` build still qualifies for a contiguous
+/// [`DenseIntTable`] array map above [`RADIX_JOIN_THRESHOLD_ROWS`], so sparse
+/// integer builds (e.g. TPC-H Q4/Q7/Q10/Q12 `orders`/`lineitem`) immediately
+/// switch to 8-core parallel radix finalize instead of single-threaded `R = 0`.
+#[inline]
+fn r0_dense_int_eligible(
+    key_kind: KeyKind,
+    num_rows: usize,
+    mem_bytes: usize,
+    min_k: i128,
+    max_k: i128,
+    min_density_pct: u128,
+) -> bool {
+    if !matches!(
+        key_kind,
+        KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+    ) {
+        return false;
+    }
+    if num_rows == 0
+        || num_rows > RADIX_JOIN_DENSE_INT_MAX_ROWS
+        || mem_bytes > RADIX_JOIN_THRESHOLD_BYTES
+        || min_k > max_k
+    {
+        return false;
+    }
+    let Some(span_u128) = (max_k - min_k)
+        .try_into()
+        .ok()
+        .and_then(|d: u128| d.checked_add(1))
+    else {
+        return false;
+    };
+    span_u128 <= MAX_DENSE_INT_SPAN as u128
+        && (num_rows as u128).saturating_mul(100)
+            >= span_u128.saturating_mul(min_density_pct)
+}
+
 #[inline]
 fn exceeds_single_table_budget(
     key_kind: KeyKind,
     num_rows: usize,
     mem_bytes: usize,
+    min_k: i128,
+    max_k: i128,
+    min_density_pct: u128,
 ) -> bool {
     if mem_bytes > RADIX_JOIN_THRESHOLD_BYTES {
         return true;
     }
-    let row_cap = match key_kind {
-        KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64 => {
-            RADIX_JOIN_SINGLE_INT_THRESHOLD_ROWS
-        }
-        KeyKind::Int32Pair | KeyKind::Int64Pair => RADIX_JOIN_INT_PAIR_THRESHOLD_ROWS,
-        _ => RADIX_JOIN_THRESHOLD_ROWS,
-    };
-    num_rows > row_cap
+    if num_rows <= RADIX_JOIN_THRESHOLD_ROWS {
+        return false;
+    }
+    !r0_dense_int_eligible(key_kind, num_rows, mem_bytes, min_k, max_k, min_density_pct)
 }
 
 // Fixed hash seed shared between build and probe workers within a run.
@@ -656,6 +692,8 @@ impl HashJoinBuildSink {
             hash_chunks: Vec::new(),
             valid_masks: Vec::new(),
             r0_mem_bytes: 0,
+            r0_int_min: i128::MAX,
+            r0_int_max: i128::MIN,
             radix: None,
             pending_radix_batches: Vec::new(),
             pending_radix_hashes: Vec::new(),
@@ -752,14 +790,17 @@ impl HashJoinBuildSink {
                 )
                 .await;
         }
-        // If total rows/bytes in R=0 exceed single-table budget (e.g. multiple
-        // workers each under threshold combined above threshold), transition to
-        // parallel radix finalize.
+        // If total rows/bytes in R=0 exceed single-table budget (only builds
+        // qualifying for a dense >=15% `DenseIntTable` stay in R=0 above
+        // `RADIX_JOIN_THRESHOLD_ROWS`), transition to parallel radix finalize.
         if self.can_radix_spill()
             && exceeds_single_table_budget(
                 self.key_kind,
                 combined.num_rows,
                 combined.r0_mem_bytes,
+                combined.r0_int_min,
+                combined.r0_int_max,
+                15,
             )
         {
             combined.flush_r0_to_radix(tx)?;
@@ -2297,6 +2338,8 @@ pub(super) struct HashJoinBuildState {
     hash_chunks: Vec<Vec<u64>>,
     valid_masks: Vec<Option<BooleanBuffer>>,
     r0_mem_bytes: usize,
+    r0_int_min: i128,
+    r0_int_max: i128,
     radix: Option<RadixBuildStore>,
     pending_radix_batches: Vec<RecordBatch>,
     pending_radix_hashes: Vec<u64>,
@@ -2568,6 +2611,9 @@ impl HashJoinBuildState {
                 self.key_kind,
                 self.num_rows.saturating_add(view.num_rows()),
                 self.r0_mem_bytes,
+                self.r0_int_min,
+                self.r0_int_max,
+                10,
             )
             || self
                 .build_spill
@@ -2737,6 +2783,9 @@ impl HashJoinBuildState {
                     self.key_kind,
                     self.num_rows.saturating_add(other.num_rows),
                     self.r0_mem_bytes.saturating_add(other.r0_mem_bytes),
+                    self.r0_int_min.min(other.r0_int_min),
+                    self.r0_int_max.max(other.r0_int_max),
+                    10,
                 ));
         if !use_radix {
             self.combine(other);
@@ -2764,6 +2813,53 @@ impl HashJoinBuildState {
         let transferred = other.reservation.free();
         self.reservation.grow(transferred);
         Ok(())
+    }
+
+    fn update_r0_int_bounds(
+        &mut self,
+        keys: &[ArrayRef],
+        valid_mask: Option<&BooleanBuffer>,
+    ) {
+        macro_rules! scan_int_bounds {
+            ($Arr:ty) => {{
+                if let Some(arr) = keys[0].as_any().downcast_ref::<$Arr>() {
+                    let mut lo = self.r0_int_min;
+                    let mut hi = self.r0_int_max;
+                    if let Some(bits) = valid_mask {
+                        for (i, &v) in arr.values().iter().enumerate() {
+                            if bits.value(i) {
+                                let k = v as i128;
+                                if k < lo {
+                                    lo = k;
+                                }
+                                if k > hi {
+                                    hi = k;
+                                }
+                            }
+                        }
+                    } else {
+                        for &v in arr.values().iter() {
+                            let k = v as i128;
+                            if k < lo {
+                                lo = k;
+                            }
+                            if k > hi {
+                                hi = k;
+                            }
+                        }
+                    }
+                    self.r0_int_min = lo;
+                    self.r0_int_max = hi;
+                }
+            }};
+        }
+        match self.key_kind {
+            KeyKind::Int32 => scan_int_bounds!(Int32Array),
+            KeyKind::Int64 => scan_int_bounds!(Int64Array),
+            KeyKind::UInt32 => scan_int_bounds!(UInt32Array),
+            KeyKind::UInt64 => scan_int_bounds!(UInt64Array),
+            _ => {}
+        }
     }
 
     pub(super) fn add_view(&mut self, view: &BatchView) -> Result<()> {
@@ -2837,6 +2933,7 @@ impl HashJoinBuildState {
                     self.null_equality,
                 )?;
             }
+            self.update_r0_int_bounds(&normalized_keys, valid_mask.as_ref());
             if let Some(payload) = payload_batch {
                 self.batches.push(payload);
             }
@@ -2897,6 +2994,7 @@ impl HashJoinBuildState {
         if let Some(summary) = &mut self.key_summary {
             summary.update(&normalized_keys, None, self.null_equality)?;
         }
+        self.update_r0_int_bounds(&normalized_keys, None);
 
         if let Some(payload) = payload_batch {
             self.batches.push(payload);
@@ -2976,6 +3074,7 @@ impl HashJoinBuildState {
                     self.null_equality,
                 )?;
             }
+            self.update_r0_int_bounds(&normalized_keys, valid_mask.as_ref());
             if let Some(payload) = payload_batch {
                 self.batches.push(payload);
             }
@@ -3034,6 +3133,7 @@ impl HashJoinBuildState {
         if let Some(summary) = &mut self.key_summary {
             summary.update(&normalized_keys, None, self.null_equality)?;
         }
+        self.update_r0_int_bounds(&normalized_keys, None);
 
         if let Some(payload) = payload_batch {
             self.batches.push(payload);
@@ -3067,6 +3167,8 @@ impl HashJoinBuildState {
         self.hash_chunks.append(&mut other.hash_chunks);
         self.valid_masks.append(&mut other.valid_masks);
         self.r0_mem_bytes = self.r0_mem_bytes.saturating_add(other.r0_mem_bytes);
+        self.r0_int_min = self.r0_int_min.min(other.r0_int_min);
+        self.r0_int_max = self.r0_int_max.max(other.r0_int_max);
         self.num_rows += other.num_rows;
         let transferred = other.reservation.free();
         self.reservation.grow(transferred);

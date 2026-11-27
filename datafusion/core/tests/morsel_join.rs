@@ -4158,3 +4158,431 @@ async fn two_sided_range_and_projected_width_selects_filtered_narrow_build_side(
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn small_wide_utf8_dim_stays_build_side_against_large_narrow_int_fact() -> Result<()>
+{
+    // Repro: a 20K-row (~2.6 MB) dim projecting 6 wide Utf8 columns joined to
+    // a 400K-row (~5.8 MB) narrow fact projecting 2 Int64 columns must keep
+    // the smaller `dim` on the build side instead of double-counting width.
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("s1", DataType::Utf8, false),
+        Field::new("s2", DataType::Utf8, false),
+        Field::new("s3", DataType::Utf8, false),
+        Field::new("s4", DataType::Utf8, false),
+        Field::new("s5", DataType::Utf8, false),
+        Field::new("s6", DataType::Utf8, false),
+    ]));
+    let n_dim = 20_000i64;
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..n_dim)),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s1-wide-value-{i:08}-abcdefghij")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s2-wide-value-{i:08}-klmnopqrst")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s3-wide-value-{i:08}-uvwxyz0123")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s4-wide-value-{i:08}-456789abcd")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s5-wide-value-{i:08}-efghijklmn")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n_dim).map(|i| format!("dim-s6-wide-value-{i:08}-opqrstuvwx")),
+            )),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 10_000)?;
+
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("fk", DataType::Int64, false),
+        Field::new("fval", DataType::Int64, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(4);
+    for chunk in 0..4i64 {
+        let base = chunk * 100_000;
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (base..base + 100_000).map(|i| i % 40_000),
+                )),
+                Arc::new(Int64Array::from_iter_values(base..base + 100_000)),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 2, 100_000)?;
+
+    let make_ctx = |mode: &str| {
+        let dim_p = dim_dir.path().to_str().unwrap().to_owned();
+        let fact_p = fact_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("dim", &dim_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("fact", &fact_p, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT COUNT(*), MIN(d.s1), MIN(d.s2), MIN(d.s3), MIN(d.s4), MIN(d.s5), MIN(d.s6), SUM(f.fval) \
+               FROM dim d INNER JOIN fact f ON d.dk = f.fk";
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+    let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("[Build: NativeParquet[dim"),
+        "expected smaller wide `dim` to stay on build side, got:\n{plan_str}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn radix_int_pair_join_parity_all_types_nulls_and_residual() -> Result<()> {
+    // 20,000 build rows (> RADIX_JOIN_THRESHOLD_ROWS = 16,384) forces 64-way
+    // radix builds for both `Int32Pair` and `Int64Pair` across all join types,
+    // NULLs, duplicates, and residual filters.
+    let b_schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+        Field::new("i1", DataType::Int32, true),
+        Field::new("i2", DataType::Int32, true),
+        Field::new("bval", DataType::Int64, false),
+    ]));
+    let p_schema = Arc::new(Schema::new(vec![
+        Field::new("pk1", DataType::Int64, true),
+        Field::new("pk2", DataType::Int64, true),
+        Field::new("pi1", DataType::Int32, true),
+        Field::new("pi2", DataType::Int32, true),
+        Field::new("pval", DataType::Int64, false),
+    ]));
+
+    let n_build = 20_000i64;
+    let b_batch = RecordBatch::try_new(
+        Arc::clone(&b_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n_build)
+                    .map(|i| if i % 97 == 0 { None } else { Some(i % 15_000) })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n_build)
+                    .map(|i| {
+                        if i % 101 == 0 {
+                            None
+                        } else {
+                            Some((i % 15_000) * 3)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..n_build)
+                    .map(|i| {
+                        if i % 97 == 0 {
+                            None
+                        } else {
+                            Some((i % 15_000) as i32)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..n_build)
+                    .map(|i| {
+                        if i % 101 == 0 {
+                            None
+                        } else {
+                            Some(((i % 15_000) * 3) as i32)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..n_build)),
+        ],
+    )?;
+
+    let n_probe = 24_000i64;
+    let p_batch = RecordBatch::try_new(
+        Arc::clone(&p_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n_probe)
+                    .map(|i| {
+                        if i % 89 == 0 {
+                            None
+                        } else {
+                            Some((i * 2) % 20_000)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n_probe)
+                    .map(|i| {
+                        if i % 103 == 0 {
+                            None
+                        } else {
+                            Some(((i * 2) % 20_000) * 3)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..n_probe)
+                    .map(|i| {
+                        if i % 89 == 0 {
+                            None
+                        } else {
+                            Some(((i * 2) % 20_000) as i32)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..n_probe)
+                    .map(|i| {
+                        if i % 103 == 0 {
+                            None
+                        } else {
+                            Some((((i * 2) % 20_000) * 3) as i32)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..n_probe)),
+        ],
+    )?;
+
+    let stock = stock_context(4, 512);
+    let native = morsel_context(4, 512, MorselMode::Required, false);
+    for ctx in [&stock, &native] {
+        ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&b_schema),
+                vec![vec![b_batch.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "p",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&p_schema),
+                vec![vec![p_batch.clone()]],
+            )?),
+        )?;
+    }
+
+    let queries = [
+        // Radix Int64Pair across all join types + residual filter
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b INNER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b LEFT JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b RIGHT JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b FULL OUTER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT COUNT(*), SUM(b.bval) FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.pk1 = b.k1 AND p.pk2 = b.k2)",
+        "SELECT COUNT(*), SUM(b.bval) FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.pk1 = b.k1 AND p.pk2 = b.k2)",
+        "SELECT COUNT(*), SUM(p.pval) FROM p WHERE EXISTS (SELECT 1 FROM b WHERE b.k1 = p.pk1 AND b.k2 = p.pk2)",
+        "SELECT COUNT(*), SUM(p.pval) FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k1 = p.pk1 AND b.k2 = p.pk2)",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b INNER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2 AND b.bval < p.pval",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b LEFT JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2 AND b.bval < p.pval",
+        // Radix Int32Pair across all join types + residual filter
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b INNER JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b LEFT JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b RIGHT JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b FULL OUTER JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT COUNT(*), SUM(b.bval) FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.pi1 = b.i1 AND p.pi2 = b.i2)",
+        "SELECT COUNT(*), SUM(b.bval) FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.pi1 = b.i1 AND p.pi2 = b.i2)",
+        "SELECT COUNT(*), SUM(b.bval), SUM(p.pval) FROM b INNER JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2 AND b.bval < p.pval",
+    ];
+
+    for sql in queries {
+        assert_native_parity(&stock, &native, sql).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn radix_partition_slice_bloom_prunes_filtered_utf8_build() -> Result<()> {
+    // Filtered Utf8 build with 20,000 surviving rows (> RADIX_JOIN_THRESHOLD_ROWS = 16,384)
+    // exercises `finalize_radix_all_in_memory` with lock-free partition-slice Bloom
+    // construction (`bloom_radix_low_bits = Some(...)`).
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dskey", DataType::Utf8, false),
+        Field::new("keep", DataType::Int64, false),
+    ]));
+    let mut dim_batches = Vec::with_capacity(4);
+    for chunk in 0..4i64 {
+        let base = chunk * 10_000;
+        dim_batches.push(RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000).map(|i| format!("k-{:07}", i * 5)),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (base..base + 10_000).map(|i| i % 2),
+                )),
+            ],
+        )?);
+    }
+    let dim_dir = write_parquet_files(&dim_batches, 2, 10_000)?;
+
+    // 100,000 probe rows across the full string domain `k-0000000..k-0199998`:
+    // min/max prunes 0 RGs; only ~20% match the filtered 20K-row dim Bloom.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("fskey", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    let mut fact_batches = Vec::with_capacity(10);
+    for rg in 0..10i64 {
+        let base = rg * 10_000;
+        fact_batches.push(RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000).map(|i| format!("k-{:07}", i * 2)),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (base..base + 10_000).map(|i| format!("wide-fact-payload-{i:08}")),
+                )),
+                Arc::new(Int64Array::from_iter_values(base..base + 10_000)),
+            ],
+        )?);
+    }
+    let fact_dir = write_parquet_files(&fact_batches, 2, 10_000)?;
+
+    let make_ctx = |mode: &str| {
+        let dim_p = dim_dir.path().to_str().unwrap().to_owned();
+        let fact_p = fact_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("dim", &dim_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("fact", &fact_p, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT COUNT(*), SUM(f.val), MIN(f.payload) \
+               FROM fact f INNER JOIN dim d ON f.fskey = d.dskey \
+               WHERE d.keep = 1";
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+    let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+    let pruned = metric(plan.as_ref(), "pushdown_rows_pruned");
+    assert!(
+        pruned > 40_000,
+        "expected radix partition-slice Bloom to prune >40,000 probe rows, got {pruned}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chained_double_short_circuit_skips_earlier_build_emission() -> Result<()> {
+    // Repro: `p JOIN emptyA RIGHT JOIN b JOIN emptyA2 RIGHT JOIN c` has two
+    // runtime-empty inner builds (`a1 WHERE v < 0`, `a2 WHERE v < 0`);
+    // `short_circuit_op` must keep the later (`max`) op_idx so `b`'s build
+    // emission is skipped and only `c`'s build emission runs.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let non_empty = |lo: i64, hi: i64| -> Result<RecordBatch> {
+        Ok(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(lo..hi)),
+                Arc::new(Int64Array::from_iter_values(lo..hi)),
+            ],
+        )?)
+    };
+
+    let stock = stock_context(4, 16);
+    let native = morsel_context(4, 16, MorselMode::Required, false);
+
+    for ctx in [&stock, &native] {
+        ctx.register_table(
+            "p",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![non_empty(0, 100)?]],
+            )?),
+        )?;
+        ctx.register_table(
+            "a1",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![non_empty(0, 5)?]],
+            )?),
+        )?;
+        ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![non_empty(0, 20)?]],
+            )?),
+        )?;
+        ctx.register_table(
+            "a2",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![non_empty(0, 5)?]],
+            )?),
+        )?;
+        ctx.register_table(
+            "c",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![non_empty(0, 10)?]],
+            )?),
+        )?;
+    }
+
+    let sql = "SELECT p.v AS pv, b.v AS bv, c.v AS cv \
+               FROM p \
+               INNER JOIN (SELECT k, v FROM a1 WHERE v < 0) empty_a ON p.k = empty_a.k \
+               RIGHT JOIN b ON p.k = b.k \
+               INNER JOIN (SELECT k, v FROM a2 WHERE v < 0) empty_a2 ON b.k = empty_a2.k \
+               RIGHT JOIN c ON b.k = c.k";
+
+    let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+    assert_eq!(
+        metric(plan.as_ref(), "join_empty_build_short_circuits"),
+        2,
+        "expected both empty inner builds to record short-circuits"
+    );
+    assert_eq!(
+        metric(plan.as_ref(), "join_build_emission_pipelines"),
+        1,
+        "expected only 1 build_emission pipeline to run after double short-circuit"
+    );
+    Ok(())
+}
