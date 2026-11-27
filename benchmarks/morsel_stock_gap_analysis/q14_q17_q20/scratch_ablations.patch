@@ -1,0 +1,468 @@
+diff --git a/datafusion/core/src/morsel.rs b/datafusion/core/src/morsel.rs
+index a6b96bfc4..f130e0283 100644
+--- a/datafusion/core/src/morsel.rs
++++ b/datafusion/core/src/morsel.rs
+@@ -318,6 +318,18 @@ fn estimate_join_side_size(
+     if base.is_empty {
+         return base;
+     }
++    #[cfg(feature = "parquet")]
++    if std::env::var("MORSEL_SCRATCH_STATS_BUILD_SIDE").as_deref() == Ok("1")
++        && operators.iter().all(|op| matches!(op, Operator::Projection(_)))
++        && let Source::Parquet(pq) = source
++        && let Some(est_bytes) = pq.stats_estimated_filtered_bytes()
++    {
++        return SideEstimate {
++            is_empty: false,
++            mem_rows: None,
++            approx_bytes: est_bytes,
++        };
++    }
+     let shift = pipeline_filter_shift(source, operators);
+     let mut est = if shift == 0 {
+         base
+@@ -2463,6 +2475,8 @@ impl Pipeline {
+                     (Some(prefix), false) => format!("{prefix}_build"),
+                     (Some(prefix), true) => format!("{prefix}_build_{idx}"),
+                 };
++                let trace_on = std::env::var("MORSEL_SCRATCH_TRACE_WALL").as_deref() == Ok("1");
++                let trace_t0 = trace_on.then(std::time::Instant::now);
+                 let Some(table) = Box::pin(Self::run_single_build_pipeline(
+                     &probe.build_pipeline,
+                     &build_label,
+@@ -2480,6 +2494,9 @@ impl Pipeline {
+                     }
+                     return Ok(BuildRunOutcome::Cancelled);
+                 };
++                if let Some(t0) = trace_t0 {
++                    eprintln!("[trace] build {build_label}: dur={:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
++                }
+                 #[cfg(feature = "parquet")]
+                 if let Some(df) = table.dynamic_filter() {
+                     published_filters.insert(probe.filter_id, Arc::clone(df));
+diff --git a/datafusion/core/src/morsel/hash_join.rs b/datafusion/core/src/morsel/hash_join.rs
+index f7f18df32..dd141660d 100644
+--- a/datafusion/core/src/morsel/hash_join.rs
++++ b/datafusion/core/src/morsel/hash_join.rs
+@@ -595,6 +595,10 @@ impl HashJoinBuildSink {
+         &self.payload_columns
+     }
+
++    pub(super) fn key_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
++        &self.key_exprs
++    }
++
+     #[cfg(feature = "parquet")]
+     pub(super) fn enable_dynamic_filter(&mut self, cfg: DynamicJoinFilterConfig) {
+         match &mut self.dynamic_filter {
+diff --git a/datafusion/core/src/morsel/join_filter.rs b/datafusion/core/src/morsel/join_filter.rs
+index 88dfd845d..61e1e9578 100644
+--- a/datafusion/core/src/morsel/join_filter.rs
++++ b/datafusion/core/src/morsel/join_filter.rs
+@@ -99,16 +99,27 @@ pub(super) struct DynamicJoinFilterConfig {
+ pub(super) struct SplitBlockBloomFilter {
+     blocks: Vec<[u32; 8]>,
+     block_mask: usize,
++    radix_sub_bits: u32,
++    radix_sub_mask: usize,
++    radix_aligned: bool,
+ }
+
+ impl SplitBlockBloomFilter {
+     /// Returns the power-of-two block count for `entries`, or `None` when
+     /// `entries == 0` or exceeds [`MAX_BLOOM_KEYS`].
+     pub(super) fn num_blocks_for_entries(entries: usize) -> Option<usize> {
+-        if entries == 0 || entries > MAX_BLOOM_KEYS {
++        let max_keys = std::env::var("MORSEL_SCRATCH_SKIP_LARGE_BLOOM")
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or(MAX_BLOOM_KEYS);
++        if entries == 0 || entries > max_keys {
+             return None;
+         }
+-        let needed_bits = entries.saturating_mul(MIN_BLOOM_BITS_PER_KEY);
++        let bits_per_key = std::env::var("MORSEL_SCRATCH_BLOOM_BITS")
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or(MIN_BLOOM_BITS_PER_KEY);
++        let needed_bits = entries.saturating_mul(bits_per_key);
+         let needed_blocks = needed_bits.div_ceil(256).max(1).next_power_of_two();
+         let max_blocks = MAX_BLOOM_BYTES / size_of::<[u32; 8]>();
+         Some(needed_blocks.min(max_blocks))
+@@ -120,9 +131,15 @@ impl SplitBlockBloomFilter {
+
+     pub(super) fn with_blocks(num_blocks: usize) -> Self {
+         debug_assert!(num_blocks.is_power_of_two());
++        let radix_aligned = num_blocks >= 64
++            && std::env::var("MORSEL_SCRATCH_NONATOMIC_BLOOM").as_deref() == Ok("1");
++        let sub_bits = num_blocks.trailing_zeros().saturating_sub(6);
+         Self {
+             blocks: vec![[0u32; 8]; num_blocks],
+             block_mask: num_blocks - 1,
++            radix_sub_bits: sub_bits,
++            radix_sub_mask: (1usize << sub_bits) - 1,
++            radix_aligned,
+         }
+     }
+
+@@ -145,10 +162,44 @@ impl SplitBlockBloomFilter {
+         ]
+     }
+
++    /// Level-0 radix partition `p = (h >> 51) & 63` (from `radix.rs`:
++    /// `RADIX_MAX_HIGH_BIT = 57`, `level0_shift(6) = 51`) forms the top 6 bits
++    /// of the block index so every radix partition owns a disjoint, contiguous
++    /// slice `[p << sub_bits .. (p + 1) << sub_bits)` for all `num_blocks >= 64`.
++    #[inline]
++    fn radix_block_index(h: u64, sub_bits: u32, sub_mask: usize) -> usize {
++        let part = ((h >> 51) & 63) as usize;
++        (part << sub_bits) | ((h as usize) & sub_mask)
++    }
++
++    /// Uses bits `[19..51)` — disjoint from both the `[51..57)` radix bits and
++    /// the low `sub_bits` (`<= 12`, since `MAX_BLOOM_BYTES = 8 MiB` -> `2^18` blocks).
++    #[inline]
++    fn intra_block_mask_mid(h: u64) -> [u32; 8] {
++        let x = (h >> 19) as u32;
++        [
++            1u32 << (x.wrapping_mul(SBBF_SALTS[0]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[1]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[2]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[3]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[4]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[5]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[6]) >> 27),
++            1u32 << (x.wrapping_mul(SBBF_SALTS[7]) >> 27),
++        ]
++    }
++
+     #[inline]
+     pub(super) fn insert(&mut self, h: u64) {
+-        let block = &mut self.blocks[(h as usize) & self.block_mask];
+-        let mask = Self::intra_block_mask(h);
++        let (idx, mask) = if self.radix_aligned {
++            (
++                Self::radix_block_index(h, self.radix_sub_bits, self.radix_sub_mask),
++                Self::intra_block_mask_mid(h),
++            )
++        } else {
++            ((h as usize) & self.block_mask, Self::intra_block_mask(h))
++        };
++        let block = &mut self.blocks[idx];
+         for (word, bit) in block.iter_mut().zip(mask) {
+             *word |= bit;
+         }
+@@ -157,8 +208,15 @@ impl SplitBlockBloomFilter {
+     #[cfg(any(feature = "parquet", test))]
+     #[inline]
+     pub(super) fn might_contain(&self, h: u64) -> bool {
+-        let block = &self.blocks[(h as usize) & self.block_mask];
+-        let mask = Self::intra_block_mask(h);
++        let (idx, mask) = if self.radix_aligned {
++            (
++                Self::radix_block_index(h, self.radix_sub_bits, self.radix_sub_mask),
++                Self::intra_block_mask_mid(h),
++            )
++        } else {
++            ((h as usize) & self.block_mask, Self::intra_block_mask(h))
++        };
++        let block = &self.blocks[idx];
+         let mut all = true;
+         for (&word, bit) in block.iter().zip(mask) {
+             all &= (word & bit) != 0;
+@@ -172,11 +230,17 @@ impl SplitBlockBloomFilter {
+ pub(super) struct AtomicSplitBlockBloomFilter {
+     blocks: Vec<[AtomicU32; 8]>,
+     block_mask: usize,
++    radix_sub_bits: u32,
++    radix_sub_mask: usize,
++    radix_aligned: bool,
+ }
+
+ impl AtomicSplitBlockBloomFilter {
+     pub(super) fn with_blocks(num_blocks: usize) -> Self {
+         debug_assert!(num_blocks.is_power_of_two());
++        let radix_aligned = num_blocks >= 64
++            && std::env::var("MORSEL_SCRATCH_NONATOMIC_BLOOM").as_deref() == Ok("1");
++        let sub_bits = num_blocks.trailing_zeros().saturating_sub(6);
+         let mut blocks = Vec::with_capacity(num_blocks);
+         for _ in 0..num_blocks {
+             blocks.push(std::array::from_fn(|_| AtomicU32::new(0)));
+@@ -184,11 +248,30 @@ impl AtomicSplitBlockBloomFilter {
+         Self {
+             blocks,
+             block_mask: num_blocks - 1,
++            radix_sub_bits: sub_bits,
++            radix_sub_mask: (1usize << sub_bits) - 1,
++            radix_aligned,
+         }
+     }
+
+     #[inline]
+     pub(super) fn insert(&self, h: u64) {
++        if self.radix_aligned {
++            let idx = SplitBlockBloomFilter::radix_block_index(
++                h,
++                self.radix_sub_bits,
++                self.radix_sub_mask,
++            );
++            let block = &self.blocks[idx];
++            let mask = SplitBlockBloomFilter::intra_block_mask_mid(h);
++            for (word, bit) in block.iter().zip(mask) {
++                let cur = word.load(Ordering::Relaxed);
++                if (cur & bit) == 0 {
++                    word.store(cur | bit, Ordering::Relaxed);
++                }
++            }
++            return;
++        }
+         let block = &self.blocks[(h as usize) & self.block_mask];
+         let mask = SplitBlockBloomFilter::intra_block_mask(h);
+         for (word, bit) in block.iter().zip(mask) {
+@@ -207,6 +290,9 @@ impl AtomicSplitBlockBloomFilter {
+         SplitBlockBloomFilter {
+             blocks,
+             block_mask: self.block_mask,
++            radix_sub_bits: self.radix_sub_bits,
++            radix_sub_mask: self.radix_sub_mask,
++            radix_aligned: self.radix_aligned,
+         }
+     }
+ }
+diff --git a/datafusion/core/src/morsel/parquet.rs b/datafusion/core/src/morsel/parquet.rs
+index ce692888b..bad91b4e7 100644
+--- a/datafusion/core/src/morsel/parquet.rs
++++ b/datafusion/core/src/morsel/parquet.rs
+@@ -91,6 +91,8 @@ pub(super) struct ParquetScan {
+     pushdown_filters: bool,
+     bulk_scan_plan: Option<BulkScanPlan>,
+     dynamic_join_filters: Vec<JoinFilterBinding>,
++    table_statistics: Option<datafusion_common::Statistics>,
++    file_schema: Option<SchemaRef>,
+     pub(super) metrics: ExecutionPlanMetricsSet,
+ }
+
+@@ -145,6 +147,8 @@ impl ParquetScan {
+             pushdown_filters: false,
+             bulk_scan_plan: None,
+             dynamic_join_filters: Vec::new(),
++            table_statistics: None,
++            file_schema: None,
+             metrics: ExecutionPlanMetricsSet::new(),
+         };
+         if source.schema.as_ref() != scan.projected_schema.as_arrow() {
+@@ -205,6 +209,8 @@ impl ParquetScan {
+         }
+         source.pushdown_filters = pushdown_filters;
+         source.metrics = config.file_source().metrics().clone();
++        source.table_statistics = Some(config.statistics());
++        source.file_schema = Some(Arc::clone(config.file_schema()));
+         source.files = std::mem::take(&mut config.file_groups)
+             .into_iter()
+             .flat_map(|group| group.into_inner())
+@@ -537,6 +543,41 @@ impl ParquetScan {
+             .fold(0u64, u64::saturating_add)
+     }
+
++    pub(super) fn stats_estimated_filtered_bytes(&self) -> Option<u64> {
++        let stats = self.table_statistics.as_ref()?;
++        let schema = self.file_schema.as_ref()?;
++        let base_rows = *stats.num_rows.get_value()? as f64;
++        if base_rows <= 0.0 {
++            return Some(0);
++        }
++        let base_bytes = stats
++            .total_byte_size
++            .get_value()
++            .copied()
++            .map(|b| b as f64)
++            .unwrap_or_else(|| (self.total_file_bytes().saturating_mul(4)) as f64);
++        let selectivity = if let Some(pred) = self.pushed_predicate() {
++            if datafusion_physical_expr::intervals::utils::check_support(&pred, schema) {
++                datafusion_physical_expr::AnalysisContext::try_from_statistics(
++                    schema,
++                    &stats.column_statistics,
++                )
++                .ok()
++                .and_then(|ctx| datafusion_physical_expr::analyze(&pred, ctx, schema).ok())
++                .and_then(|res| res.selectivity)
++                .unwrap_or(1.0)
++            } else {
++                1.0
++            }
++        } else {
++            1.0
++        };
++        // Scale by projected vs table width ratio so narrow projections aren't over-weighted.
++        let width_ratio = (self.schema.fields().len().max(1) as f64)
++            / (schema.fields().len().max(1) as f64);
++        Some(((base_bytes * selectivity * width_ratio).max(1.0)) as u64)
++    }
++
+     pub(super) fn apply_expressions(
+         &self,
+         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+@@ -693,8 +734,15 @@ impl ParquetScan {
+             None
+         };
+
++        let chan_cap = if has_pushed_filter
++            && std::env::var("MORSEL_SCRATCH_READ_AHEAD_2X").as_deref() == Ok("1")
++        {
++            read_ahead * 2
++        } else {
++            read_ahead
++        };
+         let (publish, phase2, ready) = ready::channel(
+-            read_ahead,
++            chan_cap,
+             measurement.cloned(),
+             claimed_counter,
+             bulk_filter_plan,
+@@ -1298,7 +1346,14 @@ fn remap_probe_key_to_scan(
+                     .data;
+             }
+             Operator::HashProbe(mid_probe) => {
+-                if mid_probe.needs_build_emission() {
++                let allow_equijoin_sub = std::env::var("MORSEL_SCRATCH_Q20_SUPPKEY_PUSH")
++                    .as_deref()
++                    == Ok("1")
++                    && matches!(
++                        mid_probe.kind,
++                        ProbeJoinKind::Inner | ProbeJoinKind::BuildSemi
++                    );
++                if mid_probe.needs_build_emission() && !allow_equijoin_sub {
+                     return Ok(None);
+                 }
+                 let mut unmappable = false;
+@@ -1312,6 +1367,26 @@ fn remap_probe_key_to_scan(
+                                         p_idx,
+                                     ))));
+                                 }
++                                JoinOutputCol::Build(b_idx) if allow_equijoin_sub => {
++                                    if let Sink::HashJoinBuild(build_sink) =
++                                        &mid_probe.build_pipeline.sink
++                                    {
++                                        let payload_col = build_sink.payload_columns()[b_idx];
++                                        if let Some(k) = build_sink
++                                            .key_exprs()
++                                            .iter()
++                                            .position(|ke| {
++                                                ke.downcast_ref::<Column>()
++                                                    .is_some_and(|c| c.index() == payload_col)
++                                            })
++                                        {
++                                            return Ok(Transformed::yes(Arc::clone(
++                                                &mid_probe.probe_key_exprs()[k],
++                                            )));
++                                        }
++                                    }
++                                    unmappable = true;
++                                }
+                                 JoinOutputCol::Build(_) => {
+                                     unmappable = true;
+                                 }
+diff --git a/datafusion/datasource-parquet/src/opener/buffered.rs b/datafusion/datasource-parquet/src/opener/buffered.rs
+index 0d59c114a..556efde5d 100644
+--- a/datafusion/datasource-parquet/src/opener/buffered.rs
++++ b/datafusion/datasource-parquet/src/opener/buffered.rs
+@@ -282,6 +282,20 @@ fn build_file_row_filter_plan(
+     // (e.g. Date32 `l_shipdate`) always decode before wide join keys, breaking
+     // ties by expression heuristic cost and original plan/join order (`idx`).
+     initial_order.sort_by_key(|&idx| (candidates[idx].required_bytes(), costs[idx], idx));
++    if std::env::var("MORSEL_SCRATCH_LOG_RF").as_deref() == Ok("1") {
++        let desc: Vec<String> = candidates
++            .iter()
++            .enumerate()
++            .map(|(i, c)| {
++                let exprs: Vec<String> = c.physical_exprs().iter().map(|e| format!("{e}")).collect();
++                format!("#{i}(bytes={},cost={},inf={},exprs=[{}])", c.required_bytes(), costs[i], !c.has_fallible(), exprs.join(" | "))
++            })
++            .collect();
++        eprintln!("[rf-plan] order={initial_order:?} cands={}", desc.join(", "));
++    }
++    if std::env::var("MORSEL_SCRATCH_DISABLE_RF_BANDIT").as_deref() == Ok("1") {
++        return FileRowFilterPlan::FixedIdentity(initial_order);
++    }
+     FileRowFilterPlan::Adaptive {
+         signature: candidate_list_signature(candidates),
+         initial_order,
+@@ -552,6 +566,12 @@ impl AdaptiveRowFilterContext {
+                     self.metrics.fast_path_bulk_rgs.add(1);
+                     self.metrics.bulk_decode_rgs.add(1);
+                     (RgFilterMode::BulkDecode, None)
++                } else if (self.has_dynamic_join_filter
++                    && std::env::var("MORSEL_SCRATCH_FORCE_RF_ON_DYN").as_deref() == Ok("1"))
++                    || std::env::var("MORSEL_SCRATCH_FORCE_RF_ALL").as_deref() == Ok("1")
++                {
++                    self.metrics.row_filter_rgs.add(1);
++                    (RgFilterMode::RowFilter, None)
+                 } else if estimated_scan_rgs < min_rgs_for_probe {
+                     // Tiny scan with too few row groups to amortize A/B probing:
+                     // execute directly in RowFilter mode.
+@@ -601,6 +621,7 @@ impl AdaptiveRowFilterContext {
+                                 } else if (stats.rf_samples > 0
+                                     && stats.bulk_samples == 0)
+                                     || self.has_dynamic_join_filter
++                                    || std::env::var("MORSEL_SCRATCH_FIX_WAVE1_RF").as_deref() == Ok("1")
+                                 {
+                                     RgFilterMode::RowFilter
+                                 } else {
+diff --git a/datafusion/datasource-parquet/src/row_filter.rs b/datafusion/datasource-parquet/src/row_filter.rs
+index 2d91ebf53..c00710576 100644
+--- a/datafusion/datasource-parquet/src/row_filter.rs
++++ b/datafusion/datasource-parquet/src/row_filter.rs
+@@ -281,6 +281,11 @@ fn is_infallible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+         ) && is_infallible_expr(e.left())
+             && is_infallible_expr(e.right());
+     }
++    if std::env::var("MORSEL_SCRATCH_INFALLIBLE_BLOOM").as_deref() == Ok("1")
++        && format!("{expr}").starts_with("morsel_bloom_filter(")
++    {
++        return true;
++    }
+     false
+ }
+
+@@ -754,6 +759,41 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
+                 last_fallible_idx = Some(grouped.len() - 1);
+             }
+         }
++        if std::env::var("MORSEL_SCRATCH_NO_RANGE_WITH_BLOOM").as_deref() == Ok("1") {
++            for cand in &mut grouped {
++                if cand.leaf_indices.len() == 1 {
++                    let all_parts: Vec<Arc<dyn PhysicalExpr>> = cand
++                        .exprs
++                        .iter()
++                        .flat_map(|e| split_conjunction(e).into_iter().cloned())
++                        .collect();
++                    let bloom_parts: Vec<Arc<dyn PhysicalExpr>> = all_parts
++                        .iter()
++                        .filter(|e| format!("{e}").starts_with("morsel_bloom_filter("))
++                        .cloned()
++                        .collect();
++                    if !bloom_parts.is_empty() && bloom_parts.len() < all_parts.len() {
++                        // Keep any non-range predicates (e.g. static filters), drop only simple range bounds `col >= lit` / `col <= lit`.
++                        let kept: Vec<Arc<dyn PhysicalExpr>> = all_parts
++                            .into_iter()
++                            .filter(|e| {
++                                if let Some(b) = e.downcast_ref::<BinaryExpr>() {
++                                    let is_range = matches!(b.op(), Operator::GtEq | Operator::LtEq)
++                                        && ((b.left().is::<Column>() && b.right().is::<Literal>())
++                                            || (b.right().is::<Column>() && b.left().is::<Literal>()));
++                                    return !is_range;
++                                }
++                                true
++                            })
++                            .collect();
++                        if !kept.is_empty() {
++                            cand.exprs = vec![conjunction(kept)];
++                            cand.last_is_infallible = true;
++                        }
++                    }
++                }
++            }
++        }
+         grouped
+     } else {
+         candidates
