@@ -16,7 +16,7 @@
 //! (`[0..33)`), so 64-bit hashes are passed unchanged into `hashbrown` and
 //! open-addressing / chained join tables without entropy collapse.
 
-use arrow::array::UInt32Array;
+use arrow::array::{RecordBatch, UInt32Array};
 use arrow::buffer::ScalarBuffer;
 
 pub(super) const RADIX_MAX_HIGH_BIT: u32 = 57;
@@ -24,6 +24,38 @@ pub(super) const RADIX_MIN_LOW_BIT: u32 = 33;
 pub(super) const DEFAULT_RADIX_BITS: u32 = 6; // 64 partitions
 pub(super) const RECURSIVE_RADIX_BITS: u32 = 4; // 16 sub-partitions per recursive split
 pub(super) const MAX_RADIX_DEPTH: usize = 2;
+
+/// One radix-permuted batch paired with its per-partition `(offset, len)`
+/// ranges, avoiding `2^R` eager `RecordBatch::slice` heap allocations per batch.
+#[derive(Clone)]
+pub(super) struct RadixChunk {
+    pub(super) batch: RecordBatch,
+    pub(super) ranges: Vec<(u32, u32)>,
+}
+
+impl RadixChunk {
+    pub(super) fn from_permuted(batch: RecordBatch, ranges: &[(usize, usize)]) -> Self {
+        Self {
+            batch,
+            ranges: ranges
+                .iter()
+                .map(|&(off, len)| (off as u32, len as u32))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn part_range(&self, p: usize) -> (usize, usize) {
+        let (off, len) = self.ranges[p];
+        (off as usize, len as usize)
+    }
+
+    #[inline]
+    pub(super) fn part_slice(&self, p: usize) -> Option<RecordBatch> {
+        let (off, len) = self.part_range(p);
+        (len > 0).then(|| self.batch.slice(off, len))
+    }
+}
 
 /// Extract radix partition index from a middle bit window disjoint from
 /// `hashbrown`'s `h2` (`[57..64)`) and low `h1` bucket bits (`[0..33)`).

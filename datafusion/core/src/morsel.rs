@@ -4,6 +4,8 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
+#[cfg(feature = "parquet")]
+use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{BooleanArray, RecordBatch, UInt32Array};
 use arrow::compute::{filter_record_batch, take_record_batch};
-#[cfg(test)]
+#[cfg(any(feature = "parquet", test))]
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -208,11 +210,36 @@ fn estimate_side_size(
         }
         #[cfg(feature = "parquet")]
         Source::Parquet(pq) => {
+            let col_width = |f: &Arc<arrow::datatypes::Field>| match f.data_type() {
+                DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView => 4u64,
+                DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 2u64,
+                _ => 1u64,
+            };
             let file_bytes = pq.total_file_bytes();
+            let proj_width: u64 =
+                pq.schema.fields().iter().map(col_width).sum::<u64>().max(1);
+            let file_width: u64 = pq
+                .file_schema()
+                .fields()
+                .iter()
+                .map(col_width)
+                .sum::<u64>()
+                .max(proj_width);
+            let approx_bytes =
+                file_bytes.saturating_mul(4).saturating_mul(proj_width) / file_width;
             SideEstimate {
                 is_empty: pq.is_empty(),
                 mem_rows: None,
-                approx_bytes: file_bytes.saturating_mul(4),
+                approx_bytes: if pq.is_empty() {
+                    0
+                } else {
+                    approx_bytes.max(1)
+                },
             }
         }
         Source::Stage(stage_src) => stages[stage_src.stage_id.0].estimate,
@@ -247,11 +274,36 @@ fn is_equality_with_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
     (left_cols == 1 && right_cols == 0) || (left_cols == 0 && right_cols == 1)
 }
 
+/// Returns `(is_lower_bound, is_upper_bound)` for a single-column comparison
+/// against a constant expression (e.g. `col >= c` -> `(true, false)`).
+fn constant_range_bound(expr: &Arc<dyn PhysicalExpr>) -> (bool, bool) {
+    let Some(bin) = expr.downcast_ref::<BinaryExpr>() else {
+        return (false, false);
+    };
+    let left_cols = collect_columns(bin.left()).len();
+    let right_cols = collect_columns(bin.right()).len();
+    if left_cols == 1 && right_cols == 0 {
+        match bin.op() {
+            ExprOperator::Gt | ExprOperator::GtEq => (true, false),
+            ExprOperator::Lt | ExprOperator::LtEq => (false, true),
+            _ => (false, false),
+        }
+    } else if left_cols == 0 && right_cols == 1 {
+        match bin.op() {
+            ExprOperator::Lt | ExprOperator::LtEq => (true, false),
+            ExprOperator::Gt | ExprOperator::GtEq => (false, true),
+            _ => (false, false),
+        }
+    } else {
+        (false, false)
+    }
+}
+
 fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
     if matches!(source, Source::Stage(_)) {
         return 0;
     }
-    let mut distinct_groups: BTreeMap<Vec<String>, u32> = BTreeMap::new();
+    let mut distinct_groups: BTreeMap<Vec<String>, (u32, bool, bool)> = BTreeMap::new();
     let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
         for conjunct in split_conjunction(pred) {
             let mut cols: Vec<String> = collect_columns(conjunct)
@@ -266,10 +318,22 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
                 } else {
                     1
                 };
+                let (has_lo, has_hi) = if cols.len() == 1 {
+                    constant_range_bound(conjunct)
+                } else {
+                    (false, false)
+                };
                 distinct_groups
                     .entry(cols)
-                    .and_modify(|w| *w = (*w).max(weight))
-                    .or_insert(weight);
+                    .and_modify(|(w, lo, hi)| {
+                        *lo |= has_lo;
+                        *hi |= has_hi;
+                        *w = (*w).max(weight);
+                        if *lo && *hi {
+                            *w = (*w).max(2);
+                        }
+                    })
+                    .or_insert((weight, has_lo, has_hi));
             }
         }
     };
@@ -297,7 +361,7 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
             _ => {}
         }
     }
-    let own_shift: u32 = distinct_groups.values().copied().sum();
+    let own_shift: u32 = distinct_groups.values().map(|&(w, _, _)| w).sum();
     own_shift.saturating_add(join_shift).min(6)
 }
 
@@ -351,6 +415,42 @@ fn estimate_join_side_size(
     est
 }
 
+async fn drop_finalized_tables_parallel(
+    tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+    workers: usize,
+) {
+    let Some(tables_arc) = tables else {
+        return;
+    };
+    let Ok(tables_vec) = Arc::try_unwrap(tables_arc) else {
+        return;
+    };
+    let total_rows: usize = tables_vec.iter().map(|t| t.num_rows()).sum();
+    if workers <= 1 || total_rows < 250_000 {
+        drop(tables_vec);
+        return;
+    }
+    let mut units: Vec<SingleHashTable> = Vec::new();
+    for table in tables_vec {
+        units.extend(table.take_resident_drop_units());
+    }
+    if units.len() <= 1 {
+        drop(units);
+        return;
+    }
+    let num_tasks = workers.min(units.len());
+    let chunk_size = units.len().div_ceil(num_tasks);
+    let mut tasks = JoinSet::new();
+    while !units.is_empty() {
+        let split_at = units.len().saturating_sub(chunk_size);
+        let chunk = units.split_off(split_at);
+        tasks.spawn(async move {
+            drop(chunk);
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
 fn choose_build_side(
     left: SideEstimate,
     right: SideEstimate,
@@ -375,6 +475,22 @@ fn choose_build_side(
             std::cmp::Ordering::Greater => BuildSide::Right,
             std::cmp::Ordering::Equal => tie_side,
         };
+    }
+    // When one side is a materialized `Stage` (e.g. grouped aggregate) and the
+    // non-stage side is within 2x of the stage's byte estimate, keep the stage
+    // on the probe side so cross-stage dynamic filters and empty-build
+    // short-circuits can prune or skip the stage scan completely.
+    if !left_is_stage
+        && right_is_stage
+        && left.approx_bytes <= right.approx_bytes.saturating_mul(2)
+    {
+        return BuildSide::Left;
+    }
+    if left_is_stage
+        && !right_is_stage
+        && right.approx_bytes <= left.approx_bytes.saturating_mul(2)
+    {
+        return BuildSide::Right;
     }
     match left.approx_bytes.cmp(&right.approx_bytes) {
         std::cmp::Ordering::Less => BuildSide::Left,
@@ -2445,15 +2561,77 @@ impl Pipeline {
             let multi = probes.len() > 1;
             let mut slots: Vec<Option<Arc<FinalizedHashTable>>> =
                 vec![None; probes.len()];
-            let mut short_circuit_op = None;
-            // Execute builds in reverse probe order (`probes[N-1]` down to
-            // `probes[0]`) so downstream selective builds publish dynamic
-            // filters before earlier builds open their Parquet scans.
-            for idx in (0..probes.len()).rev() {
+            let mut short_circuit_op: Option<usize> = None;
+
+            // Execute builds in topological order of dynamic-filter dependencies,
+            // breaking ties in reverse probe order (`probes[N-1]` down to `probes[0]`)
+            // so both downstream filters and forward sibling filters (e.g.
+            // `part -> partsupp` in TPC-H Q9) publish before consumers open scans.
+            let build_order: Vec<usize> = {
+                #[cfg(feature = "parquet")]
+                {
+                    let n = probes.len();
+                    let mut filter_id_to_idx: HashMap<usize, usize> =
+                        HashMap::with_capacity(n);
+                    for (idx, &(_, probe)) in probes.iter().enumerate() {
+                        filter_id_to_idx.insert(probe.filter_id, idx);
+                    }
+                    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+                    let mut indegree: Vec<usize> = vec![0; n];
+                    let mut bound_ids = HashSet::new();
+                    for (dst, &(_, probe)) in probes.iter().enumerate() {
+                        bound_ids.clear();
+                        parquet::collect_pipeline_bound_filter_ids(
+                            &probe.build_pipeline,
+                            dag.stages(),
+                            &mut bound_ids,
+                        );
+                        for fid in &bound_ids {
+                            if let Some(&src) = filter_id_to_idx.get(fid)
+                                && src != dst
+                            {
+                                adj[src].push(dst);
+                                indegree[dst] += 1;
+                            }
+                        }
+                    }
+                    let mut ready = BinaryHeap::new();
+                    for (idx, &deg) in indegree.iter().enumerate() {
+                        if deg == 0 {
+                            ready.push(idx);
+                        }
+                    }
+                    let mut order = Vec::with_capacity(n);
+                    while let Some(u) = ready.pop() {
+                        order.push(u);
+                        for &v in &adj[u] {
+                            indegree[v] -= 1;
+                            if indegree[v] == 0 {
+                                ready.push(v);
+                            }
+                        }
+                    }
+                    if order.len() < n {
+                        // Defensive fallback if an unexpected cycle ever occurred.
+                        for idx in (0..n).rev() {
+                            if !order.contains(&idx) {
+                                order.push(idx);
+                            }
+                        }
+                    }
+                    order
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    (0..probes.len()).rev().collect()
+                }
+            };
+
+            for (order_pos, &idx) in build_order.iter().enumerate() {
                 let (op_idx, probe) = probes[idx];
                 if tx.is_closed() {
-                    for &(_, remaining_probe) in &probes[..=idx] {
-                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    for &rem_idx in &build_order[order_pos..] {
+                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                     }
                     return Ok(BuildRunOutcome::Cancelled);
                 }
@@ -2475,8 +2653,8 @@ impl Pipeline {
                 ))
                 .await?
                 else {
-                    for &(_, remaining_probe) in &probes[..idx] {
-                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    for &rem_idx in &build_order[order_pos + 1..] {
+                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                     }
                     return Ok(BuildRunOutcome::Cancelled);
                 };
@@ -2498,16 +2676,15 @@ impl Pipeline {
                         .iter()
                         .any(|(_, p)| p.needs_build_emission());
                     if !has_later_build_emission {
-                        for &(_, remaining_probe) in &probes[..idx] {
-                            dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                        for &rem_idx in &build_order[order_pos + 1..] {
+                            dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                         }
                         drop(table);
                         drop(slots);
                         return Ok(BuildRunOutcome::ShortCircuitAll);
                     }
-                    if short_circuit_op.is_none() {
-                        short_circuit_op = Some(op_idx);
-                    }
+                    short_circuit_op =
+                        Some(short_circuit_op.map_or(op_idx, |prev| prev.max(op_idx)));
                 }
                 slots[idx] = Some(table);
             }
@@ -3046,7 +3223,7 @@ impl Pipeline {
                 let slice_table = build_single_table_from_packed_batches(
                     &slice_batches,
                     meta,
-                    None,
+                    &mut hash_join::BloomBuildSink::None,
                     slice_res,
                 )?;
                 drop(slice_batches);
@@ -4995,7 +5172,7 @@ impl Pipeline {
         }
         drop(sink_reservation);
         drop(shared_sort_memory);
-        drop(finalized_tables);
+        drop_finalized_tables_parallel(finalized_tables, self.workers.get()).await;
 
         // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
         // buffered tail only after all workers and any scan producers succeed.

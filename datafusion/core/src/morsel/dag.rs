@@ -384,6 +384,11 @@ impl DagRuntime {
         }
     }
 
+    #[cfg(feature = "parquet")]
+    pub(super) fn stages(&self) -> &[StageSpec] {
+        &self.stages
+    }
+
     pub(super) fn release_consumer(&mut self, stage_id: StageId) {
         let rem = &mut self.remaining_consumers[stage_id.0];
         *rem = rem.saturating_sub(1);

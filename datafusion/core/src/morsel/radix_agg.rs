@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use super::metrics::{self, RunMetrics};
 use super::radix::{
-    DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, level0_shift,
+    DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, RadixChunk, level0_shift,
     next_level_shift, radix_permute_indices,
 };
 use super::spill::{SpillContext, SyncSpillWriter, spill_batches_async};
@@ -106,7 +106,8 @@ pub(super) fn hash_group_columns(
 pub(super) struct RadixPartitionStore {
     pub(super) radix_bits: u32,
     pub(super) shift: u32,
-    pub(super) mem_batches: Vec<Vec<RecordBatch>>,
+    pub(super) mem_chunks: Vec<RadixChunk>,
+    pub(super) part_non_empty: Vec<bool>,
     pub(super) mem_part_bytes: Vec<usize>,
     pub(super) total_mem_bytes: usize,
     pub(super) spill_files: Vec<Vec<Arc<dyn SpillFile>>>,
@@ -123,7 +124,8 @@ impl RadixPartitionStore {
         Self {
             radix_bits,
             shift,
-            mem_batches: vec![Vec::new(); num_parts],
+            mem_chunks: Vec::new(),
+            part_non_empty: vec![false; num_parts],
             mem_part_bytes: vec![0; num_parts],
             total_mem_bytes: 0,
             spill_files: vec![Vec::new(); num_parts],
@@ -132,17 +134,17 @@ impl RadixPartitionStore {
     }
 
     pub(super) fn num_partitions(&self) -> usize {
-        self.mem_batches.len()
+        self.mem_part_bytes.len()
     }
 
     pub(super) fn is_empty(&self) -> bool {
         !self.spilled
-            && self.mem_batches.iter().all(Vec::is_empty)
+            && self.mem_chunks.is_empty()
             && self.spill_files.iter().all(Vec::is_empty)
     }
 
     /// Permute a partial-state `RecordBatch` by radix partition in one O(N)
-    /// pass and either retain zero-copy slices in memory or spill on OOM.
+    /// pass and either retain a single [`RadixChunk`] in memory or spill on OOM.
     ///
     /// `extra_bytes` is the caller's other live reservation bytes (e.g. empty
     /// pre-agg table overhead) so `reservation.try_resize` tracks total bytes.
@@ -191,28 +193,37 @@ impl RadixPartitionStore {
             };
             self.spilled = true;
             spill_ctx.mark_spilled();
-            // Append previously buffered slices together with the new batch's
+            // Append previously buffered chunks together with the new batch's
             // per-partition slices into the stage-shared partition writers
             // (at most 1 open spill file per partition across all workers!).
             let num_parts = self.num_partitions();
             let writers =
                 spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+            let prev_chunks = std::mem::take(&mut self.mem_chunks);
             for (p, &(offset, len)) in ranges.iter().enumerate() {
                 if tx.is_closed() {
                     self.clear_mem_batches();
                     reservation.resize(extra_bytes);
                     return Ok(());
                 }
-                let mut to_spill = std::mem::take(&mut self.mem_batches[p]);
+                let mut to_spill = Vec::new();
+                if self.part_non_empty[p] {
+                    for c in &prev_chunks {
+                        if let Some(s) = c.part_slice(p) {
+                            to_spill.push(s);
+                        }
+                    }
+                }
                 if len > 0 {
                     to_spill.push(permuted.slice(offset, len));
                 }
                 if !to_spill.is_empty() {
                     writers.append_batches(p, &to_spill)?;
                 }
+                self.part_non_empty[p] = false;
                 self.mem_part_bytes[p] = 0;
             }
-            debug_assert_eq!(num_parts, self.mem_batches.len());
+            drop(prev_chunks);
             self.total_mem_bytes = 0;
             drop(permuted);
             reservation.resize(extra_bytes);
@@ -220,20 +231,22 @@ impl RadixPartitionStore {
         }
 
         let total_rows = permuted.num_rows().max(1);
-        for (p, &(offset, len)) in ranges.iter().enumerate() {
+        for (p, &(_, len)) in ranges.iter().enumerate() {
             if len > 0 {
-                self.mem_batches[p].push(permuted.slice(offset, len));
+                self.part_non_empty[p] = true;
                 // Proportional share so releasing individual partitions shrinks
                 // the combined reservation smoothly without double-counting.
                 let share = batch_bytes.saturating_mul(len) / total_rows;
                 self.mem_part_bytes[p] = self.mem_part_bytes[p].saturating_add(share);
             }
         }
+        self.mem_chunks
+            .push(RadixChunk::from_permuted(permuted, &ranges));
         self.total_mem_bytes = self.total_mem_bytes.saturating_add(batch_bytes);
         Ok(())
     }
 
-    /// Spill all currently buffered in-memory batches in this store and reset
+    /// Spill all currently buffered in-memory chunks in this store and reset
     /// `total_mem_bytes` to 0.
     pub(super) fn spill_all_mem(
         &mut self,
@@ -247,53 +260,51 @@ impl RadixPartitionStore {
         let num_parts = self.num_partitions();
         let writers =
             spill.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+        let chunks = std::mem::take(&mut self.mem_chunks);
         for p in 0..num_parts {
             if tx.is_closed() {
                 self.clear_mem_batches();
                 reservation.resize(extra_bytes);
                 return Ok(());
             }
-            let batches = std::mem::take(&mut self.mem_batches[p]);
-            self.mem_part_bytes[p] = 0;
-            if !batches.is_empty() {
-                writers.append_batches(p, &batches)?;
+            if self.part_non_empty[p] {
+                let batches: Vec<RecordBatch> =
+                    chunks.iter().filter_map(|c| c.part_slice(p)).collect();
+                if !batches.is_empty() {
+                    writers.append_batches(p, &batches)?;
+                }
             }
+            self.part_non_empty[p] = false;
+            self.mem_part_bytes[p] = 0;
         }
+        drop(chunks);
         self.total_mem_bytes = 0;
         reservation.resize(extra_bytes);
         Ok(())
     }
 
     fn clear_mem_batches(&mut self) {
-        for v in &mut self.mem_batches {
-            v.clear();
-        }
+        self.mem_chunks.clear();
+        self.part_non_empty.fill(false);
         self.mem_part_bytes.fill(0);
         self.total_mem_bytes = 0;
     }
 
-    /// O(`2^R`) lock-free combine: move partition vectors without hashing or
+    /// O(`2^R`) lock-free combine: move chunk vectors without hashing or
     /// key comparisons.
     pub(super) fn combine_from(&mut self, mut other: Self) {
         debug_assert_eq!(self.radix_bits, other.radix_bits);
         debug_assert_eq!(self.shift, other.shift);
         self.spilled |= other.spilled;
         self.total_mem_bytes = self.total_mem_bytes.saturating_add(other.total_mem_bytes);
+        self.mem_chunks.append(&mut other.mem_chunks);
         for p in 0..self.num_partitions() {
-            self.mem_batches[p].append(&mut other.mem_batches[p]);
+            self.part_non_empty[p] |= other.part_non_empty[p];
             self.mem_part_bytes[p] =
                 self.mem_part_bytes[p].saturating_add(other.mem_part_bytes[p]);
             self.spill_files[p].append(&mut other.spill_files[p]);
         }
     }
-}
-
-/// Take-once per-partition input moved out of the shared finalize array as soon
-/// as a finalize worker claims partition `p`.
-struct PartitionInput {
-    mem_batches: Vec<RecordBatch>,
-    spill_files: Vec<Arc<dyn SpillFile>>,
-    est_bytes: usize,
 }
 
 /// Trait implemented by `Grouped`, `DirectGrouped`, and `GroupCount` to plug
@@ -309,6 +320,15 @@ pub(super) trait RadixGroupMerger: Send + Sync + 'static {
         table: &mut Self::Table,
         batch: &RecordBatch,
     ) -> Result<()>;
+    fn merge_partial_slice(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        self.merge_partial_batch(table, &batch.slice(offset, len))
+    }
     fn hash_partial_batch(
         &self,
         batch: &RecordBatch,
@@ -367,7 +387,7 @@ pub(super) struct RadixFinalizeConfig<'a> {
 /// and sorted-run skew fallback).
 pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     merger: Arc<M>,
-    store: RadixPartitionStore,
+    mut store: RadixPartitionStore,
     input_reservation: MemoryReservation,
     cfg: RadixFinalizeConfig<'_>,
     tx: mpsc::Sender<RecordBatch>,
@@ -383,27 +403,18 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     let any_spilled = store.spilled;
     let total_mem_bytes = store.total_mem_bytes;
 
-    let mut slots: Vec<Mutex<Option<PartitionInput>>> = Vec::with_capacity(num_parts);
-    let mut non_empty = 0usize;
-    for p in 0..num_parts {
-        let mem = store.mem_batches[p].clone();
-        let files = store.spill_files[p].clone();
-        if !mem.is_empty() || !files.is_empty() || any_spilled {
-            if !mem.is_empty() || !files.is_empty() {
-                non_empty += 1;
-            }
-            slots.push(Mutex::new(Some(PartitionInput {
-                mem_batches: mem,
-                spill_files: files,
-                est_bytes: store.mem_part_bytes[p],
-            })));
-        } else {
-            slots.push(Mutex::new(None));
-        }
-    }
+    let mut mem_chunks = std::mem::take(&mut store.mem_chunks);
+    let part_non_empty = std::mem::take(&mut store.part_non_empty);
+    let mem_part_bytes = std::mem::take(&mut store.mem_part_bytes);
+    let mut spill_files = std::mem::take(&mut store.spill_files);
     drop(store);
 
+    let non_empty: usize = (0..num_parts)
+        .filter(|&p| part_non_empty[p] || !spill_files[p].is_empty())
+        .count();
+
     if !any_spilled && non_empty == 0 {
+        drop(mem_chunks);
         drop(input_reservation);
         return Ok(());
     }
@@ -412,9 +423,9 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     // sequential spilled replay.
     let must_spill_sequential = if any_spilled {
         true
-    } else if let Some(spill_ctx) = &cfg.spill {
+    } else if cfg.spill.is_some() {
         // Check if we have enough headroom to hold parallel finalize working
-        // sets alongside the in-memory input slices. If not, spill input
+        // sets alongside the in-memory input chunks. If not, spill input
         // partitions up front and replay 1-at-a-time in bounded RAM.
         let parallel_workers = cfg.workers.min(non_empty).max(1);
         let probe_bytes = (total_mem_bytes / non_empty.max(1))
@@ -425,32 +436,7 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
             .register(cfg.memory_pool);
         let ok = probe.try_grow(probe_bytes).is_ok();
         drop(probe);
-        if !ok {
-            let writers =
-                spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
-            for (p, slot) in slots.iter().enumerate() {
-                if tx.is_closed() {
-                    return Ok(());
-                }
-                let batches = {
-                    let mut guard = slot.lock();
-                    guard
-                        .as_mut()
-                        .map(|input| std::mem::take(&mut input.mem_batches))
-                        .unwrap_or_default()
-                };
-                if !batches.is_empty() {
-                    writers.append_batches(p, &batches)?;
-                    if let Some(input) = slot.lock().as_mut() {
-                        input.est_bytes = 0;
-                    }
-                }
-            }
-            input_reservation.resize(0);
-            true
-        } else {
-            false
-        }
+        !ok
     } else {
         false
     };
@@ -461,56 +447,48 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                 "Spilled GROUP BY partitions require SpillContext"
             );
         };
-        // Flush any remaining in-memory batches into the stage-shared partition
+        // Flush any remaining in-memory chunks into the stage-shared partition
         // writers and finish them so every partition has at most 1 spill file
         // and 100% of sink memory is freed before replaying partition 0.
-        let writers =
-            spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
-        for (p, slot) in slots.iter().enumerate() {
-            if tx.is_closed() {
-                drop(slots);
-                drop(input_reservation);
-                return Ok(());
-            }
-            let batches = {
-                let mut guard = slot.lock();
-                guard
-                    .as_mut()
-                    .map(|i| std::mem::take(&mut i.mem_batches))
-                    .unwrap_or_default()
-            };
-            if !batches.is_empty() {
-                writers.append_batches(p, &batches)?;
-                if let Some(input) = slot.lock().as_mut() {
-                    input.est_bytes = 0;
+        if !mem_chunks.is_empty() {
+            let writers =
+                spill_ctx.get_or_init_partition_writers(num_parts, "MorselGroupBySpill");
+            for (p, &has_mem) in part_non_empty.iter().enumerate() {
+                if tx.is_closed() {
+                    drop(mem_chunks);
+                    drop(input_reservation);
+                    return Ok(());
+                }
+                if has_mem {
+                    let batches: Vec<RecordBatch> =
+                        mem_chunks.iter().filter_map(|c| c.part_slice(p)).collect();
+                    if !batches.is_empty() {
+                        writers.append_batches(p, &batches)?;
+                    }
                 }
             }
+            mem_chunks.clear();
         }
-        drop(writers);
+        drop(mem_chunks);
         if let Some(finished) = spill_ctx.finish_partition_writers()? {
             for (p, sf_opt) in finished.into_iter().enumerate() {
-                if let Some(sf) = sf_opt
-                    && let Some(input) = slots[p].lock().as_mut()
-                {
-                    input.spill_files.push(sf);
+                if let Some(sf) = sf_opt {
+                    spill_files[p].push(sf);
                 }
             }
         }
         drop(input_reservation);
 
-        for slot in &slots {
+        for files in spill_files {
             if tx.is_closed() {
                 break;
             }
-            let Some(input) = slot.lock().take() else {
-                continue;
-            };
-            if input.spill_files.is_empty() {
+            if files.is_empty() {
                 continue;
             }
             finalize_spilled_partition(
                 &merger,
-                input.spill_files,
+                files,
                 shift,
                 0,
                 cfg.memory_pool,
@@ -527,7 +505,9 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
     }
 
     // Parallel lock-free in-memory partition finalization across `workers` tasks.
-    let slots = Arc::new(slots);
+    let mem_chunks = Arc::new(mem_chunks);
+    let part_non_empty = Arc::new(part_non_empty);
+    let mem_part_bytes = Arc::new(mem_part_bytes);
     let input_reservation = Arc::new(Mutex::new(input_reservation));
     let next_part = Arc::new(AtomicUsize::new(0));
     let worker_count = cfg.workers.min(non_empty).max(1);
@@ -535,7 +515,9 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
 
     for _ in 0..worker_count {
         let merger = Arc::clone(&merger);
-        let slots = Arc::clone(&slots);
+        let mem_chunks = Arc::clone(&mem_chunks);
+        let part_non_empty = Arc::clone(&part_non_empty);
+        let mem_part_bytes = Arc::clone(&mem_part_bytes);
         let input_res = Arc::clone(&input_reservation);
         let next_part = Arc::clone(&next_part);
         let pool = Arc::clone(cfg.memory_pool);
@@ -552,22 +534,29 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                     return Ok(());
                 }
                 let p = next_part.fetch_add(1, Ordering::Relaxed);
-                if p >= slots.len() {
+                if p >= num_parts {
                     return Ok(());
                 }
-                let Some(input) = slots[p].lock().take() else {
+                if !part_non_empty[p] {
                     continue;
-                };
+                }
+                let est = mem_part_bytes[p];
                 let part_res = MemoryConsumer::new(consumer_name)
                     .with_can_spill(spill.is_some())
                     .register(&pool);
                 let mut table = merger.new_table(part_res)?;
                 let mut merge_err = None;
-                for batch in &input.mem_batches {
+                for chunk in mem_chunks.iter() {
+                    let (off, len) = chunk.part_range(p);
+                    if len == 0 {
+                        continue;
+                    }
                     if tx.is_closed() {
                         return Ok(());
                     }
-                    if let Err(err) = merger.merge_partial_batch(&mut table, batch) {
+                    if let Err(err) =
+                        merger.merge_partial_slice(&mut table, &chunk.batch, off, len)
+                    {
                         merge_err = Some(err);
                         break;
                     }
@@ -578,11 +567,13 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                         && let Some(spill_ctx) = spill.as_ref()
                     {
                         // Partition overflowed during parallel finalize: spill
-                        // this partition's batches and replay via recursive
+                        // this partition's slices and replay via recursive
                         // radix split without duplicating any output rows.
+                        let part_batches: Vec<RecordBatch> =
+                            mem_chunks.iter().filter_map(|c| c.part_slice(p)).collect();
                         let spilled = if let Some((sf, _)) = spill_batches_async(
                             &spill_ctx.manager,
-                            &input.mem_batches,
+                            &part_batches,
                             "MorselGroupBySpill",
                             &tx,
                         )
@@ -592,8 +583,7 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                         } else {
                             Vec::new()
                         };
-                        let est = input.est_bytes;
-                        drop(input);
+                        drop(part_batches);
                         {
                             let guard = input_res.lock();
                             let cur = guard.size();
@@ -618,9 +608,7 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
                     return Err(err);
                 }
 
-                // Release input partition chunks & shrink static lease before emit.
-                let est = input.est_bytes;
-                drop(input);
+                // Shrink static lease for this partition before emit.
                 {
                     let guard = input_res.lock();
                     let cur = guard.size();

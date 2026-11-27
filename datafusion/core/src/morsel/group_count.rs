@@ -320,9 +320,19 @@ where
     }
 
     fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if batch.num_rows() == 0 {
+        self.merge_partial_slice(batch, 0, batch.num_rows())
+    }
+
+    fn merge_partial_slice(
+        &mut self,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
             return Ok(());
         }
+        let end = offset + len;
         let key_arr = batch
             .column(0)
             .as_any()
@@ -341,8 +351,8 @@ where
                     "GroupCount partial count array type mismatch"
                 )
             })?;
-        let key_vals = key_arr.values();
-        let count_vals = count_arr.values();
+        let key_vals = &key_arr.values()[offset..end];
+        let count_vals = &count_arr.values()[offset..end];
         if key_arr.null_count() == 0 {
             for (&k, &c) in key_vals.iter().zip(count_vals.iter()) {
                 self.add_key(k, c)?;
@@ -350,7 +360,7 @@ where
         } else {
             let nulls = key_arr.nulls().unwrap();
             for (i, (&k, &c)) in key_vals.iter().zip(count_vals.iter()).enumerate() {
-                if nulls.is_valid(i) {
+                if nulls.is_valid(offset + i) {
                     self.add_key(k, c)?;
                 } else {
                     self.add_null(c)?;
@@ -837,6 +847,15 @@ impl GroupCountMapKind {
 
     fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         dispatch_group_map!(self, m => m.merge_partial_batch(batch))
+    }
+
+    fn merge_partial_slice(
+        &mut self,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        dispatch_group_map!(self, m => m.merge_partial_slice(batch, offset, len))
     }
 }
 
@@ -1442,6 +1461,16 @@ impl RadixGroupMerger for GroupCountRadixMerger {
         batch: &RecordBatch,
     ) -> Result<()> {
         table.merge_partial_batch(batch)
+    }
+
+    fn merge_partial_slice(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        table.merge_partial_slice(batch, offset, len)
     }
 
     fn hash_partial_batch(

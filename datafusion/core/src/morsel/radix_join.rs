@@ -22,12 +22,22 @@ use datafusion_physical_plan::spill::SpillManager;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use super::radix::{DEFAULT_RADIX_BITS, level0_shift, radix_permute_indices};
+use super::radix::{DEFAULT_RADIX_BITS, RadixChunk, level0_shift, radix_permute_indices};
 use super::spill::{SharedPartitionWriters, SpillContext};
 
 /// Switch from `R = 0` single-partition build to `R = 6` (64-way) radix build
-/// once build rows exceed this threshold (keeps tiny dimension builds fast).
+/// once non-dense build rows exceed this threshold.
 pub(super) const RADIX_JOIN_THRESHOLD_ROWS: usize = 16_384;
+
+/// Dense single-column integer builds that qualify for [`DenseIntTable`] stay
+/// on the contiguous `R = 0` path up to this row count (e.g. 750K `customer`
+/// @ 3 MiB), while sparse integer builds switch to parallel radix at
+/// [`RADIX_JOIN_THRESHOLD_ROWS`].
+pub(super) const RADIX_JOIN_DENSE_INT_MAX_ROWS: usize = 1_048_576;
+
+/// Memory ceiling above which even a dense integer build transitions to
+/// 64-way radix partitioning so wide-payload builds parallelize across workers.
+pub(super) const RADIX_JOIN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Flush threshold for `LocalProbeSpill` per-worker buffered probe batches
 /// (falls back immediately if `MemoryReservation::try_grow` fails earlier).
@@ -121,7 +131,7 @@ pub(super) fn unpack_build_spill_batch(
 pub(super) struct RadixBuildStore {
     pub(super) radix_bits: u32,
     pub(super) shift: u32,
-    pub(super) mem_batches: Vec<Vec<RecordBatch>>,
+    pub(super) mem_chunks: Vec<RadixChunk>,
     pub(super) mem_part_bytes: Vec<usize>,
     pub(super) part_rows: Vec<usize>,
     pub(super) part_est_bytes: Vec<usize>,
@@ -140,7 +150,7 @@ impl RadixBuildStore {
         Self {
             radix_bits,
             shift,
-            mem_batches: vec![Vec::new(); num_parts],
+            mem_chunks: Vec::new(),
             mem_part_bytes: vec![0; num_parts],
             part_rows: vec![0; num_parts],
             part_est_bytes: vec![0; num_parts],
@@ -151,11 +161,11 @@ impl RadixBuildStore {
     }
 
     pub(super) fn num_partitions(&self) -> usize {
-        self.mem_batches.len()
+        self.part_rows.len()
     }
 
-    /// Permute a packed build batch into `2^R` radix slices, retaining slices
-    /// in memory when budget allows or spilling to disk on OOM.
+    /// Permute a packed build batch into `2^R` radix partition ranges, retaining
+    /// one [`RadixChunk`] in memory when budget allows or spilling to disk on OOM.
     pub(super) fn push_packed_batch(
         &mut self,
         packed: RecordBatch,
@@ -205,13 +215,21 @@ impl RadixBuildStore {
             let num_parts = self.num_partitions();
             let writers = spill_ctx
                 .get_or_init_partition_writers(num_parts, "MorselHashJoinBuildSpill");
+            let prev_chunks = std::mem::take(&mut self.mem_chunks);
             for (p, &(offset, len)) in ranges.iter().enumerate() {
                 if tx.is_closed() {
                     self.clear_mem_batches();
                     reservation.resize(extra_bytes);
                     return Ok(());
                 }
-                let mut to_spill = std::mem::take(&mut self.mem_batches[p]);
+                let mut to_spill = Vec::new();
+                if self.mem_part_bytes[p] > 0 || self.part_rows[p] > 0 {
+                    for c in &prev_chunks {
+                        if let Some(s) = c.part_slice(p) {
+                            to_spill.push(s);
+                        }
+                    }
+                }
                 if len > 0 {
                     to_spill.push(permuted.slice(offset, len));
                     self.part_rows[p] = self.part_rows[p].saturating_add(len);
@@ -223,21 +241,23 @@ impl RadixBuildStore {
                     writers.append_batches(p, &to_spill)?;
                 }
             }
+            drop(prev_chunks);
             self.total_mem_bytes = 0;
             drop(permuted);
             reservation.resize(extra_bytes);
             return Ok(());
         }
 
-        for (p, &(offset, len)) in ranges.iter().enumerate() {
+        for (p, &(_, len)) in ranges.iter().enumerate() {
             if len > 0 {
-                self.mem_batches[p].push(permuted.slice(offset, len));
                 let share = batch_bytes.saturating_mul(len) / total_rows;
                 self.mem_part_bytes[p] = self.mem_part_bytes[p].saturating_add(share);
                 self.part_rows[p] = self.part_rows[p].saturating_add(len);
                 self.part_est_bytes[p] = self.part_est_bytes[p].saturating_add(share);
             }
         }
+        self.mem_chunks
+            .push(RadixChunk::from_permuted(permuted, &ranges));
         self.total_mem_bytes = self.total_mem_bytes.saturating_add(batch_bytes);
         Ok(())
     }
@@ -254,27 +274,30 @@ impl RadixBuildStore {
         let num_parts = self.num_partitions();
         let writers =
             spill.get_or_init_partition_writers(num_parts, "MorselHashJoinBuildSpill");
+        let chunks = std::mem::take(&mut self.mem_chunks);
         for p in 0..num_parts {
             if tx.is_closed() {
                 self.clear_mem_batches();
                 reservation.resize(extra_bytes);
                 return Ok(());
             }
-            let batches = std::mem::take(&mut self.mem_batches[p]);
-            self.mem_part_bytes[p] = 0;
-            if !batches.is_empty() {
-                writers.append_batches(p, &batches)?;
+            if self.part_rows[p] > 0 {
+                let batches: Vec<RecordBatch> =
+                    chunks.iter().filter_map(|c| c.part_slice(p)).collect();
+                if !batches.is_empty() {
+                    writers.append_batches(p, &batches)?;
+                }
             }
+            self.mem_part_bytes[p] = 0;
         }
+        drop(chunks);
         self.total_mem_bytes = 0;
         reservation.resize(extra_bytes);
         Ok(())
     }
 
     fn clear_mem_batches(&mut self) {
-        for v in &mut self.mem_batches {
-            v.clear();
-        }
+        self.mem_chunks.clear();
         self.mem_part_bytes.fill(0);
         self.total_mem_bytes = 0;
     }
@@ -285,8 +308,8 @@ impl RadixBuildStore {
         debug_assert_eq!(self.shift, other.shift);
         self.spilled |= other.spilled;
         self.total_mem_bytes = self.total_mem_bytes.saturating_add(other.total_mem_bytes);
+        self.mem_chunks.append(&mut other.mem_chunks);
         for p in 0..self.num_partitions() {
-            self.mem_batches[p].append(&mut other.mem_batches[p]);
             self.mem_part_bytes[p] =
                 self.mem_part_bytes[p].saturating_add(other.mem_part_bytes[p]);
             self.part_rows[p] = self.part_rows[p].saturating_add(other.part_rows[p]);
