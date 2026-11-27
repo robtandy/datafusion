@@ -26,7 +26,7 @@ ABLATION_CONFIGS: dict[str, list[tuple[str, bool, str, str, dict[str, str]]]] = 
         ("stock_pushdown", False, "off", "pushdown", {}),
         ("morsel_baseline", False, "required", "pushdown", {}),
         (
-            "+msb_nonatomic_bloom (part)",
+            "+radix_nonatomic_bloom (part)",
             True,
             "required",
             "pushdown",
@@ -50,7 +50,7 @@ ABLATION_CONFIGS: dict[str, list[tuple[str, bool, str, str, dict[str, str]]]] = 
             },
         ),
         (
-            "+stats+wave1+msb_bloom",
+            "+stats+wave1+radix_bloom",
             True,
             "required",
             "pushdown",
@@ -63,7 +63,7 @@ ABLATION_CONFIGS: dict[str, list[tuple[str, bool, str, str, dict[str, str]]]] = 
             },
         ),
         (
-            "+stats+wave1+msb+ra2x",
+            "+stats+wave1+radix_bloom+ra2x",
             True,
             "required",
             "pushdown",
