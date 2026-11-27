@@ -892,10 +892,8 @@ impl PhysicalExpr for JoinBloomFilterExpr {
                     BooleanBuffer::collect_bool(num_rows, |i| {
                         n0.is_none_or(|n| n.is_valid(i))
                             && n1.is_none_or(|n| n.is_valid(i))
-                            && filter.might_contain(mix_u64_pair(
-                                to_u64(v0[i]),
-                                to_u64(v1[i]),
-                            ))
+                            && filter
+                                .might_contain(mix_u64_pair(to_u64(v0[i]), to_u64(v1[i])))
                     })
                 };
                 return Ok(ColumnarValue::Array(Arc::new(BooleanArray::new(buf, None))));
@@ -1355,8 +1353,9 @@ mod tests {
         let shift = level0_shift(DEFAULT_RADIX_BITS);
 
         let mut seq = SplitBlockBloomFilter::with_blocks(num_blocks);
-        let mut parts: Vec<Option<Vec<[u32; 8]>>> =
-            (0..num_parts).map(|_| Some(vec![[0u32; 8]; stride])).collect();
+        let mut parts: Vec<Option<Vec<[u32; 8]>>> = (0..num_parts)
+            .map(|_| Some(vec![[0u32; 8]; stride]))
+            .collect();
 
         for k in 0..n as u64 {
             let h = mix_u64(k);
@@ -1370,7 +1369,10 @@ mod tests {
         }
 
         let par = SplitBlockBloomFilter::from_radix_partition_blocks(num_blocks, parts);
-        assert_eq!(seq.blocks, par.blocks, "partitioned Bloom must match bit-for-bit");
+        assert_eq!(
+            seq.blocks, par.blocks,
+            "partitioned Bloom must match bit-for-bit"
+        );
         for k in 0..n as u64 {
             assert!(par.might_contain(mix_u64(k)));
         }
@@ -1407,8 +1409,7 @@ mod tests {
 
         // Extreme i64::MIN..i64::MAX must never overflow span arithmetic.
         let mut extreme = LocalJoinKeySummary::new(1, false);
-        let ext_arr: ArrayRef =
-            Arc::new(Int64Array::from(vec![i64::MIN, 0, i64::MAX]));
+        let ext_arr: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN, 0, i64::MAX]));
         extreme.update(&[ext_arr], None, NullEquality::NullEqualsNothing)?;
         assert!(!extreme.is_saturated_int_domain(3));
         Ok(())

@@ -1054,8 +1054,7 @@ fn bind_pipeline_dynamic_join_filters_with_stages(
             let mut a_bound_any = false;
             let mut a_any_pushdown = false;
 
-            for b_pos in (a_pos + 1)..probe_op_indices.len() {
-                let b = probe_op_indices[b_pos];
+            for (b_pos, &b) in probe_op_indices.iter().enumerate().skip(a_pos + 1) {
                 // Stop if any operator between `a` and `b` can fabricate NULL-padded
                 // probe rows or emit unmatched build rows instead of filtering probe rows.
                 let safe_span = operators[a + 1..b].iter().all(|op| match op {

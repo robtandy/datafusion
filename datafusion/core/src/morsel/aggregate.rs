@@ -5644,7 +5644,9 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                for (&c, &gid) in arr.values()[offset..end].iter().zip(group_indices.iter()) {
+                for (&c, &gid) in
+                    arr.values()[offset..end].iter().zip(group_indices.iter())
+                {
                     counts[gid] =
                         counts[gid].checked_add(c).ok_or_else(count_overflow)?;
                 }
@@ -5701,7 +5703,9 @@ impl DirectAggState {
                             )
                         },
                     )?;
-                    for (&c, &gid) in arr.values()[offset..end].iter().zip(group_indices.iter()) {
+                    for (&c, &gid) in
+                        arr.values()[offset..end].iter().zip(group_indices.iter())
+                    {
                         counts[gid] =
                             counts[gid].checked_add(c).ok_or_else(count_overflow)?;
                     }
@@ -5718,14 +5722,15 @@ impl DirectAggState {
                     sliced = col_ref.slice(offset, len);
                     &sliced
                 };
-                let arr = arr_ref
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Int64 partial sum column"
-                        )
-                    })?;
+                let arr =
+                    arr_ref
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected Int64 partial sum column"
+                            )
+                        })?;
                 update_sum_int64_array(
                     arr,
                     group_indices,
@@ -5772,14 +5777,15 @@ impl DirectAggState {
                     sliced = col_ref.slice(offset, len);
                     &sliced
                 };
-                let arr = arr_ref
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Float64 partial sum column"
-                        )
-                    })?;
+                let arr =
+                    arr_ref
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected Float64 partial sum column"
+                            )
+                        })?;
                 update_sum_float64_array(
                     arr,
                     group_indices,
@@ -5842,7 +5848,8 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid])
+                        {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5873,7 +5880,8 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid])
+                        {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5904,7 +5912,8 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid])
+                        {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5935,7 +5944,8 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid])
+                        {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
