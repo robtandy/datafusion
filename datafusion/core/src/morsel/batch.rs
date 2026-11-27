@@ -555,7 +555,7 @@ impl BatchView {
             return Ok(Self::empty(out_schema));
         }
         if self.is_all() {
-            return Ok(Self::all(projector.project_batch(&self.batch)?));
+            return Ok(Self::all(project_batch_fast(projector, &self.batch)?));
         }
 
         let exprs = projector.projection().as_ref();
@@ -593,12 +593,12 @@ impl BatchView {
             && needed_cols.iter().enumerate().all(|(i, &c)| i == c);
         if is_identity {
             let compact = self.materialize()?;
-            return Ok(Self::all(projector.project_batch(&compact)?));
+            return Ok(Self::all(project_batch_fast(projector, &compact)?));
         }
         let compact = self.materialize_columns(&needed_cols)?;
         let selected_rows = compact.num_rows();
         let mut out_cols = Vec::with_capacity(exprs.len());
-        for proj in exprs {
+        for (i, proj) in exprs.iter().enumerate() {
             if let Some(col) = proj.expr.downcast_ref::<Column>() {
                 let pos = needed_cols.binary_search(&col.index()).map_err(|_| {
                     datafusion_common::internal_datafusion_err!(
@@ -609,7 +609,14 @@ impl BatchView {
                 out_cols.push(Arc::clone(compact.column(pos)));
             } else {
                 let rebound = remap_expr_columns(Arc::clone(&proj.expr), &needed_cols)?;
-                out_cols.push(rebound.evaluate(&compact)?.into_array(selected_rows)?);
+                let out_dt = out_schema.field(i).data_type();
+                if let Some(fast) = super::aggregate::try_eval_fast_decimal128_expr(
+                    &rebound, &compact, out_dt,
+                )? {
+                    out_cols.push(fast);
+                } else {
+                    out_cols.push(rebound.evaluate(&compact)?.into_array(selected_rows)?);
+                }
             }
         }
         let batch = RecordBatch::try_new_with_options(
@@ -859,6 +866,42 @@ fn materialize_batch_with_selection(
             Ok(RecordBatch::try_new(batch.schema(), cols)?)
         }
     }
+}
+
+fn project_batch_fast(projector: &Projector, batch: &RecordBatch) -> Result<RecordBatch> {
+    let out_schema = projector.output_schema();
+    let exprs = projector.projection().as_ref();
+    let has_decimal_expr = exprs.iter().enumerate().any(|(i, proj)| {
+        proj.expr.downcast_ref::<Column>().is_none()
+            && matches!(
+                out_schema.field(i).data_type(),
+                arrow::datatypes::DataType::Decimal128(_, _)
+            )
+    });
+    if !has_decimal_expr {
+        return projector.project_batch(batch);
+    }
+    let num_rows = batch.num_rows();
+    let mut out_cols = Vec::with_capacity(exprs.len());
+    for (i, proj) in exprs.iter().enumerate() {
+        if let Some(col) = proj.expr.downcast_ref::<Column>() {
+            out_cols.push(Arc::clone(batch.column(col.index())));
+        } else {
+            let out_dt = out_schema.field(i).data_type();
+            if let Some(fast) = super::aggregate::try_eval_fast_decimal128_expr(
+                &proj.expr, batch, out_dt,
+            )? {
+                out_cols.push(fast);
+            } else {
+                out_cols.push(proj.expr.evaluate(batch)?.into_array(num_rows)?);
+            }
+        }
+    }
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(out_schema),
+        out_cols,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?)
 }
 
 pub(super) fn is_pure_column_projection(projector: &Projector) -> bool {
