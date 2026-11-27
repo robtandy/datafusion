@@ -4586,3 +4586,344 @@ async fn chained_double_short_circuit_skips_earlier_build_emission() -> Result<(
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> Result<()>
+{
+    // Q14-like schema: large `fact` (30,000 rows, shipdate 0..1000) joined with
+    // unfiltered `dim` (10,000 rows with wide string `ptype`). A 1% shipdate window
+    // (300 rows) must beat `dim` (10,000 rows) using Parquet footer column stats,
+    // building on filtered `fact` and pushing dynamic filters onto `dim`.
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("partkey", DataType::Int64, false),
+        Field::new("shipdate", DataType::Int32, false),
+        Field::new("extprice", DataType::Int64, false),
+        Field::new("discount", DataType::Int64, false),
+        Field::new("pad1", DataType::Utf8, false),
+    ]));
+    let fact_batch = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..30_000i64).map(|i| (i * 17) % 10_000),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..30_000i32).map(|i| i % 1000),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..30_000i64)),
+            Arc::new(Int64Array::from_iter_values((0..30_000i64).map(|i| i % 10))),
+            Arc::new(StringArray::from_iter_values(
+                (0..30_000i64).map(|i| format!("fact-padding-value-{i:08}")),
+            )),
+        ],
+    )?;
+    let fact_dir = write_parquet_files(&[fact_batch], 2, 5_000)?;
+
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_type", DataType::Utf8, false),
+    ]));
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..10_000i64)),
+            Arc::new(StringArray::from_iter_values((0..10_000i64).map(|i| {
+                if i % 5 == 0 {
+                    format!("PROMO STEEL {i:06}")
+                } else {
+                    format!("STANDARD BRASS {i:06}")
+                }
+            }))),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 2, 2_500)?;
+
+    let make_ctx = |mode: &str| {
+        let fp = fact_dir.path().to_str().unwrap().to_owned();
+        let dp = dim_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("fact", &fp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim", &dp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+
+    let q14_like = "SELECT SUM(CASE WHEN d.p_type LIKE 'PROMO%' THEN f.extprice * (100 - f.discount) ELSE 0 END), \
+                           SUM(f.extprice * (100 - f.discount)) \
+                    FROM fact f INNER JOIN dim d ON f.partkey = d.p_partkey \
+                    WHERE f.shipdate >= 100 AND f.shipdate < 110";
+    let (plan, _) = assert_native_parity(&stock, &native, q14_like).await?;
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    // Filtered `fact` (300 rows) must be chosen as the build side, probing `dim`.
+    assert!(
+        plan_str.contains("Build: NativeParquet[fact"),
+        "expected filtered `fact` on build side, got:\n{plan_str}"
+    );
+    assert!(
+        metric(plan.as_ref(), "join_dynamic_filters_pushed") > 0,
+        "expected dynamic join filter pushed from filtered `fact` onto `dim`"
+    );
+
+    // Non-interval predicate (`Utf8` equality) on `dim` must still fall back cleanly
+    // to `pipeline_filter_shift` and match Stock exactly.
+    let string_filter_sql = "SELECT COUNT(*), SUM(f.extprice) \
+                             FROM fact f INNER JOIN dim d ON f.partkey = d.p_partkey \
+                             WHERE d.p_type = 'PROMO STEEL 000010'";
+    assert_native_parity(&stock, &native, string_filter_sql).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transitive_equijoin_key_substitution_across_build_semi_and_inner() -> Result<()>
+{
+    // Q20-like 3-table topology:
+    //   `lineitem` (20,000 rows) -> GROUP BY (l_partkey, l_suppkey)
+    //     -> BuildSemi with `partsupp` (4,000 rows, residual `ps_availqty > 0.5 * sum_qty`)
+    //     -> Inner/Semi with selective `supplier` (20 rows out of 500 keys = 4%)
+    // Equijoin substitution across `BuildSemi` must propagate `supplier.s_suppkey`
+    // dynamic filters all the way into `lineitem` (`stage_0`).
+    let li_schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int64, true),
+        Field::new("l_suppkey", DataType::Int64, true),
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_shipdate", DataType::Int32, false),
+    ]));
+    let li_batch = RecordBatch::try_new(
+        Arc::clone(&li_schema),
+        vec![
+            Arc::new(Int64Array::from_iter((0..20_000i64).map(|i| {
+                if i % 97 == 0 {
+                    None
+                } else {
+                    Some((i * 13) % 400)
+                }
+            }))),
+            Arc::new(Int64Array::from_iter((0..20_000i64).map(|i| {
+                if i % 89 == 0 {
+                    None
+                } else {
+                    Some((i * 7) % 500)
+                }
+            }))),
+            Arc::new(Int64Array::from_iter_values(
+                (0..20_000i64).map(|i| 1 + (i % 20)),
+            )),
+            Arc::new(Int32Array::from_iter_values((0..20_000i32).map(|i| i % 10))),
+        ],
+    )?;
+    let li_dir = write_parquet_files(&[li_batch], 2, 5_000)?;
+
+    let ps_schema = Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, true),
+        Field::new("ps_suppkey", DataType::Int64, true),
+        Field::new("ps_availqty", DataType::Int64, false),
+    ]));
+    let ps_batch = RecordBatch::try_new(
+        Arc::clone(&ps_schema),
+        vec![
+            Arc::new(Int64Array::from_iter(
+                (0..4_000i64).map(|i| if i % 101 == 0 { None } else { Some(i % 400) }),
+            )),
+            Arc::new(Int64Array::from_iter((0..4_000i64).map(|i| {
+                if i % 83 == 0 {
+                    None
+                } else {
+                    Some((i * 11) % 500)
+                }
+            }))),
+            Arc::new(Int64Array::from_iter_values(
+                (0..4_000i64).map(|i| (i % 40) * 5),
+            )),
+        ],
+    )?;
+    let ps_dir = write_parquet_files(&[ps_batch], 2, 1_000)?;
+
+    let sup_schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, true),
+        Field::new("s_nation", DataType::Int32, false),
+        Field::new("s_name", DataType::Utf8, false),
+    ]));
+    let sup_batch = RecordBatch::try_new(
+        Arc::clone(&sup_schema),
+        vec![
+            Arc::new(Int64Array::from_iter(
+                (0..500i64).map(|i| if i == 0 { None } else { Some(i) }),
+            )),
+            Arc::new(Int32Array::from_iter_values((0..500i32).map(|i| i % 25))),
+            Arc::new(StringArray::from_iter_values(
+                (0..500i64).map(|i| format!("Supplier#{i:04}")),
+            )),
+        ],
+    )?;
+    let sup_dir = write_parquet_files(&[sup_batch], 1, 500)?;
+
+    let make_ctx = |mode: &str| {
+        let lp = li_dir.path().to_str().unwrap().to_owned();
+        let pp = ps_dir.path().to_str().unwrap().to_owned();
+        let sp = sup_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("li", &lp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("ps", &pp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("sup", &sp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+
+    // Q20-shaped query with BuildSemi + residual filter + downstream selective supplier join.
+    let q20_like = "SELECT s.s_name \
+                    FROM sup s \
+                    WHERE s.s_nation = 3 \
+                      AND s.s_suppkey IN ( \
+                        SELECT ps.ps_suppkey \
+                        FROM ps \
+                        WHERE ps.ps_availqty > ( \
+                            SELECT SUM(l.l_quantity) \
+                            FROM li l \
+                            WHERE l.l_partkey = ps.ps_partkey \
+                              AND l.l_suppkey = ps.ps_suppkey \
+                              AND l.l_shipdate >= 2 AND l.l_shipdate < 7 \
+                        ) \
+                      ) \
+                    ORDER BY s.s_name";
+    let (plan, _) = assert_native_parity(&stock, &native, q20_like).await?;
+    // Dynamic filters pushed must include both `ps` composite filter AND `sup`'s
+    // transitively substituted `s_suppkey` filter into `li` (total >= 8).
+    let dyn_pushed = metric(plan.as_ref(), "join_dynamic_filters_pushed");
+    assert!(
+        dyn_pushed >= 8,
+        "expected transitive s_suppkey dynamic filter pushdown across BuildSemi (>= 8), got {dyn_pushed}"
+    );
+
+    // Negative soundness checks: BuildOuter, FullOuter, BuildAnti, and NullEqualsNull
+    // chains must never corrupt unmatched or NULL-matching rows.
+    let soundness_queries = [
+        "SELECT COUNT(*), SUM(s.s_suppkey) \
+         FROM (SELECT ps_partkey, ps_suppkey FROM ps WHERE ps_availqty > 100) ps \
+         LEFT JOIN (SELECT l_partkey, l_suppkey FROM li WHERE l_shipdate < 3) l \
+           ON ps.ps_partkey = l.l_partkey AND ps.ps_suppkey = l.l_suppkey \
+         INNER JOIN (SELECT s_suppkey FROM sup WHERE s_nation = 3) s \
+           ON ps.ps_suppkey = s.s_suppkey",
+        "SELECT COUNT(*) \
+         FROM sup s \
+         WHERE s.s_nation = 3 \
+           AND s.s_suppkey IN ( \
+             SELECT ps.ps_suppkey FROM ps \
+             WHERE NOT EXISTS ( \
+               SELECT 1 FROM li l \
+               WHERE l.l_partkey = ps.ps_partkey AND l.l_suppkey = ps.ps_suppkey \
+                 AND l.l_shipdate < 3 \
+             ) \
+           )",
+        "SELECT COUNT(*) \
+         FROM (SELECT ps_partkey, ps_suppkey FROM ps) ps \
+         INNER JOIN (SELECT l_partkey, l_suppkey FROM li WHERE l_shipdate < 3) l \
+           ON ps.ps_partkey IS NOT DISTINCT FROM l.l_partkey \
+          AND ps.ps_suppkey IS NOT DISTINCT FROM l.l_suppkey \
+         INNER JOIN (SELECT s_suppkey FROM sup WHERE s_nation = 0) s \
+           ON ps.ps_suppkey IS NOT DISTINCT FROM s.s_suppkey",
+    ];
+    for sql in soundness_queries {
+        assert_native_parity(&stock, &native, sql).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_range_filter_preserved_alongside_dynamic_bloom_on_same_column()
+-> Result<()> {
+    // Both a static user range filter (`f.k >= 100 AND f.k <= 200`) AND a wider
+    // dynamic join Bloom filter (`dim.dk` in `50..=250`, skipping every 3rd key so
+    // Bloom is active and NOT domain-saturated) target the exact same column `f.k`.
+    // Omitting redundant dynamic `[50, 250]` bounds from `RowFilter` MUST NEVER drop
+    // the static `[100, 200]` bounds!
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("pad", DataType::Utf8, false),
+    ]));
+    let fact_batch = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..12_000i64).map(|i| i % 500),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..12_000i64)),
+            Arc::new(StringArray::from_iter_values(
+                (0..12_000i64).map(|i| format!("payload-{i:08}")),
+            )),
+        ],
+    )?;
+    let fact_dir = write_parquet_files(&[fact_batch], 2, 3_000)?;
+
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, false),
+        Field::new("keep", DataType::Int64, false),
+    ]));
+    // 200 distinct keys in 50..=647 (step 3 -> sparse, not saturated, > InList cap 150 -> Bloom!)
+    let dim_batch = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..400i64).map(|i| 50 + (i % 200) * 3),
+            )),
+            Arc::new(Int64Array::from_iter_values((0..400i64).map(|i| i % 2))),
+        ],
+    )?;
+    let dim_dir = write_parquet_files(&[dim_batch], 1, 400)?;
+
+    let make_ctx = |mode: &str| {
+        let fp = fact_dir.path().to_str().unwrap().to_owned();
+        let dp = dim_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("fact", &fp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("dim", &dp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+
+    let sql = "SELECT COUNT(*), MIN(f.k), MAX(f.k), SUM(f.v) \
+               FROM fact f INNER JOIN dim d ON f.k = d.dk \
+               WHERE d.keep = 1 AND f.k >= 100 AND f.k <= 200";
+    assert_native_parity(&stock, &native, sql).await?;
+    Ok(())
+}
