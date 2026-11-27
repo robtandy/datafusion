@@ -686,6 +686,13 @@ pub(super) struct JoinBloomFilterExpr {
 }
 
 #[cfg(any(feature = "parquet", test))]
+impl JoinBloomFilterExpr {
+    pub(super) fn filter_memory_bytes(&self) -> usize {
+        self.filter.memory_bytes()
+    }
+}
+
+#[cfg(any(feature = "parquet", test))]
 impl PartialEq for JoinBloomFilterExpr {
     fn eq(&self, other: &Self) -> bool {
         self.key_kind == other.key_kind

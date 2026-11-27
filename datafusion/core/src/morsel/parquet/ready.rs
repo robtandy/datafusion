@@ -10,12 +10,14 @@ use datafusion_physical_plan::metrics::Count;
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
+use super::BulkFilterPlan;
 use super::RunMetrics;
 
 pub(super) fn channel(
     capacity: usize,
     measurement: Option<Arc<RunMetrics>>,
     claimed: Count,
+    bulk_filter: Option<Arc<BulkFilterPlan>>,
 ) -> (Publisher, Phase2Queue, ReadyReaders) {
     let queue = Arc::new(Queue {
         inner: Mutex::new(QueueInner {
@@ -29,6 +31,7 @@ pub(super) fn channel(
         phase2_available: Semaphore::new(0),
         measurement,
         claimed,
+        bulk_filter,
     });
     (
         Publisher(Arc::clone(&queue)),
@@ -53,6 +56,7 @@ struct Queue {
     phase2_available: Semaphore,
     measurement: Option<Arc<RunMetrics>>,
     claimed: Count,
+    bulk_filter: Option<Arc<BulkFilterPlan>>,
 }
 
 impl Queue {
@@ -258,6 +262,10 @@ impl Phase2Queue {
 pub(in crate::morsel) struct ReadyReaders(Arc<Queue>);
 
 impl ReadyReaders {
+    pub(in crate::morsel) fn bulk_filter(&self) -> Option<&Arc<BulkFilterPlan>> {
+        self.0.bulk_filter.as_ref()
+    }
+
     pub(in crate::morsel) async fn claim(&self) -> Option<ClaimedWork> {
         if let Ok(item) = self.0.available.acquire().await {
             item.forget();

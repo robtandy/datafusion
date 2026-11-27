@@ -54,6 +54,7 @@ use tokio::sync::mpsc;
 use crate::datasource::MemTable;
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
+mod adaptive_filter;
 mod aggregate;
 mod batch;
 mod count;
@@ -72,6 +73,9 @@ mod radix_join;
 mod sort;
 mod spill;
 
+#[cfg(feature = "parquet")]
+use adaptive_filter::CompiledFilter;
+use adaptive_filter::WorkerFilterState;
 use aggregate::{AggregateSink, AggregateState, FinalizedAggregate};
 use batch::{BatchView, Selection, is_pure_column_projection};
 use count::{CountSink, CountState, FinalizedCount};
@@ -81,6 +85,8 @@ use dag::{
     DagRuntime, MaterializedStage, ScalarSubqueryState, StageSource, StageSpec,
     collect_stage_seed_buffers, ensure_stage, validate_dag,
 };
+#[cfg(feature = "parquet")]
+use datafusion_datasource_parquet::{RgProbeHandle, capture_rg_handle};
 #[cfg(test)]
 use group_count::IntKeyType;
 use group_count::{FinalizedGroupCounts, GroupCountSink, GroupCountState};
@@ -600,17 +606,23 @@ fn filter_batch(
     }
 }
 
-fn apply_operators_view(
+fn apply_operators_view(operators: &[Operator], view: BatchView) -> Result<BatchView> {
+    let mut filters = WorkerFilterState::default();
+    apply_operators_view_with_filters(operators, view, &mut filters)
+}
+
+fn apply_operators_view_with_filters(
     operators: &[Operator],
     mut view: BatchView,
+    filters: &mut WorkerFilterState,
 ) -> Result<BatchView> {
-    for operator in operators {
+    for (idx, operator) in operators.iter().enumerate() {
         view = match operator {
             Operator::Filter {
                 predicate,
                 projection,
             } => {
-                let filtered = view.filter(predicate)?;
+                let filtered = filters.evaluate_view(idx, predicate, view)?;
                 match projection {
                     Some(columns) => filtered.project_columns(columns)?,
                     None => filtered,
@@ -679,6 +691,7 @@ struct ResultBuffer {
     is_pure_projection: Vec<bool>,
     filter_schemas: Vec<Option<SchemaRef>>,
     narrow_projectors: Vec<NarrowProjectorCache>,
+    filters: WorkerFilterState,
     output: Option<RecordBatch>,
     next_to_finish: usize,
 }
@@ -713,6 +726,7 @@ impl ResultBuffer {
             })
             .take(op_cache_len)
             .collect(),
+            filters: WorkerFilterState::default(),
             output: None,
             next_to_finish: 0,
         }
@@ -829,7 +843,7 @@ impl ResultBuffer {
                     predicate,
                     projection,
                 } => {
-                    view = view.filter(predicate)?;
+                    view = self.filters.evaluate_view(index, predicate, view)?;
                     if let Some(columns) = projection {
                         let schema = match &self.filter_schemas[index] {
                             Some(s) => Arc::clone(s),
@@ -1272,6 +1286,7 @@ struct JoinWorkerState {
     probe_spill_env: Option<ProbeSpillEnv>,
     scratch: ProbeScratch,
     probe_reservation: MemoryReservation,
+    filters: WorkerFilterState,
 }
 
 impl JoinWorkerState {
@@ -1295,6 +1310,7 @@ impl JoinWorkerState {
             probe_spill_env,
             scratch: ProbeScratch::default(),
             probe_reservation,
+            filters: WorkerFilterState::default(),
         }
     }
 
@@ -1703,6 +1719,7 @@ impl Pipeline {
         let mut join_state = join_context.map(|jc| {
             JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
         });
+        let mut filters = WorkerFilterState::default();
         let tx = &output.tx;
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
@@ -1727,7 +1744,14 @@ impl Pipeline {
                     )
                     .await?
                 } else {
-                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                    self.consume_view(
+                        BatchView::all(batch),
+                        tx,
+                        &mut sink,
+                        &mut filters,
+                        &mut worker,
+                    )
+                    .await?
                 };
                 if !cont {
                     return Ok(WorkerState::None);
@@ -1760,6 +1784,7 @@ impl Pipeline {
         let mut join_state = join_context.map(|jc| {
             JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
         });
+        let mut filters = WorkerFilterState::default();
         let tx = &output.tx;
         let stride = if sequential {
             batches.len().max(1)
@@ -1789,7 +1814,14 @@ impl Pipeline {
                     )
                     .await?
                 } else {
-                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                    self.consume_view(
+                        BatchView::all(batch),
+                        tx,
+                        &mut sink,
+                        &mut filters,
+                        &mut worker,
+                    )
+                    .await?
                 };
                 if !cont {
                     return Ok(WorkerState::None);
@@ -1819,6 +1851,13 @@ impl Pipeline {
         let mut sink = self.worker_sink(output.batch_size, sink_memory)?;
         let mut join_state = join_context.map(|jc| {
             JoinWorkerState::new(jc.tables, jc.probe_reservation, jc.probe_spill_env)
+        });
+        let mut filters = WorkerFilterState::default();
+        let bulk_plan = ready.bulk_filter().cloned();
+        let mut bulk_adaptive = bulk_plan.as_ref().and_then(|plan| {
+            plan.compiled_filter
+                .as_ref()
+                .map(CompiledFilter::new_worker_state)
         });
         let tx = &output.tx;
         while let Some(claimed) = worker.ready(ready.claim()).await {
@@ -1867,15 +1906,67 @@ impl Pipeline {
                     }
                 }
             };
-            let mut reader = worker.decode(|| morsel.into_stream());
-            while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
+            let (mut reader, rg_handle) =
+                worker.decode(|| capture_rg_handle(|| morsel.into_stream()));
+            let is_bulk = rg_handle.as_ref().is_some_and(RgProbeHandle::is_bulk);
+            if is_bulk && bulk_plan.is_none() {
+                return internal_err!(
+                    "BulkDecode Parquet morsel received without a BulkFilterPlan"
+                );
+            }
+            let track_cpu = rg_handle
+                .as_ref()
+                .is_some_and(RgProbeHandle::needs_worker_timing);
+            let mut rg_cpu_ns: u64 = 0;
+            while let Some(batch) = {
+                let dec_start = track_cpu.then(Instant::now);
+                let next = metrics::decode(&mut worker, reader.next()).await;
+                if let Some(t0) = dec_start {
+                    rg_cpu_ns = rg_cpu_ns.saturating_add(t0.elapsed().as_nanos() as u64);
+                }
+                next
+            } {
                 if tx.is_closed() {
                     return Ok(WorkerState::None);
                 }
                 let batch = batch?;
+                let proc_start = track_cpu.then(Instant::now);
+                let view = if is_bulk {
+                    let Some(plan) = &bulk_plan else {
+                        return internal_err!(
+                            "BulkDecode Parquet morsel received without a BulkFilterPlan"
+                        );
+                    };
+                    worker.process(|| -> Result<BatchView> {
+                        let mut view = BatchView::all(batch);
+                        if let (Some(compiled), Some(adaptive)) =
+                            (&plan.compiled_filter, bulk_adaptive.as_mut())
+                        {
+                            view = compiled.evaluate_view(view, adaptive)?;
+                        }
+                        if let Some(cols) = &plan.bulk_to_output {
+                            view = view.project_columns_with_schema(
+                                cols,
+                                Arc::clone(&plan.output_schema),
+                            )?;
+                        }
+                        Ok(view)
+                    })?
+                } else {
+                    BatchView::all(batch)
+                };
+                if view.is_empty() {
+                    if let Some(t0) = proc_start {
+                        rg_cpu_ns =
+                            rg_cpu_ns.saturating_add(t0.elapsed().as_nanos() as u64);
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 let cont = if let Some(js) = join_state.as_mut() {
-                    self.consume_with_joins(
-                        batch,
+                    self.consume_view_with_joins_from(
+                        0,
+                        view,
                         tx,
                         output.batch_size,
                         &mut sink,
@@ -1884,12 +1975,19 @@ impl Pipeline {
                     )
                     .await?
                 } else {
-                    self.consume(batch, tx, &mut sink, &mut worker).await?
+                    self.consume_view(view, tx, &mut sink, &mut filters, &mut worker)
+                        .await?
                 };
+                if let Some(t0) = proc_start {
+                    rg_cpu_ns = rg_cpu_ns.saturating_add(t0.elapsed().as_nanos() as u64);
+                }
                 if !cont {
                     return Ok(WorkerState::None);
                 }
                 tokio::task::yield_now().await;
+            }
+            if let Some(handle) = rg_handle {
+                handle.finish(rg_cpu_ns);
             }
             worker.complete();
             tokio::task::yield_now().await;
@@ -1915,7 +2013,7 @@ impl Pipeline {
                     predicate,
                     projection,
                 } => {
-                    view = view.filter(predicate)?;
+                    view = join_state.filters.evaluate_view(idx, predicate, view)?;
                     if let Some(columns) = projection {
                         view = view.project_columns(columns)?;
                     }
@@ -2055,15 +2153,32 @@ impl Pipeline {
         join_state: &mut JoinWorkerState,
         worker: &mut WorkerMetrics,
     ) -> Result<bool> {
+        self.consume_view_with_joins_from(
+            start_op,
+            BatchView::all(batch),
+            tx,
+            batch_size,
+            sink,
+            join_state,
+            worker,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn consume_view_with_joins_from(
+        &self,
+        start_op: usize,
+        view: BatchView,
+        tx: &mpsc::Sender<RecordBatch>,
+        batch_size: usize,
+        sink: &mut WorkerSink,
+        join_state: &mut JoinWorkerState,
+        worker: &mut WorkerMetrics,
+    ) -> Result<bool> {
         let mut frames: Vec<(usize, ProbeCursor)> = Vec::new();
         let mut produced = worker.process(|| {
-            self.advance_join_chain(
-                start_op,
-                BatchView::all(batch),
-                join_state,
-                &mut frames,
-                batch_size,
-            )
+            self.advance_join_chain(start_op, view, join_state, &mut frames, batch_size)
         })?;
         loop {
             if let Some(out) = produced
@@ -2112,22 +2227,27 @@ impl Pipeline {
         }
     }
 
-    async fn consume(
+    async fn consume_view(
         &self,
-        batch: RecordBatch,
+        view: BatchView,
         tx: &mpsc::Sender<RecordBatch>,
         sink: &mut WorkerSink,
+        filters: &mut WorkerFilterState,
         worker: &mut WorkerMetrics,
     ) -> Result<bool> {
         match sink {
             WorkerSink::Count(local) => worker.process(|| {
                 let rows = match self.count_strategy() {
-                    CountStrategy::DirectRows => batch.num_rows(),
+                    CountStrategy::DirectRows => view.num_rows(),
                     CountStrategy::DirectMask(predicate) => {
-                        count::count_filtered_rows(&batch, predicate)?
+                        if view.is_all() {
+                            filters.count_filtered_rows(0, predicate, view.batch())?
+                        } else {
+                            filters.evaluate_view(0, predicate, view)?.num_rows()
+                        }
                     }
                     CountStrategy::General => {
-                        apply_operators_view(&self.operators, BatchView::all(batch))?
+                        apply_operators_view_with_filters(&self.operators, view, filters)?
                             .num_rows()
                     }
                 };
@@ -2141,20 +2261,45 @@ impl Pipeline {
                 worker.process(|| {
                     match self.group_count_strategy(sink.key_index) {
                         GroupCountStrategy::DirectColumn(col_index) => {
-                            local.add_column_spillable(batch.column(col_index), tx)?;
+                            if view.is_all() {
+                                local.add_column_spillable(
+                                    view.batch().column(col_index),
+                                    tx,
+                                )?;
+                            } else if !view.is_empty() {
+                                local.add_view_spillable(&view, col_index, tx)?;
+                            }
                         }
                         GroupCountStrategy::DirectMask {
                             predicate,
                             key_index,
                         } => {
-                            local.add_filtered_batch_spillable(
-                                &batch, predicate, key_index, tx,
-                            )?;
+                            if view.is_all()
+                                && !filters.is_multi_conjunct(
+                                    0,
+                                    predicate,
+                                    view.batch().schema().as_ref(),
+                                )?
+                            {
+                                local.add_filtered_batch_spillable(
+                                    view.batch(),
+                                    predicate,
+                                    key_index,
+                                    tx,
+                                )?;
+                            } else {
+                                let filtered =
+                                    filters.evaluate_view(0, predicate, view)?;
+                                if !filtered.is_empty() {
+                                    local.add_view_spillable(&filtered, key_index, tx)?;
+                                }
+                            }
                         }
                         GroupCountStrategy::General(col_index) => {
-                            let view = apply_operators_view(
+                            let view = apply_operators_view_with_filters(
                                 &self.operators,
-                                BatchView::all(batch),
+                                view,
+                                filters,
                             )?;
                             if !view.is_empty() {
                                 local.add_view_spillable(&view, col_index, tx)?;
@@ -2165,7 +2310,8 @@ impl Pipeline {
                 })
             }
             WorkerSink::Aggregate(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                let view =
+                    apply_operators_view_with_filters(&self.operators, view, filters)?;
                 if !view.is_empty() {
                     local.add_view_spillable(&view, tx)?;
                 }
@@ -2173,7 +2319,7 @@ impl Pipeline {
             }),
             WorkerSink::TopN(local) => {
                 let view = worker.process(|| {
-                    apply_operators_view(&self.operators, BatchView::all(batch))
+                    apply_operators_view_with_filters(&self.operators, view, filters)
                 })?;
                 if !view.is_empty() {
                     worker
@@ -2184,7 +2330,7 @@ impl Pipeline {
             }
             WorkerSink::Sort(local) => {
                 let view = worker.process(|| {
-                    apply_operators_view(&self.operators, BatchView::all(batch))
+                    apply_operators_view_with_filters(&self.operators, view, filters)
                 })?;
                 if !view.is_empty() {
                     worker.process_async(local.add_view_async(view, tx)).await?;
@@ -2192,7 +2338,8 @@ impl Pipeline {
                 Ok(true)
             }
             WorkerSink::HashJoinBuild(local) => worker.process(|| {
-                let view = apply_operators_view(&self.operators, BatchView::all(batch))?;
+                let view =
+                    apply_operators_view_with_filters(&self.operators, view, filters)?;
                 if !view.is_empty() {
                     local.add_view_spillable(&view, tx)?;
                 }
@@ -2200,7 +2347,11 @@ impl Pipeline {
             }),
             WorkerSink::Result(buffer) => {
                 let mut output = worker.process(|| {
-                    buffer.push_input(&self.operators, batch)?;
+                    if view.is_all() {
+                        buffer.push_input(&self.operators, view.into_parts().0)?;
+                    } else {
+                        buffer.push_view(&self.operators, view)?;
+                    }
                     buffer.next(&self.operators, false)
                 })?;
                 while let Some(batch) = output {
@@ -3619,6 +3770,7 @@ impl Pipeline {
                         build_pipeline.workers,
                         measurement,
                         published_filters,
+                        true,
                     )?;
                     for id in 0..build_pipeline.workers.get() {
                         let (pipeline, ready, output) = (
@@ -4651,6 +4803,7 @@ impl Pipeline {
                         self.workers,
                         measurement,
                         &published_filters,
+                        !self.has_join(),
                     )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =

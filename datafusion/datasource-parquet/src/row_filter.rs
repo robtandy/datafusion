@@ -552,8 +552,10 @@ pub fn build_row_filter(
 #[derive(Clone, Debug)]
 pub(crate) struct PrebuiltRowFilterCandidate {
     /// Ordered predicate expressions with all `Column` indices rewritten to
-    /// point into the projected file schema.
+    /// point into `projected_schema`.
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// Projected file schema matching `physical_exprs` column indices.
+    projected_schema: SchemaRef,
     /// Projection mask over the parquet leaf columns needed to evaluate this
     /// predicate.
     projection_mask: ProjectionMask,
@@ -572,6 +574,22 @@ pub(crate) struct PrebuiltRowFilterCandidate {
 impl PrebuiltRowFilterCandidate {
     pub(crate) fn reads_leaf(&self, leaf_idx: usize) -> bool {
         self.projection_mask.leaf_included(leaf_idx)
+    }
+
+    pub(crate) fn physical_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.physical_exprs
+    }
+
+    pub(crate) fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
+    pub(crate) fn required_bytes(&self) -> usize {
+        self.required_bytes
+    }
+
+    pub(crate) fn has_fallible(&self) -> bool {
+        self.has_fallible
     }
 }
 
@@ -698,33 +716,42 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
 
     let candidates = if group_same_column && candidates.len() > 1 {
         let mut grouped: Vec<FilterCandidate> = Vec::with_capacity(candidates.len());
+        let mut last_fallible_idx: Option<usize> = None;
         for mut cand in candidates {
+            let cand_infallible = cand.last_is_infallible;
             let same_leaves = |g: &FilterCandidate, c: &FilterCandidate| {
                 !c.leaf_indices.is_empty()
                     && g.leaf_indices == c.leaf_indices
                     && g.read_plan.projected_schema == c.read_plan.projected_schema
             };
-            // Only merge into an earlier non-adjacent group when `cand` is
-            // infallible; never move a potentially-fallible conjunct (e.g.
-            // `CAST`, division, or dynamic expression key) ahead of an
-            // intervening guard on another column.
-            let target = if cand.last_is_infallible {
-                grouped.iter_mut().find(|g| same_leaves(g, &cand))
+            // Never cross a fallible barrier in either direction:
+            // - A potentially-fallible conjunct only merges into the immediately
+            //   preceding group (never jumps ahead of an intervening guard).
+            // - A later infallible conjunct only searches groups *after* the
+            //   most recent fallible candidate so Mode A (RowFilter) and Mode B
+            //   (BulkDecode) evaluate the exact same conjuncts before every
+            //   fallible expression.
+            let target = if cand_infallible {
+                let start = last_fallible_idx.map_or(0, |i| i + 1);
+                grouped[start..].iter_mut().find(|g| same_leaves(g, &cand))
             } else {
                 grouped.last_mut().filter(|g| same_leaves(g, &cand))
             };
             if let Some(existing) = target {
                 let next_expr = cand.exprs.pop().expect("non-empty candidate exprs");
-                if existing.last_is_infallible && cand.last_is_infallible {
+                if existing.last_is_infallible && cand_infallible {
                     let tail =
                         existing.exprs.last_mut().expect("non-empty grouped exprs");
                     *tail = conjunction([Arc::clone(tail), next_expr]);
                 } else {
                     existing.exprs.push(next_expr);
-                    existing.last_is_infallible = cand.last_is_infallible;
+                    existing.last_is_infallible = cand_infallible;
                 }
             } else {
                 grouped.push(cand);
+            }
+            if !cand_infallible {
+                last_fallible_idx = Some(grouped.len() - 1);
             }
         }
         grouped
@@ -746,6 +773,7 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
                 .collect::<Result<Vec<_>>>()?;
             Ok(PrebuiltRowFilterCandidate {
                 physical_exprs,
+                projected_schema: candidate.read_plan.projected_schema,
                 projection_mask: candidate.read_plan.projection_mask.clone(),
                 required_bytes: candidate.required_bytes,
                 has_fallible,
@@ -765,10 +793,6 @@ pub(crate) fn row_filter_from_prebuilt(
     reorder_predicates: bool,
     file_metrics: &ParquetFileMetrics,
 ) -> RowFilter {
-    let rows_pruned = &file_metrics.pushdown_rows_pruned;
-    let rows_matched = &file_metrics.pushdown_rows_matched;
-    let time = &file_metrics.row_pushdown_eval_time;
-
     // Clone (cheap: Arc bumps + ProjectionMask clone) into a working list we
     // can sort without disturbing the shared cache.
     let mut ordered: Vec<&PrebuiltRowFilterCandidate> = prebuilt.iter().collect();
@@ -787,6 +811,28 @@ pub(crate) fn row_filter_from_prebuilt(
         }
     }
 
+    row_filter_from_ordered(ordered, file_metrics)
+}
+
+/// Wrap prebuilt candidates into a fresh [`RowFilter`] in an explicit caller-provided
+/// `permutation` order (used by the native buffered morsel adaptive filter path).
+pub(crate) fn row_filter_from_prebuilt_with_order(
+    prebuilt: &[PrebuiltRowFilterCandidate],
+    permutation: &[usize],
+    file_metrics: &ParquetFileMetrics,
+) -> RowFilter {
+    let ordered: Vec<&PrebuiltRowFilterCandidate> =
+        permutation.iter().map(|&idx| &prebuilt[idx]).collect();
+    row_filter_from_ordered(ordered, file_metrics)
+}
+
+fn row_filter_from_ordered(
+    ordered: Vec<&PrebuiltRowFilterCandidate>,
+    file_metrics: &ParquetFileMetrics,
+) -> RowFilter {
+    let rows_pruned = &file_metrics.pushdown_rows_pruned;
+    let rows_matched = &file_metrics.pushdown_rows_matched;
+    let time = &file_metrics.row_pushdown_eval_time;
     let total = ordered.len();
     let filters: Vec<Box<dyn ArrowPredicate>> = ordered
         .into_iter()
@@ -2618,5 +2664,64 @@ mod test {
         assert!(!guard_grouped[0].has_fallible);
         assert!(!guard_grouped[1].has_fallible);
         assert!(guard_grouped[2].has_fallible);
+    }
+
+    #[test]
+    fn test_group_same_column_does_not_move_trailing_infallible_ahead_of_fallible() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 5, 12, 3])),
+                Arc::new(Int32Array::from(vec![5, 5, 0, 5])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // `a > 1 AND 100 / b > 3 AND a < 10`: the trailing infallible `a < 10`
+        // shares leaf 0 with `a > 1` but MUST NOT be merged ahead of the
+        // intervening fallible `100 / b > 3`.
+        let expr = col("a")
+            .gt(lit(1i32))
+            .and((lit(100i32) / col("b")).gt(lit(3i32)))
+            .and(col("a").lt(lit(10i32)));
+        let phys = logical2physical(&expr, &file_schema);
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            grouped.len(),
+            3,
+            "trailing `a < 10` must stay after fallible `100 / b > 3`"
+        );
+        assert!(grouped[0].reads_leaf(0));
+        assert!(!grouped[0].has_fallible);
+        assert!(grouped[1].reads_leaf(1));
+        assert!(grouped[1].has_fallible);
+        assert!(grouped[2].reads_leaf(0));
+        assert!(!grouped[2].has_fallible);
     }
 }

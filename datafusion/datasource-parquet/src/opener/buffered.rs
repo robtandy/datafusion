@@ -2,13 +2,16 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion_common::instant::Instant;
 use datafusion_common::{
@@ -18,6 +21,8 @@ use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner};
 use datafusion_execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, Label, MetricBuilder, Time,
 };
@@ -45,6 +50,941 @@ use crate::ParquetFileMetrics;
 use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::push_decoder::{RgPlanEntry, RowFilterContext};
+use crate::row_filter::PrebuiltRowFilterCandidate;
+
+const DEFAULT_ADAPTIVE_PROBE_RGS_PER_MODE: usize = 2;
+const DEFAULT_ADAPTIVE_REPROBE_INTERVAL: usize = 64;
+const ADAPTIVE_REPROBE_RGS_PER_MODE: usize = 1;
+const MIN_RGS_FOR_ADAPTIVE_PROBE: usize = 12;
+const RF_BANDIT_WARMUP: usize = 2;
+const RF_BANDIT_EXECUTE_INTERVAL: usize = 16;
+const RF_BANDIT_OBSERVE_INTERVAL: usize = 2;
+const RF_BANDIT_INITIAL_LIKELINESS: u32 = 100;
+const RF_BANDIT_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+/// Execution mode policy for native morsel per-row-group `RowFilter` vs.
+/// `BulkDecode` switching.
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdaptiveRowFilterMode {
+    /// Dynamically probe `RowFilter` vs. `BulkDecode` per row group and commit
+    /// the lower-cost mode, with periodic re-probing.
+    #[default]
+    Adaptive,
+    /// Always execute surviving row groups in `RowFilter` mode.
+    ForceRowFilter,
+    /// Always execute surviving row groups in `BulkDecode` mode.
+    ForceBulk,
+    /// Deterministically alternate `RowFilter` and `BulkDecode` across
+    /// successive row groups (for exact parity testing).
+    AlternateForTest,
+}
+
+/// Configuration for runtime-adaptive per-row-group `RowFilter` vs. `BulkDecode`
+/// switching in the native morsel Parquet path.
+///
+/// Attach via `SessionConfig::with_extension` to override defaults in tests or
+/// benchmarks. Only affects the native buffered morsel path; stock `FileStream`
+/// never uses it.
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AdaptiveRowFilterConfig {
+    /// Mode selection policy (default: [`AdaptiveRowFilterMode::Adaptive`]).
+    pub mode: AdaptiveRowFilterMode,
+    /// Number of row groups probed per mode before committing (default: 2).
+    pub probe_rgs_per_mode: usize,
+    /// Re-probe every N committed row groups (`0` disables re-probing; default: 64).
+    pub reprobe_interval: usize,
+    /// Optional deterministic per-row cost override `(rf_ns_per_row, bulk_ns_per_row)`
+    /// for tests so convergence assertions never depend on noisy wall-clock timing.
+    pub test_mode_costs_ns_per_row: Option<(u64, u64)>,
+}
+
+impl Default for AdaptiveRowFilterConfig {
+    fn default() -> Self {
+        Self {
+            mode: AdaptiveRowFilterMode::Adaptive,
+            probe_rgs_per_mode: DEFAULT_ADAPTIVE_PROBE_RGS_PER_MODE,
+            reprobe_interval: DEFAULT_ADAPTIVE_REPROBE_INTERVAL,
+            test_mode_costs_ns_per_row: None,
+        }
+    }
+}
+
+/// Per-row-group execution mode chosen by [`AdaptiveRowFilterContext`].
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RgFilterMode {
+    RowFilter,
+    BulkDecode,
+}
+
+impl RgFilterMode {
+    fn other(self) -> Self {
+        match self {
+            Self::RowFilter => Self::BulkDecode,
+            Self::BulkDecode => Self::RowFilter,
+        }
+    }
+}
+
+/// Callback returning `(is_infallible, heuristic_cost)` for a physical
+/// predicate expression over a given schema.
+pub type ConjunctAnalyzer =
+    Arc<dyn Fn(&Arc<dyn PhysicalExpr>, &Schema) -> (bool, u64) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerPhase {
+    InitialProbe {
+        dispatched_rf: usize,
+        dispatched_bulk: usize,
+    },
+    Committed {
+        winner: RgFilterMode,
+        rgs_since_probe: usize,
+        next_reprobe_interval: usize,
+    },
+    Reprobe {
+        current_winner: RgFilterMode,
+        dispatched_rf: usize,
+        dispatched_bulk: usize,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ProbeWindowStats {
+    rf_samples: usize,
+    rf_cost_ns: u128,
+    rf_rows: u128,
+    bulk_samples: usize,
+    bulk_cost_ns: u128,
+    bulk_rows: u128,
+}
+
+impl ProbeWindowStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn rf_cost_per_row(&self) -> f64 {
+        self.rf_cost_ns as f64 / self.rf_rows.max(1) as f64
+    }
+
+    fn bulk_cost_per_row(&self) -> f64 {
+        self.bulk_cost_ns as f64 / self.bulk_rows.max(1) as f64
+    }
+}
+
+fn scaled_reprobe_interval(base: usize, ratio: f64) -> usize {
+    if base == 0 {
+        return 0;
+    }
+    if ratio >= 2.0 {
+        base.saturating_mul(4)
+    } else if ratio >= 1.5 {
+        base.saturating_mul(2)
+    } else {
+        base
+    }
+}
+
+struct ControllerState {
+    phase: ControllerPhase,
+    epoch: u64,
+    stats: ProbeWindowStats,
+}
+
+type CandidateSignature = Arc<Vec<String>>;
+type RowFilterOrderKey = (CandidateSignature, u64);
+
+/// Per-file pre-analyzed `RowFilter` ordering plan computed from that file's
+/// surviving candidates (after per-file stats elision and constant folding).
+enum FileRowFilterPlan {
+    /// Permutation disabled (`<= 1` candidate or at least one fallible/volatile
+    /// candidate in this file): always preserve exact left-to-right order.
+    FixedIdentity(Vec<usize>),
+    /// All `>= 2` candidates in this file are strictly infallible: share a
+    /// bandit keyed by the exact candidate signature across files with the same
+    /// surviving candidate list.
+    Adaptive {
+        signature: CandidateSignature,
+        initial_order: Vec<usize>,
+    },
+}
+
+fn candidate_list_signature(
+    candidates: &[PrebuiltRowFilterCandidate],
+) -> CandidateSignature {
+    let sig: Vec<String> = candidates
+        .iter()
+        .map(|cand| {
+            let schema = cand.projected_schema();
+            let cols: Vec<&str> =
+                schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let exprs: Vec<String> = cand
+                .physical_exprs()
+                .iter()
+                .map(|e| format!("{e}"))
+                .collect();
+            format!("cols=[{}];exprs=[{}]", cols.join(","), exprs.join(" AND "))
+        })
+        .collect();
+    Arc::new(sig)
+}
+
+fn build_file_row_filter_plan(
+    candidates: &[PrebuiltRowFilterCandidate],
+    analyzer: Option<&ConjunctAnalyzer>,
+) -> FileRowFilterPlan {
+    let n = candidates.len();
+    if n <= 1 {
+        return FileRowFilterPlan::FixedIdentity((0..n).collect());
+    }
+    let mut costs = Vec::with_capacity(n);
+    for cand in candidates {
+        let (cand_infallible, cand_cost) = if let Some(analyze) = analyzer {
+            let mut inf = true;
+            let mut total_cost = 0u64;
+            for expr in cand.physical_exprs() {
+                let (e_inf, e_cost) = analyze(expr, cand.projected_schema());
+                inf &= e_inf;
+                total_cost = total_cost.saturating_add(e_cost);
+            }
+            (inf, if total_cost == 0 { 100 } else { total_cost })
+        } else {
+            (!cand.has_fallible(), cand.required_bytes() as u64)
+        };
+        if !cand_infallible {
+            // Exact DuckDB safety invariant: preserve left-to-right order
+            // whenever any surviving candidate in this file can throw or is
+            // volatile.
+            return FileRowFilterPlan::FixedIdentity((0..n).collect());
+        }
+        costs.push(cand_cost);
+    }
+    let mut initial_order: Vec<usize> = (0..n).collect();
+    // Sort by decoded column size (`required_bytes`) first so narrow columns
+    // (e.g. Date32 `l_shipdate`) always decode before wide join keys, breaking
+    // ties by expression heuristic cost and original plan/join order (`idx`).
+    initial_order.sort_by_key(|&idx| (candidates[idx].required_bytes(), costs[idx], idx));
+    FileRowFilterPlan::Adaptive {
+        signature: candidate_list_signature(candidates),
+        initial_order,
+    }
+}
+
+struct RowFilterOrderBandit {
+    /// Incumbent candidate order used during warmup/execute and for concurrent
+    /// RGs dispatched while a bounded trial swap is in flight.
+    permutation: Vec<usize>,
+    /// Trial candidate order during `observe` (only `RF_BANDIT_OBSERVE_INTERVAL`
+    /// RGs are dispatched with this order so concurrent file lanes never flood
+    /// a bad swap across 16+ row groups).
+    trial_permutation: Vec<usize>,
+    trial_dispatched: usize,
+    swap_likeliness: Vec<u32>,
+    disable_permutations: bool,
+    epoch: u64,
+    iteration_count: usize,
+    swap_idx: usize,
+    right_random_border: u32,
+    runtime_sum: f64,
+    prev_mean: f64,
+    observe: bool,
+    warmup: bool,
+    rng_state: u64,
+}
+
+impl RowFilterOrderBandit {
+    fn new(initial_order: Vec<usize>) -> Self {
+        let n = initial_order.len();
+        let pairs = n.saturating_sub(1);
+        Self {
+            permutation: initial_order,
+            trial_permutation: Vec::new(),
+            trial_dispatched: 0,
+            swap_likeliness: vec![RF_BANDIT_INITIAL_LIKELINESS; pairs],
+            disable_permutations: n <= 1,
+            epoch: 1,
+            iteration_count: 0,
+            swap_idx: 0,
+            right_random_border: (RF_BANDIT_INITIAL_LIKELINESS as usize * pairs) as u32,
+            runtime_sum: 0.0,
+            prev_mean: 0.0,
+            observe: false,
+            warmup: true,
+            rng_state: RF_BANDIT_SEED,
+        }
+    }
+
+    fn next_random_u32(&mut self, upper_exclusive: u32) -> u32 {
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        let mixed = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        ((mixed >> 32) as u32) % upper_exclusive
+    }
+
+    fn peek_order(&self) -> Vec<usize> {
+        self.permutation.clone()
+    }
+
+    fn current_order(&mut self) -> (Vec<usize>, Option<u64>) {
+        if self.disable_permutations {
+            return (self.permutation.clone(), None);
+        }
+        if self.observe {
+            if self.trial_dispatched < RF_BANDIT_OBSERVE_INTERVAL {
+                self.trial_dispatched += 1;
+                return (self.trial_permutation.clone(), Some(self.epoch));
+            }
+            // Bounded trial RGs already in flight: keep concurrent file lanes
+            // on the proven incumbent order until the trial finishes.
+            return (self.permutation.clone(), None);
+        }
+        (self.permutation.clone(), Some(self.epoch))
+    }
+
+    fn report(&mut self, epoch: u64, cost_per_row: f64) {
+        if self.disable_permutations || epoch != self.epoch {
+            return;
+        }
+        self.iteration_count += 1;
+        self.runtime_sum += cost_per_row;
+
+        if self.warmup {
+            if self.iteration_count == RF_BANDIT_WARMUP {
+                self.iteration_count = 0;
+                self.runtime_sum = 0.0;
+                self.observe = false;
+                self.warmup = false;
+            }
+            return;
+        }
+
+        if self.observe && self.iteration_count == RF_BANDIT_OBSERVE_INTERVAL {
+            let trial_mean = self.runtime_sum / self.iteration_count as f64;
+            if self.prev_mean - trial_mean <= 0.0 {
+                if self.swap_likeliness[self.swap_idx] > 1 {
+                    self.swap_likeliness[self.swap_idx] /= 2;
+                }
+            } else {
+                self.permutation = self.trial_permutation.clone();
+                self.swap_likeliness[self.swap_idx] = RF_BANDIT_INITIAL_LIKELINESS;
+            }
+            self.epoch = self.epoch.wrapping_add(1);
+            self.observe = false;
+            self.trial_dispatched = 0;
+            self.iteration_count = 0;
+            self.runtime_sum = 0.0;
+        } else if !self.observe && self.iteration_count == RF_BANDIT_EXECUTE_INTERVAL {
+            self.prev_mean = self.runtime_sum / self.iteration_count as f64;
+            let random_number = self.next_random_u32(self.right_random_border);
+            self.swap_idx = (random_number / RF_BANDIT_INITIAL_LIKELINESS) as usize;
+            let likeliness =
+                random_number - RF_BANDIT_INITIAL_LIKELINESS * self.swap_idx as u32;
+            if self.swap_likeliness[self.swap_idx] > likeliness {
+                self.trial_permutation = self.permutation.clone();
+                self.trial_permutation
+                    .swap(self.swap_idx, self.swap_idx + 1);
+                self.trial_dispatched = 0;
+                self.observe = true;
+                self.epoch = self.epoch.wrapping_add(1);
+            }
+            self.iteration_count = 0;
+            self.runtime_sum = 0.0;
+        }
+    }
+}
+
+struct AdaptiveMetrics {
+    row_filter_rgs: Count,
+    bulk_decode_rgs: Count,
+    fast_path_bulk_rgs: Count,
+    mode_switches: Count,
+}
+
+/// Query-wide runtime-adaptive controller shared across all file lanes and
+/// workers of one native buffered Parquet scan.
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+pub struct AdaptiveRowFilterContext {
+    config: AdaptiveRowFilterConfig,
+    num_files: usize,
+    has_dynamic_join_filter: bool,
+    /// Optional wider projection `(ProjectionExprs, bulk_schema)` used when
+    /// `ParquetScan` narrowed its output schema away from static predicate
+    /// columns, so `BulkDecode` row groups still decode predicate columns.
+    bulk_projection: Option<(ProjectionExprs, SchemaRef)>,
+    analyzer: Option<ConjunctAnalyzer>,
+    alt_seq: AtomicUsize,
+    controller: Mutex<ControllerState>,
+    rf_orders: Mutex<HashMap<CandidateSignature, RowFilterOrderBandit>>,
+    metrics: AdaptiveMetrics,
+}
+
+impl fmt::Debug for AdaptiveRowFilterContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdaptiveRowFilterContext")
+            .field("config", &self.config)
+            .field("num_files", &self.num_files)
+            .field("has_dynamic_join_filter", &self.has_dynamic_join_filter)
+            .field("has_bulk_projection", &self.bulk_projection.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdaptiveRowFilterContext {
+    pub fn new(
+        config: AdaptiveRowFilterConfig,
+        num_files: usize,
+        has_dynamic_join_filter: bool,
+        bulk_projection: Option<(ProjectionExprs, SchemaRef)>,
+        analyzer: Option<ConjunctAnalyzer>,
+        metrics_set: &ExecutionPlanMetricsSet,
+    ) -> Self {
+        let metrics = AdaptiveMetrics {
+            row_filter_rgs: MetricBuilder::new(metrics_set)
+                .counter("adaptive_row_filter_rgs", 0),
+            bulk_decode_rgs: MetricBuilder::new(metrics_set)
+                .counter("adaptive_bulk_decode_rgs", 0),
+            fast_path_bulk_rgs: MetricBuilder::new(metrics_set)
+                .counter("adaptive_fast_path_bulk_rgs", 0),
+            mode_switches: MetricBuilder::new(metrics_set)
+                .counter("adaptive_mode_switches", 0),
+        };
+        Self {
+            config,
+            num_files: num_files.max(1),
+            has_dynamic_join_filter,
+            bulk_projection,
+            analyzer,
+            alt_seq: AtomicUsize::new(0),
+            controller: Mutex::new(ControllerState {
+                phase: ControllerPhase::InitialProbe {
+                    dispatched_rf: 0,
+                    dispatched_bulk: 0,
+                },
+                epoch: 1,
+                stats: ProbeWindowStats::default(),
+            }),
+            rf_orders: Mutex::new(HashMap::new()),
+            metrics,
+        }
+    }
+
+    fn build_file_row_filter_plan(
+        &self,
+        candidates: &[PrebuiltRowFilterCandidate],
+    ) -> FileRowFilterPlan {
+        build_file_row_filter_plan(candidates, self.analyzer.as_ref())
+    }
+
+    pub(crate) fn bulk_projection(&self) -> Option<&(ProjectionExprs, SchemaRef)> {
+        self.bulk_projection.as_ref()
+    }
+
+    pub(crate) fn has_dynamic_join_filter(&self) -> bool {
+        self.has_dynamic_join_filter
+    }
+
+    fn assign_rg(
+        self: &Arc<Self>,
+        can_skip_columns: bool,
+        file_surviving_rgs: usize,
+        input_rows: u64,
+    ) -> RgProbeHandle {
+        let (mode, track_mode_epoch) = match self.config.mode {
+            AdaptiveRowFilterMode::ForceRowFilter => {
+                self.metrics.row_filter_rgs.add(1);
+                (RgFilterMode::RowFilter, None)
+            }
+            AdaptiveRowFilterMode::ForceBulk => {
+                self.metrics.bulk_decode_rgs.add(1);
+                (RgFilterMode::BulkDecode, None)
+            }
+            AdaptiveRowFilterMode::AlternateForTest => {
+                let seq = self.alt_seq.fetch_add(1, Ordering::Relaxed);
+                if seq.is_multiple_of(2) {
+                    self.metrics.row_filter_rgs.add(1);
+                    (RgFilterMode::RowFilter, None)
+                } else {
+                    self.metrics.bulk_decode_rgs.add(1);
+                    (RgFilterMode::BulkDecode, None)
+                }
+            }
+            AdaptiveRowFilterMode::Adaptive => {
+                let probe_target = self.config.probe_rgs_per_mode.max(1);
+                let min_rgs_for_probe = probe_target
+                    .saturating_mul(4)
+                    .max(MIN_RGS_FOR_ADAPTIVE_PROBE);
+                let estimated_scan_rgs =
+                    file_surviving_rgs.saturating_mul(self.num_files);
+                if input_rows == 0 {
+                    self.metrics.bulk_decode_rgs.add(1);
+                    (RgFilterMode::BulkDecode, None)
+                } else if !can_skip_columns {
+                    // Fast-path metadata gate: zero non-predicate payload columns,
+                    // <= 1 predicate candidate, and no dynamic join filter ->
+                    // RowFilter cannot skip any column; BulkDecode is strictly
+                    // dominant without probing.
+                    self.metrics.fast_path_bulk_rgs.add(1);
+                    self.metrics.bulk_decode_rgs.add(1);
+                    (RgFilterMode::BulkDecode, None)
+                } else if estimated_scan_rgs < min_rgs_for_probe {
+                    // Tiny scan with too few row groups to amortize A/B probing:
+                    // execute directly in RowFilter mode.
+                    self.metrics.row_filter_rgs.add(1);
+                    (RgFilterMode::RowFilter, None)
+                } else {
+                    let mut guard = self.controller.lock();
+                    let ControllerState {
+                        phase,
+                        epoch: state_epoch,
+                        stats,
+                    } = &mut *guard;
+                    let (chosen, epoch) = match phase {
+                        ControllerPhase::InitialProbe {
+                            dispatched_rf,
+                            dispatched_bulk,
+                        } => {
+                            if *dispatched_rf < probe_target
+                                || *dispatched_bulk < probe_target
+                            {
+                                let mode = if *dispatched_rf <= *dispatched_bulk {
+                                    *dispatched_rf += 1;
+                                    RgFilterMode::RowFilter
+                                } else {
+                                    *dispatched_bulk += 1;
+                                    RgFilterMode::BulkDecode
+                                };
+                                (mode, Some(*state_epoch))
+                            } else {
+                                // All probe RGs are already in flight. Never
+                                // over-dispatch slow BulkDecode probes while
+                                // waiting: prefer whichever mode has completed
+                                // samples faster (or RowFilter as the lower-
+                                // regret default while wave 1 finishes).
+                                let mode = if stats.rf_samples > 0
+                                    && stats.bulk_samples > 0
+                                {
+                                    if stats.bulk_cost_per_row() < stats.rf_cost_per_row()
+                                    {
+                                        RgFilterMode::BulkDecode
+                                    } else {
+                                        RgFilterMode::RowFilter
+                                    }
+                                } else if stats.bulk_samples > 0 && stats.rf_samples == 0
+                                {
+                                    RgFilterMode::BulkDecode
+                                } else if (stats.rf_samples > 0
+                                    && stats.bulk_samples == 0)
+                                    || self.has_dynamic_join_filter
+                                {
+                                    RgFilterMode::RowFilter
+                                } else {
+                                    RgFilterMode::BulkDecode
+                                };
+                                (mode, None)
+                            }
+                        }
+                        ControllerPhase::Committed {
+                            winner,
+                            rgs_since_probe,
+                            next_reprobe_interval,
+                        } => {
+                            let current = *winner;
+                            if *next_reprobe_interval > 0
+                                && *rgs_since_probe >= *next_reprobe_interval
+                            {
+                                let challenger = current.other();
+                                *state_epoch = state_epoch.wrapping_add(1);
+                                stats.reset();
+                                let (dispatched_rf, dispatched_bulk) = match challenger {
+                                    RgFilterMode::RowFilter => (1, 0),
+                                    RgFilterMode::BulkDecode => (0, 1),
+                                };
+                                *phase = ControllerPhase::Reprobe {
+                                    current_winner: current,
+                                    dispatched_rf,
+                                    dispatched_bulk,
+                                };
+                                (challenger, Some(*state_epoch))
+                            } else {
+                                *rgs_since_probe += 1;
+                                (current, None)
+                            }
+                        }
+                        ControllerPhase::Reprobe {
+                            current_winner,
+                            dispatched_rf,
+                            dispatched_bulk,
+                        } => {
+                            let current = *current_winner;
+                            let challenger = current.other();
+                            if *dispatched_rf < ADAPTIVE_REPROBE_RGS_PER_MODE
+                                || *dispatched_bulk < ADAPTIVE_REPROBE_RGS_PER_MODE
+                            {
+                                let (chal_cnt, cur_cnt) = match challenger {
+                                    RgFilterMode::RowFilter => {
+                                        (dispatched_rf, dispatched_bulk)
+                                    }
+                                    RgFilterMode::BulkDecode => {
+                                        (dispatched_bulk, dispatched_rf)
+                                    }
+                                };
+                                let mode = if *chal_cnt < ADAPTIVE_REPROBE_RGS_PER_MODE
+                                    && *chal_cnt <= *cur_cnt
+                                {
+                                    *chal_cnt += 1;
+                                    challenger
+                                } else {
+                                    *cur_cnt += 1;
+                                    current
+                                };
+                                (mode, Some(*state_epoch))
+                            } else {
+                                (current, None)
+                            }
+                        }
+                    };
+                    drop(guard);
+                    match chosen {
+                        RgFilterMode::RowFilter => self.metrics.row_filter_rgs.add(1),
+                        RgFilterMode::BulkDecode => self.metrics.bulk_decode_rgs.add(1),
+                    }
+                    (chosen, epoch)
+                }
+            }
+        };
+
+        RgProbeHandle {
+            controller: Arc::clone(self),
+            mode,
+            input_rows,
+            cpu_ns: 0,
+            bytes_fetched: 0,
+            track_mode_epoch,
+            rf_order_key: None,
+            finished: false,
+        }
+    }
+
+    fn peek_row_filter_order(&self, plan: &FileRowFilterPlan) -> Vec<usize> {
+        match plan {
+            FileRowFilterPlan::FixedIdentity(identity) => identity.clone(),
+            FileRowFilterPlan::Adaptive {
+                signature,
+                initial_order,
+            } => self
+                .rf_orders
+                .lock()
+                .get(signature)
+                .map_or_else(|| initial_order.clone(), RowFilterOrderBandit::peek_order),
+        }
+    }
+
+    fn row_filter_order(
+        &self,
+        plan: &FileRowFilterPlan,
+    ) -> (Vec<usize>, Option<RowFilterOrderKey>) {
+        match plan {
+            FileRowFilterPlan::FixedIdentity(identity) => (identity.clone(), None),
+            FileRowFilterPlan::Adaptive {
+                signature,
+                initial_order,
+            } => {
+                let mut orders = self.rf_orders.lock();
+                let bandit = orders
+                    .entry(Arc::clone(signature))
+                    .or_insert_with(|| RowFilterOrderBandit::new(initial_order.clone()));
+                let (order, epoch) = bandit.current_order();
+                let key = epoch.map(|e| (Arc::clone(signature), e));
+                (order, key)
+            }
+        }
+    }
+
+    fn report_mode_sample(
+        &self,
+        mode: RgFilterMode,
+        epoch: u64,
+        input_rows: u64,
+        total_cpu_ns: u64,
+        bytes_fetched: u64,
+    ) {
+        if input_rows == 0 {
+            return;
+        }
+        // Account for both worker CPU (`decode + process + RowFilter`) and
+        // compressed I/O bytes fetched (`0.5 ns/byte`), so page-index / column
+        // skipping gets credited cleanly without distorting warm-cache CPU.
+        let cost_ns = if let Some((rf_per_row, bulk_per_row)) =
+            self.config.test_mode_costs_ns_per_row
+        {
+            let per_row = match mode {
+                RgFilterMode::RowFilter => rf_per_row,
+                RgFilterMode::BulkDecode => bulk_per_row,
+            };
+            (per_row as u128).saturating_mul(input_rows as u128)
+        } else {
+            (total_cpu_ns as u128).saturating_add((bytes_fetched as u128) / 2)
+        };
+        let probe_target = self.config.probe_rgs_per_mode.max(1);
+        let mut state = self.controller.lock();
+        if epoch != state.epoch {
+            return;
+        }
+        match mode {
+            RgFilterMode::RowFilter => {
+                state.stats.rf_samples += 1;
+                state.stats.rf_cost_ns = state.stats.rf_cost_ns.saturating_add(cost_ns);
+                state.stats.rf_rows =
+                    state.stats.rf_rows.saturating_add(input_rows as u128);
+            }
+            RgFilterMode::BulkDecode => {
+                state.stats.bulk_samples += 1;
+                state.stats.bulk_cost_ns =
+                    state.stats.bulk_cost_ns.saturating_add(cost_ns);
+                state.stats.bulk_rows =
+                    state.stats.bulk_rows.saturating_add(input_rows as u128);
+            }
+        }
+        match state.phase {
+            ControllerPhase::InitialProbe { .. } => {
+                if state.stats.rf_samples >= probe_target
+                    && state.stats.bulk_samples >= probe_target
+                {
+                    let rf_cost = state.stats.rf_cost_per_row();
+                    let bulk_cost = state.stats.bulk_cost_per_row();
+                    let (winner, ratio) = if bulk_cost < rf_cost {
+                        (RgFilterMode::BulkDecode, rf_cost / bulk_cost.max(1e-9))
+                    } else {
+                        (RgFilterMode::RowFilter, bulk_cost / rf_cost.max(1e-9))
+                    };
+                    let next_reprobe_interval =
+                        scaled_reprobe_interval(self.config.reprobe_interval, ratio);
+                    state.phase = ControllerPhase::Committed {
+                        winner,
+                        rgs_since_probe: 0,
+                        next_reprobe_interval,
+                    };
+                    self.metrics.mode_switches.add(1);
+                }
+            }
+            ControllerPhase::Reprobe { current_winner, .. } => {
+                if state.stats.rf_samples >= ADAPTIVE_REPROBE_RGS_PER_MODE
+                    && state.stats.bulk_samples >= ADAPTIVE_REPROBE_RGS_PER_MODE
+                {
+                    let rf_cost = state.stats.rf_cost_per_row();
+                    let bulk_cost = state.stats.bulk_cost_per_row();
+                    // 5% hysteresis margin avoids thrashing on measurement noise.
+                    let new_winner = match current_winner {
+                        RgFilterMode::RowFilter => {
+                            if bulk_cost < rf_cost * 0.95 {
+                                RgFilterMode::BulkDecode
+                            } else {
+                                RgFilterMode::RowFilter
+                            }
+                        }
+                        RgFilterMode::BulkDecode => {
+                            if rf_cost < bulk_cost * 0.95 {
+                                RgFilterMode::RowFilter
+                            } else {
+                                RgFilterMode::BulkDecode
+                            }
+                        }
+                    };
+                    let ratio = match new_winner {
+                        RgFilterMode::BulkDecode => rf_cost / bulk_cost.max(1e-9),
+                        RgFilterMode::RowFilter => bulk_cost / rf_cost.max(1e-9),
+                    };
+                    if new_winner != current_winner {
+                        self.metrics.mode_switches.add(1);
+                    }
+                    let next_reprobe_interval =
+                        scaled_reprobe_interval(self.config.reprobe_interval, ratio);
+                    state.phase = ControllerPhase::Committed {
+                        winner: new_winner,
+                        rgs_since_probe: 0,
+                        next_reprobe_interval,
+                    };
+                }
+            }
+            ControllerPhase::Committed { .. } => {}
+        }
+    }
+
+    fn report_rf_order_sample(
+        &self,
+        signature: &CandidateSignature,
+        order_epoch: u64,
+        input_rows: u64,
+        total_cpu_ns: u64,
+        bytes_fetched: u64,
+    ) {
+        if input_rows == 0 {
+            return;
+        }
+        let cost_ns = (total_cpu_ns as u128).saturating_add((bytes_fetched as u128) / 2);
+        let cost_per_row = cost_ns as f64 / input_rows as f64;
+        if let Some(bandit) = self.rf_orders.lock().get_mut(signature) {
+            bandit.report(order_epoch, cost_per_row);
+        }
+    }
+}
+
+/// Per-row-group telemetry and mode handle carried from file-lane planning
+/// through `FilteredRowGroupPlanner` / `BufferedReader` to the pipeline worker.
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+pub struct RgProbeHandle {
+    controller: Arc<AdaptiveRowFilterContext>,
+    mode: RgFilterMode,
+    input_rows: u64,
+    cpu_ns: u64,
+    bytes_fetched: u64,
+    track_mode_epoch: Option<u64>,
+    rf_order_key: Option<RowFilterOrderKey>,
+    finished: bool,
+}
+
+impl RgProbeHandle {
+    pub fn mode(&self) -> RgFilterMode {
+        self.mode
+    }
+
+    pub fn is_bulk(&self) -> bool {
+        self.mode == RgFilterMode::BulkDecode
+    }
+
+    pub fn needs_worker_timing(&self) -> bool {
+        self.track_mode_epoch.is_some() || self.rf_order_key.is_some()
+    }
+
+    fn add_cpu_ns(&mut self, ns: u64) {
+        self.cpu_ns = self.cpu_ns.saturating_add(ns);
+    }
+
+    fn add_bytes_fetched(&mut self, bytes: u64) {
+        self.bytes_fetched = self.bytes_fetched.saturating_add(bytes);
+    }
+
+    fn set_rf_order_key(&mut self, key: Option<RowFilterOrderKey>) {
+        self.rf_order_key = key;
+    }
+
+    /// Record final worker CPU (`decode + process`) for this row group and
+    /// report completed telemetry to [`AdaptiveRowFilterContext`].
+    pub fn finish(mut self, worker_cpu_ns: u64) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let total_cpu_ns = self.cpu_ns.saturating_add(worker_cpu_ns);
+        if let Some(epoch) = self.track_mode_epoch {
+            self.controller.report_mode_sample(
+                self.mode,
+                epoch,
+                self.input_rows,
+                total_cpu_ns,
+                self.bytes_fetched,
+            );
+        }
+        if let Some((sig, order_epoch)) = self.rf_order_key.take() {
+            self.controller.report_rf_order_sample(
+                &sig,
+                order_epoch,
+                self.input_rows,
+                total_cpu_ns,
+                self.bytes_fetched,
+            );
+        }
+    }
+}
+
+struct CaptureSlot {
+    active: bool,
+    handle: Option<RgProbeHandle>,
+}
+
+thread_local! {
+    static INTO_STREAM_CAPTURE: RefCell<CaptureSlot> = const {
+        RefCell::new(CaptureSlot {
+            active: false,
+            handle: None,
+        })
+    };
+}
+
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        INTO_STREAM_CAPTURE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            slot.active = false;
+            slot.handle = None;
+        });
+    }
+}
+
+fn publish_into_stream_handle(handle: RgProbeHandle) -> bool {
+    INTO_STREAM_CAPTURE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.active {
+            slot.handle = Some(handle);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Synchronously capture the [`RgProbeHandle`] (if any) emitted by
+/// `BufferedReader::into_stream` during `f()`.
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+pub fn capture_rg_handle<R>(f: impl FnOnce() -> R) -> (R, Option<RgProbeHandle>) {
+    INTO_STREAM_CAPTURE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        slot.active = true;
+        slot.handle = None;
+    });
+    let _guard = CaptureGuard;
+    let res = f();
+    let handle = INTO_STREAM_CAPTURE.with(|cell| cell.borrow_mut().handle.take());
+    (res, handle)
+}
 
 const DEFAULT_MIN_ROW_GROUP_ROWS: usize = 1 << 20;
 const DEFAULT_TARGET_SLICE_ROWS: usize = 1 << 17;
@@ -2430,6 +3370,7 @@ pub(super) struct FilteredBufferedReadersConfig {
     pub(super) pending: VecDeque<(RowGroupSelection, RgPlanEntry)>,
     pub(super) reader_metadata: ArrowReaderMetadata,
     pub(super) projection: Arc<DecoderProjection>,
+    pub(super) bulk_projection: Option<Arc<DecoderProjection>>,
     pub(super) row_filter_context: RowFilterContext,
     pub(super) row_filter_skipped_fully_matched: RowFilterSkippedFullyMatchedMetric,
     pub(super) batch_size: usize,
@@ -2446,6 +3387,7 @@ pub(super) struct FilteredBufferedReadersConfig {
     pub(super) async_file_reader: Box<dyn AsyncFileReader>,
     pub(super) direct_store: Option<Arc<dyn ObjectStore>>,
     pub(super) split_context: Option<Arc<SplitContext>>,
+    pub(super) adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
 }
 
 type HandbackRequest = (Vec<Range<u64>>, oneshot::Sender<Result<Vec<Bytes>>>);
@@ -2476,9 +3418,11 @@ struct ActiveSplitFilteredRg {
 
 pub(super) struct FilteredBufferedReaders {
     pending: VecDeque<FilteredRgWork>,
+    file_surviving_rgs: usize,
     active_split: Option<Box<ActiveSplitFilteredRg>>,
     reader_metadata: ArrowReaderMetadata,
     projection: Arc<DecoderProjection>,
+    bulk_projection: Option<Arc<DecoderProjection>>,
     row_filter_context: RowFilterContext,
     row_filter_skipped_fully_matched: RowFilterSkippedFullyMatchedMetric,
     batch_size: usize,
@@ -2499,6 +3443,8 @@ pub(super) struct FilteredBufferedReaders {
     in_flight: Option<InFlight>,
     handback_rx: Option<mpsc::UnboundedReceiver<HandbackRequest>>,
     split_context: Option<Arc<SplitContext>>,
+    adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
+    file_rf_plan: Option<FileRowFilterPlan>,
 }
 
 impl BufferedReaders {
@@ -2631,11 +3577,17 @@ impl BufferedReaders {
             })
             .collect();
 
+        let file_surviving_rgs = pending.len();
+        let file_rf_plan = config.adaptive_context.as_ref().map(|adaptive| {
+            adaptive.build_file_row_filter_plan(config.row_filter_context.candidates())
+        });
         Self::Filtered(Box::new(FilteredBufferedReaders {
             pending,
+            file_surviving_rgs,
             active_split: None,
             reader_metadata: config.reader_metadata,
             projection: config.projection,
+            bulk_projection: config.bulk_projection,
             row_filter_context: config.row_filter_context,
             row_filter_skipped_fully_matched: config.row_filter_skipped_fully_matched,
             batch_size: config.batch_size,
@@ -2652,6 +3604,8 @@ impl BufferedReaders {
             in_flight: None,
             handback_rx: None,
             split_context: config.split_context,
+            adaptive_context: config.adaptive_context,
+            file_rf_plan,
         }))
     }
 }
@@ -2706,6 +3660,7 @@ impl PlainBufferedReaders {
                     cache_metrics: None,
                     decoded_lease: None,
                     in_flight_guard: None,
+                    rg_handle: None,
                 };
                 MorselPlan::new()
                     .with_morsels(vec![Box::new(reader)])
@@ -2864,6 +3819,7 @@ impl SplitPlainBufferedReaders {
                                 cache_metrics: None,
                                 decoded_lease: None,
                                 in_flight_guard: None,
+                                rg_handle: None,
                             });
                             return Ok(Some(self.publish_morsel(morsel)));
                         }
@@ -3045,6 +4001,7 @@ impl SplitPlainBufferedReaders {
                                     cache_metrics: None,
                                     decoded_lease: Some(decoded_lease),
                                     in_flight_guard: Some(in_flight_guard),
+                                    rg_handle: None,
                                 });
                                 return Ok(Some(self.publish_morsel(morsel)));
                             }
@@ -3303,6 +4260,7 @@ impl SplitPlainBufferedReaders {
                                             cache_metrics: None,
                                             decoded_lease: Some(decoded_lease),
                                             in_flight_guard: Some(in_flight_guard),
+                                            rg_handle: None,
                                         });
                                         Ok(Box::new(PublishReadyMorsel {
                                             morsel: Some(morsel),
@@ -3344,6 +4302,7 @@ impl SplitPlainBufferedReaders {
                                 cache_metrics: None,
                                 decoded_lease: Some(decoded_lease),
                                 in_flight_guard: Some(in_flight_guard),
+                                rg_handle: None,
                             });
                             return Ok(Some(self.publish_morsel(morsel)));
                         }
@@ -3480,6 +4439,7 @@ enum InFlight {
         ranges: Vec<Range<u64>>,
         bytes: Vec<Bytes>,
         split_meta: Option<Box<SplitSliceMeta>>,
+        rg_handle: Option<RgProbeHandle>,
     },
     FullyMatched {
         decoder: ParquetPushDecoder,
@@ -3488,6 +4448,8 @@ enum InFlight {
         bytes: Vec<Bytes>,
         fetched_bytes: usize,
         split_meta: Option<Box<SplitSliceMeta>>,
+        use_bulk_projection: bool,
+        rg_handle: Option<RgProbeHandle>,
     },
 }
 
@@ -3503,14 +4465,35 @@ impl MorselPlanner for EmptyDonePlanner {
 }
 
 impl FilteredBufferedReaders {
+    fn can_row_filter_skip_columns(&self) -> bool {
+        if self
+            .adaptive_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_dynamic_join_filter())
+        {
+            return true;
+        }
+        if self.row_filter_context.num_predicates() >= 2 {
+            return true;
+        }
+        let proj_mask = self.projection.projection_mask();
+        let num_leaves = self.reader_metadata.parquet_schema().num_columns();
+        (0..num_leaves).any(|leaf_idx| {
+            proj_mask.leaf_included(leaf_idx)
+                && !self.row_filter_context.reads_leaf(leaf_idx)
+        })
+    }
+
     fn build_rg_decoder(
         &self,
         selection: RowGroupSelection,
+        projection: &DecoderProjection,
         install_filter: bool,
+        rg_handle: &mut Option<RgProbeHandle>,
     ) -> Result<ParquetPushDecoder> {
         let mut builder =
             ParquetPushDecoderBuilder::new_with_metadata(self.reader_metadata.clone())
-                .with_projection(self.projection.projection_mask().clone())
+                .with_projection(projection.projection_mask().clone())
                 .with_batch_size(self.batch_size)
                 .with_metrics(self.arrow_reader_metrics.clone())
                 .with_row_group_selections(vec![selection]);
@@ -3518,7 +4501,23 @@ impl FilteredBufferedReaders {
             builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
         }
         if install_filter {
-            builder = builder.with_row_filter(self.row_filter_context.build_row_filter());
+            let row_filter = if let (Some(adaptive), Some(rf_plan)) =
+                (&self.adaptive_context, &self.file_rf_plan)
+            {
+                if let Some(handle) = rg_handle.as_mut() {
+                    let (order, order_key) = adaptive.row_filter_order(rf_plan);
+                    handle.set_rf_order_key(order_key);
+                    self.row_filter_context.build_row_filter_with_order(&order)
+                } else {
+                    // Untracked callers (e.g. split RG slices) must read the
+                    // current incumbent order without consuming bandit trials.
+                    let order = adaptive.peek_row_filter_order(rf_plan);
+                    self.row_filter_context.build_row_filter_with_order(&order)
+                }
+            } else {
+                self.row_filter_context.build_row_filter()
+            };
+            builder = builder.with_row_filter(row_filter);
             if let Some(cap) = self.max_predicate_cache_size {
                 builder = builder.with_max_predicate_cache_size(cap);
             }
@@ -3617,8 +4616,12 @@ impl FilteredBufferedReaders {
                     ranges,
                     bytes,
                     split_meta,
+                    mut rg_handle,
                 } => {
                     let buffered_bytes = bytes.iter().map(Bytes::len).sum();
+                    if let Some(handle) = rg_handle.as_mut() {
+                        handle.add_bytes_fetched(buffered_bytes as u64);
+                    }
                     if let Some(meta) = &split_meta {
                         let ctx = format!(
                             "file={}, row_group={}, rows={}..{}",
@@ -3689,6 +4692,7 @@ impl FilteredBufferedReaders {
                             cache_metrics: self.cache_metrics(),
                             decoded_lease,
                             split_phase2,
+                            rg_handle,
                             _in_flight_guard: in_flight_guard,
                         });
                     let file_continuation: Box<dyn MorselPlanner> =
@@ -3711,6 +4715,8 @@ impl FilteredBufferedReaders {
                     bytes,
                     mut fetched_bytes,
                     split_meta,
+                    use_bulk_projection,
+                    mut rg_handle,
                 } => {
                     fetched_bytes += bytes.iter().map(Bytes::len).sum::<usize>();
                     if let Some(meta) = &split_meta {
@@ -3760,6 +4766,8 @@ impl FilteredBufferedReaders {
                                                     bytes: res,
                                                     fetched_bytes,
                                                     split_meta: Some(meta),
+                                                    use_bulk_projection,
+                                                    rg_handle,
                                                 });
                                             return Ok(
                                                 Box::new(BufferedReaders::Filtered(self))
@@ -3779,6 +4787,8 @@ impl FilteredBufferedReaders {
                                         bytes,
                                         fetched_bytes,
                                         split_meta: None,
+                                        use_bulk_projection,
+                                        rg_handle,
                                     });
                                     Ok(Box::new(BufferedReaders::Filtered(self))
                                         as Box<dyn MorselPlanner>)
@@ -3817,20 +4827,36 @@ impl FilteredBufferedReaders {
                                         (None, None, None)
                                     }
                                 };
+                            if let Some(handle) = rg_handle.as_mut() {
+                                handle.add_bytes_fetched(fetched_bytes as u64);
+                            }
+                            let projection = if use_bulk_projection {
+                                self.bulk_projection.as_ref().map_or_else(
+                                    || Arc::clone(&self.projection),
+                                    Arc::clone,
+                                )
+                            } else {
+                                Arc::clone(&self.projection)
+                            };
                             let morsel = Box::new(BufferedReader {
                                 reader,
                                 compressed_bytes: fetched_bytes as u64,
-                                projection: Arc::clone(&self.projection),
+                                projection,
                                 file_name: Arc::clone(&self.file_name),
                                 row_context,
                                 elapsed_compute: elapsed_compute.clone(),
                                 cache_metrics: Some(self.cache_metrics()),
                                 decoded_lease,
                                 in_flight_guard,
+                                rg_handle,
                             });
                             return Ok(Some(self.publish_morsel(morsel)));
                         }
                         DecodeResult::Finished => {
+                            if let Some(mut handle) = rg_handle.take() {
+                                handle.add_bytes_fetched(fetched_bytes as u64);
+                                handle.finish(0);
+                            }
                             if let Some(meta) = split_meta {
                                 if let Some(credit) = meta.credit_entry_bytes {
                                     self.byte_progress.credit(credit);
@@ -3901,10 +4927,13 @@ impl FilteredBufferedReaders {
                     slice.row_range.start,
                     slice.row_range.end
                 );
+                let mut no_handle = None;
                 let mut decoder = self
                     .build_rg_decoder(
                         RowGroupSelection::new(split_rg.rg_index, Some(slice.selection)),
+                        &self.projection,
                         install_filter,
+                        &mut no_handle,
                     )
                     .map_err(|e| {
                         e.context(format!("Building Parquet split decoder ({ctx})"))
@@ -3989,6 +5018,7 @@ impl FilteredBufferedReaders {
                                         ranges,
                                         bytes,
                                         split_meta: Some(meta),
+                                        rg_handle: None,
                                     }
                                 } else {
                                     InFlight::FullyMatched {
@@ -3998,6 +5028,8 @@ impl FilteredBufferedReaders {
                                         bytes,
                                         fetched_bytes: 0,
                                         split_meta: Some(meta),
+                                        use_bulk_projection: false,
+                                        rg_handle: None,
                                     }
                                 });
                                 Ok(Box::new(BufferedReaders::Filtered(self))
@@ -4056,6 +5088,7 @@ impl FilteredBufferedReaders {
                                         cache_metrics: Some(cache_metrics),
                                         decoded_lease: Some(decoded_lease),
                                         in_flight_guard: Some(in_flight_guard),
+                                        rg_handle: None,
                                     });
                                     Ok(Box::new(PublishReadyMorsel {
                                         morsel: Some(morsel),
@@ -4084,6 +5117,7 @@ impl FilteredBufferedReaders {
                             cache_metrics: Some(self.cache_metrics()),
                             decoded_lease: Some(decoded_lease),
                             in_flight_guard: Some(in_flight_guard),
+                            rg_handle: None,
                         });
                         return Ok(Some(self.publish_morsel(morsel)));
                     }
@@ -4134,11 +5168,41 @@ impl FilteredBufferedReaders {
                     }));
                 }
                 FilteredRgWork::Unsplit { selection, entry } => {
-                    let install_filter = !entry.fully_matched;
-                    if entry.fully_matched {
-                        self.row_filter_skipped_fully_matched.add_one();
-                    }
-                    let mut decoder = self.build_rg_decoder(selection, install_filter)?;
+                    let (install_filter, use_bulk_projection, mut rg_handle) =
+                        if entry.fully_matched {
+                            self.row_filter_skipped_fully_matched.add_one();
+                            (false, false, None)
+                        } else if let Some(adaptive) = &self.adaptive_context {
+                            let rg_rows = self
+                                .reader_metadata
+                                .metadata()
+                                .row_group(entry.rg_index)
+                                .num_rows()
+                                .max(0) as u64;
+                            let can_skip = self.can_row_filter_skip_columns();
+                            let handle = adaptive.assign_rg(
+                                can_skip,
+                                self.file_surviving_rgs,
+                                rg_rows,
+                            );
+                            match handle.mode() {
+                                RgFilterMode::RowFilter => (true, false, Some(handle)),
+                                RgFilterMode::BulkDecode => (false, true, Some(handle)),
+                            }
+                        } else {
+                            (true, false, None)
+                        };
+                    let decoder_projection = if use_bulk_projection {
+                        self.bulk_projection.as_ref().unwrap_or(&self.projection)
+                    } else {
+                        &self.projection
+                    };
+                    let mut decoder = self.build_rg_decoder(
+                        selection,
+                        decoder_projection,
+                        install_filter,
+                        &mut rg_handle,
+                    )?;
                     match decoder.try_next_reader()? {
                         DecodeResult::NeedsData(ranges) => {
                             return Ok(Some(MorselPlan::new().with_pending_planner(
@@ -4154,6 +5218,7 @@ impl FilteredBufferedReaders {
                                             ranges,
                                             bytes,
                                             split_meta: None,
+                                            rg_handle,
                                         }
                                     } else {
                                         InFlight::FullyMatched {
@@ -4163,6 +5228,8 @@ impl FilteredBufferedReaders {
                                             bytes,
                                             fetched_bytes: 0,
                                             split_meta: None,
+                                            use_bulk_projection,
+                                            rg_handle,
                                         }
                                     });
                                     Ok(Box::new(BufferedReaders::Filtered(self))
@@ -4172,20 +5239,32 @@ impl FilteredBufferedReaders {
                         }
                         DecodeResult::Data(reader) => {
                             self.byte_progress.credit(entry.bytes);
+                            let projection = if use_bulk_projection {
+                                self.bulk_projection.as_ref().map_or_else(
+                                    || Arc::clone(&self.projection),
+                                    Arc::clone,
+                                )
+                            } else {
+                                Arc::clone(&self.projection)
+                            };
                             let morsel = Box::new(BufferedReader {
                                 reader,
                                 compressed_bytes: 0,
-                                projection: Arc::clone(&self.projection),
+                                projection,
                                 file_name: Arc::clone(&self.file_name),
                                 row_context: None,
                                 elapsed_compute: elapsed_compute.clone(),
                                 cache_metrics: Some(self.cache_metrics()),
                                 decoded_lease: None,
                                 in_flight_guard: None,
+                                rg_handle,
                             });
                             return Ok(Some(self.publish_morsel(morsel)));
                         }
                         DecodeResult::Finished => {
+                            if let Some(handle) = rg_handle {
+                                handle.finish(0);
+                            }
                             self.byte_progress.credit(entry.bytes);
                         }
                     }
@@ -4259,6 +5338,7 @@ struct FilteredRowGroupPlanner {
     cache_metrics: PredicateCacheMetrics,
     decoded_lease: Option<SplitDecodedLease>,
     split_phase2: Option<SplitPhase2State>,
+    rg_handle: Option<RgProbeHandle>,
     _in_flight_guard: Option<InFlightReaderGuard>,
 }
 
@@ -4296,6 +5376,7 @@ impl FilteredRowGroupPlanner {
             cache_metrics,
             decoded_lease,
             split_phase2,
+            rg_handle,
             _in_flight_guard: filter_guard,
             ..
         } = self;
@@ -4318,6 +5399,7 @@ impl FilteredRowGroupPlanner {
             cache_metrics: Some(cache_metrics),
             decoded_lease,
             in_flight_guard,
+            rg_handle,
         })
     }
 
@@ -4362,14 +5444,25 @@ impl MorselPlanner for FilteredRowGroupPlanner {
 
         match self.stage {
             RgStage::RunFilter => {
+                let start = self
+                    .rg_handle
+                    .as_ref()
+                    .is_some_and(RgProbeHandle::needs_worker_timing)
+                    .then(Instant::now);
                 let result = self
                     .decoder
                     .try_next_reader()
                     .map_err(|err| self.context_err(DataFusionError::from(err)))?;
+                if let (Some(t0), Some(handle)) = (start, self.rg_handle.as_mut()) {
+                    handle.add_cpu_ns(t0.elapsed().as_nanos() as u64);
+                }
                 self.pending_predicates = self.pending_predicates.saturating_sub(1);
                 match result {
                     DecodeResult::Finished => {
                         self.cache_metrics.copy_to_gauges();
+                        if let Some(handle) = self.rg_handle.take() {
+                            handle.finish(0);
+                        }
                         Ok(None)
                     }
                     DecodeResult::Data(reader) => {
@@ -4383,7 +5476,11 @@ impl MorselPlanner for FilteredRowGroupPlanner {
             }
             RgStage::AfterIo => {
                 if let Some((ranges, bytes)) = self.fetched.take() {
-                    self.buffered_bytes += bytes.iter().map(Bytes::len).sum::<usize>();
+                    let added = bytes.iter().map(Bytes::len).sum::<usize>();
+                    self.buffered_bytes += added;
+                    if let Some(handle) = self.rg_handle.as_mut() {
+                        handle.add_bytes_fetched(added as u64);
+                    }
                     self.decoder
                         .push_ranges(ranges, bytes)
                         .map_err(|err| self.context_err(DataFusionError::from(err)))?;
@@ -4399,13 +5496,24 @@ impl MorselPlanner for FilteredRowGroupPlanner {
                 }
                 // All predicates have run: build the decode-only reader from
                 // the buffered chunks without decoding output rows here.
+                let start = self
+                    .rg_handle
+                    .as_ref()
+                    .is_some_and(RgProbeHandle::needs_worker_timing)
+                    .then(Instant::now);
                 let result = self
                     .decoder
                     .try_next_reader()
                     .map_err(|err| self.context_err(DataFusionError::from(err)))?;
+                if let (Some(t0), Some(handle)) = (start, self.rg_handle.as_mut()) {
+                    handle.add_cpu_ns(t0.elapsed().as_nanos() as u64);
+                }
                 match result {
                     DecodeResult::Finished => {
                         self.cache_metrics.copy_to_gauges();
+                        if let Some(handle) = self.rg_handle.take() {
+                            handle.finish(0);
+                        }
                         Ok(None)
                     }
                     DecodeResult::Data(reader) => {
@@ -4429,6 +5537,7 @@ struct BufferedReader {
     reader: ParquetRecordBatchReader,
     decoded_lease: Option<SplitDecodedLease>,
     in_flight_guard: Option<InFlightReaderGuard>,
+    rg_handle: Option<RgProbeHandle>,
     compressed_bytes: u64,
     projection: Arc<DecoderProjection>,
     file_name: Arc<str>,
@@ -4493,6 +5602,7 @@ impl Morsel for BufferedReader {
             reader,
             decoded_lease,
             in_flight_guard,
+            rg_handle,
             projection,
             file_name,
             row_context,
@@ -4500,6 +5610,17 @@ impl Morsel for BufferedReader {
             cache_metrics,
             ..
         } = *self;
+        if let Some(handle) = rg_handle {
+            let is_bulk = handle.is_bulk();
+            if !publish_into_stream_handle(handle) && is_bulk {
+                return stream::once(async {
+                    Err(internal_datafusion_err!(
+                        "BulkDecode Parquet morsel consumed without an active capture_rg_handle scope"
+                    ))
+                })
+                .boxed();
+            }
+        }
         stream::iter(BufferedReaderIter {
             reader,
             _decoded_lease: decoded_lease,
@@ -6053,5 +7174,367 @@ mod tests {
         assert_eq!(split_ctx.budget.live_bytes(), 0);
         assert_eq!(pool.reserved(), 0);
         assert!(broker.state.lock().is_empty());
+    }
+
+    #[test]
+    fn adaptive_controller_probe_commit_reprobe_hysteresis_backoff_and_stale_epochs() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let cfg = AdaptiveRowFilterConfig {
+            mode: AdaptiveRowFilterMode::Adaptive,
+            probe_rgs_per_mode: 2,
+            reprobe_interval: 4,
+            test_mode_costs_ns_per_row: None,
+        };
+        let ctx = Arc::new(AdaptiveRowFilterContext::new(
+            cfg, 1, false, None, None, &metrics,
+        ));
+
+        // 1. Fast-path metadata gate (can_skip_columns = false) -> BulkDecode immediately.
+        let fast = ctx.assign_rg(false, 20, 1000);
+        assert_eq!(fast.mode(), RgFilterMode::BulkDecode);
+        assert!(!fast.needs_worker_timing());
+        fast.finish(500);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_fast_path_bulk_rgs")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+
+        // 2. Small-scan bypass (< MIN_RGS_FOR_ADAPTIVE_PROBE) -> RowFilter directly.
+        let small = ctx.assign_rg(true, 4, 1000);
+        assert_eq!(small.mode(), RgFilterMode::RowFilter);
+        assert!(!small.needs_worker_timing());
+        small.finish(500);
+
+        // 3. Initial probe dispatches exactly 2 RowFilter + 2 BulkDecode tracked handles.
+        let p0 = ctx.assign_rg(true, 40, 1000);
+        let p1 = ctx.assign_rg(true, 40, 1000);
+        let p2 = ctx.assign_rg(true, 40, 1000);
+        let p3 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(p0.mode(), RgFilterMode::RowFilter);
+        assert_eq!(p1.mode(), RgFilterMode::BulkDecode);
+        assert_eq!(p2.mode(), RgFilterMode::RowFilter);
+        assert_eq!(p3.mode(), RgFilterMode::BulkDecode);
+        assert!(p0.needs_worker_timing());
+        assert!(p1.needs_worker_timing());
+
+        // Extra concurrent RG while probes are in flight is NOT tracked (bounded probes).
+        let in_flight_extra = ctx.assign_rg(true, 40, 1000);
+        assert!(!in_flight_extra.needs_worker_timing());
+        assert_eq!(in_flight_extra.mode(), RgFilterMode::BulkDecode);
+
+        // BulkDecode is 1.2x cheaper (< 1.5x -> no backoff, reprobe_interval stays 4).
+        p0.finish(120_000);
+        p1.finish(100_000);
+        p2.finish(120_000);
+        p3.finish(100_000);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+
+        // Next 4 committed RGs run BulkDecode untracked.
+        for _ in 0..4 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::BulkDecode);
+            assert!(!h.needs_worker_timing());
+            h.finish(100_000);
+        }
+
+        // 4. Reprobe triggers after 4 committed RGs: 1 challenger (RowFilter) + 1 incumbent (BulkDecode).
+        let r0 = ctx.assign_rg(true, 40, 1000);
+        let r1 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(r0.mode(), RgFilterMode::RowFilter);
+        assert_eq!(r1.mode(), RgFilterMode::BulkDecode);
+        assert!(r0.needs_worker_timing());
+        assert!(r1.needs_worker_timing());
+
+        // Stale epoch sample (epoch 1) is ignored and must not corrupt epoch 2 reprobe.
+        ctx.report_mode_sample(RgFilterMode::RowFilter, 1, 1000, 1, 0);
+
+        // Hysteresis test: challenger only 3% faster (97k vs 100k, within 5% margin) -> keep BulkDecode.
+        r0.finish(97_000);
+        r1.finish(100_000);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            1
+        );
+        for _ in 0..4 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::BulkDecode);
+            h.finish(100_000);
+        }
+
+        // 5. Reprobe where RowFilter wins by > 2.0x (including bytes_fetched credit):
+        // switches to RowFilter and triggers 4x exponential backoff (4 * 4 = 16 RGs).
+        let mut r2 = ctx.assign_rg(true, 40, 1000);
+        let mut r3 = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(r2.mode(), RgFilterMode::RowFilter);
+        assert_eq!(r3.mode(), RgFilterMode::BulkDecode);
+        r2.add_bytes_fetched(10_000); // +5_000 ns
+        r3.add_bytes_fetched(400_000); // +200_000 ns
+        r2.finish(20_000); // total 25_000 ns
+        r3.finish(100_000); // total 300_000 ns -> 12x win -> 4x backoff = 16 RGs!
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .sum_by_name("adaptive_mode_switches")
+                .unwrap()
+                .as_usize(),
+            2
+        );
+        for _ in 0..16 {
+            let h = ctx.assign_rg(true, 40, 1000);
+            assert_eq!(h.mode(), RgFilterMode::RowFilter);
+            assert!(!h.needs_worker_timing());
+        }
+        // 17th RG starts the next reprobe (challenger = BulkDecode).
+        let next_reprobe = ctx.assign_rg(true, 40, 1000);
+        assert_eq!(next_reprobe.mode(), RgFilterMode::BulkDecode);
+        assert!(next_reprobe.needs_worker_timing());
+    }
+
+    #[test]
+    fn adaptive_controller_forced_and_alternating_modes() {
+        for (mode, expected) in [
+            (
+                AdaptiveRowFilterMode::ForceRowFilter,
+                vec![RgFilterMode::RowFilter; 4],
+            ),
+            (
+                AdaptiveRowFilterMode::ForceBulk,
+                vec![RgFilterMode::BulkDecode; 4],
+            ),
+            (
+                AdaptiveRowFilterMode::AlternateForTest,
+                vec![
+                    RgFilterMode::RowFilter,
+                    RgFilterMode::BulkDecode,
+                    RgFilterMode::RowFilter,
+                    RgFilterMode::BulkDecode,
+                ],
+            ),
+        ] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let ctx = Arc::new(AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode,
+                    ..Default::default()
+                },
+                1,
+                false,
+                None,
+                None,
+                &metrics,
+            ));
+            let actual: Vec<_> = (0..4)
+                .map(|_| ctx.assign_rg(false, 2, 100).mode())
+                .collect();
+            assert_eq!(actual, expected, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn row_filter_order_bandit_bounded_trial_keep_revert_and_stale_epoch() {
+        let mut bandit = RowFilterOrderBandit::new(vec![0, 1]);
+
+        // Warmup (2 iterations) + execute (16 iterations) with cost 100.0 for [0, 1].
+        for _ in 0..(RF_BANDIT_WARMUP + RF_BANDIT_EXECUTE_INTERVAL) {
+            let (order, epoch) = bandit.current_order();
+            assert_eq!(order, vec![0, 1]);
+            bandit.report(epoch.unwrap(), 100.0);
+        }
+
+        // Now in observe mode: peeking (as split RG slices do without a handle)
+        // must return the incumbent order without consuming trial dispatches.
+        assert_eq!(bandit.peek_order(), vec![0, 1]);
+        assert_eq!(bandit.trial_dispatched, 0);
+
+        // Strictly RF_BANDIT_OBSERVE_INTERVAL (2) dispatches receive the trial
+        // order [1, 0]; concurrent callers get incumbent [0, 1] untracked.
+        let (t0, e0) = bandit.current_order();
+        assert_eq!(bandit.peek_order(), vec![0, 1]);
+        assert_eq!(bandit.trial_dispatched, 1);
+        let (t1, e1) = bandit.current_order();
+        let (overflow, e_overflow) = bandit.current_order();
+        assert_eq!(t0, vec![1, 0]);
+        assert_eq!(t1, vec![1, 0]);
+        assert!(e0.is_some() && e0 == e1);
+        assert_eq!(overflow, vec![0, 1]);
+        assert_eq!(e_overflow, None);
+
+        // Stale epoch report from before the swap must be ignored.
+        bandit.report(e0.unwrap() - 1, 1.0);
+        assert!(bandit.observe);
+
+        // Trial improves cost (20.0 < 100.0) -> keeps [1, 0] and keeps likeliness at 100.
+        bandit.report(e0.unwrap(), 20.0);
+        bandit.report(e1.unwrap(), 20.0);
+        assert!(!bandit.observe);
+        assert_eq!(bandit.permutation, vec![1, 0]);
+        assert_eq!(bandit.swap_likeliness, vec![RF_BANDIT_INITIAL_LIKELINESS]);
+
+        // Execute 16 iterations at cost 20.0 -> triggers next trial swap back to [0, 1].
+        for _ in 0..RF_BANDIT_EXECUTE_INTERVAL {
+            let (order, epoch) = bandit.current_order();
+            assert_eq!(order, vec![1, 0]);
+            bandit.report(epoch.unwrap(), 20.0);
+        }
+        let (b0, eb0) = bandit.current_order();
+        let (b1, eb1) = bandit.current_order();
+        assert_eq!(b0, vec![0, 1]);
+        assert_eq!(b1, vec![0, 1]);
+
+        // Regressing trial (100.0 >= 20.0) -> reverts to [1, 0] and halves likeliness (100 -> 50).
+        bandit.report(eb0.unwrap(), 100.0);
+        bandit.report(eb1.unwrap(), 100.0);
+        assert!(!bandit.observe);
+        assert_eq!(bandit.permutation, vec![1, 0]);
+        assert_eq!(
+            bandit.swap_likeliness,
+            vec![RF_BANDIT_INITIAL_LIKELINESS / 2]
+        );
+    }
+
+    #[test]
+    fn row_filter_order_per_signature_isolation_and_fixed_identity() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let ctx = AdaptiveRowFilterContext::new(
+            AdaptiveRowFilterConfig::default(),
+            2,
+            false,
+            None,
+            None,
+            &metrics,
+        );
+
+        let sig_a = Arc::new(vec!["a".to_owned(), "b".to_owned()]);
+        let sig_b = Arc::new(vec!["a".to_owned(), "c".to_owned()]);
+        let plan_a = FileRowFilterPlan::Adaptive {
+            signature: Arc::clone(&sig_a),
+            initial_order: vec![1, 0],
+        };
+        let plan_b = FileRowFilterPlan::Adaptive {
+            signature: Arc::clone(&sig_b),
+            initial_order: vec![0, 1],
+        };
+        let plan_fallible = FileRowFilterPlan::FixedIdentity(vec![0, 1]);
+
+        let (ord_a, key_a) = ctx.row_filter_order(&plan_a);
+        let (ord_b, key_b) = ctx.row_filter_order(&plan_b);
+        let (ord_f, key_f) = ctx.row_filter_order(&plan_fallible);
+
+        assert_eq!(ord_a, vec![1, 0]);
+        assert!(key_a.is_some());
+        assert_eq!(ord_b, vec![0, 1]);
+        assert!(key_b.is_some());
+        assert_eq!(ord_f, vec![0, 1]);
+        assert!(key_f.is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_decode_morsel_fails_closed_without_capture_scope() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let data = write_parquet_bytes(&batch, WriterProperties::builder().build());
+        let reader_metadata = load_metadata(&data, false);
+        let proj = ProjectionExprs::from_indices(&[0], &schema);
+        let decoder_proj = Arc::new(
+            DecoderProjection::try_new(
+                &proj,
+                &schema,
+                reader_metadata.parquet_schema(),
+                &schema,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let build_morsel = |mode: AdaptiveRowFilterMode| {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let ctx = Arc::new(AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode,
+                    ..Default::default()
+                },
+                1,
+                false,
+                None,
+                None,
+                &metrics,
+            ));
+            let handle = ctx.assign_rg(true, 1, 4);
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                    data.clone(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            Box::new(BufferedReader {
+                reader,
+                decoded_lease: None,
+                in_flight_guard: None,
+                rg_handle: Some(handle),
+                compressed_bytes: data.len() as u64,
+                projection: Arc::clone(&decoder_proj),
+                file_name: Arc::from("test.parquet"),
+                row_context: None,
+                elapsed_compute: Time::new(),
+                cache_metrics: None,
+            }) as Box<dyn Morsel>
+        };
+
+        // 1. Calling `into_stream()` on a BulkDecode morsel WITHOUT `capture_rg_handle`
+        // must fail closed with an error rather than yielding unfiltered rows.
+        let bulk_morsel = build_morsel(AdaptiveRowFilterMode::ForceBulk);
+        let mut uncaptured_stream = bulk_morsel.into_stream();
+        let first = uncaptured_stream.next().await.expect("expected error item");
+        let err = first.expect_err("uncaptured BulkDecode morsel must error");
+        assert!(
+            err.to_string().contains("BulkDecode"),
+            "unexpected error: {err}"
+        );
+
+        // 2. Calling `into_stream()` on a BulkDecode morsel WITH `capture_rg_handle`
+        // captures the handle cleanly and streams batches.
+        let bulk_morsel_ok = build_morsel(AdaptiveRowFilterMode::ForceBulk);
+        let (mut captured_stream, handle) =
+            capture_rg_handle(|| bulk_morsel_ok.into_stream());
+        let handle = handle.expect("expected captured RgProbeHandle");
+        assert!(handle.is_bulk());
+        let out = captured_stream
+            .next()
+            .await
+            .expect("expected batch")
+            .expect("captured BulkDecode stream should succeed");
+        assert_eq!(out.num_rows(), 4);
+        handle.finish(100);
+
+        // 3. Calling `into_stream()` on an already-filtered RowFilter morsel without
+        // `capture_rg_handle` still streams normally (rows are already filtered).
+        let rf_morsel = build_morsel(AdaptiveRowFilterMode::ForceRowFilter);
+        let mut rf_stream = rf_morsel.into_stream();
+        let rf_batch = rf_stream
+            .next()
+            .await
+            .expect("expected batch")
+            .expect("RowFilter morsel should succeed without capture scope");
+        assert_eq!(rf_batch.num_rows(), 4);
     }
 }

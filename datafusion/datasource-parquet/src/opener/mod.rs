@@ -9,8 +9,11 @@ mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 
-pub use self::buffered::ParquetSplitConfig;
 pub(crate) use self::buffered::SplitContext;
+pub use self::buffered::{
+    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
+    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle, capture_rg_handle,
+};
 use self::buffered::{
     BufferedReaders, FilteredBufferedReadersConfig, PlainBufferedReaders,
     SplitPlainBufferedReadersConfig,
@@ -318,6 +321,7 @@ pub(super) struct ParquetMorselizer {
     pub(super) buffered: bool,
     pub(super) direct_store: Option<Arc<dyn ObjectStore>>,
     pub(super) split_context: Option<Arc<SplitContext>>,
+    pub(super) adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -462,6 +466,7 @@ struct PreparedParquetOpen {
     parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     direct_store: Option<Arc<dyn ObjectStore>>,
     split_context: Option<Arc<SplitContext>>,
+    adaptive_context: Option<Arc<AdaptiveRowFilterContext>>,
     schema_provider: Option<Arc<dyn crate::ParquetFileSchemaProvider>>,
     async_file_reader: Box<dyn AsyncFileReader>,
     batch_size: usize,
@@ -469,6 +474,7 @@ struct PreparedParquetOpen {
     physical_file_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: ProjectionExprs,
+    bulk_projection: Option<(ProjectionExprs, SchemaRef)>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
@@ -553,6 +559,7 @@ struct RowGroupsPrunedParquetOpen {
 /// Per-file projection and filter plans shared by index loading and decoding.
 struct DecoderReadPlans {
     projection: DecoderProjection,
+    bulk_projection: Option<DecoderProjection>,
     row_filter_context: Option<RowFilterContext>,
 }
 
@@ -574,6 +581,19 @@ impl DecoderReadPlans {
             &prepared.output_schema,
             prepared.virtual_state.as_deref(),
         )?;
+        let bulk_projection = prepared
+            .bulk_projection
+            .as_ref()
+            .map(|(bulk_proj, bulk_schema)| {
+                DecoderProjection::try_new(
+                    bulk_proj,
+                    &prepared.physical_file_schema,
+                    metadata.parquet_schema(),
+                    bulk_schema,
+                    prepared.virtual_state.as_deref(),
+                )
+            })
+            .transpose()?;
         let pushdown_predicate = prepared
             .pushdown_filters
             .then_some(prepared.predicate.as_ref())
@@ -599,6 +619,7 @@ impl DecoderReadPlans {
         });
         Ok(Self {
             projection,
+            bulk_projection,
             row_filter_context,
         })
     }
@@ -961,6 +982,10 @@ impl ParquetMorselizer {
         literal_columns.extend(stats_constants);
 
         let mut projection = self.projection.clone();
+        let mut bulk_projection = self
+            .adaptive_context
+            .as_ref()
+            .and_then(|ctx| ctx.bulk_projection().cloned());
         let mut predicate = self.predicate.clone();
         if !literal_columns.is_empty() {
             // Keep the field metadata of the replaced columns, such as extension types
@@ -972,6 +997,16 @@ impl ParquetMorselizer {
                     table_schema,
                 )
             })?;
+            if let Some((bulk_proj, bulk_schema)) = bulk_projection {
+                let rewritten = bulk_proj.try_map_exprs(|expr| {
+                    replace_columns_with_literals_keeping_metadata(
+                        Arc::clone(&expr),
+                        &literal_columns,
+                        table_schema,
+                    )
+                })?;
+                bulk_projection = Some((rewritten, bulk_schema));
+            }
             predicate = predicate
                 .map(|p| {
                     replace_columns_with_literals_keeping_metadata(
@@ -985,6 +1020,10 @@ impl ParquetMorselizer {
 
         // Replace any `input_file_name()` UDFs in the projection with a literal for this file.
         projection = rewrite_input_file_name_in_projection(projection, &file_name)?;
+        if let Some((bulk_proj, bulk_schema)) = bulk_projection {
+            let rewritten = rewrite_input_file_name_in_projection(bulk_proj, &file_name)?;
+            bulk_projection = Some((rewritten, bulk_schema));
+        }
 
         let predicate_creation_errors = MetricBuilder::new(&self.metrics)
             .with_category(MetricCategory::Rows)
@@ -1028,6 +1067,7 @@ impl ParquetMorselizer {
             parquet_file_reader_factory: Arc::clone(&self.parquet_file_reader_factory),
             direct_store: self.direct_store.as_ref().map(Arc::clone),
             split_context: self.split_context.as_ref().map(Arc::clone),
+            adaptive_context: self.adaptive_context.as_ref().map(Arc::clone),
             schema_provider: self.schema_provider.clone(),
             async_file_reader,
             batch_size: self.batch_size,
@@ -1035,6 +1075,7 @@ impl ParquetMorselizer {
             physical_file_schema: logical_file_schema,
             output_schema,
             projection,
+            bulk_projection,
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
@@ -1259,6 +1300,11 @@ impl MetadataLoadedParquetOpen {
             prepared.projection = prepared
                 .projection
                 .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+            if let Some((bulk_proj, bulk_schema)) = prepared.bulk_projection.take() {
+                let rewritten = bulk_proj
+                    .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+                prepared.bulk_projection = Some((rewritten, bulk_schema));
+            }
         }
         prepared.physical_file_schema = Arc::clone(&physical_file_schema);
 
@@ -1852,6 +1898,7 @@ impl RowGroupsPrunedParquetOpen {
         // scans defer this work until the stream is built.
         let DecoderReadPlans {
             projection: decoder_projection,
+            bulk_projection: bulk_decoder_projection,
             row_filter_context: precomputed_context,
         } = match decoder_read_plans {
             Some(plans) => plans,
@@ -1926,6 +1973,7 @@ impl RowGroupsPrunedParquetOpen {
                     pending,
                     reader_metadata,
                     projection: Arc::new(decoder_projection),
+                    bulk_projection: bulk_decoder_projection.map(Arc::new),
                     row_filter_context,
                     row_filter_skipped_fully_matched,
                     batch_size: prepared.batch_size,
@@ -1942,6 +1990,7 @@ impl RowGroupsPrunedParquetOpen {
                     async_file_reader: prepared.async_file_reader,
                     direct_store: prepared.direct_store,
                     split_context: prepared.split_context,
+                    adaptive_context: prepared.adaptive_context,
                 }),
             )));
         }
@@ -2958,6 +3007,7 @@ mod test {
                 buffered: false,
                 direct_store: None,
                 split_context: None,
+                adaptive_context: None,
             })
         }
     }

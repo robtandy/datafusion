@@ -44,7 +44,10 @@ pub use bloom_filter::BloomFilterStatistics;
 pub use file_format::*;
 pub use metrics::ParquetFileMetrics;
 #[doc(hidden)]
-pub use opener::ParquetSplitConfig;
+pub use opener::{
+    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
+    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle, capture_rg_handle,
+};
 pub use page_filter::PagePruningAccessPlanFilter;
 pub use reader::*; // Expose so downstream crates can use it
 pub use row_filter::build_row_filter;
