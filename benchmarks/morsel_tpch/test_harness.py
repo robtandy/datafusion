@@ -1468,6 +1468,15 @@ class TpchHarnessTest(unittest.TestCase):
             self.assertEqual(q3_report["spilled_bytes"], 0)
             self.assertEqual(q3_report["spilled_rows"], 0)
             self.assertGreater(q3_report["join_dynamic_filters_pushed"], 0)
+            self.assertGreaterEqual(q3_report["adaptive_row_filter_rgs"], 0)
+            self.assertGreaterEqual(q3_report["adaptive_bulk_decode_rgs"], 0)
+            self.assertGreaterEqual(q3_report["adaptive_fast_path_bulk_rgs"], 0)
+            self.assertGreaterEqual(q3_report["adaptive_mode_switches"], 0)
+            self.assertGreater(
+                q3_report["adaptive_row_filter_rgs"]
+                + q3_report["adaptive_bulk_decode_rgs"],
+                0,
+            )
 
             # Check bounded-memory spill execution and metrics via MORSEL_MEMORY_LIMIT_BYTES.
             q18 = WORKLOADS["q18"]
