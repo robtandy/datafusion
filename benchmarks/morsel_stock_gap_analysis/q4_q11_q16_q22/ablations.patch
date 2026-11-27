@@ -186,7 +186,7 @@ index a6b96bfc4..c1af1e3d6 100644
 +            }
          }
          drop(probe_stage_input);
- 
+
 @@ -5103,6 +5229,9 @@ impl Pipeline {
                          && !cancel_tx.is_closed()
                          && let Some(combined) = combined_agg.take()
@@ -227,7 +227,7 @@ index a6b96bfc4..c1af1e3d6 100644
                  }
 @@ -5218,9 +5361,16 @@ impl Pipeline {
              );
- 
+
              if let Some(sq_state) = &scalar_subqueries {
 +                let t_sq = Instant::now();
                  let cont = sq_state
@@ -248,24 +248,24 @@ index 12d307d8a..a9a65ceeb 100644
 +++ b/datafusion/core/src/morsel/dag.rs
 @@ -636,6 +636,8 @@ pub(super) fn ensure_stage<'a>(
          }
- 
+
          dag.executed[stage_id.0] = true;
 +        let diag = std::env::var("MORSEL_DIAG_PHASES").as_deref() == Ok("1");
 +        let t_stage = std::time::Instant::now();
          let stage_pipeline = Arc::clone(&dag.stages[stage_id.0].pipeline);
          let stage_label = dag.stages[stage_id.0].label.clone();
- 
+
 @@ -657,7 +659,10 @@ pub(super) fn ensure_stage<'a>(
              return Ok(None);
          };
- 
+
 -        let channel_cap = stage_pipeline.sink_capacity.max(4);
 +        let channel_cap = std::env::var("MORSEL_DIAG_STAGE_CAP")
 +            .ok()
 +            .and_then(|s| s.parse::<usize>().ok())
 +            .unwrap_or_else(|| stage_pipeline.sink_capacity.max(4));
          let (stage_tx, mut stage_rx) = mpsc::channel(channel_cap);
- 
+
          let mut stage_tasks: JoinSet<Result<()>> = JoinSet::new();
 @@ -666,10 +671,11 @@ pub(super) fn ensure_stage<'a>(
              let metrics = plan_metrics.clone();
@@ -283,7 +283,7 @@ index 12d307d8a..a9a65ceeb 100644
 @@ -786,6 +792,14 @@ pub(super) fn ensure_stage<'a>(
              return Ok(None);
          }
- 
+
 +        if diag {
 +            let total_rows: usize = stage.batches.iter().map(|b| b.num_rows()).sum();
 +            eprintln!(
@@ -435,7 +435,7 @@ index 88dfd845d..08d5e724e 100644
 +    blocks: Vec<BloomBlock>,
      block_mask: usize,
  }
- 
+
 @@ -110,24 +114,24 @@ impl SplitBlockBloomFilter {
          }
          let needed_bits = entries.saturating_mul(MIN_BLOOM_BITS_PER_KEY);
@@ -444,12 +444,12 @@ index 88dfd845d..08d5e724e 100644
 +        let max_blocks = MAX_BLOOM_BYTES / size_of::<BloomBlock>();
          Some(needed_blocks.min(max_blocks))
      }
- 
+
      pub(super) fn estimated_bytes(num_blocks: usize) -> usize {
 -        num_blocks.saturating_mul(size_of::<[u32; 8]>())
 +        num_blocks.saturating_mul(size_of::<BloomBlock>())
      }
- 
+
      pub(super) fn with_blocks(num_blocks: usize) -> Self {
          debug_assert!(num_blocks.is_power_of_two());
          Self {
@@ -458,15 +458,15 @@ index 88dfd845d..08d5e724e 100644
              block_mask: num_blocks - 1,
          }
      }
- 
+
      pub(super) fn memory_bytes(&self) -> usize {
 -        self.blocks.capacity().saturating_mul(size_of::<[u32; 8]>())
 +        self.blocks.capacity().saturating_mul(size_of::<BloomBlock>())
      }
- 
+
      #[inline]
 @@ -147,7 +151,7 @@ impl SplitBlockBloomFilter {
- 
+
      #[inline]
      pub(super) fn insert(&mut self, h: u64) {
 -        let block = &mut self.blocks[(h as usize) & self.block_mask];
@@ -524,7 +524,7 @@ index 88dfd845d..08d5e724e 100644
 +        }
 +    }
  }
- 
+
  /// Lock-free atomic builder for [`SplitBlockBloomFilter`], enabling parallel
 @@ -202,7 +242,7 @@ impl AtomicSplitBlockBloomFilter {
          let blocks = self
@@ -589,7 +589,7 @@ index ce692888b..b65b35e30 100644
 @@ -553,6 +553,10 @@ impl ParquetScan {
          }
      }
- 
+
 +    pub(super) fn dynamic_join_filters_empty(&self) -> bool {
 +        self.dynamic_join_filters.is_empty()
 +    }
@@ -599,7 +599,7 @@ index ce692888b..b65b35e30 100644
          context: &TaskContext,
 @@ -701,11 +705,18 @@ impl ParquetScan {
          );
- 
+
          let adaptive_ctx = can_adapt.then(|| {
 -            let adaptive_cfg = context
 +            let mut adaptive_cfg = context
