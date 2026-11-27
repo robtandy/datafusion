@@ -321,7 +321,7 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
                         *hi |= has_hi;
                         *w = (*w).max(weight);
                         if *lo && *hi {
-                            *w = (*w).max(4);
+                            *w = (*w).max(2);
                         }
                     })
                     .or_insert((weight, has_lo, has_hi));

@@ -863,6 +863,30 @@ pub(super) fn collect_pipeline_bound_filter_ids(
     }
 }
 
+fn build_pipeline_is_filtered(pipeline: &Pipeline) -> bool {
+    match &pipeline.source {
+        Source::Stage(_) => return true,
+        Source::Parquet(pq) if !pq.dynamic_join_filters().is_empty() => return true,
+        _ => {}
+    }
+    if super::pipeline_filter_shift(&pipeline.source, &pipeline.operators) > 0 {
+        return true;
+    }
+    pipeline.operators.iter().any(|op| {
+        matches!(
+            op,
+            Operator::HashProbe(probe)
+                if matches!(
+                    probe.kind,
+                    ProbeJoinKind::Inner
+                        | ProbeJoinKind::ProbeSemi
+                        | ProbeJoinKind::BuildSemi
+                        | ProbeJoinKind::BuildAnti
+                ) && build_pipeline_is_filtered(&probe.build_pipeline)
+        )
+    })
+}
+
 fn can_reach(adj: &[Vec<usize>], start: usize, target: usize) -> bool {
     if start == target {
         return true;
@@ -911,6 +935,7 @@ fn bind_pipeline_dynamic_join_filters_with_stages(
 
     let schemas = compute_pipeline_schemas(source, operators)?;
 
+    let mut backward_bound: Vec<(usize, bool)> = Vec::new();
     for op_idx in 0..operators.len() {
         let (filter_id, probe_keys) = match &operators[op_idx] {
             Operator::HashProbe(probe) if probe.kind.allows_dynamic_filter_pushdown() => {
@@ -933,24 +958,31 @@ fn bind_pipeline_dynamic_join_filters_with_stages(
             stages_prefix,
             stage_ref_counts,
         )?;
-        if bound_any
-            && let Operator::HashProbe(probe_arc) = &mut operators[op_idx]
+        if bound_any {
+            backward_bound.push((op_idx, any_pushdown));
+        }
+    }
+
+    // Enable dynamic filters AFTER the full backward loop completes so earlier
+    // builds that received a backward dynamic filter (e.g. TPC-H Q18 `orders`
+    // filtered by `stage_0`) are recognized as filtered before sibling forward
+    // propagation runs.
+    for (op_idx, any_pushdown) in backward_bound {
+        if let Operator::HashProbe(probe_arc) = &mut operators[op_idx]
             && let Some(probe) = Arc::get_mut(probe_arc)
             && let Some(build_pipeline) = Arc::get_mut(&mut probe.build_pipeline)
-            && let Sink::HashJoinBuild(sink_arc) = &mut build_pipeline.sink
-            && let Some(sink) = Arc::get_mut(sink_arc)
         {
-            let build_is_filtered = matches!(build_pipeline.source, Source::Stage(_))
-                || super::pipeline_filter_shift(
-                    &build_pipeline.source,
-                    &build_pipeline.operators,
-                ) > 0;
-            sink.enable_dynamic_filter(DynamicJoinFilterConfig {
-                max_inlist_values,
-                max_inlist_bytes,
-                build_bloom: any_pushdown,
-                build_is_filtered,
-            });
+            let build_is_filtered = build_pipeline_is_filtered(build_pipeline);
+            if let Sink::HashJoinBuild(sink_arc) = &mut build_pipeline.sink
+                && let Some(sink) = Arc::get_mut(sink_arc)
+            {
+                sink.enable_dynamic_filter(DynamicJoinFilterConfig {
+                    max_inlist_values,
+                    max_inlist_bytes,
+                    build_bloom: any_pushdown,
+                    build_is_filtered,
+                });
+            }
         }
     }
 
