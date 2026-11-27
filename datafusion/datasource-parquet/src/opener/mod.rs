@@ -12,7 +12,8 @@ mod encryption;
 pub(crate) use self::buffered::SplitContext;
 pub use self::buffered::{
     AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
-    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle, capture_rg_handle,
+    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle,
+    RowFilterSkipPredicate, capture_rg_handle,
 };
 use self::buffered::{
     BufferedReaders, FilteredBufferedReadersConfig, PlainBufferedReaders,
@@ -615,6 +616,14 @@ impl DecoderReadPlans {
                 (prepared.group_row_filter_conjuncts
                     && prepared.enable_row_group_stats_pruning)
                     .then_some(surviving_row_groups),
+                prepared
+                    .adaptive_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.analyzer()),
+                prepared
+                    .adaptive_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.skip_row_filter_conjunct()),
             )
         });
         Ok(Self {

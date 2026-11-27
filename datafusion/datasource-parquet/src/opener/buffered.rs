@@ -148,6 +148,13 @@ impl RgFilterMode {
 pub type ConjunctAnalyzer =
     Arc<dyn Fn(&Arc<dyn PhysicalExpr>, &Schema) -> (bool, u64) + Send + Sync>;
 
+/// Callback returning `true` for a redundant dynamic range conjunct that can be
+/// omitted from row-level `RowFilter` evaluation when an accompanying membership
+/// predicate (e.g. a split-block Bloom filter) survives on the same leaf column.
+#[doc(hidden)]
+pub type RowFilterSkipPredicate =
+    Arc<dyn Fn(&Arc<dyn PhysicalExpr>) -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControllerPhase {
     InitialProbe {
@@ -438,6 +445,9 @@ pub struct AdaptiveRowFilterContext {
     /// columns, so `BulkDecode` row groups still decode predicate columns.
     bulk_projection: Option<(ProjectionExprs, SchemaRef)>,
     analyzer: Option<ConjunctAnalyzer>,
+    skip_row_filter_conjunct: Option<RowFilterSkipPredicate>,
+    prefer_rf_wave1: bool,
+    skip_bulk_probe: bool,
     alt_seq: AtomicUsize,
     controller: Mutex<ControllerState>,
     rf_orders: Mutex<HashMap<CandidateSignature, RowFilterOrderBandit>>,
@@ -480,6 +490,9 @@ impl AdaptiveRowFilterContext {
             has_dynamic_join_filter,
             bulk_projection,
             analyzer,
+            skip_row_filter_conjunct: None,
+            prefer_rf_wave1: false,
+            skip_bulk_probe: false,
             alt_seq: AtomicUsize::new(0),
             controller: Mutex::new(ControllerState {
                 phase: ControllerPhase::InitialProbe {
@@ -492,6 +505,32 @@ impl AdaptiveRowFilterContext {
             rf_orders: Mutex::new(HashMap::new()),
             metrics,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_row_filter_skip(mut self, pred: RowFilterSkipPredicate) -> Self {
+        self.skip_row_filter_conjunct = Some(pred);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_prefer_rf_wave1(mut self, prefer: bool) -> Self {
+        self.prefer_rf_wave1 = prefer;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_skip_bulk_probe(mut self, skip: bool) -> Self {
+        self.skip_bulk_probe = skip;
+        self
+    }
+
+    pub(crate) fn analyzer(&self) -> Option<&ConjunctAnalyzer> {
+        self.analyzer.as_ref()
+    }
+
+    pub(crate) fn skip_row_filter_conjunct(&self) -> Option<&RowFilterSkipPredicate> {
+        self.skip_row_filter_conjunct.as_ref()
     }
 
     fn build_file_row_filter_plan(
@@ -552,6 +591,11 @@ impl AdaptiveRowFilterContext {
                     self.metrics.fast_path_bulk_rgs.add(1);
                     self.metrics.bulk_decode_rgs.add(1);
                     (RgFilterMode::BulkDecode, None)
+                } else if self.skip_bulk_probe
+                    && self.config.test_mode_costs_ns_per_row.is_none()
+                {
+                    self.metrics.row_filter_rgs.add(1);
+                    (RgFilterMode::RowFilter, None)
                 } else if estimated_scan_rgs < min_rgs_for_probe {
                     // Tiny scan with too few row groups to amortize A/B probing:
                     // execute directly in RowFilter mode.
@@ -601,6 +645,7 @@ impl AdaptiveRowFilterContext {
                                 } else if (stats.rf_samples > 0
                                     && stats.bulk_samples == 0)
                                     || self.has_dynamic_join_filter
+                                    || self.prefer_rf_wave1
                                 {
                                     RgFilterMode::RowFilter
                                 } else {
@@ -7536,5 +7581,122 @@ mod tests {
             .expect("expected batch")
             .expect("RowFilter morsel should succeed without capture scope");
         assert_eq!(rf_batch.num_rows(), 4);
+    }
+
+    #[test]
+    fn adaptive_prefer_rf_wave1_and_skip_bulk_probe_policies() {
+        // 1. Default static scan (`prefer_rf_wave1 = false`): after the initial
+        // 2+2 probe RGs are dispatched in flight, wave-1 overflow defaults to BulkDecode.
+        let m_default = ExecutionPlanMetricsSet::new();
+        let ctx_default = Arc::new(AdaptiveRowFilterContext::new(
+            AdaptiveRowFilterConfig::default(),
+            4,
+            false,
+            None,
+            None,
+            &m_default,
+        ));
+        let mut inflight = Vec::new();
+        for _ in 0..4 {
+            inflight.push(ctx_default.assign_rg(true, 10, 1000));
+        }
+        let wave1_default = ctx_default.assign_rg(true, 10, 1000);
+        assert!(wave1_default.is_bulk());
+        drop(inflight);
+
+        // 2. Scoped `prefer_rf_wave1 = true`: wave-1 overflow defaults to RowFilter
+        // while still dispatching the initial 2+2 probes.
+        let m_rf = ExecutionPlanMetricsSet::new();
+        let ctx_rf = Arc::new(
+            AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig::default(),
+                4,
+                false,
+                None,
+                None,
+                &m_rf,
+            )
+            .with_prefer_rf_wave1(true),
+        );
+        let mut inflight = Vec::new();
+        let mut probe_bulk = 0usize;
+        for _ in 0..4 {
+            let h = ctx_rf.assign_rg(true, 10, 1000);
+            if h.is_bulk() {
+                probe_bulk += 1;
+            }
+            inflight.push(h);
+        }
+        assert_eq!(probe_bulk, 2);
+        let wave1_rf = ctx_rf.assign_rg(true, 10, 1000);
+        assert!(!wave1_rf.is_bulk());
+        drop(inflight);
+
+        // 3. `skip_bulk_probe = true`: dispatches pure RowFilter without BulkDecode probes
+        // in Adaptive mode, while still honoring ForceBulk and deterministic test costs.
+        let m_skip = ExecutionPlanMetricsSet::new();
+        let ctx_skip = Arc::new(
+            AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig::default(),
+                4,
+                true,
+                None,
+                None,
+                &m_skip,
+            )
+            .with_skip_bulk_probe(true),
+        );
+        for _ in 0..10 {
+            let h = ctx_skip.assign_rg(true, 10, 1000);
+            assert!(!h.is_bulk());
+        }
+        assert_eq!(
+            m_skip
+                .clone_inner()
+                .sum_by_name("adaptive_bulk_decode_rgs")
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+
+        let m_force = ExecutionPlanMetricsSet::new();
+        let ctx_force = Arc::new(
+            AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode: AdaptiveRowFilterMode::ForceBulk,
+                    ..AdaptiveRowFilterConfig::default()
+                },
+                4,
+                true,
+                None,
+                None,
+                &m_force,
+            )
+            .with_skip_bulk_probe(true),
+        );
+        assert!(ctx_force.assign_rg(true, 10, 1000).is_bulk());
+
+        let m_det = ExecutionPlanMetricsSet::new();
+        let ctx_det = Arc::new(
+            AdaptiveRowFilterContext::new(
+                AdaptiveRowFilterConfig {
+                    mode: AdaptiveRowFilterMode::Adaptive,
+                    test_mode_costs_ns_per_row: Some((10, 50)),
+                    ..AdaptiveRowFilterConfig::default()
+                },
+                4,
+                true,
+                None,
+                None,
+                &m_det,
+            )
+            .with_skip_bulk_probe(true),
+        );
+        let mut saw_bulk_probe = false;
+        for _ in 0..4 {
+            if ctx_det.assign_rg(true, 10, 1000).is_bulk() {
+                saw_bulk_probe = true;
+            }
+        }
+        assert!(saw_bulk_probe);
     }
 }

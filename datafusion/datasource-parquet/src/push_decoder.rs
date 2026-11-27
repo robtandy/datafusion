@@ -365,6 +365,8 @@ impl RowFilterContext {
         max_predicate_cache_size: Option<usize>,
         group_same_column: bool,
         surviving_row_groups: Option<&[usize]>,
+        conjunct_analyzer: Option<&crate::opener::ConjunctAnalyzer>,
+        skip_redundant_conjunct: Option<&crate::opener::RowFilterSkipPredicate>,
     ) -> Option<Self> {
         match prebuild_row_filter_candidates_with_grouping(
             predicate,
@@ -372,6 +374,8 @@ impl RowFilterContext {
             file_metadata.as_ref(),
             group_same_column,
             surviving_row_groups,
+            conjunct_analyzer,
+            skip_redundant_conjunct,
         ) {
             Ok(Some(prebuilt)) => Some(Self {
                 prebuilt: PrebuiltRowFilterCandidateList::new(prebuilt),
