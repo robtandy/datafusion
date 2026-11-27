@@ -4590,34 +4590,40 @@ async fn chained_double_short_circuit_skips_earlier_build_emission() -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> Result<()>
 {
-    // Q14-like schema: large `fact` (30,000 rows, shipdate 0..1000) joined with
-    // unfiltered `dim` (10,000 rows with wide string `ptype`). A 1% shipdate window
-    // (300 rows) must beat `dim` (10,000 rows) using Parquet footer column stats,
-    // building on filtered `fact` and pushing dynamic filters onto `dim`.
+    // Q14-like schema sized so `pipeline_filter_shift` (>> 2 = 25% selectivity)
+    // still prefers building on `dim` (`fact_bytes ≈ 15x dim_bytes`, so
+    // `fact * 3/4 > dim * 4`), whereas Parquet footer column-stats interval
+    // selectivity (0.2% window) flips the build side to filtered `fact`.
     let fact_schema = Arc::new(Schema::new(vec![
         Field::new("partkey", DataType::Int64, false),
         Field::new("shipdate", DataType::Int32, false),
         Field::new("extprice", DataType::Int64, false),
         Field::new("discount", DataType::Int64, false),
-        Field::new("pad1", DataType::Utf8, false),
     ]));
     let fact_batch = RecordBatch::try_new(
         Arc::clone(&fact_schema),
         vec![
             Arc::new(Int64Array::from_iter_values(
-                (0..30_000i64).map(|i| (i * 17) % 10_000),
+                (0..80_000i64)
+                    .map(|i| (i.wrapping_mul(2_654_435_761) & 0x7fff_ffff) % 6_000),
             )),
-            Arc::new(Int32Array::from_iter_values(
-                (0..30_000i32).map(|i| i % 1000),
+            Arc::new(Int32Array::from_iter_values((0..80_000i32).map(|i| {
+                ((i as u32).wrapping_mul(2_246_822_519) % 10_000) as i32
+            }))),
+            Arc::new(Int64Array::from_iter_values(
+                (0..80_000i64)
+                    .map(|i| (i.wrapping_mul(1_103_515_245) + 12_345) & 0x00ff_ffff),
             )),
-            Arc::new(Int64Array::from_iter_values(0..30_000i64)),
-            Arc::new(Int64Array::from_iter_values((0..30_000i64).map(|i| i % 10))),
-            Arc::new(StringArray::from_iter_values(
-                (0..30_000i64).map(|i| format!("fact-padding-value-{i:08}")),
+            Arc::new(Int64Array::from_iter_values(
+                (0..80_000i64).map(|i| ((i.wrapping_mul(16_807)) % 100) & 0x7f),
             )),
         ],
     )?;
-    let fact_dir = write_parquet_files(&[fact_batch], 2, 5_000)?;
+    let fact_batches = vec![
+        fact_batch.slice(0, 40_000),
+        fact_batch.slice(40_000, 40_000),
+    ];
+    let fact_dir = write_parquet_files(&fact_batches, 2, 20_000)?;
 
     let dim_schema = Arc::new(Schema::new(vec![
         Field::new("p_partkey", DataType::Int64, false),
@@ -4626,8 +4632,8 @@ async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> R
     let dim_batch = RecordBatch::try_new(
         Arc::clone(&dim_schema),
         vec![
-            Arc::new(Int64Array::from_iter_values(0..10_000i64)),
-            Arc::new(StringArray::from_iter_values((0..10_000i64).map(|i| {
+            Arc::new(Int64Array::from_iter_values(0..6_000i64)),
+            Arc::new(StringArray::from_iter_values((0..6_000i64).map(|i| {
                 if i % 5 == 0 {
                     format!("PROMO STEEL {i:06}")
                 } else {
@@ -4636,7 +4642,8 @@ async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> R
             }))),
         ],
     )?;
-    let dim_dir = write_parquet_files(&[dim_batch], 2, 2_500)?;
+    let dim_batches = vec![dim_batch.slice(0, 3_000), dim_batch.slice(3_000, 3_000)];
+    let dim_dir = write_parquet_files(&dim_batches, 2, 1_500)?;
 
     let make_ctx = |mode: &str| {
         let fp = fact_dir.path().to_str().unwrap().to_owned();
@@ -4661,13 +4668,15 @@ async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> R
     let stock = make_ctx("off").await?;
     let native = make_ctx("required").await?;
 
+    // 0.2% shipdate window (~160 rows) vs 6,000-row `dim`:
+    // Old `pipeline_filter_shift` (>> 2 = 25%) estimates `fact >> 2` > `dim` (builds `dim`),
+    // while Parquet footer interval selectivity (0.2%) flips build side to `fact`.
     let q14_like = "SELECT SUM(CASE WHEN d.p_type LIKE 'PROMO%' THEN f.extprice * (100 - f.discount) ELSE 0 END), \
                            SUM(f.extprice * (100 - f.discount)) \
                     FROM fact f INNER JOIN dim d ON f.partkey = d.p_partkey \
-                    WHERE f.shipdate >= 100 AND f.shipdate < 110";
+                    WHERE f.shipdate >= 100 AND f.shipdate < 120";
     let (plan, _) = assert_native_parity(&stock, &native, q14_like).await?;
     let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
-    // Filtered `fact` (300 rows) must be chosen as the build side, probing `dim`.
     assert!(
         plan_str.contains("Build: NativeParquet[fact"),
         "expected filtered `fact` on build side, got:\n{plan_str}"
@@ -4689,91 +4698,93 @@ async fn stats_interval_selectivity_flips_q14_build_side_to_filtered_fact() -> R
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transitive_equijoin_key_substitution_across_build_semi_and_inner() -> Result<()>
 {
-    // Q20-like 3-table topology:
-    //   `lineitem` (20,000 rows) -> GROUP BY (l_partkey, l_suppkey)
-    //     -> BuildSemi with `partsupp` (4,000 rows, residual `ps_availqty > 0.5 * sum_qty`)
-    //     -> Inner/Semi with selective `supplier` (20 rows out of 500 keys = 4%)
-    // Equijoin substitution across `BuildSemi` must propagate `supplier.s_suppkey`
-    // dynamic filters all the way into `lineitem` (`stage_0`).
-    let li_schema = Arc::new(Schema::new(vec![
-        Field::new("l_partkey", DataType::Int64, true),
-        Field::new("l_suppkey", DataType::Int64, true),
-        Field::new("l_quantity", DataType::Int64, false),
-        Field::new("l_shipdate", DataType::Int32, false),
+    // Three-table Parquet fixture where `ta` (20,000 rows) is always the probe side,
+    // `tb` (3,000 rows) is the first join's build side, and filtered `tc` (~200 rows)
+    // is the second join's build side whose probe key references `tb.bx`
+    // (`JoinOutputCol::Build` of the first join!).
+    let ta_schema = Arc::new(Schema::new(vec![
+        Field::new("ax", DataType::Int64, true),
+        Field::new("ay", DataType::Int64, true),
+        Field::new("av", DataType::Int64, false),
+        Field::new("apad", DataType::Utf8, false),
     ]));
-    let li_batch = RecordBatch::try_new(
-        Arc::clone(&li_schema),
+    let ta_batch = RecordBatch::try_new(
+        Arc::clone(&ta_schema),
         vec![
             Arc::new(Int64Array::from_iter((0..20_000i64).map(|i| {
                 if i % 97 == 0 {
                     None
                 } else {
-                    Some((i * 13) % 400)
+                    Some((i * 7) % 1_000)
                 }
             }))),
             Arc::new(Int64Array::from_iter((0..20_000i64).map(|i| {
                 if i % 89 == 0 {
                     None
                 } else {
-                    Some((i * 7) % 500)
+                    Some((i * 13) % 200)
                 }
             }))),
             Arc::new(Int64Array::from_iter_values(
                 (0..20_000i64).map(|i| 1 + (i % 20)),
             )),
-            Arc::new(Int32Array::from_iter_values((0..20_000i32).map(|i| i % 10))),
+            Arc::new(StringArray::from_iter_values(
+                (0..20_000i64).map(|i| format!("ta-payload-{i:08}")),
+            )),
         ],
     )?;
-    let li_dir = write_parquet_files(&[li_batch], 2, 5_000)?;
+    let ta_batches = vec![ta_batch.slice(0, 10_000), ta_batch.slice(10_000, 10_000)];
+    let ta_dir = write_parquet_files(&ta_batches, 2, 5_000)?;
 
-    let ps_schema = Arc::new(Schema::new(vec![
-        Field::new("ps_partkey", DataType::Int64, true),
-        Field::new("ps_suppkey", DataType::Int64, true),
-        Field::new("ps_availqty", DataType::Int64, false),
+    let tb_schema = Arc::new(Schema::new(vec![
+        Field::new("bx", DataType::Int64, true),
+        Field::new("by", DataType::Int64, true),
+        Field::new("bv", DataType::Int64, false),
     ]));
-    let ps_batch = RecordBatch::try_new(
-        Arc::clone(&ps_schema),
+    let tb_batch = RecordBatch::try_new(
+        Arc::clone(&tb_schema),
         vec![
-            Arc::new(Int64Array::from_iter(
-                (0..4_000i64).map(|i| if i % 101 == 0 { None } else { Some(i % 400) }),
-            )),
-            Arc::new(Int64Array::from_iter((0..4_000i64).map(|i| {
-                if i % 83 == 0 {
+            Arc::new(Int64Array::from_iter((0..3_000i64).map(|i| {
+                if i % 101 == 0 {
                     None
                 } else {
-                    Some((i * 11) % 500)
+                    Some((i * 11) % 1_000)
                 }
             }))),
+            Arc::new(Int64Array::from_iter(
+                (0..3_000i64).map(|i| if i % 83 == 0 { None } else { Some(i % 200) }),
+            )),
             Arc::new(Int64Array::from_iter_values(
-                (0..4_000i64).map(|i| (i % 40) * 5),
+                (0..3_000i64).map(|i| (i % 40) * 5),
             )),
         ],
     )?;
-    let ps_dir = write_parquet_files(&[ps_batch], 2, 1_000)?;
+    let tb_batches = vec![tb_batch.slice(0, 1_500), tb_batch.slice(1_500, 1_500)];
+    let tb_dir = write_parquet_files(&tb_batches, 2, 1_000)?;
 
-    let sup_schema = Arc::new(Schema::new(vec![
-        Field::new("s_suppkey", DataType::Int64, true),
-        Field::new("s_nation", DataType::Int32, false),
-        Field::new("s_name", DataType::Utf8, false),
+    let tc_schema = Arc::new(Schema::new(vec![
+        Field::new("cx", DataType::Int64, true),
+        Field::new("cg", DataType::Int32, false),
+        Field::new("cname", DataType::Utf8, false),
     ]));
-    let sup_batch = RecordBatch::try_new(
-        Arc::clone(&sup_schema),
+    let tc_batch = RecordBatch::try_new(
+        Arc::clone(&tc_schema),
         vec![
             Arc::new(Int64Array::from_iter(
-                (0..500i64).map(|i| if i == 0 { None } else { Some(i) }),
+                (0..1_000i64).map(|i| if i == 0 { None } else { Some(i) }),
             )),
-            Arc::new(Int32Array::from_iter_values((0..500i32).map(|i| i % 25))),
+            Arc::new(Int32Array::from_iter_values((0..1_000i32).map(|i| i % 5))),
             Arc::new(StringArray::from_iter_values(
-                (0..500i64).map(|i| format!("Supplier#{i:04}")),
+                (0..1_000i64).map(|i| format!("Supplier#{i:04}")),
             )),
         ],
     )?;
-    let sup_dir = write_parquet_files(&[sup_batch], 1, 500)?;
+    let tc_dir = write_parquet_files(&[tc_batch], 1, 1_000)?;
 
     let make_ctx = |mode: &str| {
-        let lp = li_dir.path().to_str().unwrap().to_owned();
-        let pp = ps_dir.path().to_str().unwrap().to_owned();
-        let sp = sup_dir.path().to_str().unwrap().to_owned();
+        let ap = ta_dir.path().to_str().unwrap().to_owned();
+        let bp = tb_dir.path().to_str().unwrap().to_owned();
+        let cp = tc_dir.path().to_str().unwrap().to_owned();
         let mode = mode.to_owned();
         async move {
             let mut cfg = SessionConfig::new().with_target_partitions(4);
@@ -4781,11 +4792,11 @@ async fn transitive_equijoin_key_substitution_across_build_semi_and_inner() -> R
             cfg.options_mut().execution.parquet.pruning = true;
             cfg.options_mut().execution.collect_statistics = true;
             let ctx = SessionContext::new_with_config(cfg);
-            ctx.register_parquet("li", &lp, ParquetReadOptions::default())
+            ctx.register_parquet("ta", &ap, ParquetReadOptions::default())
                 .await?;
-            ctx.register_parquet("ps", &pp, ParquetReadOptions::default())
+            ctx.register_parquet("tb", &bp, ParquetReadOptions::default())
                 .await?;
-            ctx.register_parquet("sup", &sp, ParquetReadOptions::default())
+            ctx.register_parquet("tc", &cp, ParquetReadOptions::default())
                 .await?;
             ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
                 .await?;
@@ -4796,73 +4807,150 @@ async fn transitive_equijoin_key_substitution_across_build_semi_and_inner() -> R
     let stock = make_ctx("off").await?;
     let native = make_ctx("required").await?;
 
-    // Q20-shaped query with BuildSemi + residual filter + downstream selective supplier join.
-    let q20_like = "SELECT s.s_name \
-                    FROM sup s \
-                    WHERE s.s_nation = 3 \
-                      AND s.s_suppkey IN ( \
-                        SELECT ps.ps_suppkey \
-                        FROM ps \
-                        WHERE ps.ps_availqty > ( \
-                            SELECT SUM(l.l_quantity) \
-                            FROM li l \
-                            WHERE l.l_partkey = ps.ps_partkey \
-                              AND l.l_suppkey = ps.ps_suppkey \
-                              AND l.l_shipdate >= 2 AND l.l_shipdate < 7 \
-                        ) \
-                      ) \
-                    ORDER BY s.s_name";
-    let (plan, _) = assert_native_parity(&stock, &native, q20_like).await?;
-    // Dynamic filters pushed must include both `ps` composite filter AND `sup`'s
-    // transitively substituted `s_suppkey` filter into `li` (total >= 8).
-    let dyn_pushed = metric(plan.as_ref(), "join_dynamic_filters_pushed");
+    // 1. Inner join build-key equijoin substitution:
+    //    `ta -> HashProbe(Inner, tb) -> HashProbe(Inner, tc on tb.bx = tc.cx)`.
+    //    Baseline pushes `tb -> ta` (2 bounds; unfiltered tb skips Bloom? Wait: tb <= 16K so 3)
+    //    + `tc -> tb` (3: lo, hi, bloom) = 6; PR substitutes `tb.bx -> ta.ax` and ALSO
+    //    pushes `tc -> ta` (+3) = 9.
+    let inner_sql = "SELECT COUNT(*), SUM(ta.av), SUM(tb.bv) \
+                     FROM ta \
+                     INNER JOIN tb ON ta.ax = tb.bx \
+                     INNER JOIN tc ON tb.bx = tc.cx \
+                     WHERE tc.cg = 3";
+    let (inner_plan, _) = assert_native_parity(&stock, &native, inner_sql).await?;
+    let inner_plan_str = format!("{}", displayable(inner_plan.as_ref()).indent(true));
     assert!(
-        dyn_pushed >= 8,
-        "expected transitive s_suppkey dynamic filter pushdown across BuildSemi (>= 8), got {dyn_pushed}"
+        inner_plan_str.contains("NativeParquet[ta"),
+        "expected ta probe plan, got:\n{inner_plan_str}"
+    );
+    let inner_pushed = metric(inner_plan.as_ref(), "join_dynamic_filters_pushed");
+    assert_eq!(
+        inner_pushed, 9,
+        "expected 9 pushed dynamic filters (3 tb->ta + 3 tc->tb + 3 substituted tc->ta), got {inner_pushed}\n{inner_plan_str}"
     );
 
-    // Negative soundness checks: BuildOuter, FullOuter, BuildAnti, and NullEqualsNull
-    // chains must never corrupt unmatched or NULL-matching rows.
-    let soundness_queries = [
-        "SELECT COUNT(*), SUM(s.s_suppkey) \
-         FROM (SELECT ps_partkey, ps_suppkey FROM ps WHERE ps_availqty > 100) ps \
-         LEFT JOIN (SELECT l_partkey, l_suppkey FROM li WHERE l_shipdate < 3) l \
-           ON ps.ps_partkey = l.l_partkey AND ps.ps_suppkey = l.l_suppkey \
-         INNER JOIN (SELECT s_suppkey FROM sup WHERE s_nation = 3) s \
-           ON ps.ps_suppkey = s.s_suppkey",
-        "SELECT COUNT(*) \
-         FROM sup s \
-         WHERE s.s_nation = 3 \
-           AND s.s_suppkey IN ( \
-             SELECT ps.ps_suppkey FROM ps \
-             WHERE NOT EXISTS ( \
-               SELECT 1 FROM li l \
-               WHERE l.l_partkey = ps.ps_partkey AND l.l_suppkey = ps.ps_suppkey \
-                 AND l.l_shipdate < 3 \
-             ) \
-           )",
-        "SELECT COUNT(*) \
-         FROM (SELECT ps_partkey, ps_suppkey FROM ps) ps \
-         INNER JOIN (SELECT l_partkey, l_suppkey FROM li WHERE l_shipdate < 3) l \
-           ON ps.ps_partkey IS NOT DISTINCT FROM l.l_partkey \
-          AND ps.ps_suppkey IS NOT DISTINCT FROM l.l_suppkey \
-         INNER JOIN (SELECT s_suppkey FROM sup WHERE s_nation = 0) s \
-           ON ps.ps_suppkey IS NOT DISTINCT FROM s.s_suppkey",
-    ];
-    for sql in soundness_queries {
-        assert_native_parity(&stock, &native, sql).await?;
-    }
+    // 2. BuildSemi build-key equijoin substitution (exact Q20 topology):
+    //    `stage_0(ta GROUP BY ax, ay) -> HashProbe(BuildSemi, tb) -> HashProbe(tc on tb.bx = tc.cx)`.
+    //    `ta` has ~20,000 groups (> `tb` 3,000 rows), so `tb` is on the BUILD side of BuildSemi
+    //    and `stage_0(ta)` is on the PROBE side. Baseline cannot push `tc.cx` across BuildSemi
+    //    into `ta`; PR substitutes `tb.bx -> ta.ax` and pushes `tc.cx` (+3) all the way to `ta`.
+    let build_semi_sql = "SELECT c.cname \
+                          FROM tc c \
+                          WHERE c.cg = 3 \
+                            AND c.cx IN ( \
+                              SELECT b.bx \
+                              FROM tb b \
+                              WHERE b.bv > ( \
+                                  SELECT SUM(a.av) \
+                                  FROM ta a \
+                                  WHERE a.ax = b.bx AND a.ay = b.by \
+                              ) \
+                            ) \
+                          ORDER BY c.cname";
+    let (semi_plan, _) = assert_native_parity(&stock, &native, build_semi_sql).await?;
+    let semi_plan_str = format!("{}", displayable(semi_plan.as_ref()).indent(true));
+    assert!(
+        semi_plan_str.contains("HashJoinProbe[type=LeftSemi, keys=[ax, ay], build=Left")
+            && semi_plan_str.contains("Build: NativeParquet[tb"),
+        "expected BuildSemi (LeftSemi, build=Left) with tb on build side, got:\n{semi_plan_str}"
+    );
+    let semi_pushed = metric(semi_plan.as_ref(), "join_dynamic_filters_pushed");
+    assert_eq!(
+        semi_pushed, 11,
+        "expected 11 pushed dynamic filters (5 tb->ta + 3 tc->tb + 3 substituted tc->ta vs baseline 8), got {semi_pushed}\n{semi_plan_str}"
+    );
+
+    // 3. Negative soundness checks reaching the exact same `JoinOutputCol::Build` branch
+    //    (`ta` probe, `tb` build, downstream `tc` probing on `tb.bx`) for BuildOuter,
+    //    FullOuter, BuildAnti, and NullEqualsNull — none may substitute `tc` onto `ta`
+    //    and all must preserve exact parity with Stock (including unmatched & NULL rows).
+    let build_outer_sql = "SELECT COUNT(*), SUM(tb.bv) \
+                           FROM ta \
+                           RIGHT JOIN tb ON ta.ax = tb.bx \
+                           INNER JOIN tc ON tb.bx = tc.cx \
+                           WHERE tc.cg = 3";
+    let (bo_plan, _) = assert_native_parity(&stock, &native, build_outer_sql).await?;
+    let bo_str = format!("{}", displayable(bo_plan.as_ref()).indent(true));
+    assert!(
+        bo_str.contains("HashJoinProbe[type=Right, keys=[ax], build=Right")
+            && bo_str.contains("Build: NativeParquet[tb"),
+        "expected BuildOuter (Right, build=Right) with tb on build side, got:\n{bo_str}"
+    );
+    // `tb -> ta` pushes only tb's own non-preserving bounds (2, since unfiltered tb's
+    // key domain is saturated); downstream `tc` must NOT push onto `ta` or `tb`.
+    assert_eq!(
+        metric(bo_plan.as_ref(), "join_dynamic_filters_pushed"),
+        2,
+        "BuildOuter must not push downstream `tc` filter onto `ta` or `tb` (expected only tb->ta = 2)\n{bo_str}"
+    );
+
+    let full_outer_sql = "SELECT COUNT(*), SUM(tb.bv) \
+                          FROM ta \
+                          FULL OUTER JOIN tb ON ta.ax = tb.bx \
+                          INNER JOIN tc ON tb.bx = tc.cx \
+                          WHERE tc.cg = 3";
+    let (fo_plan, _) = assert_native_parity(&stock, &native, full_outer_sql).await?;
+    let fo_str = format!("{}", displayable(fo_plan.as_ref()).indent(true));
+    assert!(
+        fo_str.contains("HashJoinProbe[type=Full, keys=[ax], build=Right")
+            && fo_str.contains("Build: NativeParquet[tb"),
+        "expected FullOuter with tb on build side, got:\n{fo_str}"
+    );
+    assert_eq!(
+        metric(fo_plan.as_ref(), "join_dynamic_filters_pushed"),
+        0,
+        "FullOuter must not push downstream filter onto probe scan `ta`"
+    );
+
+    let build_anti_sql = "SELECT COUNT(*), SUM(tb.bv) \
+                          FROM tb \
+                          INNER JOIN tc ON tb.bx = tc.cx \
+                          WHERE tc.cg = 3 \
+                            AND NOT EXISTS (SELECT 1 FROM ta WHERE ta.ax = tb.bx)";
+    let (ba_plan, _) = assert_native_parity(&stock, &native, build_anti_sql).await?;
+    let ba_str = format!("{}", displayable(ba_plan.as_ref()).indent(true));
+    assert!(
+        ba_str.contains("HashJoinProbe[type=LeftAnti, keys=[ax], build=Left")
+            && ba_str.contains("Build: NativeParquet[tb"),
+        "expected BuildAnti (LeftAnti, build=Left) with tb on build side, got:\n{ba_str}"
+    );
+    // `tc -> tb` pushes 3 filters onto `tb`, and `tb -> ta` is BuildAnti (pushes 3);
+    // crucially `tc` must NOT be substituted onto `ta` through BuildAnti (6, never 9).
+    assert_eq!(
+        metric(ba_plan.as_ref(), "join_dynamic_filters_pushed"),
+        6,
+        "BuildAnti must not substitute downstream `tc` filter onto `ta` (expected 6, never 9)\n{ba_str}"
+    );
+
+    let null_eq_sql = "SELECT COUNT(*), SUM(ta.av), SUM(tb.bv) \
+                       FROM ta \
+                       INNER JOIN tb ON ta.ax IS NOT DISTINCT FROM tb.bx \
+                       INNER JOIN tc ON tb.bx IS NOT DISTINCT FROM tc.cx \
+                       WHERE tc.cg = 0";
+    let (ne_plan, _) = assert_native_parity(&stock, &native, null_eq_sql).await?;
+    let ne_str = format!("{}", displayable(ne_plan.as_ref()).indent(true));
+    assert!(
+        ne_str.contains("Build: NativeParquet[tb"),
+        "expected tb on build side for NullEqualsNull check, got:\n{ne_str}"
+    );
+    // Under NullEqualsNull, `allow_equijoin_sub` is false so `tc` does not substitute onto `ta`:
+    // only `tb -> ta` (2: `(range OR IS NULL)` + Bloom) + `tc -> tb` (2) = 4 (never 6).
+    assert_eq!(
+        metric(ne_plan.as_ref(), "join_dynamic_filters_pushed"),
+        4,
+        "NullEqualsNull must not substitute downstream `tc` filter onto `ta` (expected 4, never 6)\n{ne_str}"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_range_filter_preserved_alongside_dynamic_bloom_on_same_column()
 -> Result<()> {
-    // Both a static user range filter (`f.k >= 100 AND f.k <= 200`) AND a wider
-    // dynamic join Bloom filter (`dim.dk` in `50..=250`, skipping every 3rd key so
-    // Bloom is active and NOT domain-saturated) target the exact same column `f.k`.
-    // Omitting redundant dynamic `[50, 250]` bounds from `RowFilter` MUST NEVER drop
-    // the static `[100, 200]` bounds!
+    // Both a static user range filter AND a wider dynamic join Bloom filter target
+    // the exact same column `f.k`. The filtered build (`dim WHERE d.keep = 1`) has
+    // 200 distinct sparse keys (`103, 109, 115, ..., 1297`, step 6 -> > 150 InList
+    // cap and not domain-saturated), so a real `JoinBloomFilterExpr` is built and
+    // `build_redundant_dynamic_range_skip` actively runs.
     let fact_schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
@@ -4872,26 +4960,28 @@ async fn static_range_filter_preserved_alongside_dynamic_bloom_on_same_column()
         Arc::clone(&fact_schema),
         vec![
             Arc::new(Int64Array::from_iter_values(
-                (0..12_000i64).map(|i| i % 500),
+                (0..15_000i64).map(|i| i % 1_500),
             )),
-            Arc::new(Int64Array::from_iter_values(0..12_000i64)),
+            Arc::new(Int64Array::from_iter_values(0..15_000i64)),
             Arc::new(StringArray::from_iter_values(
-                (0..12_000i64).map(|i| format!("payload-{i:08}")),
+                (0..15_000i64).map(|i| format!("payload-{i:08}")),
             )),
         ],
     )?;
-    let fact_dir = write_parquet_files(&[fact_batch], 2, 3_000)?;
+    let fact_batches = vec![fact_batch.slice(0, 7_500), fact_batch.slice(7_500, 7_500)];
+    let fact_dir = write_parquet_files(&fact_batches, 2, 3_000)?;
 
     let dim_schema = Arc::new(Schema::new(vec![
         Field::new("dk", DataType::Int64, false),
         Field::new("keep", DataType::Int64, false),
     ]));
-    // 200 distinct keys in 50..=647 (step 3 -> sparse, not saturated, > InList cap 150 -> Bloom!)
+    // 400 distinct keys in 100..=1297 (step 3); `keep = i % 2` leaves 200 distinct
+    // filtered keys (`103, 109, ..., 1297`, min = 103, max = 1297, > 150 InList cap -> Bloom!).
     let dim_batch = RecordBatch::try_new(
         Arc::clone(&dim_schema),
         vec![
             Arc::new(Int64Array::from_iter_values(
-                (0..400i64).map(|i| 50 + (i % 200) * 3),
+                (0..400i64).map(|i| 100 + i * 3),
             )),
             Arc::new(Int64Array::from_iter_values((0..400i64).map(|i| i % 2))),
         ],
@@ -4921,9 +5011,30 @@ async fn static_range_filter_preserved_alongside_dynamic_bloom_on_same_column()
     let stock = make_ctx("off").await?;
     let native = make_ctx("required").await?;
 
-    let sql = "SELECT COUNT(*), MIN(f.k), MAX(f.k), SUM(f.v) \
-               FROM fact f INNER JOIN dim d ON f.k = d.dk \
-               WHERE d.keep = 1 AND f.k >= 100 AND f.k <= 200";
-    assert_native_parity(&stock, &native, sql).await?;
+    // 1. Static bounds strictly tighter than dynamic [103, 1297]: dynamic bounds skip,
+    //    while static [300, 900] must reject matching Bloom keys in [103..299] & [901..1297].
+    let tighter_sql = "SELECT COUNT(*), MIN(f.k), MAX(f.k), SUM(f.v) \
+                       FROM fact f INNER JOIN dim d ON f.k = d.dk \
+                       WHERE d.keep = 1 AND f.k >= 300 AND f.k <= 900";
+    let (p1, _) = assert_native_parity(&stock, &native, tighter_sql).await?;
+    assert_eq!(
+        metric(p1.as_ref(), "join_dynamic_filters_pushed"),
+        3,
+        "expected dynamic lo + hi + Bloom (3) for 200-key filtered build"
+    );
+
+    // 2. Static lower bound equal to dynamic min (`f.k >= 103`, plus reversed literal
+    //    form `103 <= f.k`) alongside dynamic Bloom: static bound must be preserved.
+    let equal_min_sql = "SELECT COUNT(*), MIN(f.k), MAX(f.k), SUM(f.v) \
+                         FROM fact f INNER JOIN dim d ON f.k = d.dk \
+                         WHERE d.keep = 1 AND f.k >= 103 AND f.k <= 600";
+    let (p2, _) = assert_native_parity(&stock, &native, equal_min_sql).await?;
+    assert_eq!(metric(p2.as_ref(), "join_dynamic_filters_pushed"), 3);
+
+    let reversed_lit_sql = "SELECT COUNT(*), MIN(f.k), MAX(f.k), SUM(f.v) \
+                            FROM fact f INNER JOIN dim d ON f.k = d.dk \
+                            WHERE d.keep = 1 AND 103 <= f.k AND 600 >= f.k";
+    let (p3, _) = assert_native_parity(&stock, &native, reversed_lit_sql).await?;
+    assert_eq!(metric(p3.as_ref(), "join_dynamic_filters_pushed"), 3);
     Ok(())
 }

@@ -821,3 +821,230 @@ async fn pushdown_skips_phase2_for_unmatched_rg_and_cancels_pending_phase2_io()
     }
     Ok(())
 }
+
+#[test]
+fn extract_col_range_bound_canonicalizes_and_filters_ops() {
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::Operator as ExprOperator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
+
+    let col_k: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+    let col_m: Arc<dyn PhysicalExpr> = Arc::new(Column::new("m", 1));
+    let lit_10: Arc<dyn PhysicalExpr> =
+        Arc::new(Literal::new(ScalarValue::Int64(Some(10))));
+
+    // Direct `k >= 10` and `k <= 10`
+    let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_k),
+        ExprOperator::GtEq,
+        Arc::clone(&lit_10),
+    ));
+    let le: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_k),
+        ExprOperator::LtEq,
+        Arc::clone(&lit_10),
+    ));
+    assert_eq!(
+        extract_col_range_bound(&ge),
+        Some((
+            "k".to_owned(),
+            ExprOperator::GtEq,
+            ScalarValue::Int64(Some(10))
+        ))
+    );
+    assert_eq!(
+        extract_col_range_bound(&le),
+        Some((
+            "k".to_owned(),
+            ExprOperator::LtEq,
+            ScalarValue::Int64(Some(10))
+        ))
+    );
+
+    // Reversed `10 <= k` -> `k >= 10` and `10 >= k` -> `k <= 10`
+    let rev_ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&lit_10),
+        ExprOperator::LtEq,
+        Arc::clone(&col_k),
+    ));
+    let rev_le: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&lit_10),
+        ExprOperator::GtEq,
+        Arc::clone(&col_k),
+    ));
+    assert_eq!(
+        extract_col_range_bound(&rev_ge),
+        Some((
+            "k".to_owned(),
+            ExprOperator::GtEq,
+            ScalarValue::Int64(Some(10))
+        ))
+    );
+    assert_eq!(
+        extract_col_range_bound(&rev_le),
+        Some((
+            "k".to_owned(),
+            ExprOperator::LtEq,
+            ScalarValue::Int64(Some(10))
+        ))
+    );
+
+    // Non-GtEq/LtEq operators and col-to-col comparisons return None
+    for op in [
+        ExprOperator::Eq,
+        ExprOperator::NotEq,
+        ExprOperator::Lt,
+        ExprOperator::Gt,
+    ] {
+        let e: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(&col_k), op, Arc::clone(&lit_10)));
+        assert_eq!(extract_col_range_bound(&e), None);
+    }
+    let col_cmp: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_k),
+        ExprOperator::GtEq,
+        Arc::clone(&col_m),
+    ));
+    assert_eq!(extract_col_range_bound(&col_cmp), None);
+}
+
+#[test]
+fn build_redundant_dynamic_range_skip_guards_static_and_bloom_invariants() {
+    use super::super::hash_join::KeyKind;
+    use super::super::join_filter::{JoinBloomFilterExpr, SplitBlockBloomFilter};
+    use datafusion_common::{NullEquality, ScalarValue};
+    use datafusion_expr::Operator as ExprOperator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
+
+    let col_k: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+    let col_m: Arc<dyn PhysicalExpr> = Arc::new(Column::new("m", 1));
+    let mk_bound = |col: &Arc<dyn PhysicalExpr>, op: ExprOperator, v: i64| {
+        Arc::new(BinaryExpr::new(
+            Arc::clone(col),
+            op,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(v)))),
+        )) as Arc<dyn PhysicalExpr>
+    };
+    let mk_rev_bound = |v: i64, op: ExprOperator, col: &Arc<dyn PhysicalExpr>| {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::Int64(Some(v)))),
+            op,
+            Arc::clone(col),
+        )) as Arc<dyn PhysicalExpr>
+    };
+
+    let bloom_filter = Arc::new(SplitBlockBloomFilter::with_blocks(64));
+    let single_bloom: Arc<dyn PhysicalExpr> =
+        Arc::new(JoinBloomFilterExpr::new_for_test(
+            vec![Arc::clone(&col_k)],
+            KeyKind::Int64,
+            NullEquality::NullEqualsNothing,
+            Arc::clone(&bloom_filter),
+        ));
+    let multi_bloom: Arc<dyn PhysicalExpr> = Arc::new(JoinBloomFilterExpr::new_for_test(
+        vec![Arc::clone(&col_k), Arc::clone(&col_m)],
+        KeyKind::Int64Pair,
+        NullEquality::NullEqualsNothing,
+        Arc::clone(&bloom_filter),
+    ));
+    let null_eq_bloom: Arc<dyn PhysicalExpr> =
+        Arc::new(JoinBloomFilterExpr::new_for_test(
+            vec![Arc::clone(&col_k)],
+            KeyKind::Int64,
+            NullEquality::NullEqualsNull,
+            Arc::clone(&bloom_filter),
+        ));
+
+    let dyn_lo = mk_bound(&col_k, ExprOperator::GtEq, 10);
+    let dyn_hi = mk_bound(&col_k, ExprOperator::LtEq, 100);
+    let dyn_other_col = mk_bound(&col_m, ExprOperator::GtEq, 1);
+
+    // 1. Without a single-column NullEqualsNothing Bloom -> returns None.
+    assert!(
+        build_redundant_dynamic_range_skip(
+            &[Arc::clone(&dyn_lo), Arc::clone(&dyn_hi)],
+            &[],
+        )
+        .is_none()
+    );
+    assert!(
+        build_redundant_dynamic_range_skip(
+            &[
+                Arc::clone(&dyn_lo),
+                Arc::clone(&dyn_hi),
+                Arc::clone(&multi_bloom),
+            ],
+            &[],
+        )
+        .is_none()
+    );
+    assert!(
+        build_redundant_dynamic_range_skip(
+            &[
+                Arc::clone(&dyn_lo),
+                Arc::clone(&dyn_hi),
+                Arc::clone(&null_eq_bloom),
+            ],
+            &[],
+        )
+        .is_none()
+    );
+
+    // 2. With single-column NullEqualsNothing Bloom + static `10 <= k` (reversed
+    //    literal form matching dynamic min) and static `k <= 50`:
+    //    - Dynamic `k <= 100` (and reversed `100 >= k`) IS skipped.
+    //    - Static `10 <= k` AND dynamic `k >= 10` are NOT skipped (static protects it).
+    //    - Static `k <= 50`, unrelated col `m >= 1`, and Bloom expr are NOT skipped.
+    let static_rev_lo = mk_rev_bound(10, ExprOperator::LtEq, &col_k);
+    let static_hi = mk_bound(&col_k, ExprOperator::LtEq, 50);
+    let skip = build_redundant_dynamic_range_skip(
+        &[
+            Arc::clone(&dyn_lo),
+            Arc::clone(&dyn_hi),
+            Arc::clone(&dyn_other_col),
+            Arc::clone(&single_bloom),
+        ],
+        &[Arc::clone(&static_rev_lo), Arc::clone(&static_hi)],
+    )
+    .expect("expected skip predicate for dynamic hi");
+
+    assert!(skip(&dyn_hi), "redundant dynamic k <= 100 should skip");
+    assert!(
+        skip(&mk_rev_bound(100, ExprOperator::GtEq, &col_k)),
+        "reversed redundant dynamic 100 >= k should skip"
+    );
+    assert!(
+        !skip(&static_rev_lo),
+        "static reversed bound 10 <= k must never be skipped"
+    );
+    assert!(
+        !skip(&dyn_lo),
+        "bound matching static 10 <= k must never be skipped"
+    );
+    assert!(
+        !skip(&static_hi),
+        "static bound k <= 50 must never be skipped"
+    );
+    assert!(
+        !skip(&dyn_other_col),
+        "bound on non-Bloom column m must never be skipped"
+    );
+    assert!(
+        !skip(&single_bloom),
+        "Bloom expression itself must never be skipped"
+    );
+
+    // 3. When all dynamic bounds on the Bloom column match static bounds -> None.
+    let static_rev_hi = mk_rev_bound(100, ExprOperator::GtEq, &col_k);
+    assert!(
+        build_redundant_dynamic_range_skip(
+            &[
+                Arc::clone(&dyn_lo),
+                Arc::clone(&dyn_hi),
+                Arc::clone(&single_bloom),
+            ],
+            &[Arc::clone(&static_rev_lo), Arc::clone(&static_rev_hi)],
+        )
+        .is_none()
+    );
+}

@@ -789,6 +789,22 @@ impl JoinBloomFilterExpr {
     pub(super) fn null_equality(&self) -> NullEquality {
         self.null_equality
     }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        key_exprs: Vec<Arc<dyn PhysicalExpr>>,
+        key_kind: KeyKind,
+        null_equality: NullEquality,
+        filter: Arc<SplitBlockBloomFilter>,
+    ) -> Self {
+        Self {
+            key_exprs,
+            key_kind,
+            null_equality,
+            has_floats: false,
+            filter,
+        }
+    }
 }
 
 #[cfg(any(feature = "parquet", test))]
