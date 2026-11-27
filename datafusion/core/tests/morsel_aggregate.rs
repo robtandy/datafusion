@@ -1676,17 +1676,25 @@ async fn shared_sum_avg_count_spill_parity() -> Result<()> {
     stock.register_table("t", mem.clone())?;
 
     let spill_queries = [
-        // DirectGroupedState spill path (single Int64 key + shared SUM/AVG/COUNT + fused Decimal128)
+        // DirectGroupedState spill path (single Int64 key + shared Float64/Decimal128 SUM/AVG/COUNT + fused Decimal128)
+        "SELECT
+            k_i64,
+            SUM(v_i32), COUNT(v_i32),
+            SUM(v_i64), COUNT(v_i64),
+            SUM(v_f64), AVG(v_f64),
+            SUM(v_dec), AVG(v_dec),
+            SUM(v_dec * (1 - disc)),
+            COUNT(*)
+         FROM t GROUP BY k_i64",
+        // GroupedState spill path (single Int64 key with Int32/Int64 AVG + multi-column key + shared SUM/AVG/COUNT)
         "SELECT
             k_i64,
             SUM(v_i32), AVG(v_i32), COUNT(v_i32),
             SUM(v_i64), AVG(v_i64), COUNT(v_i64),
             SUM(v_f64), AVG(v_f64),
             SUM(v_dec), AVG(v_dec),
-            SUM(v_dec * (1 - disc)),
             COUNT(*)
          FROM t GROUP BY k_i64",
-        // GroupedState spill path (multi-column key + shared SUM/AVG/COUNT)
         "SELECT
             k_str, k_i64,
             SUM(v_i32), AVG(v_i32), COUNT(v_i32),
@@ -1744,6 +1752,156 @@ async fn shared_sum_avg_count_spill_parity() -> Result<()> {
         );
         drop(native_plan);
         assert_eq!(pool.reserved(), 0, "memory leak after spill on {sql}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ungrouped_float64_sum_avg_exact_parity_with_stock() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("f", DataType::Float64, false),
+        Field::new("f_null", DataType::Float64, true),
+        Field::new("gate", DataType::Int32, false),
+    ]));
+    let n = 4096usize;
+    let f_vals: Vec<f64> = (0..n)
+        .map(|i| (i as f64) * 0.1 + 1e-7 * (i as f64).sin())
+        .collect();
+    let f_null_vals: Vec<Option<f64>> = (0..n)
+        .map(|i| (!i.is_multiple_of(13)).then_some(f_vals[i]))
+        .collect();
+    let gates: Vec<i32> = (0..n).map(|i| (i % 10) as i32).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Float64Array::from(f_vals)),
+            Arc::new(Float64Array::from(f_null_vals)),
+            Arc::new(Int32Array::from(gates)),
+        ],
+    )?;
+
+    let mem = Arc::new(MemTable::try_new(
+        Arc::clone(&schema),
+        vec![vec![batch.clone()]],
+    )?);
+    let dir = TempDir::new()?;
+    write_parquet_files(&dir, &schema, &[vec![batch]], 4096)?;
+
+    let queries = [
+        "SELECT SUM(f) FROM t",
+        "SELECT SUM(f), MIN(f) FROM t",
+        "SELECT AVG(f) FROM t",
+        "SELECT AVG(f), COUNT(*) FROM t",
+        "SELECT SUM(f), AVG(f), COUNT(*) FROM t",
+        "SELECT SUM(f), AVG(f), COUNT(*) FROM t WHERE gate >= 3",
+        "SELECT SUM(f), MIN(f) FROM t WHERE gate >= 3",
+        "SELECT SUM(f_null) FROM t",
+        "SELECT SUM(f_null), AVG(f_null), COUNT(f_null), COUNT(*) FROM t",
+        "SELECT SUM(f_null), AVG(f_null), COUNT(f_null), COUNT(*) FROM t WHERE gate >= 3",
+    ];
+
+    // Single-partition MemTable: stock and morsel process the same batch in the same order.
+    let cfg = SessionConfig::new().with_target_partitions(1);
+    let stock = SessionContext::new_with_config(cfg.clone());
+    let native = morsel_context_with_config(1, cfg);
+    native
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    for ctx in [&stock, &native] {
+        ctx.register_table("t", mem.clone())?;
+    }
+    for sql in queries {
+        assert_parity(&stock, &native, sql, "AggregateSink").await?;
+    }
+
+    // Parquet with pushdown_filters = false and true.
+    for pushdown in [false, true] {
+        let mut pq_cfg = SessionConfig::new().with_target_partitions(1);
+        pq_cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+        pq_cfg.options_mut().execution.collect_statistics = false;
+        let stock = SessionContext::new_with_config(pq_cfg.clone());
+        let native = morsel_context_with_config(1, pq_cfg);
+        native
+            .sql("SET datafusion.execution.morsel_mode = 'required'")
+            .await?;
+        for ctx in [&stock, &native] {
+            ctx.register_parquet(
+                "t",
+                dir.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        }
+        for sql in queries {
+            assert_parity(&stock, &native, sql, "AggregateSink").await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn int64_sum_avg_above_2_to_53_parity() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k_i64", DataType::Int64, false),
+        Field::new("k_str", DataType::Utf8View, false),
+        Field::new("v_i64", DataType::Int64, true),
+        Field::new("v_i64_nn", DataType::Int64, false),
+    ]));
+    let p53: i64 = 1i64 << 53;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 1, 1, 2, 2, 2, 3, 3, 4])),
+            Arc::new(StringViewArray::from(vec![
+                "g1", "g1", "g1", "g2", "g2", "g2", "g3", "g3", "g4",
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(p53 + 1),
+                Some(p53 + 1),
+                Some(p53 + 1),
+                Some(p53),
+                Some(1),
+                Some(1),
+                Some(i64::MAX),
+                Some(i64::MAX),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![
+                p53 + 1,
+                p53 + 1,
+                p53 + 1,
+                p53,
+                1,
+                1,
+                i64::MAX,
+                i64::MAX,
+                0,
+            ])),
+        ],
+    )?;
+
+    let mem = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?);
+    let cfg = SessionConfig::new().with_target_partitions(1);
+    let stock = SessionContext::new_with_config(cfg.clone());
+    let native = morsel_context_with_config(1, cfg);
+    native
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    for ctx in [&stock, &native] {
+        ctx.register_table("t", mem.clone())?;
+    }
+
+    for sql in [
+        "SELECT AVG(v_i64) FROM t WHERE k_i64 = 1",
+        "SELECT SUM(v_i64), AVG(v_i64) FROM t WHERE k_i64 = 1",
+        "SELECT SUM(v_i64), AVG(v_i64), COUNT(v_i64), COUNT(*) FROM t WHERE k_i64 = 1",
+        "SELECT SUM(v_i64_nn), AVG(v_i64_nn), COUNT(*) FROM t WHERE k_i64 = 1",
+        "SELECT SUM(v_i64), AVG(v_i64) FROM t WHERE k_i64 = 2",
+        "SELECT SUM(v_i64), AVG(v_i64) FROM t WHERE k_i64 = 3",
+        "SELECT k_i64, SUM(v_i64), AVG(v_i64), COUNT(v_i64), SUM(v_i64_nn), AVG(v_i64_nn), COUNT(*) FROM t GROUP BY k_i64",
+        "SELECT k_str, SUM(v_i64), AVG(v_i64), COUNT(v_i64), SUM(v_i64_nn), AVG(v_i64_nn), COUNT(*) FROM t GROUP BY k_str",
+    ] {
+        assert_parity(&stock, &native, sql, "AggregateSink").await?;
     }
     Ok(())
 }

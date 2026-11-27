@@ -80,9 +80,14 @@ group interning).
     `p <= 25` (where DataFusion's `Avg` keeps its intermediate sum in
     `Decimal128(38, s)`); precisions `p >= 26` remain on `Decimal256`-backed
     accumulators so overflow semantics stay identical to stock DataFusion.
-  - Shared `SUM(Int64)` + `AVG(Int64)` promotes the shared physical sum to
-    `i128` (`SumInt64Wide`) so `SUM` keeps exact wrapping `i64` semantics while
-    `AVG` avoids `i64` overflow bugs (e.g. `[i64::MAX, i64::MAX]`).
+  - `Int32`/`Int64` `AVG` expressions accumulate their sum in `Float64` (via
+    `CAST(x AS Float64)`) rather than sharing integer `SUM` accumulators,
+    preserving bit-for-bit parity with stock DataFusion above `2^53` and on
+    `i64` overflow while still sharing `COUNT(x)` / `COUNT(*)` and deduplicating
+    identical `AVG` expressions.
+  - Ungrouped `Float64` sums (and decomposed `AVG(Float64)`) always delegate to
+    `arrow::compute::sum` so floating-point summation order matches stock
+    `SumAccumulator`/`AvgAccumulator`.
   - `CountCol` linked to `CountStar` tracks `COUNT(col) = COUNT(*) - NULL_COUNT(col)`
     with lazy allocation of `null_counts`, doing zero per-row work on non-null
     Parquet batches (where Arrow schemas still declare `nullable=true`) while

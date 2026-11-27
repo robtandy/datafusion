@@ -752,17 +752,12 @@ pub(super) fn try_eval_fast_decimal128_expr(
 #[derive(Clone, Debug)]
 enum SharedAvgKind {
     Float64,
-    Int64ToFloat64,
-    Int128ToFloat64,
     Decimal128(Decimal128Averager),
 }
 
 #[derive(Clone, Debug)]
 enum OutputAggPlan {
     Direct {
-        phys_idx: usize,
-    },
-    SumInt64FromWide {
         phys_idx: usize,
     },
     AvgFromSumCount {
@@ -794,10 +789,6 @@ enum PhysAggKind {
     SumInt64 {
         direct_col: Option<(usize, SumIntInputKind)>,
         rebound_direct_col: Option<(usize, SumIntInputKind)>,
-    },
-    SumInt64Wide {
-        direct_col: Option<usize>,
-        rebound_direct_col: Option<usize>,
     },
     SumFloat64 {
         direct_col: Option<usize>,
@@ -915,12 +906,7 @@ enum AvgShareCandidate {
     },
     Float64 {
         arg: Arc<dyn PhysicalExpr>,
-    },
-    IntSmallToFloat64 {
-        base_expr: Arc<dyn PhysicalExpr>,
-    },
-    Int64ToFloat64 {
-        base_expr: Arc<dyn PhysicalExpr>,
+        count_expr: Arc<dyn PhysicalExpr>,
     },
 }
 
@@ -955,21 +941,15 @@ fn classify_shareable_avg(
             }
         }
         (DataType::Float64, DataType::Float64) => {
-            if let Some((base_expr, inner_dt)) =
-                unwrap_widening_int_cast(arg, input_schema)
-            {
-                return match inner_dt {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                        Ok(Some(AvgShareCandidate::IntSmallToFloat64 { base_expr }))
-                    }
-                    DataType::Int64 => {
-                        Ok(Some(AvgShareCandidate::Int64ToFloat64 { base_expr }))
-                    }
-                    _ => Ok(None),
-                };
-            }
+            // Integer inputs coerced via `CAST(x AS Float64)` must still accumulate
+            // their sum in `f64` to preserve exact parity with stock `Avg` above 2^53,
+            // but their null mask is identical to `x`, so `COUNT(x)` can be shared.
+            let count_expr = unwrap_widening_int_cast(arg, input_schema)
+                .map(|(inner, _)| inner)
+                .unwrap_or_else(|| Arc::clone(arg));
             return Ok(Some(AvgShareCandidate::Float64 {
                 arg: Arc::clone(arg),
+                count_expr,
             }));
         }
         _ => {}
@@ -1235,7 +1215,7 @@ fn build_aggregate_plan(
                     None
                 }
             }
-            AvgShareCandidate::Float64 { arg } => {
+            AvgShareCandidate::Float64 { arg, count_expr } => {
                 let existing_sum = phys_aggrs.iter().position(|p| {
                     matches!(p.kind, PhysAggKind::SumFloat64 { .. })
                         && p.args.len() == 1
@@ -1266,88 +1246,15 @@ fn build_aggregate_plan(
                     None
                 };
                 if let Some(sum_phys_idx) = sum_phys_idx {
-                    let count_phys_idx =
-                        ensure_count_for_expr(arg, &mut phys_aggrs, &mut count_star_idx)?;
+                    let count_phys_idx = ensure_count_for_expr(
+                        count_expr,
+                        &mut phys_aggrs,
+                        &mut count_star_idx,
+                    )?;
                     Some(OutputAggPlan::AvgFromSumCount {
                         sum_phys_idx,
                         count_phys_idx,
                         kind: SharedAvgKind::Float64,
-                    })
-                } else {
-                    None
-                }
-            }
-            AvgShareCandidate::IntSmallToFloat64 { base_expr } => {
-                let existing_sum = phys_aggrs.iter().position(|p| {
-                    matches!(p.kind, PhysAggKind::SumInt64 { .. })
-                        && p.args.len() == 1
-                        && unwrap_widening_int_cast(&p.args[0], input_schema)
-                            .is_some_and(|(inner, _)| inner.eq(base_expr))
-                });
-                if let Some(sum_phys_idx) = existing_sum {
-                    let count_phys_idx = ensure_count_for_expr(
-                        base_expr,
-                        &mut phys_aggrs,
-                        &mut count_star_idx,
-                    )?;
-                    Some(OutputAggPlan::AvgFromSumCount {
-                        sum_phys_idx,
-                        count_phys_idx,
-                        kind: SharedAvgKind::Int64ToFloat64,
-                    })
-                } else {
-                    None
-                }
-            }
-            AvgShareCandidate::Int64ToFloat64 { base_expr } => {
-                let existing_sum = phys_aggrs.iter().position(|p| {
-                    matches!(
-                        p.kind,
-                        PhysAggKind::SumInt64 { .. } | PhysAggKind::SumInt64Wide { .. }
-                    ) && p.args.len() == 1
-                        && p.args[0].eq(base_expr)
-                });
-                if let Some(sum_phys_idx) = existing_sum {
-                    // Promote `SumInt64` to `SumInt64Wide` (`i128`) so `SUM` keeps exact
-                    // wrapping `i64` semantics while `AVG` avoids `i64` overflow parity bugs.
-                    if matches!(
-                        phys_aggrs[sum_phys_idx].kind,
-                        PhysAggKind::SumInt64 { .. }
-                    ) {
-                        let direct_col = base_expr
-                            .downcast_ref::<Column>()
-                            .filter(|c| {
-                                input_schema.field(c.index()).data_type()
-                                    == &DataType::Int64
-                            })
-                            .map(|c| c.index());
-                        phys_aggrs[sum_phys_idx].kind = PhysAggKind::SumInt64Wide {
-                            direct_col,
-                            rebound_direct_col: None,
-                        };
-                        phys_aggrs[sum_phys_idx].state_types =
-                            vec![DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0)];
-                        for plan in output_plan.iter_mut().flatten() {
-                            if matches!(
-                                plan,
-                                OutputAggPlan::Direct { phys_idx }
-                                    if *phys_idx == sum_phys_idx
-                            ) {
-                                *plan = OutputAggPlan::SumInt64FromWide {
-                                    phys_idx: sum_phys_idx,
-                                };
-                            }
-                        }
-                    }
-                    let count_phys_idx = ensure_count_for_expr(
-                        base_expr,
-                        &mut phys_aggrs,
-                        &mut count_star_idx,
-                    )?;
-                    Some(OutputAggPlan::AvgFromSumCount {
-                        sum_phys_idx,
-                        count_phys_idx,
-                        kind: SharedAvgKind::Int128ToFloat64,
                     })
                 } else {
                     None
@@ -1413,18 +1320,6 @@ fn evaluate_output_plan(
             OutputAggPlan::Direct { phys_idx } => {
                 out.push(Arc::clone(&phys_arrays[*phys_idx]));
             }
-            OutputAggPlan::SumInt64FromWide { phys_idx } => {
-                let arr = phys_arrays[*phys_idx]
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Decimal128 wide sum array"
-                        )
-                    })?;
-                let vals: Vec<i64> = arr.values().iter().map(|&v| v as i64).collect();
-                out.push(Arc::new(Int64Array::new(vals.into(), arr.nulls().cloned())));
-            }
             OutputAggPlan::AvgFromSumCount {
                 sum_phys_idx,
                 count_phys_idx,
@@ -1457,60 +1352,6 @@ fn evaluate_output_plan(
                             let c = count_vals[i];
                             if c > 0 && sums.is_valid(i) {
                                 vals.push(sum_vals[i] / (c as f64));
-                                nulls.append_non_null();
-                            } else {
-                                vals.push(0.0);
-                                nulls.append_null();
-                            }
-                        }
-                        out.push(Arc::new(Float64Array::new(
-                            vals.into(),
-                            nulls.finish(),
-                        )));
-                    }
-                    SharedAvgKind::Int64ToFloat64 => {
-                        let sums = phys_arrays[*sum_phys_idx]
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or_else(|| {
-                                datafusion_common::internal_datafusion_err!(
-                                    "Expected Int64 sum array for shared AVG"
-                                )
-                            })?;
-                        let sum_vals = sums.values();
-                        let mut vals = Vec::with_capacity(len);
-                        let mut nulls = NullBufferBuilder::new(len);
-                        for i in 0..len {
-                            let c = count_vals[i];
-                            if c > 0 && sums.is_valid(i) {
-                                vals.push((sum_vals[i] as f64) / (c as f64));
-                                nulls.append_non_null();
-                            } else {
-                                vals.push(0.0);
-                                nulls.append_null();
-                            }
-                        }
-                        out.push(Arc::new(Float64Array::new(
-                            vals.into(),
-                            nulls.finish(),
-                        )));
-                    }
-                    SharedAvgKind::Int128ToFloat64 => {
-                        let sums = phys_arrays[*sum_phys_idx]
-                            .as_any()
-                            .downcast_ref::<Decimal128Array>()
-                            .ok_or_else(|| {
-                                datafusion_common::internal_datafusion_err!(
-                                    "Expected Decimal128 wide sum array for shared AVG"
-                                )
-                            })?;
-                        let sum_vals = sums.values();
-                        let mut vals = Vec::with_capacity(len);
-                        let mut nulls = NullBufferBuilder::new(len);
-                        for i in 0..len {
-                            let c = count_vals[i];
-                            if c > 0 && sums.is_valid(i) {
-                                vals.push((sum_vals[i] as f64) / (c as f64));
                                 nulls.append_non_null();
                             } else {
                                 vals.push(0.0);
@@ -1568,7 +1409,6 @@ enum DirectAggSpec {
     },
     SumInt64(usize),
     SumInt32(usize),
-    SumInt64Wide(usize),
     SumFloat64(usize),
     SumDecimal128 {
         data_type: DataType,
@@ -1622,10 +1462,6 @@ fn try_build_direct_grouped_spec(
                 direct_col: Some((col, SumIntInputKind::Int32)),
                 ..
             } => DirectAggSpec::SumInt32(*col),
-            PhysAggKind::SumInt64Wide {
-                direct_col: Some(col),
-                ..
-            } => DirectAggSpec::SumInt64Wide(*col),
             PhysAggKind::SumFloat64 {
                 direct_col: Some(col),
                 ..
@@ -1705,13 +1541,6 @@ fn direct_grouped_partial_schema(spec: &DirectGroupedSpec) -> SchemaRef {
             }
             DirectAggSpec::SumInt64(_) | DirectAggSpec::SumInt32(_) => {
                 fields.push(Field::new(format!("s_{idx}"), DataType::Int64, true));
-            }
-            DirectAggSpec::SumInt64Wide(_) => {
-                fields.push(Field::new(
-                    format!("s_{idx}"),
-                    DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0),
-                    true,
-                ));
             }
             DirectAggSpec::SumFloat64(_) => {
                 fields.push(Field::new(format!("s_{idx}"), DataType::Float64, true));
@@ -1892,11 +1721,7 @@ impl AggregateSink {
                         needed_columns.binary_search(&c).ok().map(|rc| (rc, kind))
                     });
                 }
-                PhysAggKind::SumInt64Wide {
-                    direct_col,
-                    rebound_direct_col,
-                }
-                | PhysAggKind::SumFloat64 {
+                PhysAggKind::SumFloat64 {
                     direct_col,
                     rebound_direct_col,
                 } => {
@@ -2337,12 +2162,6 @@ enum FastUngroupedAccumulator {
         sum: i64,
         has_val: bool,
     },
-    SumInt64Wide {
-        direct_col: Option<usize>,
-        rebound_direct_col: Option<usize>,
-        sum: i128,
-        has_val: bool,
-    },
     SumFloat64 {
         direct_col: Option<usize>,
         rebound_direct_col: Option<usize>,
@@ -2385,15 +2204,6 @@ impl FastUngroupedAccumulator {
                 sum: 0,
                 has_val: false,
             },
-            PhysAggKind::SumInt64Wide {
-                direct_col,
-                rebound_direct_col,
-            } => Self::SumInt64Wide {
-                direct_col: *direct_col,
-                rebound_direct_col: *rebound_direct_col,
-                sum: 0,
-                has_val: false,
-            },
             PhysAggKind::SumFloat64 {
                 direct_col,
                 rebound_direct_col,
@@ -2413,9 +2223,9 @@ impl FastUngroupedAccumulator {
             Self::CountCol { direct_col, .. } => direct_col.is_some(),
             Self::SumDecimal128 { fast_input, .. } => fast_input.is_some(),
             Self::SumInt64 { direct_col, .. } => direct_col.is_some(),
-            Self::SumInt64Wide { direct_col, .. } => direct_col.is_some(),
-            Self::SumFloat64 { direct_col, .. } => direct_col.is_some(),
-            Self::Generic(_) => false,
+            // Keep ungrouped Float64 sums on `update_dense` -> `arrow::compute::sum`
+            // so floating-point summation order matches stock `SumAccumulator`/`AvgAccumulator`.
+            Self::SumFloat64 { .. } | Self::Generic(_) => false,
         }
     }
 
@@ -2662,76 +2472,6 @@ impl FastUngroupedAccumulator {
                 *sum = acc;
                 *has_val = saw;
             }
-            Self::SumInt64Wide {
-                direct_col: Some(col),
-                sum,
-                has_val,
-                ..
-            } => {
-                let arr = batch
-                    .column(*col)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Int64 column at {col}"
-                        )
-                    })?;
-                let vals = arr.values();
-                let mut acc = *sum;
-                let mut saw = *has_val;
-                if arr.null_count() == 0 {
-                    for_each_selected_row_simple!(selection, batch_rows, row => {
-                        acc = acc.wrapping_add(vals[row] as i128);
-                    });
-                    saw = true;
-                } else if arr.null_count() < arr.len() {
-                    let nulls = arr.nulls().unwrap();
-                    for_each_selected_row_simple!(selection, batch_rows, row => {
-                        if nulls.is_valid(row) {
-                            acc = acc.wrapping_add(vals[row] as i128);
-                            saw = true;
-                        }
-                    });
-                }
-                *sum = acc;
-                *has_val = saw;
-            }
-            Self::SumFloat64 {
-                direct_col: Some(col),
-                sum,
-                has_val,
-                ..
-            } => {
-                let arr = batch
-                    .column(*col)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Float64 column at {col}"
-                        )
-                    })?;
-                let vals = arr.values();
-                let mut acc = *sum;
-                let mut saw = *has_val;
-                if arr.null_count() == 0 {
-                    for_each_selected_row_simple!(selection, batch_rows, row => {
-                        acc += vals[row];
-                    });
-                    saw = true;
-                } else if arr.null_count() < arr.len() {
-                    let nulls = arr.nulls().unwrap();
-                    for_each_selected_row_simple!(selection, batch_rows, row => {
-                        if nulls.is_valid(row) {
-                            acc += vals[row];
-                            saw = true;
-                        }
-                    });
-                }
-                *sum = acc;
-                *has_val = saw;
-            }
             _ => {
                 return internal_err!(
                     "update_view_direct called on non-direct ungrouped accumulator"
@@ -2874,55 +2614,6 @@ impl FastUngroupedAccumulator {
                     *has_val = true;
                 }
             }
-            Self::SumInt64Wide {
-                direct_col,
-                rebound_direct_col,
-                sum,
-                has_val,
-            } => {
-                let col = if rebound {
-                    *rebound_direct_col
-                } else {
-                    *direct_col
-                };
-                let evaluated;
-                let arr_ref = if let Some(c) = col {
-                    batch.column(c)
-                } else {
-                    evaluated = args[0].evaluate(batch)?;
-                    &evaluated
-                };
-                let arr =
-                    arr_ref
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected Int64 array for wide SUM"
-                            )
-                        })?;
-                let vals = arr.values();
-                if arr.null_count() == 0 {
-                    if !vals.is_empty() {
-                        let mut acc = *sum;
-                        for &v in vals.iter() {
-                            acc = acc.wrapping_add(v as i128);
-                        }
-                        *sum = acc;
-                        *has_val = true;
-                    }
-                } else if arr.null_count() < arr.len() {
-                    let nulls = arr.nulls().unwrap();
-                    let mut acc = *sum;
-                    for (i, &v) in vals.iter().enumerate() {
-                        if nulls.is_valid(i) {
-                            acc = acc.wrapping_add(v as i128);
-                            *has_val = true;
-                        }
-                    }
-                    *sum = acc;
-                }
-            }
             Self::SumFloat64 {
                 direct_col,
                 rebound_direct_col,
@@ -2979,18 +2670,6 @@ impl FastUngroupedAccumulator {
                     ..
                 },
                 Self::SumDecimal128 {
-                    sum: ss,
-                    has_val: sh,
-                    ..
-                },
-            )
-            | (
-                Self::SumInt64Wide {
-                    sum: ds,
-                    has_val: dh,
-                    ..
-                },
-                Self::SumInt64Wide {
                     sum: ss,
                     has_val: sh,
                     ..
@@ -3071,10 +2750,6 @@ impl FastUngroupedAccumulator {
             Self::SumInt64 { sum, has_val, .. } => {
                 Ok(Arc::new(Int64Array::from(vec![has_val.then_some(*sum)])))
             }
-            Self::SumInt64Wide { sum, has_val, .. } => Ok(Arc::new(
-                Decimal128Array::from(vec![has_val.then_some(*sum)])
-                    .with_precision_and_scale(DECIMAL128_MAX_PRECISION, 0)?,
-            )),
             Self::SumFloat64 { sum, has_val, .. } => {
                 Ok(Arc::new(Float64Array::from(vec![has_val.then_some(*sum)])))
             }
@@ -3211,12 +2886,6 @@ enum FastGroupsAccumulator {
         sums: Vec<i64>,
         has_val: Option<Vec<bool>>,
     },
-    SumInt64Wide {
-        direct_col: Option<usize>,
-        rebound_direct_col: Option<usize>,
-        sums: Vec<i128>,
-        has_val: Option<Vec<bool>>,
-    },
     SumFloat64 {
         direct_col: Option<usize>,
         rebound_direct_col: Option<usize>,
@@ -3261,15 +2930,6 @@ impl FastGroupsAccumulator {
                 sums: Vec::new(),
                 has_val: None,
             },
-            PhysAggKind::SumInt64Wide {
-                direct_col,
-                rebound_direct_col,
-            } => Self::SumInt64Wide {
-                direct_col: *direct_col,
-                rebound_direct_col: *rebound_direct_col,
-                sums: Vec::new(),
-                has_val: None,
-            },
             PhysAggKind::SumFloat64 {
                 direct_col,
                 rebound_direct_col,
@@ -3302,8 +2962,7 @@ impl FastGroupsAccumulator {
                         .as_ref()
                         .map_or(0, |v| v.capacity().saturating_mul(size_of::<i64>())),
                 ),
-            Self::SumDecimal128 { sums, has_val, .. }
-            | Self::SumInt64Wide { sums, has_val, .. } => sums
+            Self::SumDecimal128 { sums, has_val, .. } => sums
                 .capacity()
                 .saturating_mul(size_of::<i128>())
                 .saturating_add(has_val.as_ref().map_or(0, Vec::capacity)),
@@ -3623,75 +3282,6 @@ impl FastGroupsAccumulator {
                     }
                 }
             }
-            Self::SumInt64Wide {
-                direct_col,
-                rebound_direct_col,
-                sums,
-                has_val,
-            } => {
-                if sums.len() < total_num_groups {
-                    sums.resize(total_num_groups, 0);
-                }
-                let col = if rebound {
-                    *rebound_direct_col
-                } else {
-                    *direct_col
-                };
-                let evaluated;
-                let arr_ref = if let Some(c) = col {
-                    batch.column(c)
-                } else {
-                    evaluated = args[0].evaluate(batch)?;
-                    &evaluated
-                };
-                let arr =
-                    arr_ref
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            datafusion_common::internal_datafusion_err!(
-                                "Expected Int64 array for wide SUM"
-                            )
-                        })?;
-                let vals = arr.values();
-                if arr.null_count() == 0 {
-                    if let Some(hv) = has_val.as_mut() {
-                        if hv.len() < total_num_groups {
-                            hv.resize(total_num_groups, false);
-                        }
-                        for (&v, &gid) in vals.iter().zip(group_indices.iter()) {
-                            unsafe {
-                                let s = sums.get_unchecked_mut(gid);
-                                *s = s.wrapping_add(v as i128);
-                                *hv.get_unchecked_mut(gid) = true;
-                            }
-                        }
-                    } else {
-                        for (&v, &gid) in vals.iter().zip(group_indices.iter()) {
-                            unsafe {
-                                let s = sums.get_unchecked_mut(gid);
-                                *s = s.wrapping_add(v as i128);
-                            }
-                        }
-                    }
-                } else {
-                    let hv = ensure_has_val(has_val, prev_num_groups, total_num_groups);
-                    if arr.null_count() < arr.len() {
-                        let nulls = arr.nulls().unwrap();
-                        for (row, (&v, &gid)) in
-                            vals.iter().zip(group_indices.iter()).enumerate()
-                        {
-                            if nulls.is_valid(row) {
-                                unsafe {
-                                    let s = sums.get_unchecked_mut(gid);
-                                    *s = s.wrapping_add(v as i128);
-                                    *hv.get_unchecked_mut(gid) = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             Self::SumFloat64 {
                 direct_col,
                 rebound_direct_col,
@@ -3835,8 +3425,7 @@ impl FastGroupsAccumulator {
                     }
                 }
             }
-            Self::SumDecimal128 { sums, has_val, .. }
-            | Self::SumInt64Wide { sums, has_val, .. } => {
+            Self::SumDecimal128 { sums, has_val, .. } => {
                 if sums.len() < total_num_groups {
                     sums.resize(total_num_groups, 0);
                 }
@@ -3961,14 +3550,6 @@ impl FastGroupsAccumulator {
                 let vals = std::mem::take(sums);
                 let nulls = build_null_buffer_from_has_val(has_val.take());
                 Ok(Arc::new(Int64Array::new(vals.into(), nulls)))
-            }
-            Self::SumInt64Wide { sums, has_val, .. } => {
-                let vals = std::mem::take(sums);
-                let nulls = build_null_buffer_from_has_val(has_val.take());
-                Ok(Arc::new(
-                    Decimal128Array::new(vals.into(), nulls)
-                        .with_precision_and_scale(DECIMAL128_MAX_PRECISION, 0)?,
-                ))
             }
             Self::SumFloat64 { sums, has_val, .. } => {
                 let vals = std::mem::take(sums);
@@ -4996,11 +4577,6 @@ enum DirectAggState {
         sums: Vec<i64>,
         has_val: Option<Vec<bool>>,
     },
-    SumInt64Wide {
-        col: usize,
-        sums: Vec<i128>,
-        has_val: Option<Vec<bool>>,
-    },
     SumFloat64 {
         col: usize,
         sums: Vec<f64>,
@@ -5058,11 +4634,6 @@ impl DirectAggState {
                 has_val: None,
             },
             DirectAggSpec::SumInt32(col) => Self::SumInt32 {
-                col: *col,
-                sums: Vec::new(),
-                has_val: None,
-            },
-            DirectAggSpec::SumInt64Wide(col) => Self::SumInt64Wide {
                 col: *col,
                 sums: Vec::new(),
                 has_val: None,
@@ -5130,8 +4701,7 @@ impl DirectAggState {
                     hv.resize(num_groups, false);
                 }
             }
-            Self::SumInt64Wide { sums, has_val, .. }
-            | Self::SumDecimal128 { sums, has_val, .. } => {
+            Self::SumDecimal128 { sums, has_val, .. } => {
                 sums.resize(num_groups, 0);
                 if let Some(hv) = has_val.as_mut() {
                     hv.resize(num_groups, false);
@@ -5180,8 +4750,7 @@ impl DirectAggState {
                 .capacity()
                 .saturating_mul(size_of::<i64>())
                 .saturating_add(has_val.as_ref().map_or(0, Vec::capacity)),
-            Self::SumInt64Wide { sums, has_val, .. }
-            | Self::SumDecimal128 { sums, has_val, .. } => sums
+            Self::SumDecimal128 { sums, has_val, .. } => sums
                 .capacity()
                 .saturating_mul(size_of::<i128>())
                 .saturating_add(has_val.as_ref().map_or(0, Vec::capacity)),
@@ -5382,41 +4951,6 @@ impl DirectAggState {
                         for_each_selected_row!(row, gid => {
                             if nulls.is_valid(row) {
                                 sums[gid] = sums[gid].wrapping_add(values[row] as i64);
-                                hv[gid] = true;
-                            }
-                        });
-                    }
-                }
-            }
-            Self::SumInt64Wide { col, sums, has_val } => {
-                let arr = batch
-                    .column(*col)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Int64 column for wide SUM"
-                        )
-                    })?;
-                let values = arr.values();
-                if arr.null_count() == 0 {
-                    if let Some(hv) = has_val.as_mut() {
-                        for_each_selected_row!(row, gid => {
-                            sums[gid] = sums[gid].wrapping_add(values[row] as i128);
-                            hv[gid] = true;
-                        });
-                    } else {
-                        for_each_selected_row!(row, gid => {
-                            sums[gid] = sums[gid].wrapping_add(values[row] as i128);
-                        });
-                    }
-                } else {
-                    let hv = ensure_has_val(has_val, prev_num_groups, num_groups);
-                    if arr.null_count() < arr.len() {
-                        let nulls = arr.nulls().unwrap();
-                        for_each_selected_row!(row, gid => {
-                            if nulls.is_valid(row) {
-                                sums[gid] = sums[gid].wrapping_add(values[row] as i128);
                                 hv[gid] = true;
                             }
                         });
@@ -5855,18 +5389,6 @@ impl DirectAggState {
                 }
             }
             (
-                Self::SumInt64Wide {
-                    sums: ds,
-                    has_val: dh,
-                    ..
-                },
-                Self::SumInt64Wide {
-                    sums: ss,
-                    has_val: sh,
-                    ..
-                },
-            )
-            | (
                 Self::SumDecimal128 {
                     sums: ds,
                     has_val: dh,
@@ -6044,14 +5566,6 @@ impl DirectAggState {
                 let nulls = build_null_buffer_from_has_val(has_val.take());
                 out.push(Arc::new(Int64Array::new(vals.into(), nulls)));
             }
-            Self::SumInt64Wide { sums, has_val, .. } => {
-                let vals = std::mem::take(sums);
-                let nulls = build_null_buffer_from_has_val(has_val.take());
-                out.push(Arc::new(
-                    Decimal128Array::new(vals.into(), nulls)
-                        .with_precision_and_scale(DECIMAL128_MAX_PRECISION, 0)?,
-                ));
-            }
             Self::SumFloat64 { sums, has_val, .. } => {
                 let vals = std::mem::take(sums);
                 let nulls = build_null_buffer_from_has_val(has_val.take());
@@ -6209,8 +5723,7 @@ impl DirectAggState {
                     has_val,
                 );
             }
-            Self::SumInt64Wide { sums, has_val, .. }
-            | Self::SumDecimal128 { sums, has_val, .. } => {
+            Self::SumDecimal128 { sums, has_val, .. } => {
                 let arr = batch
                     .column(*col_offset)
                     .as_any()
@@ -6456,19 +5969,6 @@ impl DirectAggState {
                 });
                 Arc::new(Int64Array::new(sums[start..end].to_vec().into(), nulls))
             }
-            Self::SumInt64Wide { sums, has_val, .. } => {
-                let nulls = has_val.as_ref().and_then(|hv| {
-                    let mut b = NullBufferBuilder::new(len);
-                    for &v in &hv[start..end] {
-                        b.append(v);
-                    }
-                    b.finish()
-                });
-                Arc::new(
-                    Decimal128Array::new(sums[start..end].to_vec().into(), nulls)
-                        .with_precision_and_scale(DECIMAL128_MAX_PRECISION, 0)?,
-                )
-            }
             Self::SumFloat64 { sums, has_val, .. } => {
                 let nulls = has_val.as_ref().and_then(|hv| {
                     let mut b = NullBufferBuilder::new(len);
@@ -6610,22 +6110,6 @@ fn build_direct_raw_partial_batch(
                     })?;
                 let vals: Vec<i64> = arr.values().iter().map(|&v| v as i64).collect();
                 cols.push(Arc::new(Int64Array::new(vals.into(), arr.nulls().cloned())));
-            }
-            DirectAggSpec::SumInt64Wide(col) => {
-                let arr = batch
-                    .column(*col)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        datafusion_common::internal_datafusion_err!(
-                            "Expected Int64 column for wide SUM"
-                        )
-                    })?;
-                let vals: Vec<i128> = arr.values().iter().map(|&v| v as i128).collect();
-                cols.push(Arc::new(
-                    Decimal128Array::new(vals.into(), arr.nulls().cloned())
-                        .with_precision_and_scale(DECIMAL128_MAX_PRECISION, 0)?,
-                ));
             }
             DirectAggSpec::SumDecimal128 { data_type, input } => {
                 cols.push(input.eval_to_array(&batch, data_type)?);
@@ -8390,6 +7874,66 @@ mod tests {
         assert!(matches!(gv, FastGroupValues::Generic(_)));
         assert_eq!(gids, vec![0, 3, 1]);
         assert_eq!(gv.len(), 4);
+
+        // Int32/Int64 AVG must accumulate in Float64 (never sharing integer SUM) so
+        // values or sums above 2^53 match stock DataFusion bit-for-bit, while COUNT
+        // and duplicate AVG expressions are still shared.
+        let int_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let int_ctx = crate::prelude::SessionContext::new();
+        int_ctx.register_table(
+            "ints",
+            Arc::new(crate::datasource::MemTable::try_new(
+                Arc::clone(&int_schema),
+                vec![vec![]],
+            )?),
+        )?;
+        let int_plan = int_ctx
+            .sql(
+                "SELECT SUM(a) AS sa, AVG(a) AS aa, SUM(b) AS sb, AVG(b) AS ab, COUNT(b) AS cb, COUNT(*) AS cs FROM ints",
+            )
+            .await?
+            .into_optimized_plan()?;
+        let mut int_agg = None;
+        let _ = datafusion_common::tree_node::TreeNode::apply(&int_plan, |node| {
+            if let LogicalPlan::Aggregate(agg) = node {
+                int_agg = Some(agg.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        let int_agg = int_agg.expect("int agg");
+        let int_in_schema: SchemaRef =
+            Arc::new(int_agg.input.schema().as_arrow().clone());
+        let int_sink =
+            AggregateSink::try_new(&int_agg, &int_in_schema, &int_ctx.state())?
+                .expect("int sink");
+        for plan in &int_sink.plan.output_plan {
+            if let OutputAggPlan::AvgFromSumCount {
+                sum_phys_idx, kind, ..
+            } = plan
+            {
+                assert!(matches!(kind, SharedAvgKind::Float64));
+                assert!(matches!(
+                    int_sink.plan.phys_aggrs[*sum_phys_idx].kind,
+                    PhysAggKind::SumFloat64 { .. }
+                ));
+            }
+        }
+        // AVG(b) shares COUNT(b)'s physical accumulator while keeping its sum in Float64.
+        match (&int_sink.plan.output_plan[3], &int_sink.plan.output_plan[4]) {
+            (
+                OutputAggPlan::AvgFromSumCount {
+                    count_phys_idx: avg_cnt,
+                    ..
+                },
+                OutputAggPlan::Direct {
+                    phys_idx: explicit_cnt,
+                },
+            ) => assert_eq!(avg_cnt, explicit_cnt),
+            other => panic!("expected AVG(b) to share COUNT(b), got {other:?}"),
+        }
         Ok(())
     }
 }
