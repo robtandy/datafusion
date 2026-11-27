@@ -1165,3 +1165,585 @@ async fn unsupported_aggregates_reject_in_required_and_fallback_in_prefer() -> R
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_sum_avg_count_cse_parity_nullable_and_non_nullable() -> Result<()> {
+    let nullable_schema = Arc::new(Schema::new(vec![
+        Field::new("k_i64", DataType::Int64, true),
+        Field::new("k_sv1", DataType::Utf8View, true),
+        Field::new("k_sv2", DataType::Utf8View, true),
+        Field::new("v_i32", DataType::Int32, true),
+        Field::new("v_i64", DataType::Int64, true),
+        Field::new("v_f64", DataType::Float64, true),
+        Field::new("v_dec15", DataType::Decimal128(15, 2), true),
+        Field::new("v_dec25", DataType::Decimal128(25, 2), true),
+        Field::new("v_dec26", DataType::Decimal128(26, 2), true),
+        Field::new("disc", DataType::Decimal128(15, 2), true),
+        Field::new("tax", DataType::Decimal128(15, 2), true),
+        Field::new("gate", DataType::Int32, true),
+    ]));
+    let non_null_schema = Arc::new(Schema::new(
+        nullable_schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new((**f).clone().with_nullable(false)))
+            .collect::<Vec<_>>(),
+    ));
+
+    let sv1_vals = [
+        Some("A"),
+        Some("N"),
+        Some("R"),
+        None,
+        Some("non-inlined-returnflag-value"),
+    ];
+    let sv2_vals = [
+        Some("F"),
+        Some("O"),
+        Some("F"),
+        Some("O"),
+        Some("non-inlined-linestatus-value"),
+    ];
+
+    let mut null_parts: Vec<Vec<RecordBatch>> = vec![Vec::new(), Vec::new()];
+    let mut non_null_parts: Vec<Vec<RecordBatch>> = vec![Vec::new(), Vec::new()];
+    for b in 0..8usize {
+        let n = 64usize;
+        let base = b * n;
+        let mut k_i64 = Vec::with_capacity(n);
+        let mut k_sv1 = Vec::with_capacity(n);
+        let mut k_sv2 = Vec::with_capacity(n);
+        let mut v_i32 = Vec::with_capacity(n);
+        let mut v_i64 = Vec::with_capacity(n);
+        let mut v_f64 = Vec::with_capacity(n);
+        let mut v_dec15 = Vec::with_capacity(n);
+        let mut v_dec25 = Vec::with_capacity(n);
+        let mut v_dec26 = Vec::with_capacity(n);
+        let mut disc = Vec::with_capacity(n);
+        let mut tax = Vec::with_capacity(n);
+        let mut gate = Vec::with_capacity(n);
+
+        let mut nn_k_i64 = Vec::with_capacity(n);
+        let mut nn_k_sv1 = Vec::with_capacity(n);
+        let mut nn_k_sv2 = Vec::with_capacity(n);
+        let mut nn_v_i32 = Vec::with_capacity(n);
+        let mut nn_v_i64 = Vec::with_capacity(n);
+        let mut nn_v_f64 = Vec::with_capacity(n);
+        let mut nn_v_dec15 = Vec::with_capacity(n);
+        let mut nn_v_dec25 = Vec::with_capacity(n);
+        let mut nn_v_dec26 = Vec::with_capacity(n);
+        let mut nn_disc = Vec::with_capacity(n);
+        let mut nn_tax = Vec::with_capacity(n);
+        let mut nn_gate = Vec::with_capacity(n);
+
+        for j in 0..n {
+            let i = base + j;
+            let grp = i % 5;
+            // Make group 2 all-NULL in nullable table to test all-NULL group semantics.
+            let is_val_null = grp == 2 || i.is_multiple_of(9);
+            // Only emit non-inlined strings in later batches to test mid-stream
+            // InlineTwoUtf8ViewGroupValues -> Generic promotion.
+            let sv_idx = if b < 4 && grp == 4 { 0 } else { grp };
+            k_i64.push((grp != 3).then_some(grp as i64));
+            k_sv1.push(sv1_vals[sv_idx]);
+            k_sv2.push(sv2_vals[sv_idx]);
+            v_i32.push((!is_val_null).then_some((i as i32) * 7 - 100));
+            v_i64.push((!is_val_null).then_some((i as i64) * 19 - 500));
+            v_f64.push((!is_val_null).then_some((i as f64) * 0.25 - 10.5));
+            v_dec15.push((!is_val_null).then_some(((i as i128) % 900 + 10) * 100 + 37));
+            v_dec25.push((!is_val_null).then_some(((i as i128) % 500 + 1) * 100_000));
+            v_dec26.push((!is_val_null).then_some(((i as i128) % 500 + 1) * 100_000));
+            disc.push((!is_val_null).then_some((i % 10) as i128));
+            tax.push((!is_val_null).then_some((i % 8) as i128));
+            gate.push(Some((i % 10) as i32));
+
+            nn_k_i64.push(grp as i64);
+            nn_k_sv1.push(sv1_vals[sv_idx].unwrap_or("Z"));
+            nn_k_sv2.push(sv2_vals[sv_idx].unwrap_or("Q"));
+            nn_v_i32.push((i as i32) * 7 - 100);
+            nn_v_i64.push((i as i64) * 19 - 500);
+            nn_v_f64.push((i as f64) * 0.25 - 10.5);
+            nn_v_dec15.push(((i as i128) % 900 + 10) * 100 + 37);
+            nn_v_dec25.push(((i as i128) % 500 + 1) * 100_000);
+            nn_v_dec26.push(((i as i128) % 500 + 1) * 100_000);
+            nn_disc.push((i % 10) as i128);
+            nn_tax.push((i % 8) as i128);
+            nn_gate.push((i % 10) as i32);
+        }
+
+        null_parts[b % 2].push(RecordBatch::try_new(
+            Arc::clone(&nullable_schema),
+            vec![
+                Arc::new(Int64Array::from(k_i64)),
+                Arc::new(StringViewArray::from(k_sv1)),
+                Arc::new(StringViewArray::from(k_sv2)),
+                Arc::new(Int32Array::from(v_i32)),
+                Arc::new(Int64Array::from(v_i64)),
+                Arc::new(Float64Array::from(v_f64)),
+                Arc::new(Decimal128Array::from(v_dec15).with_precision_and_scale(15, 2)?),
+                Arc::new(Decimal128Array::from(v_dec25).with_precision_and_scale(25, 2)?),
+                Arc::new(Decimal128Array::from(v_dec26).with_precision_and_scale(26, 2)?),
+                Arc::new(Decimal128Array::from(disc).with_precision_and_scale(15, 2)?),
+                Arc::new(Decimal128Array::from(tax).with_precision_and_scale(15, 2)?),
+                Arc::new(Int32Array::from(gate)),
+            ],
+        )?);
+        non_null_parts[b % 2].push(RecordBatch::try_new(
+            Arc::clone(&non_null_schema),
+            vec![
+                Arc::new(Int64Array::from(nn_k_i64)),
+                Arc::new(StringViewArray::from(nn_k_sv1)),
+                Arc::new(StringViewArray::from(nn_k_sv2)),
+                Arc::new(Int32Array::from(nn_v_i32)),
+                Arc::new(Int64Array::from(nn_v_i64)),
+                Arc::new(Float64Array::from(nn_v_f64)),
+                Arc::new(
+                    Decimal128Array::from(nn_v_dec15).with_precision_and_scale(15, 2)?,
+                ),
+                Arc::new(
+                    Decimal128Array::from(nn_v_dec25).with_precision_and_scale(25, 2)?,
+                ),
+                Arc::new(
+                    Decimal128Array::from(nn_v_dec26).with_precision_and_scale(26, 2)?,
+                ),
+                Arc::new(Decimal128Array::from(nn_disc).with_precision_and_scale(15, 2)?),
+                Arc::new(Decimal128Array::from(nn_tax).with_precision_and_scale(15, 2)?),
+                Arc::new(Int32Array::from(nn_gate)),
+            ],
+        )?);
+    }
+
+    let null_mem = Arc::new(MemTable::try_new(
+        Arc::clone(&nullable_schema),
+        null_parts.clone(),
+    )?);
+    let nn_mem = Arc::new(MemTable::try_new(
+        Arc::clone(&non_null_schema),
+        non_null_parts.clone(),
+    )?);
+    let empty_mem = Arc::new(MemTable::try_new(
+        Arc::clone(&nullable_schema),
+        vec![vec![], vec![]],
+    )?);
+
+    let null_dir = TempDir::new()?;
+    write_parquet_files(&null_dir, &nullable_schema, &null_parts, 48)?;
+    let nn_dir = TempDir::new()?;
+    write_parquet_files(&nn_dir, &non_null_schema, &non_null_parts, 48)?;
+
+    let queries = [
+        // Ungrouped: SUM before AVG + duplicates + COUNT(*)/COUNT(col)
+        "SELECT
+            SUM(v_i32) AS s32, SUM(v_i32) AS s32_dup, AVG(v_i32) AS a32, AVG(v_i32) AS a32_dup, COUNT(v_i32) AS c32,
+            SUM(v_i64) AS s64, AVG(v_i64) AS a64, COUNT(v_i64) AS c64,
+            SUM(v_f64) AS sf, AVG(v_f64) AS af, COUNT(v_f64) AS cf,
+            SUM(v_dec15) AS sd15, AVG(v_dec15) AS ad15,
+            SUM(v_dec25) AS sd25, AVG(v_dec25) AS ad25,
+            SUM(v_dec26) AS sd26, AVG(v_dec26) AS ad26,
+            SUM(v_dec15 * disc) AS q6_rev,
+            COUNT(*) AS c_star, COUNT(1) AS c_one, COUNT(2) AS c_two
+         FROM t",
+        // Ungrouped: AVG before SUM, without explicit COUNT(*)
+        "SELECT
+            AVG(v_i32) AS a32, SUM(v_i32) AS s32,
+            AVG(v_i64) AS a64, SUM(v_i64) AS s64,
+            AVG(v_f64) AS af, SUM(v_f64) AS sf,
+            AVG(v_dec15) AS ad15, SUM(v_dec15) AS sd15,
+            AVG(disc) AS adisc
+         FROM t WHERE gate >= 3",
+        // DirectGrouped (single Int64 key): shared SUM/AVG/COUNT + fused Decimal128 (Q15 shape)
+        "SELECT
+            k_i64,
+            SUM(v_i32) AS s32, AVG(v_i32) AS a32, COUNT(v_i32) AS c32,
+            SUM(v_i64) AS s64, AVG(v_i64) AS a64, COUNT(v_i64) AS c64,
+            SUM(v_f64) AS sf, AVG(v_f64) AS af, COUNT(v_f64) AS cf,
+            SUM(v_dec15) AS sd15, AVG(v_dec15) AS ad15, AVG(v_dec15) AS ad15_dup,
+            SUM(v_dec15 * (1 - disc)) AS disc_rev,
+            MIN(v_i64) AS lo, MIN(v_i64) AS lo_dup,
+            MAX(v_i32) AS hi, MAX(v_i32) AS hi_dup,
+            COUNT(*) AS c_star, COUNT(1) AS c_one
+         FROM t
+         WHERE gate >= 2
+         GROUP BY k_i64",
+        // GroupedState (2 Utf8View keys with mid-stream long-string promotion): Q1 shape + CSE
+        "SELECT
+            k_sv1, k_sv2,
+            SUM(v_dec15) AS sum_base,
+            SUM(v_dec15 * (1 - disc)) AS sum_disc,
+            SUM(v_dec15 * (1 - disc) * (1 + tax)) AS sum_charge,
+            AVG(v_dec15) AS avg_base,
+            AVG(disc) AS avg_disc,
+            SUM(v_i32) AS s32, AVG(v_i32) AS a32,
+            SUM(v_i64) AS s64, AVG(v_i64) AS a64,
+            SUM(v_f64) AS sf, AVG(v_f64) AS af,
+            SUM(v_dec25) AS sd25, AVG(v_dec25) AS ad25,
+            SUM(v_dec26) AS sd26, AVG(v_dec26) AS ad26,
+            COUNT(DISTINCT v_i32) AS cd1, COUNT(DISTINCT v_i32) AS cd2,
+            COUNT(*) AS cnt
+         FROM t
+         WHERE gate >= 1
+         GROUP BY k_sv1, k_sv2",
+        // Filtered-to-empty ungrouped & grouped
+        "SELECT SUM(v_i32), AVG(v_i32), SUM(v_i64), AVG(v_i64), SUM(v_f64), AVG(v_f64), SUM(v_dec15), AVG(v_dec15), COUNT(*) FROM t WHERE gate > 100",
+        "SELECT k_i64, SUM(v_i64), AVG(v_i64), SUM(v_dec15), AVG(v_dec15), COUNT(*) FROM t WHERE gate > 100 GROUP BY k_i64",
+        "SELECT k_sv1, k_sv2, SUM(v_dec15), AVG(v_dec15), COUNT(*) FROM t WHERE gate > 100 GROUP BY k_sv1, k_sv2",
+    ];
+
+    for (label, table) in [("nullable", null_mem.clone()), ("non_null", nn_mem.clone())] {
+        for workers in [1usize, 4] {
+            let stock = SessionContext::new();
+            let native = morsel_context(workers);
+            native
+                .sql("SET datafusion.execution.morsel_mode = 'required'")
+                .await?;
+            for ctx in [&stock, &native] {
+                ctx.register_table("t", table.clone())?;
+                ctx.register_table("empty_t", empty_mem.clone())?;
+            }
+            for sql in queries {
+                assert_parity(&stock, &native, sql, "AggregateSink")
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "{label} workers={workers} failed: {e}"
+                        ))
+                    })?;
+            }
+            assert_parity(
+                &stock,
+                &native,
+                "SELECT SUM(v_i32), AVG(v_i32), SUM(v_i64), AVG(v_i64), SUM(v_f64), AVG(v_f64), SUM(v_dec15), AVG(v_dec15), COUNT(*) FROM empty_t",
+                "AggregateSink",
+            )
+            .await?;
+        }
+    }
+
+    for (label, dir) in [("nullable_pq", &null_dir), ("non_null_pq", &nn_dir)] {
+        for pushdown in [false, true] {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.collect_statistics = false;
+            let stock = SessionContext::new_with_config(cfg.clone());
+            let native = morsel_context_with_config(4, cfg);
+            native
+                .sql("SET datafusion.execution.morsel_mode = 'required'")
+                .await?;
+            for ctx in [&stock, &native] {
+                ctx.register_parquet(
+                    "t",
+                    dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            }
+            for sql in queries {
+                assert_parity(&stock, &native, sql, "AggregateSink")
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "{label} pushdown={pushdown} failed: {e}"
+                        ))
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_sum_avg_overflow_and_decimal_precision_scale_parity() -> Result<()> {
+    // 1. Int64 overflow (SUM wraps in i64, AVG stays non-wrapping f64) + Float64 NaN/Inf/-0.0
+    //    + Decimal128(26, 2) Decimal256-sum boundary.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k_i64", DataType::Int64, true),
+        Field::new("k_str", DataType::Utf8View, true),
+        Field::new("v_i64", DataType::Int64, true),
+        Field::new("v_f64", DataType::Float64, true),
+        Field::new("v_d26", DataType::Decimal128(26, 2), true),
+    ]));
+    // 10^25 - 1 fits in Decimal128(26, 2); summing 2 rows stays valid in Decimal256.
+    let big_d26: i128 = 9_999_999_999_999_999_999_999_999;
+    let b1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(3),
+                Some(4),
+            ])),
+            Arc::new(StringViewArray::from(vec![
+                Some("max"),
+                Some("max"),
+                Some("min"),
+                Some("min"),
+                Some("nulls"),
+                Some("special"),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Some(i64::MIN),
+                Some(i64::MIN),
+                None,
+                Some(42),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(-0.0),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+                Some(f64::NAN),
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(big_d26),
+                    Some(big_d26),
+                    Some(-big_d26),
+                    Some(-big_d26),
+                    None,
+                    Some(12345),
+                ])
+                .with_precision_and_scale(26, 2)?,
+            ),
+        ],
+    )?;
+
+    let mem = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![b1]])?);
+    let stock = SessionContext::new();
+    let native = morsel_context(2);
+    native
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    for ctx in [&stock, &native] {
+        ctx.register_table("t", mem.clone())?;
+    }
+
+    for sql in [
+        "SELECT SUM(v_i64), AVG(v_i64), COUNT(v_i64), COUNT(*) FROM t WHERE k_i64 = 1",
+        "SELECT SUM(v_i64), AVG(v_i64), COUNT(v_i64), COUNT(*) FROM t WHERE k_i64 = 2",
+        "SELECT k_i64, SUM(v_i64), AVG(v_i64), COUNT(v_i64), SUM(v_f64), AVG(v_f64), COUNT(*) FROM t GROUP BY k_i64",
+        "SELECT k_str, SUM(v_i64), AVG(v_i64), SUM(v_f64), AVG(v_f64), SUM(v_d26), AVG(v_d26), COUNT(*) FROM t GROUP BY k_str",
+    ] {
+        assert_parity(&stock, &native, sql, "AggregateSink").await?;
+    }
+
+    // 2. Decimal128 AVG overflow parity (sum * 10^4 overflows i128 -> both stock and Morsel error).
+    let ov_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("d", DataType::Decimal128(15, 2), false),
+    ]));
+    // Raw i128 near i128::MAX / 100 so sum * 10_000 overflows i128 during AVG finalize.
+    let huge = i128::MAX / 100;
+    let ov_batch = RecordBatch::try_new(
+        Arc::clone(&ov_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 1])),
+            Arc::new(
+                Decimal128Array::from(vec![huge, 0]).with_precision_and_scale(15, 2)?,
+            ),
+        ],
+    )?;
+    let ov_mem = Arc::new(MemTable::try_new(ov_schema, vec![vec![ov_batch]])?);
+    for ctx in [&stock, &native] {
+        ctx.register_table("ov", ov_mem.clone())?;
+    }
+    for sql in [
+        "SELECT SUM(d), AVG(d), COUNT(*) FROM ov",
+        "SELECT k, SUM(d), AVG(d), COUNT(*) FROM ov GROUP BY k",
+    ] {
+        let stock_plan = physical(&stock, sql).await?;
+        let native_plan = physical(&native, sql).await?;
+        let stock_err = collect(stock_plan, stock.task_ctx()).await.unwrap_err();
+        let native_err = collect(native_plan, native.task_ctx()).await.unwrap_err();
+        assert!(
+            stock_err.to_string().contains("Overflow")
+                && native_err.to_string().contains("Overflow"),
+            "{sql}: stock={stock_err}, native={native_err}"
+        );
+    }
+
+    // 3. Fused Decimal128 multiplication overflow parity (both stock and Morsel error).
+    let mul_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("a", DataType::Decimal128(38, 2), false),
+        Field::new("b", DataType::Decimal128(38, 2), false),
+    ]));
+    let mul_batch = RecordBatch::try_new(
+        Arc::clone(&mul_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(
+                Decimal128Array::from(vec![10_i128.pow(25)])
+                    .with_precision_and_scale(38, 2)?,
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![10_i128.pow(25)])
+                    .with_precision_and_scale(38, 2)?,
+            ),
+        ],
+    )?;
+    let mul_mem = Arc::new(MemTable::try_new(mul_schema, vec![vec![mul_batch]])?);
+    for ctx in [&stock, &native] {
+        ctx.register_table("mul_ov", mul_mem.clone())?;
+    }
+    for sql in [
+        "SELECT SUM(a * b) FROM mul_ov",
+        "SELECT k, SUM(a * b) FROM mul_ov GROUP BY k",
+    ] {
+        let stock_plan = physical(&stock, sql).await?;
+        let native_plan = physical(&native, sql).await?;
+        assert!(
+            collect(stock_plan, stock.task_ctx()).await.is_err(),
+            "stock should overflow on {sql}"
+        );
+        assert!(
+            collect(native_plan, native.task_ctx()).await.is_err(),
+            "native should overflow on {sql}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_sum_avg_count_spill_parity() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k_i64", DataType::Int64, true),
+        Field::new("k_str", DataType::Utf8, true),
+        Field::new("v_i32", DataType::Int32, true),
+        Field::new("v_i64", DataType::Int64, true),
+        Field::new("v_f64", DataType::Float64, true),
+        Field::new("v_dec", DataType::Decimal128(15, 2), true),
+        Field::new("disc", DataType::Decimal128(15, 2), true),
+    ]));
+
+    // 10,000 distinct groups across 4 partitions (20,000 rows) to exceed
+    // RADIX_TRANSITION_GROUPS and force actual disk spills under a tight pool.
+    let num_groups = 10_000usize;
+    let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); 4];
+    for (p, part) in partitions.iter_mut().enumerate() {
+        for chunk in 0..5usize {
+            let n = 1_000usize;
+            let mut k_i64 = Vec::with_capacity(n);
+            let mut k_str = Vec::with_capacity(n);
+            let mut v_i32 = Vec::with_capacity(n);
+            let mut v_i64 = Vec::with_capacity(n);
+            let mut v_f64 = Vec::with_capacity(n);
+            let mut v_dec = Vec::with_capacity(n);
+            let mut disc = Vec::with_capacity(n);
+            for j in 0..n {
+                let row = (p * 5 + chunk) * n + j;
+                let g = row % num_groups;
+                let all_null_grp = g == 7;
+                let is_null = all_null_grp || row.is_multiple_of(13);
+                k_i64.push((g != 0).then_some(g as i64));
+                k_str.push((g != 0).then(|| format!("grp-{g:06}")));
+                v_i32.push((!is_null).then_some((g as i32) * 3 - 50));
+                v_i64.push(if g == 5 {
+                    Some(i64::MAX)
+                } else {
+                    (!is_null).then_some((g as i64) * 17 - 100)
+                });
+                v_f64.push((!is_null).then_some((g as f64) * 0.5));
+                v_dec.push((!is_null).then_some(((g as i128) + 1) * 100 + 25));
+                disc.push((!is_null).then_some((g % 10) as i128));
+            }
+            part.push(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(k_i64)),
+                    Arc::new(StringArray::from(k_str)),
+                    Arc::new(Int32Array::from(v_i32)),
+                    Arc::new(Int64Array::from(v_i64)),
+                    Arc::new(Float64Array::from(v_f64)),
+                    Arc::new(
+                        Decimal128Array::from(v_dec).with_precision_and_scale(15, 2)?,
+                    ),
+                    Arc::new(
+                        Decimal128Array::from(disc).with_precision_and_scale(15, 2)?,
+                    ),
+                ],
+            )?);
+        }
+    }
+
+    let mem = Arc::new(MemTable::try_new(Arc::clone(&schema), partitions)?);
+    let stock = SessionContext::new();
+    stock.register_table("t", mem.clone())?;
+
+    let spill_queries = [
+        // DirectGroupedState spill path (single Int64 key + shared SUM/AVG/COUNT + fused Decimal128)
+        "SELECT
+            k_i64,
+            SUM(v_i32), AVG(v_i32), COUNT(v_i32),
+            SUM(v_i64), AVG(v_i64), COUNT(v_i64),
+            SUM(v_f64), AVG(v_f64),
+            SUM(v_dec), AVG(v_dec),
+            SUM(v_dec * (1 - disc)),
+            COUNT(*)
+         FROM t GROUP BY k_i64",
+        // GroupedState spill path (multi-column key + shared SUM/AVG/COUNT)
+        "SELECT
+            k_str, k_i64,
+            SUM(v_i32), AVG(v_i32), COUNT(v_i32),
+            SUM(v_i64), AVG(v_i64),
+            SUM(v_f64), AVG(v_f64),
+            SUM(v_dec), AVG(v_dec),
+            SUM(v_dec * (1 - disc)),
+            COUNT(*)
+         FROM t GROUP BY k_str, k_i64",
+    ];
+
+    for sql in spill_queries {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+        let spill_dir = TempDir::new()?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .with_temp_file_path(spill_dir.path())
+            .build_arc()?;
+        let mut cfg = SessionConfig::new().with_batch_size(512);
+        cfg.options_mut().execution.morsel_mode =
+            datafusion::config::MorselMode::Required;
+        let state = SessionStateBuilder::new_with_default_features()
+            .with_config(cfg)
+            .with_runtime_env(runtime)
+            .with_query_planner(Arc::new(MorselQueryPlanner::new(
+                NonZeroUsize::new(4).unwrap(),
+            )))
+            .build();
+        let native = SessionContext::new_with_state(state);
+        native.register_table("t", mem.clone())?;
+
+        let stock_plan = physical(&stock, sql).await?;
+        let native_plan = physical(&native, sql).await?;
+        assert_eq!(native_plan.name(), "MorselExec");
+        assert_eq!(native_plan.schema(), stock_plan.schema());
+
+        let expected = collect(stock_plan, stock.task_ctx()).await?;
+        let actual = collect(Arc::clone(&native_plan), native.task_ctx()).await?;
+        assert_eq!(sorted_rows(&actual)?, sorted_rows(&expected)?, "{sql}");
+        assert!(
+            native_plan
+                .metrics()
+                .and_then(|m| m.spill_count())
+                .unwrap_or(0)
+                > 0,
+            "expected spill_count > 0 on {sql}"
+        );
+        assert!(
+            native_plan
+                .metrics()
+                .and_then(|m| m.spilled_bytes())
+                .unwrap_or(0)
+                > 0,
+            "expected spilled_bytes > 0 on {sql}"
+        );
+        drop(native_plan);
+        assert_eq!(pool.reserved(), 0, "memory leak after spill on {sql}");
+    }
+    Ok(())
+}
