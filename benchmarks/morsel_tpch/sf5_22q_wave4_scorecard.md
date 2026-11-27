@@ -48,7 +48,7 @@ overwriting it) and the earlier `#192` baseline
     single-config `morsel_pushdown` (`391.2 ms`) and per-query oracle
     `Best Morsel` (`388.1 ms`) shrinks **`5.9×`** from **`17.8 ms`** in `#195`
     to **`3.0 ms` (`< 0.8%`)**. Single-config `morsel_pushdown` is now the
-    fastest Morsel arm on **`16 / 22`** queries and within `1.4–4.5%` on the
+    fastest Morsel arm on **`16 / 22`** queries and within `1.5–5.0%` on the
     remaining 6.
 - **Head-to-head query wins for single-config `morsel_pushdown`:**
   - Beats **`stock_default` on `16 / 22` queries** (up from `11 / 22` Best
@@ -192,13 +192,18 @@ cp "$b/tpch_runner.rs" "$work/pinned/datafusion/core/examples/morsel_tpch_runner
 )
 runner="$work/target/release-nonlto/examples/morsel_tpch_runner"
 
-# 2. Run all 21/21 SF=0.01 parity/plan/spill/adaptive-metric unittests.
-py="$HOME/.cache/issue195/venv/bin/python"
+# 2. Create pinned Python venv and run all 21/21 SF=0.01 parity/plan/spill/adaptive-metric unittests.
+timeout 120s uv venv --python 3.12.10 "$work/venv"
+timeout 180s uv pip install --python "$work/venv/bin/python" -r "$b/requirements.txt"
+py="$work/venv/bin/python"
 MORSEL_TPCH_RUNNER="$runner" MORSEL_BENCH_REVISION="$revision" \
   timeout 240s "$py" -B -m unittest discover -s "$b" -v
 
-# 3. Run quiet-host warm-cache SF5 22/22 6-arm scorecard (660 timed trials).
+# 3. Generate deterministic SF5 TPC-H Parquet tables outside Git (or reuse existing SF5 dir).
 data_dir="$HOME/.cache/issue189/tpch_sf5"
+# timeout 600s "$py" -B "$b/harness.py" generate "$data_dir" --sf 5 --row-group-size 131072
+
+# 4. Run quiet-host warm-cache SF5 22/22 6-arm scorecard (660 timed trials).
 vmstat -y 1 3
 timeout --kill-after=10s 2400s taskset -c 0-7 "$py" -B "$b/harness.py" bench \
   "$data_dir" --runner "$runner" --revision "$revision" \
@@ -208,10 +213,10 @@ timeout --kill-after=10s 2400s taskset -c 0-7 "$py" -B "$b/harness.py" bench \
   > "$work/sf5_22q_wave4_scorecard.jsonl"
 vmstat -y 1 3
 
-# 4. Print summary and 3-way geometric mean table.
+# 5. Print summary and 3-way geometric mean table.
 "$py" -B "$b/harness.py" summarize "$work/sf5_22q_wave4_scorecard.jsonl"
 
-# 5. Clean up the detached worktree when finished.
+# 6. Clean up the detached worktree when finished.
 git worktree remove --force "$work/pinned"
 ```
 
@@ -314,9 +319,10 @@ join query in the suite; only single-table `q1` and `q6` have no joins).
 
 ### 3.2 Adaptive Per-RG `RowFilter` / `BulkDecode` Recovery (`#207`)
 
-In `#195`, single-config `morsel_pushdown` lagged `morsel_no_pushdown` by
-`17.8 ms` on geomean because dense static-filter scans (`q6`, `q12`, `q15`,
-`q9`) paid Parquet `RowFilter` overhead without benefiting from column skipping.
+In `#195`, single-config `morsel_pushdown` (`461.0 ms`) lagged the per-query
+`Best Morsel` oracle (`443.2 ms`) by `17.8 ms` on geomean, mostly (`~16 ms`)
+because dense static-filter scans (`q6`, `q12`, `q15`, `q9`) paid Parquet
+`RowFilter` overhead without benefiting from column skipping.
 Wave-4's per-RG `RowFilter` vs. `BulkDecode + BatchView` bandit recovers `q6`,
 `q12`, and `q15` cleanly while preserving `RowFilter` on selective dynamic-join
 probes (`q3`, `q5`, `q7`, `q8`, `q10`, `q14`, `q17`, `q18`, `q19`, `q20`):
@@ -415,16 +421,19 @@ and `stock_pushdown` (`0.90×`), the remaining `2,482.2 ms` sum gap to DuckDB
 
 1. **`q9` (`1,397.5` vs. `788.4 ms`, `+609.1 ms`) & `q21` (`937.0` vs.
    `741.7 ms`, `+195.3 ms`):** Large multi-way hash-join build/probe CPU and
-   Parquet decode on `lineitem` (`q9` decode `5,194.6 ms` + process `2,268.5 ms`
-   - `join_finalize` `276.5 ms`).
+   Parquet decode on `lineitem` (`q9` decode `5,194.6 ms`, process `2,268.5 ms`,
+   and `join_finalize` `276.5 ms`).
 2. **Stage CSE on `q15` (`704.4` vs. `272.3 ms`, `+432.1 ms`):** Materializing
    `revenue0` once instead of scanning `lineitem` twice (`stage_0` + `stage_2`:
    `605.1 MB` scanned, `4,407.3 ms` decode) would cut `q15` roughly in half.
-3. **Parquet `Decimal128` decode throughput on `q1`, `q6`, and `q18`
-   (`+466.8 ms` combined):** `q1` (`611.2` vs. `479.5 ms`), `q6` (`345.0` vs.
-   `203.3 ms`), and `q18` (`670.9` vs. `477.7 ms`) are now overwhelmingly
-   dominated by Parquet Zstd/FixedLenByteArray `Decimal128` decoding (`75–90%`
-   of total CPU on `q1` and `q6`).
+3. **Parquet `Decimal128` decode throughput on `q1`/`q6` (`+273.4 ms` combined)
+   and high-cardinality `l_orderkey` aggregation on `q18` (`+193.2 ms`):** `q1`
+   (`611.2` vs. `479.5 ms`) and `q6` (`345.0` vs. `203.3 ms`) are now
+   overwhelmingly dominated by Parquet Zstd/FixedLenByteArray `Decimal128`
+   decoding (`75–90%` of exec CPU), whereas `q18` (`670.9` vs. `477.7 ms`)
+   splits its cost across Parquet decode (`1,965.7 ms`, `43.6%` of exec CPU),
+   7.5M-group `stage_0` aggregation/join processing (`1,092.3 ms`), and
+   parallel radix aggregate finalization (`240.0 ms` wall).
 4. **High-selectivity scan `RowFilter` avoidance (`q1`, `q9`):** Avoiding
    `RowFilter` when static predicates pass nearly all rows (`q1` `l_shipdate`)
    or when downstream join CPU dominates (`q9`) would close the final `3.0 ms`
