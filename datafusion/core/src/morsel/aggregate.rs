@@ -5618,15 +5618,20 @@ impl DirectAggState {
         Ok(())
     }
 
-    fn merge_partial_columns(
+    #[expect(clippy::too_many_arguments)]
+    fn merge_partial_columns_slice(
         &mut self,
         batch: &RecordBatch,
+        offset: usize,
+        len: usize,
         col_offset: &mut usize,
         group_indices: &[usize],
         prev_num_groups: usize,
         num_groups: usize,
         cs_col: Option<&ArrayRef>,
     ) -> Result<()> {
+        let end = offset + len;
+        let full = offset == 0 && len == batch.num_rows();
         match self {
             Self::CountStar(counts) => {
                 let arr = batch
@@ -5639,7 +5644,7 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                for (&c, &gid) in arr.values().iter().zip(group_indices.iter()) {
+                for (&c, &gid) in arr.values()[offset..end].iter().zip(group_indices.iter()) {
                     counts[gid] =
                         counts[gid].checked_add(c).ok_or_else(count_overflow)?;
                 }
@@ -5658,15 +5663,15 @@ impl DirectAggState {
                     {
                         return Ok(());
                     }
-                    let cs = cs_col
+                    let cs = &cs_col
                         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                         .ok_or_else(|| {
                             datafusion_common::internal_datafusion_err!(
                                 "Missing CountStar partial column in DirectAggState merge"
                             )
                         })?
-                        .values();
-                    let cc = col_ref
+                        .values()[offset..end];
+                    let cc = &col_ref
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .ok_or_else(|| {
@@ -5674,7 +5679,7 @@ impl DirectAggState {
                                 "Expected Int64 partial count column"
                             )
                         })?
-                        .values();
+                        .values()[offset..end];
                     for ((&cs_v, &cc_v), &gid) in
                         cs.iter().zip(cc.iter()).zip(group_indices.iter())
                     {
@@ -5696,7 +5701,7 @@ impl DirectAggState {
                             )
                         },
                     )?;
-                    for (&c, &gid) in arr.values().iter().zip(group_indices.iter()) {
+                    for (&c, &gid) in arr.values()[offset..end].iter().zip(group_indices.iter()) {
                         counts[gid] =
                             counts[gid].checked_add(c).ok_or_else(count_overflow)?;
                     }
@@ -5704,8 +5709,16 @@ impl DirectAggState {
             }
             Self::SumInt64 { sums, has_val, .. }
             | Self::SumInt32 { sums, has_val, .. } => {
-                let arr = batch
-                    .column(*col_offset)
+                let col_ref = batch.column(*col_offset);
+                *col_offset += 1;
+                let sliced;
+                let arr_ref = if full {
+                    col_ref
+                } else {
+                    sliced = col_ref.slice(offset, len);
+                    &sliced
+                };
+                let arr = arr_ref
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| {
@@ -5713,7 +5726,6 @@ impl DirectAggState {
                             "Expected Int64 partial sum column"
                         )
                     })?;
-                *col_offset += 1;
                 update_sum_int64_array(
                     arr,
                     group_indices,
@@ -5724,8 +5736,16 @@ impl DirectAggState {
                 );
             }
             Self::SumDecimal128 { sums, has_val, .. } => {
-                let arr = batch
-                    .column(*col_offset)
+                let col_ref = batch.column(*col_offset);
+                *col_offset += 1;
+                let sliced;
+                let arr_ref = if full {
+                    col_ref
+                } else {
+                    sliced = col_ref.slice(offset, len);
+                    &sliced
+                };
+                let arr = arr_ref
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
@@ -5733,7 +5753,6 @@ impl DirectAggState {
                             "Expected Decimal128 partial sum column"
                         )
                     })?;
-                *col_offset += 1;
                 update_sum_decimal128_array(
                     arr,
                     group_indices,
@@ -5744,8 +5763,16 @@ impl DirectAggState {
                 );
             }
             Self::SumFloat64 { sums, has_val, .. } => {
-                let arr = batch
-                    .column(*col_offset)
+                let col_ref = batch.column(*col_offset);
+                *col_offset += 1;
+                let sliced;
+                let arr_ref = if full {
+                    col_ref
+                } else {
+                    sliced = col_ref.slice(offset, len);
+                    &sliced
+                };
+                let arr = arr_ref
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
@@ -5753,7 +5780,6 @@ impl DirectAggState {
                             "Expected Float64 partial sum column"
                         )
                     })?;
-                *col_offset += 1;
                 update_sum_float64_array(
                     arr,
                     group_indices,
@@ -5783,10 +5809,9 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 2;
-                for ((&s, &c), &gid) in s_arr
-                    .values()
+                for ((&s, &c), &gid) in s_arr.values()[offset..end]
                     .iter()
-                    .zip(c_arr.values().iter())
+                    .zip(c_arr.values()[offset..end].iter())
                     .zip(group_indices.iter())
                 {
                     sums[gid] += s;
@@ -5804,7 +5829,7 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                let src = arr.values();
+                let src = &arr.values()[offset..end];
                 if arr.null_count() == 0 {
                     for (&v, &gid) in src.iter().zip(group_indices.iter()) {
                         if !has_val[gid] || v < vals[gid] {
@@ -5817,7 +5842,7 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(i) && (!has_val[gid] || v < vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid]) {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5835,7 +5860,7 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                let src = arr.values();
+                let src = &arr.values()[offset..end];
                 if arr.null_count() == 0 {
                     for (&v, &gid) in src.iter().zip(group_indices.iter()) {
                         if !has_val[gid] || v < vals[gid] {
@@ -5848,7 +5873,7 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(i) && (!has_val[gid] || v < vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v < vals[gid]) {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5866,7 +5891,7 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                let src = arr.values();
+                let src = &arr.values()[offset..end];
                 if arr.null_count() == 0 {
                     for (&v, &gid) in src.iter().zip(group_indices.iter()) {
                         if !has_val[gid] || v > vals[gid] {
@@ -5879,7 +5904,7 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(i) && (!has_val[gid] || v > vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid]) {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -5897,7 +5922,7 @@ impl DirectAggState {
                         )
                     })?;
                 *col_offset += 1;
-                let src = arr.values();
+                let src = &arr.values()[offset..end];
                 if arr.null_count() == 0 {
                     for (&v, &gid) in src.iter().zip(group_indices.iter()) {
                         if !has_val[gid] || v > vals[gid] {
@@ -5910,7 +5935,7 @@ impl DirectAggState {
                     for (i, (&v, &gid)) in
                         src.iter().zip(group_indices.iter()).enumerate()
                     {
-                        if nulls.is_valid(i) && (!has_val[gid] || v > vals[gid]) {
+                        if nulls.is_valid(offset + i) && (!has_val[gid] || v > vals[gid]) {
                             vals[gid] = v;
                             has_val[gid] = true;
                         }
@@ -6278,9 +6303,19 @@ where
     }
 
     fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if batch.num_rows() == 0 {
+        self.merge_partial_slice(batch, 0, batch.num_rows())
+    }
+
+    fn merge_partial_slice(
+        &mut self,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
             return Ok(());
         }
+        let end = offset + len;
         let key_arr = batch
             .column(0)
             .as_any()
@@ -6291,7 +6326,7 @@ where
                 )
             })?;
         let prev_num_groups = self.keys.len();
-        let values = key_arr.values();
+        let values = &key_arr.values()[offset..end];
         self.group_indices.clear();
         self.group_indices.try_reserve(values.len()).map_err(|e| {
             datafusion_common::exec_datafusion_err!(
@@ -6306,7 +6341,7 @@ where
         } else {
             let nulls = key_arr.nulls().unwrap();
             for (i, &k) in values.iter().enumerate() {
-                let gid = if nulls.is_valid(i) {
+                let gid = if nulls.is_valid(offset + i) {
                     self.intern_key_unchecked(k)
                 } else {
                     self.intern_null()
@@ -6319,21 +6354,23 @@ where
             agg.resize(num_groups);
         }
         let cs_col_idx = self.count_star_idx.map(|cs_idx| {
-            let mut offset = 1usize;
+            let mut col_off = 1usize;
             for agg in &self.aggs[..cs_idx] {
-                offset += if matches!(agg, DirectAggState::AvgFloat64 { .. }) {
+                col_off += if matches!(agg, DirectAggState::AvgFloat64 { .. }) {
                     2
                 } else {
                     1
                 };
             }
-            offset
+            col_off
         });
         let cs_col = cs_col_idx.map(|idx| batch.column(idx));
         let mut col_offset = 1usize;
         for agg in &mut self.aggs {
-            agg.merge_partial_columns(
+            agg.merge_partial_columns_slice(
                 batch,
+                offset,
+                len,
                 &mut col_offset,
                 &self.group_indices,
                 prev_num_groups,
@@ -6700,6 +6737,15 @@ impl DirectGroupedKind {
 
     fn merge_partial_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         dispatch_direct_kind!(self, m => m.merge_partial_batch(batch))
+    }
+
+    fn merge_partial_slice(
+        &mut self,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        dispatch_direct_kind!(self, m => m.merge_partial_slice(batch, offset, len))
     }
 
     fn add_view_unchecked(&mut self, view: &BatchView) -> Result<()> {
@@ -7102,6 +7148,16 @@ impl RadixGroupMerger for DirectGroupedRadixMerger {
         batch: &RecordBatch,
     ) -> Result<()> {
         table.merge_partial_batch(batch)
+    }
+
+    fn merge_partial_slice(
+        &self,
+        table: &mut Self::Table,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        table.merge_partial_slice(batch, offset, len)
     }
 
     fn hash_partial_batch(

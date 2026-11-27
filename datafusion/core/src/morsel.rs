@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{BooleanArray, RecordBatch, UInt32Array};
 use arrow::compute::{filter_record_batch, take_record_batch};
-#[cfg(test)]
+#[cfg(any(feature = "parquet", test))]
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -402,6 +402,42 @@ fn estimate_join_side_size(
         }
     }
     est
+}
+
+async fn drop_finalized_tables_parallel(
+    tables: Option<Arc<Vec<Arc<FinalizedHashTable>>>>,
+    workers: usize,
+) {
+    let Some(tables_arc) = tables else {
+        return;
+    };
+    let Ok(tables_vec) = Arc::try_unwrap(tables_arc) else {
+        return;
+    };
+    let total_rows: usize = tables_vec.iter().map(|t| t.num_rows()).sum();
+    if workers <= 1 || total_rows < 250_000 {
+        drop(tables_vec);
+        return;
+    }
+    let mut units: Vec<SingleHashTable> = Vec::new();
+    for table in tables_vec {
+        units.extend(table.take_resident_drop_units());
+    }
+    if units.len() <= 1 {
+        drop(units);
+        return;
+    }
+    let num_tasks = workers.min(units.len());
+    let chunk_size = units.len().div_ceil(num_tasks);
+    let mut tasks = JoinSet::new();
+    while !units.is_empty() {
+        let split_at = units.len().saturating_sub(chunk_size);
+        let chunk = units.split_off(split_at);
+        tasks.spawn(async move {
+            drop(chunk);
+        });
+    }
+    while tasks.join_next().await.is_some() {}
 }
 
 fn choose_build_side(
@@ -5048,7 +5084,7 @@ impl Pipeline {
         }
         drop(sink_reservation);
         drop(shared_sort_memory);
-        drop(finalized_tables);
+        drop_finalized_tables_parallel(finalized_tables, self.workers.get()).await;
 
         // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
         // buffered tail only after all workers and any scan producers succeed.

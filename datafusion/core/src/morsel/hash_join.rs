@@ -50,8 +50,8 @@ use super::join_filter::{
     LocalJoinKeySummary, SplitBlockBloomFilter, try_build_small_inlist_from_chunks,
 };
 use super::radix::{
-    DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, next_level_shift,
-    radix_partition, radix_permute_indices,
+    DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, RadixChunk,
+    next_level_shift, radix_partition, radix_permute_indices,
 };
 use super::radix_join::{
     LocalProbeSpill, NullKeyBuildRows, ProbeSpillEnv, RADIX_JOIN_THRESHOLD_ROWS,
@@ -1451,7 +1451,7 @@ impl HashJoinBuildSink {
         )>,
     > {
         let num_parts = store.num_partitions();
-        let non_empty: usize = store.mem_batches.iter().filter(|v| !v.is_empty()).count();
+        let non_empty: usize = store.part_rows.iter().filter(|&&r| r > 0).count();
         if non_empty == 0 {
             return Ok(Some((
                 ResidentRadixPartitions {
@@ -1504,10 +1504,11 @@ impl HashJoinBuildSink {
                 None
             };
 
-        // Share per-partition input slices in Arc<Vec<Vec<RecordBatch>>> (keep
-        // `store.mem_batches` intact until parallel build succeeds so OOM fallback
-        // can cleanly spill all partitions!).
-        let part_inputs: Arc<Vec<Vec<RecordBatch>>> = Arc::new(store.mem_batches.clone());
+        // Move `store.mem_chunks` into an `Arc` with zero cloning; on OOM error
+        // we restore `store.mem_chunks` after joining workers so fallback spill
+        // can cleanly flush every partition.
+        let chunks: Arc<Vec<RadixChunk>> = Arc::new(std::mem::take(&mut store.mem_chunks));
+        let part_rows: Arc<Vec<usize>> = Arc::new(store.part_rows.clone());
         let results: Arc<Vec<Mutex<Option<SingleHashTable>>>> =
             Arc::new((0..num_parts).map(|_| Mutex::new(None)).collect());
         let next_part = Arc::new(AtomicUsize::new(0));
@@ -1515,7 +1516,8 @@ impl HashJoinBuildSink {
 
         let mut tasks: JoinSet<Result<()>> = JoinSet::new();
         for _ in 0..worker_count {
-            let part_inputs = Arc::clone(&part_inputs);
+            let chunks = Arc::clone(&chunks);
+            let part_rows = Arc::clone(&part_rows);
             let results = Arc::clone(&results);
             let next_part = Arc::clone(&next_part);
             let meta = Arc::clone(meta);
@@ -1534,11 +1536,11 @@ impl HashJoinBuildSink {
                         return Ok(());
                     }
                     let p = next_part.fetch_add(1, Ordering::Relaxed);
-                    if p >= part_inputs.len() {
+                    if p >= num_parts {
                         break;
                     }
-                    let batches = &part_inputs[p];
-                    if batches.is_empty() {
+                    let rows = part_rows[p];
+                    if rows == 0 {
                         continue;
                     }
                     // Temporary per-worker spillable consumer (bounded by W,
@@ -1562,8 +1564,10 @@ impl HashJoinBuildSink {
                         (_, _, Some(b)) => BloomBuildSink::Full(b),
                         _ => BloomBuildSink::None,
                     };
-                    let mut table = build_single_table_from_packed_batches(
-                        batches,
+                    let mut table = build_single_table_from_radix_chunks(
+                        &chunks,
+                        p,
+                        rows,
                         &meta,
                         &mut bloom_sink,
                         part_res,
@@ -1589,6 +1593,8 @@ impl HashJoinBuildSink {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     abort_and_drain(&mut tasks).await;
+                    store.mem_chunks =
+                        Arc::try_unwrap(chunks).unwrap_or_else(|a| (*a).clone());
                     return Err(err);
                 }
                 Err(err) if err.is_panic() => {
@@ -1597,21 +1603,21 @@ impl HashJoinBuildSink {
                 }
                 Err(err) => {
                     abort_and_drain(&mut tasks).await;
+                    store.mem_chunks =
+                        Arc::try_unwrap(chunks).unwrap_or_else(|a| (*a).clone());
                     return Err(exec_datafusion_err!(
                         "Morsel radix HashJoin finalize task failed: {err}"
                     ));
                 }
             }
         }
-        drop(part_inputs);
+        drop(chunks);
         if tx.is_closed() {
             return Ok(None);
         }
 
-        // Release raw input slices now that all 64 partition tables are built.
-        for v in &mut store.mem_batches {
-            v.clear();
-        }
+        // Release raw input chunks now that all 64 partition tables are built.
+        store.mem_part_bytes.fill(0);
         store.total_mem_bytes = 0;
         let _ = input_reservation;
 
@@ -2976,6 +2982,21 @@ impl FinalizedHashTable {
         self.num_rows
     }
 
+    pub(super) fn take_resident_drop_units(self: Arc<Self>) -> Vec<SingleHashTable> {
+        let Ok(table) = Arc::try_unwrap(self) else {
+            return Vec::new();
+        };
+        match table.kind {
+            FinalizedHashTableKind::Single(single) => vec![*single],
+            FinalizedHashTableKind::Radix(radix) => radix
+                .resident
+                .into_inner()
+                .and_then(|arc| Arc::try_unwrap(arc).ok())
+                .map(|r| r.partitions.into_iter().flatten().collect())
+                .unwrap_or_default(),
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.num_rows == 0
     }
@@ -3033,6 +3054,474 @@ impl BloomBuildSink<'_> {
             Self::Full(b) => b.insert(h),
         }
     }
+}
+
+/// Assemble one payload column for radix partition `part` directly from
+/// `RadixChunk` ranges, copying fixed-width primitive columns into a single
+/// contiguous buffer without creating per-chunk `RecordBatch::slice` objects.
+fn build_radix_chunk_payload_column(
+    chunks: &[RadixChunk],
+    part: usize,
+    col_idx: usize,
+    dt: &DataType,
+    num_rows: usize,
+) -> Result<ArrayRef> {
+    macro_rules! copy_primitive_col {
+        ($PrimTy:ty) => {{
+            let mut has_nulls = false;
+            for chunk in chunks {
+                let (_, len) = chunk.part_range(part);
+                if len > 0 && chunk.batch.column(col_idx).null_count() > 0 {
+                    has_nulls = true;
+                    break;
+                }
+            }
+            if !has_nulls {
+                let mut out = Vec::with_capacity(num_rows);
+                for chunk in chunks {
+                    let (off, len) = chunk.part_range(part);
+                    if len == 0 {
+                        continue;
+                    }
+                    let arr = chunk
+                        .batch
+                        .column(col_idx)
+                        .as_any()
+                        .downcast_ref::<PrimitiveArray<$PrimTy>>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected primitive payload column in RadixChunk"
+                            )
+                        })?;
+                    out.extend_from_slice(&arr.values()[off..off + len]);
+                }
+                let arr = PrimitiveArray::<$PrimTy>::new(ScalarBuffer::from(out), None)
+                    .with_data_type(dt.clone());
+                return Ok(Arc::new(arr));
+            }
+        }};
+    }
+
+    match dt {
+        DataType::Int8 => copy_primitive_col!(Int8Type),
+        DataType::Int16 => copy_primitive_col!(Int16Type),
+        DataType::Int32 => copy_primitive_col!(Int32Type),
+        DataType::Int64 => copy_primitive_col!(Int64Type),
+        DataType::UInt8 => copy_primitive_col!(UInt8Type),
+        DataType::UInt16 => copy_primitive_col!(UInt16Type),
+        DataType::UInt32 => copy_primitive_col!(UInt32Type),
+        DataType::UInt64 => copy_primitive_col!(UInt64Type),
+        DataType::Float32 => copy_primitive_col!(Float32Type),
+        DataType::Float64 => copy_primitive_col!(Float64Type),
+        DataType::Date32 => copy_primitive_col!(Date32Type),
+        DataType::Date64 => copy_primitive_col!(Date64Type),
+        DataType::Decimal128(_, _) => copy_primitive_col!(Decimal128Type),
+        _ => {}
+    }
+
+    let slices: Vec<ArrayRef> = chunks
+        .iter()
+        .filter_map(|c| {
+            let (off, len) = c.part_range(part);
+            (len > 0).then(|| c.batch.column(col_idx).slice(off, len))
+        })
+        .collect();
+    if slices.is_empty() {
+        return Ok(new_empty_array(dt));
+    }
+    if slices.len() == 1 {
+        let single_batch = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("c", dt.clone(), true),
+            ])),
+            slices,
+        )?;
+        return Ok(Arc::clone(
+            super::sort::gc_view_batch(&single_batch)?.column(0),
+        ));
+    }
+    let refs: Vec<&dyn Array> = slices.iter().map(Arc::as_ref).collect();
+    let concated = concat(&refs)?;
+    if matches!(dt, DataType::Utf8View | DataType::BinaryView) {
+        let single_batch = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("c", dt.clone(), true),
+            ])),
+            vec![concated],
+        )?;
+        Ok(Arc::clone(
+            super::sort::gc_view_batch(&single_batch)?.column(0),
+        ))
+    } else {
+        Ok(concated)
+    }
+}
+
+/// Build a single-partition [`SingleHashTable`] synchronously directly from
+/// shared [`RadixChunk`]s without materializing `2^R` sliced `RecordBatch`es.
+fn build_single_table_from_radix_chunks(
+    chunks: &[RadixChunk],
+    part: usize,
+    num_rows: usize,
+    meta: &RadixBuildMetadata,
+    bloom: &mut BloomBuildSink<'_>,
+    reservation: MemoryReservation,
+) -> Result<SingleHashTable> {
+    if num_rows == 0 {
+        reservation.resize(0);
+        return Ok(SingleHashTable::empty(
+            Arc::clone(&meta.payload_schema),
+            false,
+            reservation,
+        ));
+    }
+    if num_rows >= u32::MAX as usize {
+        return exec_err!("Morsel HashJoin partition exceeds u32::MAX rows ({num_rows})");
+    }
+
+    let num_payload_cols = meta.num_payload_cols;
+    let num_key_cols = meta.key_types.len();
+    let hash_col_idx = num_payload_cols + num_key_cols;
+
+    let mut payload_est_bytes = 0usize;
+    if num_payload_cols > 0 {
+        for chunk in chunks {
+            let (_, len) = chunk.part_range(part);
+            if len == 0 {
+                continue;
+            }
+            let total = chunk.batch.num_rows().max(1);
+            let b_bytes: usize = (0..num_payload_cols)
+                .map(|c| chunk.batch.column(c).get_array_memory_size())
+                .fold(0usize, usize::saturating_add);
+            payload_est_bytes =
+                payload_est_bytes.saturating_add(b_bytes.saturating_mul(len) / total);
+        }
+    }
+
+    let matched_words = if meta.needs_matched_bitset {
+        num_rows.div_ceil(64)
+    } else {
+        0
+    };
+    let matched_bytes = matched_words.saturating_mul(size_of::<AtomicU64>());
+    let bucket_count = num_rows.saturating_mul(2).next_power_of_two().max(16);
+    let is_flat_int = matches!(
+        meta.key_kind,
+        KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+    );
+    let (dir_bytes, keys_peak_bytes) = match meta.key_kind {
+        KeyKind::Cross => unreachable!(),
+        KeyKind::Int32 | KeyKind::UInt32 => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<u32>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Int64 | KeyKind::UInt64 => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<u64>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View => {
+            let dir = bucket_count
+                .saturating_add(num_rows)
+                .saturating_mul(size_of::<u32>());
+            let key_est: usize = chunks
+                .iter()
+                .map(|c| {
+                    let (_, len) = c.part_range(part);
+                    let total = c.batch.num_rows().max(1);
+                    c.batch
+                        .column(num_payload_cols)
+                        .get_array_memory_size()
+                        .saturating_mul(len)
+                        / total
+                })
+                .fold(0usize, usize::saturating_add);
+            (
+                dir,
+                key_est.saturating_add(num_rows.saturating_mul(size_of::<u64>())),
+            )
+        }
+        KeyKind::Rows => {
+            let dir = bucket_count
+                .saturating_add(num_rows)
+                .saturating_mul(size_of::<u32>());
+            let key_est: usize = chunks
+                .iter()
+                .map(|c| {
+                    let (_, len) = c.part_range(part);
+                    let total = c.batch.num_rows().max(1);
+                    let kb: usize = (0..num_key_cols)
+                        .map(|k| c.batch.column(num_payload_cols + k).get_array_memory_size())
+                        .fold(0usize, usize::saturating_add);
+                    kb.saturating_mul(len) / total
+                })
+                .fold(0usize, usize::saturating_add);
+            (
+                dir,
+                key_est
+                    .saturating_add(num_rows.saturating_mul(16))
+                    .saturating_add(num_rows.saturating_mul(size_of::<u64>())),
+            )
+        }
+    };
+
+    let peak_bytes = dir_bytes
+        .saturating_add(payload_est_bytes)
+        .saturating_add(keys_peak_bytes)
+        .saturating_add(matched_bytes);
+    reservation.try_grow(peak_bytes)?;
+
+    let payload = if num_payload_cols == 0 {
+        RecordBatch::try_new_with_options(
+            Arc::clone(&meta.payload_schema),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )?
+    } else {
+        let mut cols = Vec::with_capacity(num_payload_cols);
+        for c in 0..num_payload_cols {
+            let dt = meta.payload_schema.field(c).data_type();
+            cols.push(build_radix_chunk_payload_column(chunks, part, c, dt, num_rows)?);
+        }
+        RecordBatch::try_new_with_options(
+            Arc::clone(&meta.payload_schema),
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )?
+    };
+
+    if !matches!(bloom, BloomBuildSink::None) {
+        for chunk in chunks {
+            let (off, len) = chunk.part_range(part);
+            if len == 0 {
+                continue;
+            }
+            let h_arr = chunk
+                .batch
+                .column(hash_col_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected UInt64 __morsel_hash column in RadixChunk"
+                    )
+                })?;
+            for &h in &h_arr.values()[off..off + len] {
+                bloom.insert(h);
+            }
+        }
+    }
+
+    let mask = bucket_count - 1;
+    let (build_keys, buckets, next) = if is_flat_int {
+        macro_rules! build_flat_chunks {
+            ($Arr:ty, $K:ty, $Variant:ident) => {{
+                let mut slots = vec![IntSlot::<$K>::empty(); bucket_count];
+                let mut dup_next: Vec<u32> = Vec::new();
+                let mut row_idx = 0usize;
+                for chunk in chunks {
+                    let (off, len) = chunk.part_range(part);
+                    if len == 0 {
+                        continue;
+                    }
+                    let arr = chunk
+                        .batch
+                        .column(num_payload_cols)
+                        .as_any()
+                        .downcast_ref::<$Arr>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected integer join key array in RadixChunk"
+                            )
+                        })?;
+                    let h_arr = chunk
+                        .batch
+                        .column(hash_col_idx)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected UInt64 __morsel_hash column in RadixChunk"
+                            )
+                        })?;
+                    for (&key, &h) in arr.values()[off..off + len]
+                        .iter()
+                        .zip(h_arr.values()[off..off + len].iter())
+                    {
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let slot = &mut slots[pos];
+                            if slot.first_row == 0 {
+                                slot.key = key;
+                                slot.first_row = (row_idx + 1) as u32;
+                                break;
+                            }
+                            if slot.key == key {
+                                if dup_next.is_empty() {
+                                    dup_next.resize(num_rows, 0);
+                                }
+                                dup_next[row_idx] = slot.dup_head;
+                                slot.dup_head = (row_idx + 1) as u32;
+                                break;
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                        row_idx += 1;
+                    }
+                }
+                BuildKeys::$Variant(FlatIntTable {
+                    slots,
+                    mask,
+                    dup_next,
+                })
+            }};
+        }
+        let keys = match meta.key_kind {
+            KeyKind::Int32 => build_flat_chunks!(Int32Array, i32, Int32),
+            KeyKind::Int64 => build_flat_chunks!(Int64Array, i64, Int64),
+            KeyKind::UInt32 => build_flat_chunks!(UInt32Array, u32, UInt32),
+            KeyKind::UInt64 => build_flat_chunks!(UInt64Array, u64, UInt64),
+            _ => unreachable!(),
+        };
+        (keys, Vec::new(), Vec::new())
+    } else {
+        let mut flat_hashes = Vec::with_capacity(num_rows);
+        for chunk in chunks {
+            let (off, len) = chunk.part_range(part);
+            if len == 0 {
+                continue;
+            }
+            let h_arr = chunk
+                .batch
+                .column(hash_col_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected UInt64 __morsel_hash column in RadixChunk"
+                    )
+                })?;
+            flat_hashes.extend_from_slice(&h_arr.values()[off..off + len]);
+        }
+        let concat_key_col = |k: usize| -> Result<ArrayRef> {
+            let slices: Vec<ArrayRef> = chunks
+                .iter()
+                .filter_map(|c| {
+                    let (off, len) = c.part_range(part);
+                    (len > 0).then(|| c.batch.column(num_payload_cols + k).slice(off, len))
+                })
+                .collect();
+            if slices.len() == 1 {
+                Ok(slices.into_iter().next().unwrap())
+            } else {
+                let refs: Vec<&dyn Array> = slices.iter().map(Arc::as_ref).collect();
+                Ok(concat(&refs)?)
+            }
+        };
+        let build_keys = match meta.key_kind {
+            KeyKind::Utf8 => {
+                let arr_ref = concat_key_col(0)?;
+                let array = arr_ref
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Utf8 join key array"
+                        )
+                    })?
+                    .clone();
+                BuildKeys::Utf8 {
+                    array,
+                    hashes: flat_hashes.clone(),
+                }
+            }
+            KeyKind::LargeUtf8 => {
+                let arr_ref = concat_key_col(0)?;
+                let array = arr_ref
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected LargeUtf8 join key array"
+                        )
+                    })?
+                    .clone();
+                BuildKeys::LargeUtf8 {
+                    array,
+                    hashes: flat_hashes.clone(),
+                }
+            }
+            KeyKind::Utf8View => {
+                let arr_ref = concat_key_col(0)?;
+                let array = arr_ref
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Utf8View join key array"
+                        )
+                    })?
+                    .clone();
+                BuildKeys::Utf8View {
+                    array,
+                    hashes: flat_hashes.clone(),
+                }
+            }
+            KeyKind::Rows => {
+                let fields = meta
+                    .key_types
+                    .iter()
+                    .map(|dt| SortField::new(dt.clone()))
+                    .collect();
+                let converter = RowConverter::new(fields)?;
+                let mut concat_cols = Vec::with_capacity(num_key_cols);
+                for k in 0..num_key_cols {
+                    concat_cols.push(concat_key_col(k)?);
+                }
+                let rows = converter.convert_columns(&concat_cols)?;
+                BuildKeys::Rows {
+                    converter,
+                    rows,
+                    hashes: flat_hashes.clone(),
+                }
+            }
+            _ => unreachable!(),
+        };
+        let mut buckets = vec![0u32; bucket_count];
+        let mut next = vec![0u32; num_rows];
+        for (row_idx, &h) in flat_hashes.iter().enumerate() {
+            let bucket = (h as usize) & mask;
+            let entry = (row_idx + 1) as u32;
+            next[row_idx] = buckets[bucket];
+            buckets[bucket] = entry;
+        }
+        (build_keys, buckets, next)
+    };
+
+    let matched: Vec<AtomicU64> =
+        (0..matched_words).map(|_| AtomicU64::new(0)).collect();
+    let final_bytes = get_record_batch_memory_size(&payload)
+        .saturating_add(build_keys.memory_bytes())
+        .saturating_add(dir_bytes)
+        .saturating_add(matched_bytes);
+    reservation.try_resize(final_bytes)?;
+
+    Ok(SingleHashTable {
+        num_rows,
+        hash_entries: num_rows,
+        has_null_key: false,
+        payload,
+        keys: build_keys,
+        buckets,
+        mask,
+        next,
+        matched,
+        reservation,
+    })
 }
 
 /// Build a single-partition [`SingleHashTable`] synchronously from packed
