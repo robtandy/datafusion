@@ -1905,3 +1905,91 @@ async fn int64_sum_avg_above_2_to_53_parity() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn radix_chunk_direct_grouped_and_group_count_zero_slice_parity() -> Result<()> {
+    // 12,000 distinct groups (> RADIX_TRANSITION_GROUPS = 4,096) across 8 batches
+    // with NULL keys and NULL values exercises `RadixChunk` + `merge_partial_slice`
+    // in both `DirectGrouped` and `GroupCount`.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v_i64", DataType::Int64, true),
+        Field::new("v_f64", DataType::Float64, true),
+    ]));
+    let mut parts = Vec::with_capacity(4);
+    for p in 0..4i64 {
+        let mut batches = Vec::with_capacity(2);
+        for b in 0..2i64 {
+            let base = (p * 2 + b) * 4_096;
+            let ks: Vec<Option<i64>> = (0..4_096i64)
+                .map(|i| {
+                    let id = base + i;
+                    if id % 101 == 0 {
+                        None
+                    } else {
+                        Some(id % 12_000)
+                    }
+                })
+                .collect();
+            let vi: Vec<Option<i64>> = (0..4_096i64)
+                .map(|i| {
+                    let id = base + i;
+                    if id % 7 == 0 {
+                        None
+                    } else {
+                        Some((id % 500) - 250)
+                    }
+                })
+                .collect();
+            let vf: Vec<Option<f64>> = (0..4_096i64)
+                .map(|i| {
+                    let id = base + i;
+                    if id % 11 == 0 {
+                        None
+                    } else {
+                        Some(((id % 200) as f64) * 0.25)
+                    }
+                })
+                .collect();
+            batches.push(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ks)),
+                    Arc::new(Int64Array::from(vi)),
+                    Arc::new(Float64Array::from(vf)),
+                ],
+            )?);
+        }
+        parts.push(batches);
+    }
+
+    let mem = Arc::new(MemTable::try_new(Arc::clone(&schema), parts)?);
+    let cfg = SessionConfig::new()
+        .with_target_partitions(4)
+        .with_batch_size(1024);
+    let stock = SessionContext::new_with_config(cfg.clone());
+    let native = morsel_context_with_config(4, cfg);
+    native
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    for ctx in [&stock, &native] {
+        ctx.register_table("t", mem.clone())?;
+    }
+
+    assert_parity(
+        &stock,
+        &native,
+        "SELECT k, COUNT(*) FROM t GROUP BY k",
+        "GroupCountSink",
+    )
+    .await?;
+    assert_parity(
+        &stock,
+        &native,
+        "SELECT k, COUNT(*), COUNT(v_i64), SUM(v_i64), MIN(v_i64), MAX(v_i64), AVG(v_f64) \
+         FROM t GROUP BY k",
+        "AggregateSink",
+    )
+    .await?;
+    Ok(())
+}

@@ -3685,3 +3685,476 @@ async fn cross_aggregate_dynamic_join_filter_nulls_join_types_having_and_guards(
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_forward_dynamic_filter_propagation_prunes_sibling_build_q9_pattern()
+-> Result<()> {
+    // Q9-shaped multi-join: selective `part` (`p_partkey`, ~5% selective) and
+    // large unfiltered `partsupp` (`(ps_suppkey, ps_partkey)`) both join
+    // `lineitem` on `l_partkey`. Forward sibling dynamic filter propagation
+    // must schedule `part` before `partsupp` and prune `partsupp` rows in Parquet.
+    let part_schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_name", DataType::Utf8, false),
+    ]));
+    let part_batch = RecordBatch::try_new(
+        Arc::clone(&part_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=4_000i64)),
+            Arc::new(StringArray::from_iter_values((1..=4_000i64).map(|k| {
+                if k % 20 == 0 {
+                    format!("bright green item {k}")
+                } else {
+                    format!("plain blue item {k}")
+                }
+            }))),
+        ],
+    )?;
+    let part_dir = write_parquet_files(&[part_batch], 1, 2_000)?;
+
+    let supp_schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, false),
+        Field::new("s_nationkey", DataType::Int64, false),
+    ]));
+    let supp_batch = RecordBatch::try_new(
+        Arc::clone(&supp_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=200i64)),
+            Arc::new(Int64Array::from_iter_values((1..=200i64).map(|k| k % 5))),
+        ],
+    )?;
+    let supp_dir = write_parquet_files(&[supp_batch], 1, 200)?;
+
+    let ps_schema = Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, false),
+        Field::new("ps_suppkey", DataType::Int64, false),
+        Field::new("ps_supplycost", DataType::Int64, false),
+    ]));
+    let mut ps_batches = Vec::with_capacity(4);
+    for chunk in 0..4i64 {
+        let mut pk = Vec::with_capacity(4_000);
+        let mut sk = Vec::with_capacity(4_000);
+        let mut sc = Vec::with_capacity(4_000);
+        for p in (chunk * 1_000 + 1)..=((chunk + 1) * 1_000) {
+            for s_off in 0..4i64 {
+                pk.push(p);
+                sk.push(((p + s_off * 37) % 200) + 1);
+                sc.push((p * 7 + s_off) % 100);
+            }
+        }
+        ps_batches.push(RecordBatch::try_new(
+            Arc::clone(&ps_schema),
+            vec![
+                Arc::new(Int64Array::from(pk)),
+                Arc::new(Int64Array::from(sk)),
+                Arc::new(Int64Array::from(sc)),
+            ],
+        )?);
+    }
+    let ps_dir = write_parquet_files(&ps_batches, 2, 2_000)?;
+
+    let li_schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int64, false),
+        Field::new("l_suppkey", DataType::Int64, false),
+        Field::new("l_qty", DataType::Int64, false),
+    ]));
+    let mut li_batches = Vec::with_capacity(4);
+    for chunk in 0..4i64 {
+        let mut pk = Vec::with_capacity(5_000);
+        let mut sk = Vec::with_capacity(5_000);
+        let mut qty = Vec::with_capacity(5_000);
+        for i in 0..5_000i64 {
+            let p = ((chunk * 5_000 + i) % 4_000) + 1;
+            let s_off = i % 4;
+            pk.push(p);
+            sk.push(((p + s_off * 37) % 200) + 1);
+            qty.push((i % 10) + 1);
+        }
+        li_batches.push(RecordBatch::try_new(
+            Arc::clone(&li_schema),
+            vec![
+                Arc::new(Int64Array::from(pk)),
+                Arc::new(Int64Array::from(sk)),
+                Arc::new(Int64Array::from(qty)),
+            ],
+        )?);
+    }
+    let li_dir = write_parquet_files(&li_batches, 2, 2_500)?;
+
+    let make_ctx = |mode: &str, pushdown: bool, dyn_join: bool| {
+        let part_p = part_dir.path().to_str().unwrap().to_owned();
+        let supp_p = supp_dir.path().to_str().unwrap().to_owned();
+        let ps_p = ps_dir.path().to_str().unwrap().to_owned();
+        let li_p = li_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            cfg.options_mut()
+                .optimizer
+                .enable_join_dynamic_filter_pushdown = dyn_join;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("part", &part_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("supplier", &supp_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("partsupp", &ps_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("lineitem", &li_p, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT s.s_nationkey, SUM(l.l_qty * ps.ps_supplycost) AS total \
+               FROM part p, supplier s, lineitem l, partsupp ps \
+               WHERE s.s_suppkey = l.l_suppkey \
+                 AND ps.ps_suppkey = l.l_suppkey \
+                 AND ps.ps_partkey = l.l_partkey \
+                 AND p.p_partkey = l.l_partkey \
+                 AND p.p_name LIKE '%green%' \
+               GROUP BY s.s_nationkey";
+
+    let stock = make_ctx("off", true, true).await?;
+    let native_on = make_ctx("required", true, true).await?;
+    let native_off = make_ctx("required", true, false).await?;
+
+    let (plan_on, _) = assert_native_parity(&stock, &native_on, sql).await?;
+    let (plan_off, _) = assert_native_parity(&stock, &native_off, sql).await?;
+
+    let pruned_on = metric(plan_on.as_ref(), "pushdown_rows_pruned");
+    let pruned_off = metric(plan_off.as_ref(), "pushdown_rows_pruned");
+    // Without sibling propagation, only `lineitem` (20K rows, ~19K pruned) + `part`
+    // (4K, ~3.8K pruned) = ~22.8K pruned. With `part -> partsupp` sibling propagation,
+    // `partsupp` (16K rows, ~15.2K pruned) pushes total pruned well above 30,000!
+    assert!(
+        pruned_on > pruned_off + 25_000,
+        "expected sibling dynamic filter propagation to prune both lineitem and partsupp \
+         (on={pruned_on}, off={pruned_off})"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn int_pair_and_dense_array_map_join_parity_nulls_duplicates_and_extremes()
+-> Result<()> {
+    // 1. 2-key integer FlatIntTable<(i32, i32)> and <(i64, i64)> with duplicates,
+    //    NULLs, and all join types (Inner, Left, Right, Full, Semi, Anti, residual).
+    let b_schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+        Field::new("i1", DataType::Int32, true),
+        Field::new("i2", DataType::Int32, true),
+        Field::new("bval", DataType::Int64, false),
+    ]));
+    let p_schema = Arc::new(Schema::new(vec![
+        Field::new("pk1", DataType::Int64, true),
+        Field::new("pk2", DataType::Int64, true),
+        Field::new("pi1", DataType::Int32, true),
+        Field::new("pi2", DataType::Int32, true),
+        Field::new("pval", DataType::Int64, false),
+    ]));
+    let b_batch = RecordBatch::try_new(
+        Arc::clone(&b_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                None,
+                Some(3),
+                Some(i64::MIN),
+                Some(i64::MAX),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(30),
+                None,
+                Some(i64::MAX),
+                Some(i64::MIN),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                None,
+                Some(3),
+                Some(i32::MIN),
+                Some(i32::MAX),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(30),
+                None,
+                Some(i32::MAX),
+                Some(i32::MIN),
+            ])),
+            Arc::new(Int64Array::from(vec![100, 101, 200, 300, 400, 500, 600])),
+        ],
+    )?;
+    let p_batch = RecordBatch::try_new(
+        Arc::clone(&p_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(99),
+                None,
+                Some(i64::MIN),
+                Some(i64::MAX),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(21),
+                Some(99),
+                Some(30),
+                Some(i64::MAX),
+                Some(i64::MIN),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(99),
+                None,
+                Some(i32::MIN),
+                Some(i32::MAX),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(21),
+                Some(99),
+                Some(30),
+                Some(i32::MAX),
+                Some(i32::MIN),
+            ])),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7])),
+        ],
+    )?;
+
+    // 2. Dense integer ArrayMap tables (unique + duplicate + negative keys)
+    //    exercising build_key_probe_subst and contiguous zero-copy probe output.
+    let dense_b_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int64, true),
+        Field::new("dval", DataType::Int64, false),
+    ]));
+    let dense_p_schema = Arc::new(Schema::new(vec![
+        Field::new("qk", DataType::Int64, true),
+        Field::new("qval", DataType::Int64, false),
+    ]));
+    let dense_uniq_b = RecordBatch::try_new(
+        Arc::clone(&dense_b_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(-500..1_500i64)),
+            Arc::new(Int64Array::from_iter_values(0..2_000i64)),
+        ],
+    )?;
+    let dense_dup_b = RecordBatch::try_new(
+        Arc::clone(&dense_b_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..2_000i64)
+                    .map(|i| if i == 10 { None } else { Some((i % 400) - 200) })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..2_000i64)),
+        ],
+    )?;
+    let dense_p = RecordBatch::try_new(
+        Arc::clone(&dense_p_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..4_000i64)
+                    .map(|i| match i {
+                        0 => Some(i64::MIN),
+                        1 => Some(i64::MAX),
+                        2 => None,
+                        _ => Some((i % 2_200) - 600),
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..4_000i64)),
+        ],
+    )?;
+
+    let stock = stock_context(4, 256);
+    let native = morsel_context(4, 256, MorselMode::Required, false);
+    for ctx in [&stock, &native] {
+        ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&b_schema),
+                vec![vec![b_batch.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "p",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&p_schema),
+                vec![vec![p_batch.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "du",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&dense_b_schema),
+                vec![vec![dense_uniq_b.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "dd",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&dense_b_schema),
+                vec![vec![dense_dup_b.clone()]],
+            )?),
+        )?;
+        ctx.register_table(
+            "dp",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&dense_p_schema),
+                vec![vec![dense_p.clone()]],
+            )?),
+        )?;
+    }
+
+    let queries = [
+        // Int64Pair
+        "SELECT b.k1, b.k2, b.bval, p.pval FROM b INNER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT b.k1, b.k2, b.bval, p.pval FROM b LEFT JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT b.k1, b.k2, b.bval, p.pval FROM b RIGHT JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT b.k1, b.k2, b.bval, p.pval FROM b FULL OUTER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2",
+        "SELECT b.k1, b.k2, b.bval FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.pk1 = b.k1 AND p.pk2 = b.k2)",
+        "SELECT b.k1, b.k2, b.bval FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.pk1 = b.k1 AND p.pk2 = b.k2)",
+        "SELECT b.k1, p.pval FROM b INNER JOIN p ON b.k1 = p.pk1 AND b.k2 = p.pk2 AND b.bval + p.pval > 105",
+        // Int32Pair
+        "SELECT b.i1, b.i2, b.bval, p.pval FROM b INNER JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT b.i1, b.i2, b.bval, p.pval FROM b LEFT JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        "SELECT COUNT(*) FROM b INNER JOIN p ON b.i1 = p.pi1 AND b.i2 = p.pi2",
+        // Dense unique ArrayMap (q13-style LEFT OUTER + build_key_probe_subst + contiguous probe)
+        "SELECT du.dk, COUNT(dp.qval) FROM du LEFT JOIN dp ON du.dk = dp.qk GROUP BY du.dk",
+        "SELECT du.dk, dp.qval FROM du INNER JOIN dp ON du.dk = dp.qk",
+        "SELECT du.dk, dp.qval FROM du RIGHT JOIN dp ON du.dk = dp.qk",
+        "SELECT du.dk, dp.qval FROM du FULL OUTER JOIN dp ON du.dk = dp.qk",
+        "SELECT du.dk FROM du WHERE EXISTS (SELECT 1 FROM dp WHERE dp.qk = du.dk)",
+        "SELECT du.dk FROM du WHERE NOT EXISTS (SELECT 1 FROM dp WHERE dp.qk = du.dk)",
+        "SELECT COUNT(*) FROM du INNER JOIN dp ON du.dk = dp.qk",
+        // Dense duplicate ArrayMap + residual filter
+        "SELECT dd.dk, dd.dval, dp.qval FROM dd INNER JOIN dp ON dd.dk = dp.qk",
+        "SELECT dd.dk, dd.dval, dp.qval FROM dd LEFT JOIN dp ON dd.dk = dp.qk AND dd.dval > dp.qval",
+        "SELECT dd.dk, dd.dval, dp.qval FROM dd FULL OUTER JOIN dp ON dd.dk = dp.qk",
+        "SELECT dd.dk FROM dd WHERE EXISTS (SELECT 1 FROM dp WHERE dp.qk = dd.dk)",
+    ];
+
+    for sql in queries {
+        assert_native_parity(&stock, &native, sql).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sided_range_and_projected_width_selects_filtered_narrow_build_side()
+-> Result<()> {
+    // Q10-shaped join: narrow date-range-filtered `orders` (2 ints + date) vs
+    // wide unfiltered `customer` (4 wide string payload columns). Build-side
+    // estimation must choose filtered `orders` as build side and push its
+    // dynamic filter into `customer`.
+    let cust_schema = Arc::new(Schema::new(vec![
+        Field::new("c_custkey", DataType::Int64, false),
+        Field::new("c_name", DataType::Utf8, false),
+        Field::new("c_address", DataType::Utf8, false),
+        Field::new("c_phone", DataType::Utf8, false),
+        Field::new("c_comment", DataType::Utf8, false),
+    ]));
+    let cust_batch = RecordBatch::try_new(
+        Arc::clone(&cust_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=10_000i64)),
+            Arc::new(StringArray::from_iter_values(
+                (1..=10_000i64).map(|k| format!("Customer#{k:09}")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (1..=10_000i64).map(|k| format!("Address-padding-long-string-{k:09}")),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (1..=10_000i64).map(|k| format!("15-555-{k:04}-{k:04}")),
+            )),
+            Arc::new(StringArray::from_iter_values((1..=10_000i64).map(|k| {
+                format!("wide-customer-comment-payload-text-for-row-{k:09}")
+            }))),
+        ],
+    )?;
+    let cust_dir = write_parquet_files(&[cust_batch], 2, 2_500)?;
+
+    let ord_schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int64, false),
+        Field::new("o_custkey", DataType::Int64, false),
+        Field::new("o_orderdate", DataType::Date32, false),
+        Field::new("o_pad", DataType::Utf8, false),
+    ]));
+    let mut ord_batches = Vec::with_capacity(4);
+    for chunk in 0..4i64 {
+        let base = chunk * 10_000;
+        ord_batches.push(RecordBatch::try_new(
+            Arc::clone(&ord_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(base + 1..=base + 10_000)),
+                Arc::new(Int64Array::from_iter_values(
+                    (base + 1..=base + 10_000).map(|i| (i % 10_000) + 1),
+                )),
+                Arc::new(Date32Array::from_iter_values(
+                    (base + 1..=base + 10_000).map(|i| 8_000 + (i % 2_000) as i32),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (base + 1..=base + 10_000)
+                        .map(|i| format!("unprojected-order-comment-padding-{i:09}")),
+                )),
+            ],
+        )?);
+    }
+    let ord_dir = write_parquet_files(&ord_batches, 4, 10_000)?;
+
+    let make_ctx = |mode: &str| {
+        let cust_p = cust_dir.path().to_str().unwrap().to_owned();
+        let ord_p = ord_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = false;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("customer", &cust_p, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("orders", &ord_p, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let sql = "SELECT c.c_custkey, c.c_name, c.c_address, c.c_phone, c.c_comment, o.o_orderkey \
+               FROM customer c INNER JOIN orders o ON c.c_custkey = o.o_custkey \
+               WHERE o.o_orderdate >= DATE '1993-10-01' AND o.o_orderdate < DATE '1993-11-01'";
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+    let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("[Build: NativeParquet[orders"),
+        "expected narrow date-range-filtered `orders` on build side, got:\n{plan_str}"
+    );
+    Ok(())
+}

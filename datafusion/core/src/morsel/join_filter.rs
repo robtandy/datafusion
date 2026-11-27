@@ -1342,4 +1342,75 @@ mod tests {
         assert!(s1.columns[0].max.is_none());
         Ok(())
     }
+
+    #[test]
+    fn radix_partitioned_bloom_matches_sequential_with_zero_false_negatives() {
+        let n = 20_000usize;
+        let num_blocks = SplitBlockBloomFilter::num_blocks_for_entries(n).unwrap();
+        let low_bits = SplitBlockBloomFilter::radix_low_bits_for_blocks(num_blocks)
+            .expect("20K keys must use radix-partitioned blocks");
+        let stride = 1usize << low_bits;
+        let low_mask = stride - 1;
+        let num_parts = 1usize << DEFAULT_RADIX_BITS;
+        let shift = level0_shift(DEFAULT_RADIX_BITS);
+
+        let mut seq = SplitBlockBloomFilter::with_blocks(num_blocks);
+        let mut parts: Vec<Option<Vec<[u32; 8]>>> =
+            (0..num_parts).map(|_| Some(vec![[0u32; 8]; stride])).collect();
+
+        for k in 0..n as u64 {
+            let h = mix_u64(k);
+            seq.insert(h);
+            let p = radix_partition(h, shift, DEFAULT_RADIX_BITS);
+            SplitBlockBloomFilter::insert_into_partition_slice(
+                parts[p].as_mut().unwrap(),
+                low_mask,
+                h,
+            );
+        }
+
+        let par = SplitBlockBloomFilter::from_radix_partition_blocks(num_blocks, parts);
+        assert_eq!(seq.blocks, par.blocks, "partitioned Bloom must match bit-for-bit");
+        for k in 0..n as u64 {
+            assert!(par.might_contain(mix_u64(k)));
+        }
+        let fps = (0..50_000u64)
+            .filter(|&k| par.might_contain(mix_u64(k + 10_000_000)))
+            .count();
+        assert!(fps < 1_000, "unexpected FPP: {fps}/50000");
+    }
+
+    #[test]
+    fn saturated_int_domain_and_unfiltered_bloom_gating() -> Result<()> {
+        let cfg_unfiltered = DynamicJoinFilterConfig {
+            max_inlist_values: 150,
+            max_inlist_bytes: 8192,
+            build_bloom: true,
+            build_is_filtered: false,
+        };
+        assert!(cfg_unfiltered.should_build_bloom(500));
+        assert!(cfg_unfiltered.should_build_bloom(UNFILTERED_BLOOM_MAX_ROWS));
+        assert!(!cfg_unfiltered.should_build_bloom(UNFILTERED_BLOOM_MAX_ROWS + 1));
+
+        let cfg_filtered = DynamicJoinFilterConfig {
+            build_is_filtered: true,
+            ..cfg_unfiltered
+        };
+        assert!(cfg_filtered.should_build_bloom(500_000));
+
+        // 100% dense [1..=1000] -> saturated (skip Bloom).
+        let mut dense = LocalJoinKeySummary::new(1, false);
+        let dense_arr: ArrayRef = Arc::new(Int64Array::from_iter_values(1..=1000));
+        dense.update(&[dense_arr], None, NullEquality::NullEqualsNothing)?;
+        assert!(dense.is_saturated_int_domain(1000));
+        assert!(!dense.is_saturated_int_domain(100));
+
+        // Extreme i64::MIN..i64::MAX must never overflow span arithmetic.
+        let mut extreme = LocalJoinKeySummary::new(1, false);
+        let ext_arr: ArrayRef =
+            Arc::new(Int64Array::from(vec![i64::MIN, 0, i64::MAX]));
+        extreme.update(&[ext_arr], None, NullEquality::NullEqualsNothing)?;
+        assert!(!extreme.is_saturated_int_domain(3));
+        Ok(())
+    }
 }
