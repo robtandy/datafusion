@@ -4,6 +4,8 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
+#[cfg(feature = "parquet")]
+use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -224,7 +226,7 @@ fn estimate_side_size(
                     _ => 1,
                 })
                 .sum::<u64>()
-                .max(1);
+                .max(4);
             SideEstimate {
                 is_empty: pq.is_empty(),
                 mem_rows: None,
@@ -2534,15 +2536,77 @@ impl Pipeline {
             let multi = probes.len() > 1;
             let mut slots: Vec<Option<Arc<FinalizedHashTable>>> =
                 vec![None; probes.len()];
-            let mut short_circuit_op = None;
-            // Execute builds in reverse probe order (`probes[N-1]` down to
-            // `probes[0]`) so downstream selective builds publish dynamic
-            // filters before earlier builds open their Parquet scans.
-            for idx in (0..probes.len()).rev() {
+            let mut short_circuit_op: Option<usize> = None;
+
+            // Execute builds in topological order of dynamic-filter dependencies,
+            // breaking ties in reverse probe order (`probes[N-1]` down to `probes[0]`)
+            // so both downstream filters and forward sibling filters (e.g.
+            // `part -> partsupp` in TPC-H Q9) publish before consumers open scans.
+            let build_order: Vec<usize> = {
+                #[cfg(feature = "parquet")]
+                {
+                    let n = probes.len();
+                    let mut filter_id_to_idx: HashMap<usize, usize> =
+                        HashMap::with_capacity(n);
+                    for (idx, &(_, probe)) in probes.iter().enumerate() {
+                        filter_id_to_idx.insert(probe.filter_id, idx);
+                    }
+                    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+                    let mut indegree: Vec<usize> = vec![0; n];
+                    let mut bound_ids = HashSet::new();
+                    for (dst, &(_, probe)) in probes.iter().enumerate() {
+                        bound_ids.clear();
+                        parquet::collect_pipeline_bound_filter_ids(
+                            &probe.build_pipeline,
+                            dag.stages(),
+                            &mut bound_ids,
+                        );
+                        for fid in &bound_ids {
+                            if let Some(&src) = filter_id_to_idx.get(fid)
+                                && src != dst
+                            {
+                                adj[src].push(dst);
+                                indegree[dst] += 1;
+                            }
+                        }
+                    }
+                    let mut ready = BinaryHeap::new();
+                    for (idx, &deg) in indegree.iter().enumerate() {
+                        if deg == 0 {
+                            ready.push(idx);
+                        }
+                    }
+                    let mut order = Vec::with_capacity(n);
+                    while let Some(u) = ready.pop() {
+                        order.push(u);
+                        for &v in &adj[u] {
+                            indegree[v] -= 1;
+                            if indegree[v] == 0 {
+                                ready.push(v);
+                            }
+                        }
+                    }
+                    if order.len() < n {
+                        // Defensive fallback if an unexpected cycle ever occurred.
+                        for idx in (0..n).rev() {
+                            if !order.contains(&idx) {
+                                order.push(idx);
+                            }
+                        }
+                    }
+                    order
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    (0..probes.len()).rev().collect()
+                }
+            };
+
+            for (order_pos, &idx) in build_order.iter().enumerate() {
                 let (op_idx, probe) = probes[idx];
                 if tx.is_closed() {
-                    for &(_, remaining_probe) in &probes[..=idx] {
-                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    for &rem_idx in &build_order[order_pos..] {
+                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                     }
                     return Ok(BuildRunOutcome::Cancelled);
                 }
@@ -2564,8 +2628,8 @@ impl Pipeline {
                 ))
                 .await?
                 else {
-                    for &(_, remaining_probe) in &probes[..idx] {
-                        dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                    for &rem_idx in &build_order[order_pos + 1..] {
+                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                     }
                     return Ok(BuildRunOutcome::Cancelled);
                 };
@@ -2587,16 +2651,15 @@ impl Pipeline {
                         .iter()
                         .any(|(_, p)| p.needs_build_emission());
                     if !has_later_build_emission {
-                        for &(_, remaining_probe) in &probes[..idx] {
-                            dag.release_pipeline_refs(&remaining_probe.build_pipeline);
+                        for &rem_idx in &build_order[order_pos + 1..] {
+                            dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
                         }
                         drop(table);
                         drop(slots);
                         return Ok(BuildRunOutcome::ShortCircuitAll);
                     }
-                    if short_circuit_op.is_none() {
-                        short_circuit_op = Some(op_idx);
-                    }
+                    short_circuit_op =
+                        Some(short_circuit_op.map_or(op_idx, |prev| prev.min(op_idx)));
                 }
                 slots[idx] = Some(table);
             }

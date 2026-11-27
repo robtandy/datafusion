@@ -595,10 +595,21 @@ impl HashJoinBuildSink {
     }
 
     #[cfg(feature = "parquet")]
+    pub(super) fn key_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.key_exprs
+    }
+
+    #[cfg(feature = "parquet")]
+    pub(super) fn key_types(&self) -> &[DataType] {
+        &self.key_types
+    }
+
+    #[cfg(feature = "parquet")]
     pub(super) fn enable_dynamic_filter(&mut self, cfg: DynamicJoinFilterConfig) {
         match &mut self.dynamic_filter {
             Some(existing) => {
                 existing.build_bloom |= cfg.build_bloom;
+                existing.build_is_filtered |= cfg.build_is_filtered;
             }
             None => {
                 self.dynamic_filter = Some(cfg);
@@ -4134,6 +4145,11 @@ impl HashJoinProbe {
     #[cfg(any(feature = "parquet", test))]
     pub(super) fn probe_key_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.probe_key_exprs
+    }
+
+    #[cfg(feature = "parquet")]
+    pub(super) fn null_equality(&self) -> NullEquality {
+        self.null_equality
     }
 
     pub(super) fn empty_build_short_circuits(&self) -> bool {
