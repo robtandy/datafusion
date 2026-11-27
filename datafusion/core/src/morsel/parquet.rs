@@ -890,10 +890,16 @@ fn bind_pipeline_dynamic_join_filters_with_stages(
             && let Sink::HashJoinBuild(sink_arc) = &mut build_pipeline.sink
             && let Some(sink) = Arc::get_mut(sink_arc)
         {
+            let build_is_filtered = matches!(build_pipeline.source, Source::Stage(_))
+                || super::pipeline_filter_shift(
+                    &build_pipeline.source,
+                    &build_pipeline.operators,
+                ) > 0;
             sink.enable_dynamic_filter(DynamicJoinFilterConfig {
                 max_inlist_values,
                 max_inlist_bytes,
                 build_bloom: any_pushdown,
+                build_is_filtered,
             });
         }
     }

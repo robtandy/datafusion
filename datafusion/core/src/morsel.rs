@@ -209,10 +209,26 @@ fn estimate_side_size(
         #[cfg(feature = "parquet")]
         Source::Parquet(pq) => {
             let file_bytes = pq.total_file_bytes();
+            let col_weight: u64 = pq
+                .schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView => 4,
+                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 2,
+                    _ => 1,
+                })
+                .sum::<u64>()
+                .max(1);
             SideEstimate {
                 is_empty: pq.is_empty(),
                 mem_rows: None,
-                approx_bytes: file_bytes.saturating_mul(4),
+                approx_bytes: file_bytes.saturating_mul(col_weight),
             }
         }
         Source::Stage(stage_src) => stages[stage_src.stage_id.0].estimate,
@@ -247,11 +263,36 @@ fn is_equality_with_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
     (left_cols == 1 && right_cols == 0) || (left_cols == 0 && right_cols == 1)
 }
 
+/// Returns `(is_lower_bound, is_upper_bound)` for a single-column comparison
+/// against a constant expression (e.g. `col >= c` -> `(true, false)`).
+fn constant_range_bound(expr: &Arc<dyn PhysicalExpr>) -> (bool, bool) {
+    let Some(bin) = expr.downcast_ref::<BinaryExpr>() else {
+        return (false, false);
+    };
+    let left_cols = collect_columns(bin.left()).len();
+    let right_cols = collect_columns(bin.right()).len();
+    if left_cols == 1 && right_cols == 0 {
+        match bin.op() {
+            ExprOperator::Gt | ExprOperator::GtEq => (true, false),
+            ExprOperator::Lt | ExprOperator::LtEq => (false, true),
+            _ => (false, false),
+        }
+    } else if left_cols == 0 && right_cols == 1 {
+        match bin.op() {
+            ExprOperator::Lt | ExprOperator::LtEq => (true, false),
+            ExprOperator::Gt | ExprOperator::GtEq => (false, true),
+            _ => (false, false),
+        }
+    } else {
+        (false, false)
+    }
+}
+
 fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
     if matches!(source, Source::Stage(_)) {
         return 0;
     }
-    let mut distinct_groups: BTreeMap<Vec<String>, u32> = BTreeMap::new();
+    let mut distinct_groups: BTreeMap<Vec<String>, (u32, bool, bool)> = BTreeMap::new();
     let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
         for conjunct in split_conjunction(pred) {
             let mut cols: Vec<String> = collect_columns(conjunct)
@@ -266,10 +307,22 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
                 } else {
                     1
                 };
+                let (has_lo, has_hi) = if cols.len() == 1 {
+                    constant_range_bound(conjunct)
+                } else {
+                    (false, false)
+                };
                 distinct_groups
                     .entry(cols)
-                    .and_modify(|w| *w = (*w).max(weight))
-                    .or_insert(weight);
+                    .and_modify(|(w, lo, hi)| {
+                        *lo |= has_lo;
+                        *hi |= has_hi;
+                        *w = (*w).max(weight);
+                        if *lo && *hi {
+                            *w = (*w).max(4);
+                        }
+                    })
+                    .or_insert((weight, has_lo, has_hi));
             }
         }
     };
@@ -297,7 +350,7 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
             _ => {}
         }
     }
-    let own_shift: u32 = distinct_groups.values().copied().sum();
+    let own_shift: u32 = distinct_groups.values().map(|&(w, _, _)| w).sum();
     own_shift.saturating_add(join_shift).min(6)
 }
 
@@ -3046,7 +3099,7 @@ impl Pipeline {
                 let slice_table = build_single_table_from_packed_batches(
                     &slice_batches,
                     meta,
-                    None,
+                    &mut hash_join::BloomBuildSink::None,
                     slice_res,
                 )?;
                 drop(slice_batches);

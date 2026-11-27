@@ -11,7 +11,6 @@ use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(any(feature = "parquet", test))]
 use arrow::array::RecordBatch;
@@ -51,6 +50,7 @@ use datafusion_physical_expr::expressions::{
 use super::hash_join::KeyKind;
 #[cfg(any(feature = "parquet", test))]
 use super::hash_join::{join_random_state, mix_u64, valid_key_mask};
+use super::radix::{DEFAULT_RADIX_BITS, level0_shift, radix_partition};
 
 // Putze et al. / Parquet split-block Bloom filter odd multiplicative salts.
 const SBBF_SALTS: [u32; 8] = [
@@ -73,6 +73,10 @@ const MAX_BLOOM_BYTES: usize = 8 * 1024 * 1024;
 /// Skip Bloom construction above 5M build keys where an 8 MiB filter would lose selectivity.
 const MAX_BLOOM_KEYS: usize = 5_000_000;
 
+/// Skip Bloom construction on unfiltered base-table builds larger than this row
+/// count (they typically span the full key domain and prune ~0% of probe rows).
+const UNFILTERED_BLOOM_MAX_ROWS: usize = 16_384;
+
 /// Cap for per-column distinct tracking on multi-key joins (enables exact
 /// `InList` pushdown on low-cardinality keys such as `s_nationkey` in TPC-H Q5
 /// when only one key of a composite join traces back to a scan).
@@ -88,17 +92,29 @@ pub(super) struct DynamicJoinFilterConfig {
     /// row-level `RowFilter` (`pushdown_filters = true`); when false, only
     /// min/max bounds and small `InList` are needed for file-open pruning.
     pub(super) build_bloom: bool,
+    /// True when the build pipeline applies a selective filter or reads from a
+    /// materialized upstream stage.
+    pub(super) build_is_filtered: bool,
+}
+
+impl DynamicJoinFilterConfig {
+    pub(super) fn should_build_bloom(&self, entries: usize) -> bool {
+        self.build_bloom
+            && (self.build_is_filtered || entries <= UNFILTERED_BLOOM_MAX_ROWS)
+    }
 }
 
 /// Cache-line-friendly 256-bit (8 x `u32`) split-block Bloom filter.
 ///
-/// Block selection uses the low bits of the 64-bit join hash, and the 8
-/// intra-block bit positions are derived from the upper 32 bits via odd
-/// multiplicative salts.
+/// When `num_blocks >= 64`, the top 6 bits of the block index use the Level-0
+/// radix partition bits (`[51..57)`) so every Level-0 radix partition maps to a
+/// disjoint contiguous slice of `blocks` and can be built lock-free without
+/// atomics or cross-core cache-line contention.
 #[derive(Debug)]
 pub(super) struct SplitBlockBloomFilter {
     blocks: Vec<[u32; 8]>,
     block_mask: usize,
+    radix_low_bits: Option<u32>,
 }
 
 impl SplitBlockBloomFilter {
@@ -118,16 +134,64 @@ impl SplitBlockBloomFilter {
         num_blocks.saturating_mul(size_of::<[u32; 8]>())
     }
 
+    #[inline]
+    pub(super) fn radix_low_bits_for_blocks(num_blocks: usize) -> Option<u32> {
+        let min_parts = 1usize << DEFAULT_RADIX_BITS;
+        if num_blocks >= min_parts {
+            Some(num_blocks.trailing_zeros() - DEFAULT_RADIX_BITS)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn with_blocks(num_blocks: usize) -> Self {
         debug_assert!(num_blocks.is_power_of_two());
         Self {
             blocks: vec![[0u32; 8]; num_blocks],
             block_mask: num_blocks - 1,
+            radix_low_bits: Self::radix_low_bits_for_blocks(num_blocks),
+        }
+    }
+
+    pub(super) fn from_radix_partition_blocks(
+        num_blocks: usize,
+        parts: Vec<Option<Vec<[u32; 8]>>>,
+    ) -> Self {
+        let low_bits = Self::radix_low_bits_for_blocks(num_blocks)
+            .expect("radix partition Bloom requires num_blocks >= 64");
+        let stride = 1usize << low_bits;
+        debug_assert_eq!(parts.len(), 1usize << DEFAULT_RADIX_BITS);
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for part in parts {
+            match part {
+                Some(slice) => {
+                    debug_assert_eq!(slice.len(), stride);
+                    blocks.extend_from_slice(&slice);
+                }
+                None => blocks.resize(blocks.len() + stride, [0u32; 8]),
+            }
+        }
+        Self {
+            blocks,
+            block_mask: num_blocks - 1,
+            radix_low_bits: Some(low_bits),
         }
     }
 
     pub(super) fn memory_bytes(&self) -> usize {
         self.blocks.capacity().saturating_mul(size_of::<[u32; 8]>())
+    }
+
+    #[inline]
+    fn block_index(&self, h: u64) -> usize {
+        if let Some(low_bits) = self.radix_low_bits {
+            let part =
+                radix_partition(h, level0_shift(DEFAULT_RADIX_BITS), DEFAULT_RADIX_BITS);
+            let low_mask = (1usize << low_bits) - 1;
+            (part << low_bits) | ((h as usize) & low_mask)
+        } else {
+            (h as usize) & self.block_mask
+        }
     }
 
     #[inline]
@@ -146,68 +210,48 @@ impl SplitBlockBloomFilter {
     }
 
     #[inline]
-    pub(super) fn insert(&mut self, h: u64) {
-        let block = &mut self.blocks[(h as usize) & self.block_mask];
+    pub(super) fn insert_into_partition_slice(
+        slice: &mut [[u32; 8]],
+        low_mask: usize,
+        h: u64,
+    ) {
+        let block = &mut slice[(h as usize) & low_mask];
         let mask = Self::intra_block_mask(h);
         for (word, bit) in block.iter_mut().zip(mask) {
             *word |= bit;
         }
     }
 
+    #[inline]
+    pub(super) fn insert(&mut self, h: u64) {
+        let idx = self.block_index(h);
+        let block = &mut self.blocks[idx];
+        let mask = Self::intra_block_mask(h);
+        for (word, bit) in block.iter_mut().zip(mask) {
+            *word |= bit;
+        }
+    }
+
+    pub(super) fn merge_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.blocks.len(), other.blocks.len());
+        for (dst, src) in self.blocks.iter_mut().zip(other.blocks.iter()) {
+            for (w_dst, &w_src) in dst.iter_mut().zip(src.iter()) {
+                *w_dst |= w_src;
+            }
+        }
+    }
+
     #[cfg(any(feature = "parquet", test))]
     #[inline]
     pub(super) fn might_contain(&self, h: u64) -> bool {
-        let block = &self.blocks[(h as usize) & self.block_mask];
+        let idx = self.block_index(h);
+        let block = &self.blocks[idx];
         let mask = Self::intra_block_mask(h);
         let mut all = true;
         for (&word, bit) in block.iter().zip(mask) {
             all &= (word & bit) != 0;
         }
         all
-    }
-}
-
-/// Lock-free atomic builder for [`SplitBlockBloomFilter`], enabling parallel
-/// radix-partition join build finalization without cross-partition locks.
-pub(super) struct AtomicSplitBlockBloomFilter {
-    blocks: Vec<[AtomicU32; 8]>,
-    block_mask: usize,
-}
-
-impl AtomicSplitBlockBloomFilter {
-    pub(super) fn with_blocks(num_blocks: usize) -> Self {
-        debug_assert!(num_blocks.is_power_of_two());
-        let mut blocks = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            blocks.push(std::array::from_fn(|_| AtomicU32::new(0)));
-        }
-        Self {
-            blocks,
-            block_mask: num_blocks - 1,
-        }
-    }
-
-    #[inline]
-    pub(super) fn insert(&self, h: u64) {
-        let block = &self.blocks[(h as usize) & self.block_mask];
-        let mask = SplitBlockBloomFilter::intra_block_mask(h);
-        for (word, bit) in block.iter().zip(mask) {
-            if (word.load(Ordering::Relaxed) & bit) == 0 {
-                word.fetch_or(bit, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub(super) fn into_bloom(self) -> SplitBlockBloomFilter {
-        let blocks = self
-            .blocks
-            .into_iter()
-            .map(|b| b.map(AtomicU32::into_inner))
-            .collect();
-        SplitBlockBloomFilter {
-            blocks,
-            block_mask: self.block_mask,
-        }
     }
 }
 
@@ -423,6 +467,37 @@ impl LocalJoinKeySummary {
         for (a, b) in self.columns.iter_mut().zip(other.columns.iter()) {
             a.merge(b);
         }
+    }
+
+    pub(super) fn is_saturated_int_domain(&self, distinct_count: usize) -> bool {
+        if self.columns.len() != 1 {
+            return false;
+        }
+        let col = &self.columns[0];
+        if col.has_nan {
+            return false;
+        }
+        let (Some(lo), Some(hi)) = (&col.min, &col.max) else {
+            return false;
+        };
+        let span: Option<u128> = match (lo, hi) {
+            (ScalarValue::Int32(Some(a)), ScalarValue::Int32(Some(b))) if a <= b => {
+                Some((*b as i128 - *a as i128) as u128 + 1)
+            }
+            (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) if a <= b => {
+                Some((*b as i128 - *a as i128) as u128 + 1)
+            }
+            (ScalarValue::UInt32(Some(a)), ScalarValue::UInt32(Some(b))) if a <= b => {
+                Some((*b as u128 - *a as u128) + 1)
+            }
+            (ScalarValue::UInt64(Some(a)), ScalarValue::UInt64(Some(b))) if a <= b => {
+                Some((*b as u128 - *a as u128) + 1)
+            }
+            _ => None,
+        };
+        span.is_some_and(|s| {
+            (distinct_count as u128).saturating_mul(4) >= s.saturating_mul(3)
+        })
     }
 
     pub(super) fn into_bounds(mut self) -> Vec<ColumnKeyBounds> {

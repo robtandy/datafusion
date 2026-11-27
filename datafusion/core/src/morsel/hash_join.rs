@@ -46,13 +46,12 @@ use super::batch::{
     BatchView, Selection, collect_expr_column_indices, remap_expr_columns,
 };
 use super::join_filter::{
-    AtomicSplitBlockBloomFilter, DynamicJoinFilterConfig, DynamicJoinFilterData,
-    JoinMembershipFilter, LocalJoinKeySummary, SplitBlockBloomFilter,
-    try_build_small_inlist_from_chunks,
+    DynamicJoinFilterConfig, DynamicJoinFilterData, JoinMembershipFilter,
+    LocalJoinKeySummary, SplitBlockBloomFilter, try_build_small_inlist_from_chunks,
 };
 use super::radix::{
-    MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, next_level_shift, radix_partition,
-    radix_permute_indices,
+    DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, next_level_shift,
+    radix_partition, radix_permute_indices,
 };
 use super::radix_join::{
     LocalProbeSpill, NullKeyBuildRows, ProbeSpillEnv, RADIX_JOIN_THRESHOLD_ROWS,
@@ -971,6 +970,7 @@ impl HashJoinBuildSink {
                         &hash_chunks,
                         &valid_masks,
                         distinct_count,
+                        &summary,
                         cfg,
                         &reservation,
                     );
@@ -1041,7 +1041,7 @@ impl HashJoinBuildSink {
                         } else {
                             JoinMembershipFilter::None
                         }
-                    } else if cfg.build_bloom
+                    } else if cfg.should_build_bloom(hash_entries)
                         && (hash_entries > 1
                             || self.key_types.len() > 1
                             || self.has_floats)
@@ -1473,23 +1473,36 @@ impl HashJoinBuildSink {
                 .register(memory_pool),
         );
         let bloom_reservation = resident_res.new_empty();
-        let atomic_bloom = if let Some(cfg) = self.dynamic_filter
-            && cfg.build_bloom
+        let bloom_num_blocks = if let Some(cfg) = self.dynamic_filter
+            && cfg.should_build_bloom(total_hash_entries)
             && (total_hash_entries > 1 || self.key_types.len() > 1 || self.has_floats)
             && let Some(num_blocks) =
                 SplitBlockBloomFilter::num_blocks_for_entries(total_hash_entries)
         {
             let est = SplitBlockBloomFilter::estimated_bytes(num_blocks);
             if bloom_reservation.try_grow(est).is_ok() {
-                Some(Arc::new(AtomicSplitBlockBloomFilter::with_blocks(
-                    num_blocks,
-                )))
+                Some(num_blocks)
             } else {
                 None
             }
         } else {
             None
         };
+        let bloom_radix_low_bits = bloom_num_blocks.and_then(|nb| {
+            (store.radix_bits == DEFAULT_RADIX_BITS)
+                .then(|| SplitBlockBloomFilter::radix_low_bits_for_blocks(nb))
+                .flatten()
+        });
+        let bloom_part_slots: Option<Arc<Vec<Mutex<Option<Vec<[u32; 8]>>>>>> =
+            bloom_radix_low_bits.map(|_| {
+                Arc::new((0..num_parts).map(|_| Mutex::new(None)).collect())
+            });
+        let bloom_small_locals: Option<Arc<Mutex<Vec<SplitBlockBloomFilter>>>> =
+            if bloom_num_blocks.is_some() && bloom_radix_low_bits.is_none() {
+                Some(Arc::new(Mutex::new(Vec::new())))
+            } else {
+                None
+            };
 
         // Share per-partition input slices in Arc<Vec<Vec<RecordBatch>>> (keep
         // `store.mem_batches` intact until parallel build succeeds so OOM fallback
@@ -1508,17 +1521,21 @@ impl HashJoinBuildSink {
             let meta = Arc::clone(meta);
             let pool = Arc::clone(memory_pool);
             let resident_res = Arc::clone(&resident_res);
-            let bloom = atomic_bloom.clone();
+            let bloom_part_slots = bloom_part_slots.clone();
+            let bloom_small_locals = bloom_small_locals.clone();
             let tx = tx.clone();
 
             tasks.spawn(async move {
+                let mut local_small_bloom = bloom_small_locals
+                    .as_ref()
+                    .map(|_| SplitBlockBloomFilter::with_blocks(bloom_num_blocks.unwrap()));
                 loop {
                     if tx.is_closed() {
                         return Ok(());
                     }
                     let p = next_part.fetch_add(1, Ordering::Relaxed);
                     if p >= part_inputs.len() {
-                        return Ok(());
+                        break;
                     }
                     let batches = &part_inputs[p];
                     if batches.is_empty() {
@@ -1529,16 +1546,41 @@ impl HashJoinBuildSink {
                     let part_res = MemoryConsumer::new("MorselHashJoinBuildPart")
                         .with_can_spill(true)
                         .register(&pool);
+                    let mut part_bloom_vec =
+                        bloom_radix_low_bits.map(|lb| vec![[0u32; 8]; 1usize << lb]);
+                    let mut bloom_sink = match (
+                        part_bloom_vec.as_deref_mut(),
+                        bloom_radix_low_bits,
+                        local_small_bloom.as_mut(),
+                    ) {
+                        (Some(slice), Some(lb), _) => {
+                            BloomBuildSink::PartitionSlice {
+                                slice,
+                                low_mask: (1usize << lb) - 1,
+                            }
+                        }
+                        (_, _, Some(b)) => BloomBuildSink::Full(b),
+                        _ => BloomBuildSink::None,
+                    };
                     let mut table = build_single_table_from_packed_batches(
                         batches,
                         &meta,
-                        bloom.as_deref(),
+                        &mut bloom_sink,
                         part_res,
                     )?;
+                    if let (Some(slots), Some(vec)) =
+                        (&bloom_part_slots, part_bloom_vec)
+                    {
+                        *slots[p].lock() = Some(vec);
+                    }
                     transfer_to_resident_lease(&mut table, &resident_res);
                     *results[p].lock() = Some(table);
                     tokio::task::yield_now().await;
                 }
+                if let (Some(locals), Some(b)) = (bloom_small_locals, local_small_bloom) {
+                    locals.lock().push(b);
+                }
+                Ok(())
             });
         }
 
@@ -1585,12 +1627,22 @@ impl HashJoinBuildSink {
 
         let dynamic_filter = match (self.dynamic_filter, key_summary) {
             (Some(_cfg), Some(summary)) => {
-                let membership = if let Some(ab) = atomic_bloom {
-                    let bloom = Arc::try_unwrap(ab)
-                        .ok()
-                        .expect("all finalize tasks joined")
-                        .into_bloom();
-                    JoinMembershipFilter::Bloom(Arc::new(bloom))
+                let membership = if let (Some(nb), Some(slots)) =
+                    (bloom_num_blocks, bloom_part_slots)
+                {
+                    let parts: Vec<Option<Vec<[u32; 8]>>> =
+                        slots.iter().map(|s| s.lock().take()).collect();
+                    JoinMembershipFilter::Bloom(Arc::new(
+                        SplitBlockBloomFilter::from_radix_partition_blocks(nb, parts),
+                    ))
+                } else if let (Some(nb), Some(locals)) =
+                    (bloom_num_blocks, bloom_small_locals)
+                {
+                    let mut merged = SplitBlockBloomFilter::with_blocks(nb);
+                    for local in locals.lock().iter() {
+                        merged.merge_from(local);
+                    }
+                    JoinMembershipFilter::Bloom(Arc::new(merged))
                 } else {
                     JoinMembershipFilter::None
                 };
@@ -1620,6 +1672,7 @@ impl HashJoinBuildSink {
         hash_chunks: &[Vec<u64>],
         valid_masks: &[Option<BooleanBuffer>],
         distinct_count: usize,
+        summary: &LocalJoinKeySummary,
         cfg: DynamicJoinFilterConfig,
         reservation: &MemoryReservation,
     ) -> JoinMembershipFilter {
@@ -1655,7 +1708,9 @@ impl HashJoinBuildSink {
             BuildKeys::UInt64(t) => try_int_inlist!(t, UInt64Array, u64),
             _ => return JoinMembershipFilter::None,
         }
-        if !cfg.build_bloom {
+        if !cfg.should_build_bloom(distinct_count)
+            || summary.is_saturated_int_domain(distinct_count)
+        {
             return JoinMembershipFilter::None;
         }
         Self::build_bloom_membership(
@@ -2958,12 +3013,34 @@ impl FinalizedHashTable {
     }
 }
 
+pub(super) enum BloomBuildSink<'a> {
+    None,
+    PartitionSlice {
+        slice: &'a mut [[u32; 8]],
+        low_mask: usize,
+    },
+    Full(&'a mut SplitBlockBloomFilter),
+}
+
+impl BloomBuildSink<'_> {
+    #[inline]
+    fn insert(&mut self, h: u64) {
+        match self {
+            Self::None => {}
+            Self::PartitionSlice { slice, low_mask } => {
+                SplitBlockBloomFilter::insert_into_partition_slice(slice, *low_mask, h);
+            }
+            Self::Full(b) => b.insert(h),
+        }
+    }
+}
+
 /// Build a single-partition [`SingleHashTable`] synchronously from packed
-/// `build_spill_schema` batches, populating an optional parallel Bloom filter.
+/// `build_spill_schema` batches, populating an optional non-atomic Bloom sink.
 pub(super) fn build_single_table_from_packed_batches(
     packed_batches: &[RecordBatch],
     meta: &RadixBuildMetadata,
-    bloom: Option<&AtomicSplitBlockBloomFilter>,
+    bloom: &mut BloomBuildSink<'_>,
     reservation: MemoryReservation,
 ) -> Result<SingleHashTable> {
     let num_rows: usize = packed_batches.iter().map(RecordBatch::num_rows).sum();
@@ -3086,10 +3163,10 @@ pub(super) fn build_single_table_from_packed_batches(
     };
     drop(payload_batches);
 
-    if let Some(b) = bloom {
+    if !matches!(bloom, BloomBuildSink::None) {
         for chunk in &hash_chunks {
             for &h in chunk {
-                b.insert(h);
+                bloom.insert(h);
             }
         }
     }
@@ -3298,8 +3375,12 @@ pub(super) async fn load_spilled_build_partition_sync_or_async(
     if tx.is_closed() {
         return Ok(None);
     }
-    let table =
-        build_single_table_from_packed_batches(&batches, meta, None, reservation)?;
+    let table = build_single_table_from_packed_batches(
+        &batches,
+        meta,
+        &mut BloomBuildSink::None,
+        reservation,
+    )?;
     drop(batches);
     let _ = tracked_bytes;
     Ok(Some(table))
