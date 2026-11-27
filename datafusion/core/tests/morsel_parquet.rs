@@ -3807,7 +3807,8 @@ async fn adaptive_row_filter_fallible_trailing_guard_parity_across_all_modes()
             let a = if is_zero_row {
                 12
             } else {
-                2 + (r % 7) as i32 // strictly in 2..9 (satisfies `a > 1 AND a < 10`)
+                // Include a <= 1 (0 and 1) so row-group stats cannot elide `a > 1`.
+                (r % 9) as i32
             };
             let b = if is_zero_row { 0 } else { 5 };
             a_vals.push(a);
@@ -3874,6 +3875,7 @@ async fn adaptive_row_filter_fallible_trailing_guard_parity_across_all_modes()
                 test_mode_costs_ns_per_row: Some((100, 10)),
             },
         ),
+        ("Adaptive(default)", AdaptiveRowFilterConfig::default()),
     ];
 
     let mut baseline_outcome: Option<std::result::Result<String, String>> = None;

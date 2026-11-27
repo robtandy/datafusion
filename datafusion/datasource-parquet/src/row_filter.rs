@@ -2665,4 +2665,63 @@ mod test {
         assert!(!guard_grouped[1].has_fallible);
         assert!(guard_grouped[2].has_fallible);
     }
+
+    #[test]
+    fn test_group_same_column_does_not_move_trailing_infallible_ahead_of_fallible() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 5, 12, 3])),
+                Arc::new(Int32Array::from(vec![5, 5, 0, 5])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        // `a > 1 AND 100 / b > 3 AND a < 10`: the trailing infallible `a < 10`
+        // shares leaf 0 with `a > 1` but MUST NOT be merged ahead of the
+        // intervening fallible `100 / b > 3`.
+        let expr = col("a")
+            .gt(lit(1i32))
+            .and((lit(100i32) / col("b")).gt(lit(3i32)))
+            .and(col("a").lt(lit(10i32)));
+        let phys = logical2physical(&expr, &file_schema);
+        let grouped = prebuild_row_filter_candidates_with_grouping(
+            &phys,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            grouped.len(),
+            3,
+            "trailing `a < 10` must stay after fallible `100 / b > 3`"
+        );
+        assert!(grouped[0].reads_leaf(0));
+        assert!(!grouped[0].has_fallible);
+        assert!(grouped[1].reads_leaf(1));
+        assert!(grouped[1].has_fallible);
+        assert!(grouped[2].reads_leaf(0));
+        assert!(!grouped[2].has_fallible);
+    }
 }
