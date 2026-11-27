@@ -49,7 +49,7 @@ use datafusion_physical_expr::expressions::{
 
 use super::hash_join::KeyKind;
 #[cfg(any(feature = "parquet", test))]
-use super::hash_join::{join_random_state, mix_u64, valid_key_mask};
+use super::hash_join::{join_random_state, mix_u64, mix_u64_pair, valid_key_mask};
 use super::radix::{DEFAULT_RADIX_BITS, level0_shift, radix_partition};
 
 // Putze et al. / Parquet split-block Bloom filter odd multiplicative salts.
@@ -860,11 +860,57 @@ impl PhysicalExpr for JoinBloomFilterExpr {
             }};
         }
 
+        macro_rules! eval_flat_int_pair {
+            ($Arr:ty, $to_u64:expr) => {{
+                let arr0_ref = self.key_exprs[0].evaluate(batch)?.into_array(num_rows)?;
+                let arr1_ref = self.key_exprs[1].evaluate(batch)?.into_array(num_rows)?;
+                let arr0 = arr0_ref.as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected {} join key array in JoinBloomFilterExpr, got {}",
+                        stringify!($Arr),
+                        arr0_ref.data_type()
+                    )
+                })?;
+                let arr1 = arr1_ref.as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected {} join key array in JoinBloomFilterExpr, got {}",
+                        stringify!($Arr),
+                        arr1_ref.data_type()
+                    )
+                })?;
+                let v0 = arr0.values();
+                let v1 = arr1.values();
+                let filter = self.filter.as_ref();
+                let to_u64: fn(_) -> u64 = $to_u64;
+                let buf = if arr0.null_count() == 0 && arr1.null_count() == 0 {
+                    BooleanBuffer::collect_bool(num_rows, |i| {
+                        filter.might_contain(mix_u64_pair(to_u64(v0[i]), to_u64(v1[i])))
+                    })
+                } else {
+                    let n0 = arr0.nulls();
+                    let n1 = arr1.nulls();
+                    BooleanBuffer::collect_bool(num_rows, |i| {
+                        n0.is_none_or(|n| n.is_valid(i))
+                            && n1.is_none_or(|n| n.is_valid(i))
+                            && filter.might_contain(mix_u64_pair(
+                                to_u64(v0[i]),
+                                to_u64(v1[i]),
+                            ))
+                    })
+                };
+                return Ok(ColumnarValue::Array(Arc::new(BooleanArray::new(buf, None))));
+            }};
+        }
+
         match self.key_kind {
             KeyKind::Int32 => eval_flat_int!(Int32Array, |v: i32| v as u32 as u64),
             KeyKind::Int64 => eval_flat_int!(Int64Array, |v: i64| v as u64),
             KeyKind::UInt32 => eval_flat_int!(UInt32Array, |v: u32| v as u64),
             KeyKind::UInt64 => eval_flat_int!(UInt64Array, |v: u64| v),
+            KeyKind::Int32Pair => {
+                eval_flat_int_pair!(Int32Array, |v: i32| v as u32 as u64)
+            }
+            KeyKind::Int64Pair => eval_flat_int_pair!(Int64Array, |v: i64| v as u64),
             KeyKind::Cross => {
                 return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))));
             }

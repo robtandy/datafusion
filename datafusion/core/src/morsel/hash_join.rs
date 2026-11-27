@@ -79,6 +79,11 @@ pub(super) fn mix_u64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+#[inline]
+pub(super) fn mix_u64_pair(a: u64, b: u64) -> u64 {
+    mix_u64(a ^ mix_u64(b.wrapping_add(0x9e37_79b9_7f4a_7c15)))
+}
+
 pub(super) fn is_supported_join_key_type(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -298,6 +303,8 @@ pub(super) enum KeyKind {
     Int64,
     UInt32,
     UInt64,
+    Int32Pair,
+    Int64Pair,
     Utf8,
     LargeUtf8,
     Utf8View,
@@ -317,6 +324,8 @@ impl KeyKind {
             [DataType::Int64] => Self::Int64,
             [DataType::UInt32] => Self::UInt32,
             [DataType::UInt64] => Self::UInt64,
+            [DataType::Int32, DataType::Int32] => Self::Int32Pair,
+            [DataType::Int64, DataType::Int64] => Self::Int64Pair,
             [DataType::Utf8] => Self::Utf8,
             [DataType::LargeUtf8] => Self::LargeUtf8,
             [DataType::Utf8View] => Self::Utf8View,
@@ -422,6 +431,52 @@ fn compute_build_hashes(
                     })?;
             for (h, &v) in hashes.iter_mut().zip(arr.values().iter()) {
                 *h = mix_u64(v);
+            }
+        }
+        KeyKind::Int32Pair => {
+            let a0 = keys[0]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected Int32 join key array 0"
+                    )
+                })?;
+            let a1 = keys[1]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected Int32 join key array 1"
+                    )
+                })?;
+            for (h, (&v0, &v1)) in
+                hashes.iter_mut().zip(a0.values().iter().zip(a1.values().iter()))
+            {
+                *h = mix_u64_pair(v0 as u32 as u64, v1 as u32 as u64);
+            }
+        }
+        KeyKind::Int64Pair => {
+            let a0 = keys[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected Int64 join key array 0"
+                    )
+                })?;
+            let a1 = keys[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Expected Int64 join key array 1"
+                    )
+                })?;
+            for (h, (&v0, &v1)) in
+                hashes.iter_mut().zip(a0.values().iter().zip(a1.values().iter()))
+            {
+                *h = mix_u64_pair(v0 as u64, v1 as u64);
             }
         }
         KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View | KeyKind::Rows => {
@@ -883,7 +938,12 @@ impl HashJoinBuildSink {
         let bucket_count = hash_entries.saturating_mul(2).next_power_of_two().max(16);
         let is_flat_int = matches!(
             self.key_kind,
-            KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+            KeyKind::Int32
+                | KeyKind::Int64
+                | KeyKind::UInt32
+                | KeyKind::UInt64
+                | KeyKind::Int32Pair
+                | KeyKind::Int64Pair
         );
         let (dir_bytes, keys_peak_bytes) = match self.key_kind {
             KeyKind::Cross => unreachable!(),
@@ -897,6 +957,18 @@ impl HashJoinBuildSink {
                 0usize,
                 bucket_count
                     .saturating_mul(size_of::<IntSlot<u64>>())
+                    .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+            ),
+            KeyKind::Int32Pair => (
+                0usize,
+                bucket_count
+                    .saturating_mul(size_of::<IntSlot<(i32, i32)>>())
+                    .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+            ),
+            KeyKind::Int64Pair => (
+                0usize,
+                bucket_count
+                    .saturating_mul(size_of::<IntSlot<(i64, i64)>>())
                     .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
             ),
             KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View => {
@@ -1723,6 +1795,7 @@ impl HashJoinBuildSink {
             BuildKeys::Int64(t) => try_int_inlist!(t, Int64Array, i64),
             BuildKeys::UInt32(t) => try_int_inlist!(t, UInt32Array, u32),
             BuildKeys::UInt64(t) => try_int_inlist!(t, UInt64Array, u64),
+            BuildKeys::Int32Pair(_) | BuildKeys::Int64Pair(_) => {}
             _ => return JoinMembershipFilter::None,
         }
         if !cfg.should_build_bloom(distinct_count)
@@ -1837,11 +1910,86 @@ impl HashJoinBuildSink {
             }};
         }
 
+        macro_rules! build_flat_pair {
+            ($Arr:ty, $K:ty, $Variant:ident) => {{
+                let mut slots = vec![IntSlot::<($K, $K)>::empty(); slot_count];
+                let mask = slot_count - 1;
+                let mut dup_next: Vec<u32> = Vec::new();
+                let mut distinct_count = 0usize;
+                let mut row_idx = 0usize;
+                let mut since_yield = 0usize;
+                for (chunk_idx, (kb, hashes)) in
+                    key_batches.drain(..).zip(hash_chunks.iter()).enumerate()
+                {
+                    let a0 = kb[0].as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected integer join key array 0"
+                        )
+                    })?;
+                    let a1 = kb[1].as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected integer join key array 1"
+                        )
+                    })?;
+                    let valid_opt = valid_masks.get(chunk_idx).and_then(Option::as_ref);
+                    for (i, ((&k0, &k1), &h)) in a0
+                        .values()
+                        .iter()
+                        .zip(a1.values().iter())
+                        .zip(hashes.iter())
+                        .enumerate()
+                    {
+                        if valid_opt.is_none_or(|bits| bits.value(i)) {
+                            let key = (k0, k1);
+                            let mut pos = (h as usize) & mask;
+                            loop {
+                                let slot = &mut slots[pos];
+                                if slot.first_row == 0 {
+                                    slot.key = key;
+                                    slot.first_row = (row_idx + 1) as u32;
+                                    distinct_count += 1;
+                                    break;
+                                }
+                                if slot.key == key {
+                                    if dup_next.is_empty() {
+                                        dup_next.resize(num_rows, 0);
+                                    }
+                                    dup_next[row_idx] = slot.dup_head;
+                                    slot.dup_head = (row_idx + 1) as u32;
+                                    break;
+                                }
+                                pos = (pos + 1) & mask;
+                            }
+                        }
+                        row_idx += 1;
+                        since_yield += 1;
+                        if since_yield >= FINALIZE_YIELD_CHUNK {
+                            since_yield = 0;
+                            if tx.is_closed() {
+                                return Ok(None);
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                Ok(Some((
+                    BuildKeys::$Variant(FlatIntTable {
+                        slots,
+                        mask,
+                        dup_next,
+                    }),
+                    distinct_count,
+                )))
+            }};
+        }
+
         match self.key_kind {
             KeyKind::Int32 => build_flat!(Int32Array, i32, Int32),
             KeyKind::Int64 => build_flat!(Int64Array, i64, Int64),
             KeyKind::UInt32 => build_flat!(UInt32Array, u32, UInt32),
             KeyKind::UInt64 => build_flat!(UInt64Array, u64, UInt64),
+            KeyKind::Int32Pair => build_flat_pair!(Int32Array, i32, Int32Pair),
+            KeyKind::Int64Pair => build_flat_pair!(Int64Array, i64, Int64Pair),
             _ => unreachable!(),
         }
     }
@@ -1865,7 +2013,9 @@ impl HashJoinBuildSink {
             | KeyKind::Int32
             | KeyKind::Int64
             | KeyKind::UInt32
-            | KeyKind::UInt64 => {
+            | KeyKind::UInt64
+            | KeyKind::Int32Pair
+            | KeyKind::Int64Pair => {
                 unreachable!()
             }
             KeyKind::Utf8 => {
@@ -2779,6 +2929,8 @@ enum BuildKeys {
     Int64(FlatIntTable<i64>),
     UInt32(FlatIntTable<u32>),
     UInt64(FlatIntTable<u64>),
+    Int32Pair(FlatIntTable<(i32, i32)>),
+    Int64Pair(FlatIntTable<(i64, i64)>),
     Utf8 {
         array: StringArray,
         hashes: Vec<u64>,
@@ -2806,6 +2958,8 @@ impl BuildKeys {
             Self::Int64(t) => t.memory_bytes(),
             Self::UInt32(t) => t.memory_bytes(),
             Self::UInt64(t) => t.memory_bytes(),
+            Self::Int32Pair(t) => t.memory_bytes(),
+            Self::Int64Pair(t) => t.memory_bytes(),
             Self::Utf8 { array, hashes } => array
                 .get_array_memory_size()
                 .saturating_add(hashes.capacity().saturating_mul(size_of::<u64>())),
@@ -3219,7 +3373,12 @@ fn build_single_table_from_radix_chunks(
     let bucket_count = num_rows.saturating_mul(2).next_power_of_two().max(16);
     let is_flat_int = matches!(
         meta.key_kind,
-        KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+        KeyKind::Int32
+            | KeyKind::Int64
+            | KeyKind::UInt32
+            | KeyKind::UInt64
+            | KeyKind::Int32Pair
+            | KeyKind::Int64Pair
     );
     let (dir_bytes, keys_peak_bytes) = match meta.key_kind {
         KeyKind::Cross => unreachable!(),
@@ -3233,6 +3392,18 @@ fn build_single_table_from_radix_chunks(
             0usize,
             bucket_count
                 .saturating_mul(size_of::<IntSlot<u64>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Int32Pair => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<(i32, i32)>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Int64Pair => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<(i64, i64)>>())
                 .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
         ),
         KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View => {
@@ -3391,11 +3562,87 @@ fn build_single_table_from_radix_chunks(
                 })
             }};
         }
+        macro_rules! build_flat_pair_chunks {
+            ($Arr:ty, $K:ty, $Variant:ident) => {{
+                let mut slots = vec![IntSlot::<($K, $K)>::empty(); bucket_count];
+                let mut dup_next: Vec<u32> = Vec::new();
+                let mut row_idx = 0usize;
+                for chunk in chunks {
+                    let (off, len) = chunk.part_range(part);
+                    if len == 0 {
+                        continue;
+                    }
+                    let a0 = chunk
+                        .batch
+                        .column(num_payload_cols)
+                        .as_any()
+                        .downcast_ref::<$Arr>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected integer join key array 0 in RadixChunk"
+                            )
+                        })?;
+                    let a1 = chunk
+                        .batch
+                        .column(num_payload_cols + 1)
+                        .as_any()
+                        .downcast_ref::<$Arr>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected integer join key array 1 in RadixChunk"
+                            )
+                        })?;
+                    let h_arr = chunk
+                        .batch
+                        .column(hash_col_idx)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Expected UInt64 __morsel_hash column in RadixChunk"
+                            )
+                        })?;
+                    for ((&k0, &k1), &h) in a0.values()[off..off + len]
+                        .iter()
+                        .zip(a1.values()[off..off + len].iter())
+                        .zip(h_arr.values()[off..off + len].iter())
+                    {
+                        let key = (k0, k1);
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let slot = &mut slots[pos];
+                            if slot.first_row == 0 {
+                                slot.key = key;
+                                slot.first_row = (row_idx + 1) as u32;
+                                break;
+                            }
+                            if slot.key == key {
+                                if dup_next.is_empty() {
+                                    dup_next.resize(num_rows, 0);
+                                }
+                                dup_next[row_idx] = slot.dup_head;
+                                slot.dup_head = (row_idx + 1) as u32;
+                                break;
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                        row_idx += 1;
+                    }
+                }
+                BuildKeys::$Variant(FlatIntTable {
+                    slots,
+                    mask,
+                    dup_next,
+                })
+            }};
+        }
         let keys = match meta.key_kind {
             KeyKind::Int32 => build_flat_chunks!(Int32Array, i32, Int32),
             KeyKind::Int64 => build_flat_chunks!(Int64Array, i64, Int64),
             KeyKind::UInt32 => build_flat_chunks!(UInt32Array, u32, UInt32),
             KeyKind::UInt64 => build_flat_chunks!(UInt64Array, u64, UInt64),
+            KeyKind::Int32Pair => build_flat_pair_chunks!(Int32Array, i32, Int32Pair),
+            KeyKind::Int64Pair => build_flat_pair_chunks!(Int64Array, i64, Int64Pair),
             _ => unreachable!(),
         };
         (keys, Vec::new(), Vec::new())
@@ -3597,7 +3844,12 @@ pub(super) fn build_single_table_from_packed_batches(
     let bucket_count = num_rows.saturating_mul(2).next_power_of_two().max(16);
     let is_flat_int = matches!(
         meta.key_kind,
-        KeyKind::Int32 | KeyKind::Int64 | KeyKind::UInt32 | KeyKind::UInt64
+        KeyKind::Int32
+            | KeyKind::Int64
+            | KeyKind::UInt32
+            | KeyKind::UInt64
+            | KeyKind::Int32Pair
+            | KeyKind::Int64Pair
     );
     let (dir_bytes, keys_peak_bytes) = match meta.key_kind {
         KeyKind::Cross => unreachable!(),
@@ -3611,6 +3863,18 @@ pub(super) fn build_single_table_from_packed_batches(
             0usize,
             bucket_count
                 .saturating_mul(size_of::<IntSlot<u64>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Int32Pair => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<(i32, i32)>>())
+                .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
+        ),
+        KeyKind::Int64Pair => (
+            0usize,
+            bucket_count
+                .saturating_mul(size_of::<IntSlot<(i64, i64)>>())
                 .saturating_add(num_rows.saturating_mul(size_of::<u32>())),
         ),
         KeyKind::Utf8 | KeyKind::LargeUtf8 | KeyKind::Utf8View => {
@@ -3713,11 +3977,64 @@ pub(super) fn build_single_table_from_packed_batches(
                 })
             }};
         }
+        macro_rules! build_flat_pair_sync {
+            ($Arr:ty, $K:ty, $Variant:ident) => {{
+                let mut slots = vec![IntSlot::<($K, $K)>::empty(); bucket_count];
+                let mut dup_next: Vec<u32> = Vec::new();
+                let mut row_idx = 0usize;
+                for (kb, hashes) in key_batches.drain(..).zip(hash_chunks.iter()) {
+                    let a0 = kb[0].as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected integer join key array 0"
+                        )
+                    })?;
+                    let a1 = kb[1].as_any().downcast_ref::<$Arr>().ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected integer join key array 1"
+                        )
+                    })?;
+                    for ((&k0, &k1), &h) in a0
+                        .values()
+                        .iter()
+                        .zip(a1.values().iter())
+                        .zip(hashes.iter())
+                    {
+                        let key = (k0, k1);
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let slot = &mut slots[pos];
+                            if slot.first_row == 0 {
+                                slot.key = key;
+                                slot.first_row = (row_idx + 1) as u32;
+                                break;
+                            }
+                            if slot.key == key {
+                                if dup_next.is_empty() {
+                                    dup_next.resize(num_rows, 0);
+                                }
+                                dup_next[row_idx] = slot.dup_head;
+                                slot.dup_head = (row_idx + 1) as u32;
+                                break;
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                        row_idx += 1;
+                    }
+                }
+                BuildKeys::$Variant(FlatIntTable {
+                    slots,
+                    mask,
+                    dup_next,
+                })
+            }};
+        }
         let keys = match meta.key_kind {
             KeyKind::Int32 => build_flat_sync!(Int32Array, i32, Int32),
             KeyKind::Int64 => build_flat_sync!(Int64Array, i64, Int64),
             KeyKind::UInt32 => build_flat_sync!(UInt32Array, u32, UInt32),
             KeyKind::UInt64 => build_flat_sync!(UInt64Array, u64, UInt64),
+            KeyKind::Int32Pair => build_flat_pair_sync!(Int32Array, i32, Int32Pair),
+            KeyKind::Int64Pair => build_flat_pair_sync!(Int64Array, i64, Int64Pair),
             _ => unreachable!(),
         };
         (keys, Vec::new(), Vec::new())
@@ -3917,6 +4234,8 @@ enum ProbeKeys {
     Int64(Int64Array),
     UInt32(UInt32Array),
     UInt64(UInt64Array),
+    Int32Pair(Int32Array, Int32Array),
+    Int64Pair(Int64Array, Int64Array),
     Utf8 {
         array: StringArray,
         hashes: Vec<u64>,
@@ -3943,6 +4262,13 @@ impl ProbeKeys {
             Self::Int64(a) => mix_u64(a.value(key_idx) as u64),
             Self::UInt32(a) => mix_u64(a.value(key_idx) as u64),
             Self::UInt64(a) => mix_u64(a.value(key_idx)),
+            Self::Int32Pair(a0, a1) => mix_u64_pair(
+                a0.value(key_idx) as u32 as u64,
+                a1.value(key_idx) as u32 as u64,
+            ),
+            Self::Int64Pair(a0, a1) => {
+                mix_u64_pair(a0.value(key_idx) as u64, a1.value(key_idx) as u64)
+            }
             Self::Utf8 { hashes, .. }
             | Self::LargeUtf8 { hashes, .. }
             | Self::Utf8View { hashes, .. }
@@ -3959,6 +4285,8 @@ impl ProbeKeys {
             Self::Int64(a) => Self::Int64(a.clone()),
             Self::UInt32(a) => Self::UInt32(a.clone()),
             Self::UInt64(a) => Self::UInt64(a.clone()),
+            Self::Int32Pair(a0, a1) => Self::Int32Pair(a0.clone(), a1.clone()),
+            Self::Int64Pair(a0, a1) => Self::Int64Pair(a0.clone(), a1.clone()),
             Self::Utf8 { array, hashes } => Self::Utf8 {
                 array: array.clone(),
                 hashes: hashes.clone(),
@@ -4086,6 +4414,11 @@ pub(super) struct HashJoinProbe {
     has_floats: bool,
     pub(super) filter: Option<CompiledJoinFilter>,
     pub(super) output_projection: Vec<JoinOutputCol>,
+    /// For each `output_projection[i]` that projects a build equijoin key column
+    /// matching a plain probe key column of identical non-float `DataType`,
+    /// stores `Some(probe_col_idx)` so matched rows can take directly from the
+    /// L1-resident probe batch instead of gathering from the build table.
+    build_key_probe_subst: Vec<Option<usize>>,
     pub(super) output_schema: SchemaRef,
     pub(super) build_id: usize,
     pub(super) filter_id: usize,
@@ -4117,6 +4450,50 @@ impl HashJoinProbe {
             [expr] => expr.downcast_ref::<Column>().map(Column::index),
             _ => None,
         };
+        let build_key_probe_subst: Vec<Option<usize>> =
+            if let super::Sink::HashJoinBuild(build_sink) = &config.build_pipeline.sink {
+                let b_keys = &build_sink.key_exprs;
+                let b_payload = &build_sink.payload_columns;
+                let key_types = &build_sink.key_types;
+                config
+                    .output_projection
+                    .iter()
+                    .enumerate()
+                    .map(|(out_idx, out_col)| {
+                        let JoinOutputCol::Build(b_idx) = *out_col else {
+                            return None;
+                        };
+                        let build_col_idx = *b_payload.get(b_idx)?;
+                        let out_dt = config.output_schema.field(out_idx).data_type();
+                        for (k, (bk, pk)) in
+                            b_keys.iter().zip(config.probe_key_exprs.iter()).enumerate()
+                        {
+                            let Some(bk_col) = bk.downcast_ref::<Column>() else {
+                                continue;
+                            };
+                            let Some(pk_col) = pk.downcast_ref::<Column>() else {
+                                continue;
+                            };
+                            if bk_col.index() == build_col_idx {
+                                let dt = key_types.get(k)?;
+                                if dt == out_dt
+                                    && !matches!(
+                                        dt,
+                                        DataType::Float16
+                                            | DataType::Float32
+                                            | DataType::Float64
+                                    )
+                                {
+                                    return Some(pk_col.index());
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            } else {
+                vec![None; config.output_projection.len()]
+            };
         Self {
             build_pipeline: config.build_pipeline,
             build_side: config.build_side,
@@ -4130,6 +4507,7 @@ impl HashJoinProbe {
             has_floats,
             filter: config.filter,
             output_projection: config.output_projection,
+            build_key_probe_subst,
             output_schema: config.output_schema,
             build_id: config.build_id,
             filter_id: 0,
@@ -4811,6 +5189,48 @@ impl HashJoinProbe {
                     .clone();
                 Ok(ProbeKeys::UInt64(arr))
             }
+            KeyKind::Int32Pair => {
+                let a0 = key_arrays[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 probe key array 0"
+                        )
+                    })?
+                    .clone();
+                let a1 = key_arrays[1]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 probe key array 1"
+                        )
+                    })?
+                    .clone();
+                Ok(ProbeKeys::Int32Pair(a0, a1))
+            }
+            KeyKind::Int64Pair => {
+                let a0 = key_arrays[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 probe key array 0"
+                        )
+                    })?
+                    .clone();
+                let a1 = key_arrays[1]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 probe key array 1"
+                        )
+                    })?
+                    .clone();
+                Ok(ProbeKeys::Int64Pair(a0, a1))
+            }
             KeyKind::Utf8 => {
                 let mut hashes = vec![0u64; num_rows];
                 create_hashes(key_arrays, &join_random_state(), &mut hashes)?;
@@ -4965,6 +5385,48 @@ impl HashJoinProbe {
                     })?
                     .clone();
                 Ok(ProbeKeys::UInt64(arr))
+            }
+            (KeyKind::Int32Pair, BuildKeys::Int32Pair(_)) => {
+                let a0 = key_arrays[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 probe key array 0"
+                        )
+                    })?
+                    .clone();
+                let a1 = key_arrays[1]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int32 probe key array 1"
+                        )
+                    })?
+                    .clone();
+                Ok(ProbeKeys::Int32Pair(a0, a1))
+            }
+            (KeyKind::Int64Pair, BuildKeys::Int64Pair(_)) => {
+                let a0 = key_arrays[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 probe key array 0"
+                        )
+                    })?
+                    .clone();
+                let a1 = key_arrays[1]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Expected Int64 probe key array 1"
+                        )
+                    })?
+                    .clone();
+                Ok(ProbeKeys::Int64Pair(a0, a1))
             }
             (KeyKind::Utf8, BuildKeys::Utf8 { .. }) => {
                 let mut hashes = vec![0u64; num_rows];
@@ -5242,6 +5704,8 @@ impl HashJoinProbe {
                     | ProbeKeys::Int64(_)
                     | ProbeKeys::UInt32(_)
                     | ProbeKeys::UInt64(_)
+                    | ProbeKeys::Int32Pair(_, _)
+                    | ProbeKeys::Int64Pair(_, _)
             );
         if used_flat_int_fast {
             let (s_hit, m_hit) =
@@ -5354,47 +5818,76 @@ impl HashJoinProbe {
                 &RecordBatchOptions::new().with_row_count(Some(len)),
             )?
         } else {
-            let probe_idx = UInt32Array::new(
-                ScalarBuffer::from(std::mem::take(&mut scratch.probe_indices)),
-                None,
-            );
+            let probe_contig = contiguous_range(&scratch.probe_indices);
+            let probe_idx = if probe_contig.is_none() {
+                Some(UInt32Array::new(
+                    ScalarBuffer::from(std::mem::take(&mut scratch.probe_indices)),
+                    None,
+                ))
+            } else {
+                scratch.probe_indices.clear();
+                None
+            };
+            let take_probe_col = |p_col: usize| -> Result<ArrayRef> {
+                let src = cursor.batch.column(p_col);
+                if let Some(start) = probe_contig {
+                    if start == 0 && len == cursor.batch.num_rows() {
+                        Ok(Arc::clone(src))
+                    } else {
+                        Ok(src.slice(start, len))
+                    }
+                } else {
+                    Ok(take(src.as_ref(), probe_idx.as_ref().unwrap(), None)?)
+                }
+            };
             let mut cols = Vec::with_capacity(self.output_projection.len());
             for (out_idx, col) in self.output_projection.iter().enumerate() {
                 let arr = match col {
-                    JoinOutputCol::Probe(idx) => {
-                        take(cursor.batch.column(*idx).as_ref(), &probe_idx, None)?
-                    }
+                    JoinOutputCol::Probe(idx) => take_probe_col(*idx)?,
                     JoinOutputCol::Build(b_idx) => {
-                        let dt = self.output_schema.field(out_idx).data_type();
-                        if !has_null_build && !multi_part_hit {
-                            if let Some(p) = single_part_hit {
-                                let pt = cursor.resident.partitions[p]
-                                    .as_ref()
-                                    .expect("hit partition exists");
-                                let b_arr = UInt32Array::from_iter_values(
-                                    scratch
-                                        .interleave_build
-                                        .iter()
-                                        .map(|&(_, r)| r as u32),
-                                );
-                                take(pt.payload.column(*b_idx).as_ref(), &b_arr, None)?
-                            } else {
-                                new_null_array(dt, len)
-                            }
+                        if !has_null_build
+                            && let Some(p_col) = self.build_key_probe_subst[out_idx]
+                        {
+                            take_probe_col(p_col)?
                         } else {
-                            gather_radix_build_column(
-                                &cursor.resident.partitions,
-                                *b_idx,
-                                dt,
-                                &scratch.interleave_build,
-                                has_null_build,
-                            )?
+                            let dt = self.output_schema.field(out_idx).data_type();
+                            if !has_null_build && !multi_part_hit {
+                                if let Some(p) = single_part_hit {
+                                    let pt = cursor.resident.partitions[p]
+                                        .as_ref()
+                                        .expect("hit partition exists");
+                                    let b_arr = UInt32Array::from_iter_values(
+                                        scratch
+                                            .interleave_build
+                                            .iter()
+                                            .map(|&(_, r)| r as u32),
+                                    );
+                                    take(
+                                        pt.payload.column(*b_idx).as_ref(),
+                                        &b_arr,
+                                        None,
+                                    )?
+                                } else {
+                                    new_null_array(dt, len)
+                                }
+                            } else {
+                                gather_radix_build_column(
+                                    &cursor.resident.partitions,
+                                    *b_idx,
+                                    dt,
+                                    &scratch.interleave_build,
+                                    has_null_build,
+                                )?
+                            }
                         }
                     }
                 };
                 cols.push(arr);
             }
-            if let Ok(mut v) = probe_idx.into_parts().1.into_inner().into_vec::<u32>() {
+            if let Some(probe_idx) = probe_idx
+                && let Ok(mut v) =
+                    probe_idx.into_parts().1.into_inner().into_vec::<u32>()
+            {
                 v.clear();
                 scratch.probe_indices = v;
             }
@@ -6653,34 +7146,75 @@ impl HashJoinProbe {
             });
         }
 
-        let build_idx = UInt32Array::new(
-            ScalarBuffer::from(std::mem::take(&mut scratch.build_indices)),
-            None,
-        );
-        let probe_idx = UInt32Array::new(
-            ScalarBuffer::from(std::mem::take(&mut scratch.probe_indices)),
-            None,
-        );
+        let probe_contig = contiguous_range(&scratch.probe_indices);
+        let need_build_idx = self
+            .output_projection
+            .iter()
+            .enumerate()
+            .any(|(out_idx, col)| {
+                matches!(col, JoinOutputCol::Build(_))
+                    && self.build_key_probe_subst[out_idx].is_none()
+            });
+        let build_idx = if need_build_idx {
+            Some(UInt32Array::new(
+                ScalarBuffer::from(std::mem::take(&mut scratch.build_indices)),
+                None,
+            ))
+        } else {
+            scratch.build_indices.clear();
+            None
+        };
+        let probe_idx = if probe_contig.is_none() {
+            Some(UInt32Array::new(
+                ScalarBuffer::from(std::mem::take(&mut scratch.probe_indices)),
+                None,
+            ))
+        } else {
+            scratch.probe_indices.clear();
+            None
+        };
+        let take_probe_col = |p_col: usize| -> Result<ArrayRef> {
+            let src = cursor.batch.column(p_col);
+            if let Some(start) = probe_contig {
+                if start == 0 && len == cursor.batch.num_rows() {
+                    Ok(Arc::clone(src))
+                } else {
+                    Ok(src.slice(start, len))
+                }
+            } else {
+                Ok(take(src.as_ref(), probe_idx.as_ref().unwrap(), None)?)
+            }
+        };
 
         let mut columns = Vec::with_capacity(self.output_projection.len());
-        for col in &self.output_projection {
+        for (out_idx, col) in self.output_projection.iter().enumerate() {
             let taken = match col {
                 JoinOutputCol::Build(idx) => {
-                    take(table.payload.column(*idx).as_ref(), &build_idx, None)?
+                    if let Some(p_col) = self.build_key_probe_subst[out_idx] {
+                        take_probe_col(p_col)?
+                    } else {
+                        take(
+                            table.payload.column(*idx).as_ref(),
+                            build_idx.as_ref().unwrap(),
+                            None,
+                        )?
+                    }
                 }
-                JoinOutputCol::Probe(idx) => {
-                    take(cursor.batch.column(*idx).as_ref(), &probe_idx, None)?
-                }
+                JoinOutputCol::Probe(idx) => take_probe_col(*idx)?,
             };
             columns.push(taken);
         }
 
         // Return index buffers to worker scratch for reuse without reallocation.
-        if let Ok(mut v) = build_idx.into_parts().1.into_inner().into_vec::<u32>() {
+        if let Some(build_idx) = build_idx
+            && let Ok(mut v) = build_idx.into_parts().1.into_inner().into_vec::<u32>()
+        {
             v.clear();
             scratch.build_indices = v;
         }
-        if let Ok(mut v) = probe_idx.into_parts().1.into_inner().into_vec::<u32>() {
+        if let Some(probe_idx) = probe_idx
+            && let Ok(mut v) = probe_idx.into_parts().1.into_inner().into_vec::<u32>()
+        {
             v.clear();
             scratch.probe_indices = v;
         }
@@ -6839,6 +7373,21 @@ fn transfer_to_resident_lease(
     drop(prev);
 }
 
+#[inline]
+fn contiguous_range(indices: &[u32]) -> Option<usize> {
+    let first = *indices.first()? as usize;
+    let len = indices.len();
+    if (*indices.last()? as usize) != first + len - 1 {
+        return None;
+    }
+    for (i, &v) in indices.iter().enumerate() {
+        if v as usize != first + i {
+            return None;
+        }
+    }
+    Some(first)
+}
+
 /// Batch-level specialized flat-integer radix probe for `Inner` / `BuildOuter`
 /// joins: computes `mix_u64` once per row and probes `FlatIntTable<K>` inline
 /// without per-row enum dispatch or intermediate candidate vectors.
@@ -6868,8 +7417,8 @@ fn probe_collect_radix_flat_int(
     }
 
     macro_rules! run_flat_radix {
-        ($p_arr:expr, $BuildVariant:ident, $hash_key:expr) => {{
-            let values = $p_arr.values();
+        ($get_key:expr, $BuildVariant:ident, $hash_key:expr) => {{
+            let get_key = $get_key;
             let valid_mask = cursor.valid_mask.as_ref();
             macro_rules! probe_one {
                 ($key_idx:expr, $backing_row:expr) => {{
@@ -6878,7 +7427,7 @@ fn probe_collect_radix_flat_int(
                     {
                         // NULL key never matches in Inner / BuildOuter.
                     } else {
-                        let pk = values[$key_idx];
+                        let pk = get_key($key_idx);
                         let h = $hash_key(pk);
                         let p = ((h >> shift) & part_mask) as usize;
                         if ((spilled_build_mask >> p) & 1) == 0
@@ -6984,11 +7533,39 @@ fn probe_collect_radix_flat_int(
 
     match &cursor.keys {
         ProbeKeys::Int32(p) => {
-            run_flat_radix!(p, Int32, |v: i32| mix_u64(v as u32 as u64))
+            let vals = p.values();
+            run_flat_radix!(|i: usize| vals[i], Int32, |v: i32| mix_u64(v as u32 as u64))
         }
-        ProbeKeys::Int64(p) => run_flat_radix!(p, Int64, |v: i64| mix_u64(v as u64)),
-        ProbeKeys::UInt32(p) => run_flat_radix!(p, UInt32, |v: u32| mix_u64(v as u64)),
-        ProbeKeys::UInt64(p) => run_flat_radix!(p, UInt64, |v: u64| mix_u64(v)),
+        ProbeKeys::Int64(p) => {
+            let vals = p.values();
+            run_flat_radix!(|i: usize| vals[i], Int64, |v: i64| mix_u64(v as u64))
+        }
+        ProbeKeys::UInt32(p) => {
+            let vals = p.values();
+            run_flat_radix!(|i: usize| vals[i], UInt32, |v: u32| mix_u64(v as u64))
+        }
+        ProbeKeys::UInt64(p) => {
+            let vals = p.values();
+            run_flat_radix!(|i: usize| vals[i], UInt64, |v: u64| mix_u64(v))
+        }
+        ProbeKeys::Int32Pair(p0, p1) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            run_flat_radix!(
+                |i: usize| (v0[i], v1[i]),
+                Int32Pair,
+                |(a, b): (i32, i32)| mix_u64_pair(a as u32 as u64, b as u32 as u64)
+            )
+        }
+        ProbeKeys::Int64Pair(p0, p1) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            run_flat_radix!(
+                |i: usize| (v0[i], v1[i]),
+                Int64Pair,
+                |(a, b): (i64, i64)| mix_u64_pair(a as u64, b as u64)
+            )
+        }
         _ => unreachable!("probe_collect_radix_flat_int called for non-flat-int key"),
     }
 
@@ -7199,8 +7776,8 @@ fn probe_has_any_match(
     key_idx: usize,
 ) -> Result<bool> {
     macro_rules! flat_exists {
-        ($p_arr:expr, $flat:expr, $hash_key:expr) => {{
-            let pk = $p_arr.value(key_idx);
+        ($pk:expr, $flat:expr, $hash_key:expr) => {{
+            let pk = $pk;
             let slots = $flat.slots.as_slice();
             let mask = $flat.mask;
             let mut slot_pos = ($hash_key(pk) as usize) & mask;
@@ -7232,16 +7809,34 @@ fn probe_has_any_match(
     }
     match (keys, &table.keys) {
         (ProbeKeys::Int32(p), BuildKeys::Int32(f)) => {
-            flat_exists!(p, f, |v: i32| mix_u64(v as u32 as u64))
+            flat_exists!(p.value(key_idx), f, |v: i32| mix_u64(v as u32 as u64))
         }
         (ProbeKeys::Int64(p), BuildKeys::Int64(f)) => {
-            flat_exists!(p, f, |v: i64| mix_u64(v as u64))
+            flat_exists!(p.value(key_idx), f, |v: i64| mix_u64(v as u64))
         }
         (ProbeKeys::UInt32(p), BuildKeys::UInt32(f)) => {
-            flat_exists!(p, f, |v: u32| mix_u64(v as u64))
+            flat_exists!(p.value(key_idx), f, |v: u32| mix_u64(v as u64))
         }
         (ProbeKeys::UInt64(p), BuildKeys::UInt64(f)) => {
-            flat_exists!(p, f, |v: u64| mix_u64(v))
+            flat_exists!(p.value(key_idx), f, |v: u64| mix_u64(v))
+        }
+        (ProbeKeys::Int32Pair(p0, p1), BuildKeys::Int32Pair(f)) => {
+            flat_exists!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i32,
+                i32
+            )| mix_u64_pair(
+                a as u32 as u64,
+                b as u32 as u64
+            ))
+        }
+        (ProbeKeys::Int64Pair(p0, p1), BuildKeys::Int64Pair(f)) => {
+            flat_exists!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i64,
+                i64
+            )| mix_u64_pair(
+                a as u64,
+                b as u64
+            ))
         }
         (
             ProbeKeys::Utf8 {
@@ -7302,8 +7897,8 @@ fn probe_mark_all_matches(
     key_idx: usize,
 ) -> Result<()> {
     macro_rules! flat_mark {
-        ($p_arr:expr, $flat:expr, $hash_key:expr) => {{
-            let pk = $p_arr.value(key_idx);
+        ($pk:expr, $flat:expr, $hash_key:expr) => {{
+            let pk = $pk;
             let slots = $flat.slots.as_slice();
             let dup_next = $flat.dup_next.as_slice();
             let mask = $flat.mask;
@@ -7343,16 +7938,34 @@ fn probe_mark_all_matches(
     }
     match (keys, &table.keys) {
         (ProbeKeys::Int32(p), BuildKeys::Int32(f)) => {
-            flat_mark!(p, f, |v: i32| mix_u64(v as u32 as u64))
+            flat_mark!(p.value(key_idx), f, |v: i32| mix_u64(v as u32 as u64))
         }
         (ProbeKeys::Int64(p), BuildKeys::Int64(f)) => {
-            flat_mark!(p, f, |v: i64| mix_u64(v as u64))
+            flat_mark!(p.value(key_idx), f, |v: i64| mix_u64(v as u64))
         }
         (ProbeKeys::UInt32(p), BuildKeys::UInt32(f)) => {
-            flat_mark!(p, f, |v: u32| mix_u64(v as u64))
+            flat_mark!(p.value(key_idx), f, |v: u32| mix_u64(v as u64))
         }
         (ProbeKeys::UInt64(p), BuildKeys::UInt64(f)) => {
-            flat_mark!(p, f, |v: u64| mix_u64(v))
+            flat_mark!(p.value(key_idx), f, |v: u64| mix_u64(v))
+        }
+        (ProbeKeys::Int32Pair(p0, p1), BuildKeys::Int32Pair(f)) => {
+            flat_mark!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i32,
+                i32
+            )| mix_u64_pair(
+                a as u32 as u64,
+                b as u32 as u64
+            ))
+        }
+        (ProbeKeys::Int64Pair(p0, p1), BuildKeys::Int64Pair(f)) => {
+            flat_mark!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i64,
+                i64
+            )| mix_u64_pair(
+                a as u64,
+                b as u64
+            ))
         }
         (
             ProbeKeys::Utf8 {
@@ -7444,11 +8057,11 @@ fn probe_step_key_candidates(
     cand_probe: &mut Vec<u32>,
 ) -> Result<bool> {
     macro_rules! flat_step {
-        ($p_arr:expr, $flat:expr, $hash_key:expr) => {{
+        ($pk:expr, $flat:expr, $hash_key:expr) => {{
             let dup_next = $flat.dup_next.as_slice();
             let mut added = 0usize;
             let mut entry = if *next_entry == 0 {
-                let pk = $p_arr.value(key_idx);
+                let pk = $pk;
                 let slots = $flat.slots.as_slice();
                 let mask = $flat.mask;
                 let mut slot_pos = ($hash_key(pk) as usize) & mask;
@@ -7512,16 +8125,34 @@ fn probe_step_key_candidates(
     }
     match (keys, &table.keys) {
         (ProbeKeys::Int32(p), BuildKeys::Int32(f)) => {
-            flat_step!(p, f, |v: i32| mix_u64(v as u32 as u64))
+            flat_step!(p.value(key_idx), f, |v: i32| mix_u64(v as u32 as u64))
         }
         (ProbeKeys::Int64(p), BuildKeys::Int64(f)) => {
-            flat_step!(p, f, |v: i64| mix_u64(v as u64))
+            flat_step!(p.value(key_idx), f, |v: i64| mix_u64(v as u64))
         }
         (ProbeKeys::UInt32(p), BuildKeys::UInt32(f)) => {
-            flat_step!(p, f, |v: u32| mix_u64(v as u64))
+            flat_step!(p.value(key_idx), f, |v: u32| mix_u64(v as u64))
         }
         (ProbeKeys::UInt64(p), BuildKeys::UInt64(f)) => {
-            flat_step!(p, f, |v: u64| mix_u64(v))
+            flat_step!(p.value(key_idx), f, |v: u64| mix_u64(v))
+        }
+        (ProbeKeys::Int32Pair(p0, p1), BuildKeys::Int32Pair(f)) => {
+            flat_step!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i32,
+                i32
+            )| mix_u64_pair(
+                a as u32 as u64,
+                b as u32 as u64
+            ))
+        }
+        (ProbeKeys::Int64Pair(p0, p1), BuildKeys::Int64Pair(f)) => {
+            flat_step!((p0.value(key_idx), p1.value(key_idx)), f, |(a, b): (
+                i64,
+                i64
+            )| mix_u64_pair(
+                a as u64,
+                b as u64
+            ))
         }
         (
             ProbeKeys::Utf8 {
@@ -7577,7 +8208,7 @@ fn probe_step_key_candidates(
 }
 
 macro_rules! probe_flat_int_step {
-    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $key_idx:expr, $backing_row:expr, $matched:expr, $hash_key:expr, $on_match:expr) => {{
+    ($cursor:expr, $flat:expr, $get_key:expr, $limit:expr, $key_idx:expr, $backing_row:expr, $matched:expr, $hash_key:expr, $on_match:expr) => {{
         let slots = $flat.slots.as_slice();
         let dup_next = $flat.dup_next.as_slice();
         let mask = $flat.mask;
@@ -7591,7 +8222,7 @@ macro_rules! probe_flat_int_step {
                 $cursor.pos += 1;
                 continue;
             }
-            let pk = $p_vals[key_idx];
+            let pk = ($get_key)(key_idx);
             let mut slot_pos = ($hash_key(pk) as usize) & mask;
             let dup_head = loop {
                 let slot = &slots[slot_pos];
@@ -7641,7 +8272,8 @@ macro_rules! probe_flat_int_step {
 }
 
 macro_rules! probe_flat_int_core {
-    ($cursor:expr, $flat:expr, $p_vals:expr, $limit:expr, $hash_key:expr, $on_match:expr) => {{
+    ($cursor:expr, $flat:expr, $get_key:expr, $limit:expr, $hash_key:expr, $on_match:expr) => {{
+        let get_key = $get_key;
         let mut matched = 0usize;
         match &$cursor.rows {
             ProbeRows::All { num_rows } => {
@@ -7651,7 +8283,7 @@ macro_rules! probe_flat_int_core {
                     probe_flat_int_step!(
                         $cursor,
                         $flat,
-                        $p_vals,
+                        get_key,
                         $limit,
                         probe_row,
                         probe_row as u32,
@@ -7690,7 +8322,7 @@ macro_rules! probe_flat_int_core {
                     let mut hit_limit = false;
                     for rel in bits.slice(start, num_rows - start).set_indices() {
                         let probe_row = start + rel;
-                        let pk = $p_vals[probe_row];
+                        let pk = get_key(probe_row);
                         let mut slot_pos = ($hash_key(pk) as usize) & mask;
                         let dup_head = loop {
                             let slot = &slots[slot_pos];
@@ -7757,7 +8389,7 @@ macro_rules! probe_flat_int_core {
                     probe_flat_int_step!(
                         $cursor,
                         $flat,
-                        $p_vals,
+                        get_key,
                         $limit,
                         backing_row as usize,
                         backing_row,
@@ -7776,7 +8408,7 @@ macro_rules! probe_flat_int_core {
                     probe_flat_int_step!(
                         $cursor,
                         $flat,
-                        $p_vals,
+                        get_key,
                         $limit,
                         key_idx,
                         backing_row,
@@ -7902,7 +8534,7 @@ fn probe_collect_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: i32| mix_u64(v as u32 as u64),
                 |b: u32, p: u32| {
@@ -7916,7 +8548,7 @@ fn probe_collect_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: i64| mix_u64(v as u64),
                 |b: u32, p: u32| {
@@ -7930,7 +8562,7 @@ fn probe_collect_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: u32| mix_u64(v as u64),
                 |b: u32, p: u32| {
@@ -7944,9 +8576,39 @@ fn probe_collect_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: u64| mix_u64(v),
+                |b: u32, p: u32| {
+                    build_out.push(b);
+                    probe_out.push(p);
+                }
+            );
+        }
+        (ProbeKeys::Int32Pair(p0, p1), BuildKeys::Int32Pair(flat)) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            probe_flat_int_core!(
+                cursor,
+                flat,
+                |i: usize| (v0[i], v1[i]),
+                limit,
+                |(a, b): (i32, i32)| mix_u64_pair(a as u32 as u64, b as u32 as u64),
+                |b: u32, p: u32| {
+                    build_out.push(b);
+                    probe_out.push(p);
+                }
+            );
+        }
+        (ProbeKeys::Int64Pair(p0, p1), BuildKeys::Int64Pair(flat)) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            probe_flat_int_core!(
+                cursor,
+                flat,
+                |i: usize| (v0[i], v1[i]),
+                limit,
+                |(a, b): (i64, i64)| mix_u64_pair(a as u64, b as u64),
                 |b: u32, p: u32| {
                     build_out.push(b);
                     probe_out.push(p);
@@ -8066,7 +8728,7 @@ fn probe_count_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: i32| mix_u64(v as u32 as u64),
                 |_b: u32, _p: u32| {}
@@ -8077,7 +8739,7 @@ fn probe_count_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: i64| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
@@ -8088,7 +8750,7 @@ fn probe_count_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: u32| mix_u64(v as u64),
                 |_b: u32, _p: u32| {}
@@ -8099,9 +8761,33 @@ fn probe_count_matches(
             probe_flat_int_core!(
                 cursor,
                 flat,
-                p_vals,
+                |i: usize| p_vals[i],
                 limit,
                 |v: u64| mix_u64(v),
+                |_b: u32, _p: u32| {}
+            )
+        }
+        (ProbeKeys::Int32Pair(p0, p1), BuildKeys::Int32Pair(flat)) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            probe_flat_int_core!(
+                cursor,
+                flat,
+                |i: usize| (v0[i], v1[i]),
+                limit,
+                |(a, b): (i32, i32)| mix_u64_pair(a as u32 as u64, b as u32 as u64),
+                |_b: u32, _p: u32| {}
+            )
+        }
+        (ProbeKeys::Int64Pair(p0, p1), BuildKeys::Int64Pair(flat)) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            probe_flat_int_core!(
+                cursor,
+                flat,
+                |i: usize| (v0[i], v1[i]),
+                limit,
+                |(a, b): (i64, i64)| mix_u64_pair(a as u64, b as u64),
                 |_b: u32, _p: u32| {}
             )
         }
