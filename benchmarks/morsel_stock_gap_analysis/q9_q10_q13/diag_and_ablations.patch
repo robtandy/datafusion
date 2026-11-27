@@ -1,0 +1,461 @@
+diff --git a/datafusion/core/src/morsel.rs b/datafusion/core/src/morsel.rs
+index a6b96bfc4..0736cd85a 100644
+--- a/datafusion/core/src/morsel.rs
++++ b/datafusion/core/src/morsel.rs
+@@ -209,10 +209,28 @@ fn estimate_side_size(
+         #[cfg(feature = "parquet")]
+         Source::Parquet(pq) => {
+             let file_bytes = pq.total_file_bytes();
++            let scaled =
++                if std::env::var("MORSEL_Q10_FIX_BUILD_EST").ok().as_deref() == Some("1") {
++                    let col_weight: u64 = pq
++                        .schema
++                        .fields()
++                        .iter()
++                        .map(|f| match f.data_type() {
++                            arrow::datatypes::DataType::Utf8
++                            | arrow::datatypes::DataType::LargeUtf8
++                            | arrow::datatypes::DataType::Utf8View => 4,
++                            _ => 1,
++                        })
++                        .sum::<u64>()
++                        .max(1);
++                    file_bytes.saturating_mul(col_weight)
++                } else {
++                    file_bytes.saturating_mul(4)
++                };
+             SideEstimate {
+                 is_empty: pq.is_empty(),
+                 mem_rows: None,
+-                approx_bytes: file_bytes.saturating_mul(4),
++                approx_bytes: scaled,
+             }
+         }
+         Source::Stage(stage_src) => stages[stage_src.stage_id.0].estimate,
+@@ -266,9 +284,17 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
+                 } else {
+                     1
+                 };
++                let fix_est =
++                    std::env::var("MORSEL_Q10_FIX_BUILD_EST").ok().as_deref() == Some("1");
+                 distinct_groups
+                     .entry(cols)
+-                    .and_modify(|w| *w = (*w).max(weight))
++                    .and_modify(|w| {
++                        if fix_est {
++                            *w = (*w).saturating_add(3).min(4);
++                        } else {
++                            *w = (*w).max(weight);
++                        }
++                    })
+                     .or_insert(weight);
+             }
+         }
+@@ -351,6 +377,36 @@ fn estimate_join_side_size(
+     est
+ }
+
++
++fn phase_trace_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("MORSEL_PHASE_TRACE").ok().as_deref() == Some("1"))
++}
++
++fn phase_epoch() -> &'static Instant {
++    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
++    T0.get_or_init(Instant::now)
++}
++
++fn init_phase_epoch() {
++    if phase_trace_enabled() {
++        let _ = phase_epoch();
++    }
++}
++
++fn trace_phase(name: &str, start: Instant) {
++    if phase_trace_enabled() {
++        let end = Instant::now();
++        let t0 = *phase_epoch();
++        let s_ms = start.saturating_duration_since(t0).as_secs_f64() * 1000.0;
++        let e_ms = end.saturating_duration_since(t0).as_secs_f64() * 1000.0;
++        eprintln!(
++            "[PHASE] {name}: start={s_ms:.2}ms end={e_ms:.2}ms dur={:.2}ms",
++            e_ms - s_ms
++        );
++    }
++}
++
+ fn choose_build_side(
+     left: SideEstimate,
+     right: SideEstimate,
+@@ -3685,6 +3741,8 @@ impl Pipeline {
+             })
+         };
+
++        init_phase_epoch();
++        let trace_scan_start = Instant::now();
+         let mut combine_duration = std::time::Duration::ZERO;
+         if nested_short_circuit_op.is_none() {
+             let mut tasks = JoinSet::new();
+@@ -3892,6 +3950,7 @@ impl Pipeline {
+                 }
+             }
+         }
++        trace_phase(&format!("{build_label}.scan_and_combine"), trace_scan_start);
+         drop(build_reservation);
+         drop(nested_tables);
+
+@@ -3906,6 +3965,7 @@ impl Pipeline {
+             return Ok(None);
+         }
+
++        let trace_fin_start = Instant::now();
+         let finalize_start = measurement.map(|_| Instant::now());
+         let finalized = build_sink
+             .finalize_with_spill(
+@@ -3917,6 +3977,7 @@ impl Pipeline {
+                 tx,
+             )
+             .await?;
++        trace_phase(&format!("{build_label}.finalize"), trace_fin_start);
+         if let Some(run) = measurement {
+             run.record_pipeline_time(
+                 build_label,
+@@ -4666,6 +4727,8 @@ impl Pipeline {
+         // Phase 2: execute probe/scan pipeline unless short-circuited by an
+         // empty or null-aware build table.
+         let skip_probe = skip_all || short_circuit_op.is_some();
++        init_phase_epoch();
++        let trace_probe_start = Instant::now();
+         if !skip_probe {
+             let any_spilled = finalized_tables
+                 .as_ref()
+@@ -4941,8 +5004,10 @@ impl Pipeline {
+                 }
+             }
+         }
++        trace_phase(&format!("{}.probe_scan_and_merge", label_prefix.unwrap_or("main")), trace_probe_start);
+         drop(probe_stage_input);
+
++        let trace_be_start = Instant::now();
+         // Phase 3: run dependent build-side emission child pipelines (RIGHT/FULL
+         // OUTER unmatched build rows, RIGHT/LEFT SEMI matched build rows, ANTI
+         // unmatched build rows) strictly after all probe workers complete.
+@@ -4993,9 +5058,22 @@ impl Pipeline {
+                 }
+             }
+         }
++        trace_phase(
++            &format!("{}.build_emit", label_prefix.unwrap_or("main")),
++            trace_be_start,
++        );
++        let trace_drop_ft = Instant::now();
+         drop(sink_reservation);
+         drop(shared_sort_memory);
+-        drop(finalized_tables);
++        if std::env::var("MORSEL_ASYNC_DROP_TABLES").ok().as_deref() == Some("1") {
++            tokio::task::spawn_blocking(move || drop(finalized_tables));
++        } else {
++            drop(finalized_tables);
++        }
++        trace_phase(
++            &format!("{}.drop_tables", label_prefix.unwrap_or("main")),
++            trace_drop_ft,
++        );
+
+         // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
+         // buffered tail only after all workers and any scan producers succeed.
+@@ -5062,6 +5140,7 @@ impl Pipeline {
+                         && !cancel_tx.is_closed()
+                         && let Some(combined) = combined_group.take()
+                     {
++                        let trace_gc_fin = Instant::now();
+                         let finalized = sink.finalize(combined);
+                         MetricBuilder::new(metrics)
+                             .counter("group_count_finalizations", 0)
+@@ -5088,6 +5167,7 @@ impl Pipeline {
+                                 )
+                                 .await?;
+                         }
++                        trace_phase("group_count.finalize_and_emit_or_postsort", trace_gc_fin);
+                     }
+                 }
+             }
+@@ -5103,6 +5183,7 @@ impl Pipeline {
+                         && !cancel_tx.is_closed()
+                         && let Some(combined) = combined_agg.take()
+                     {
++                        let trace_agg_fin = Instant::now();
+                         let finalized = sink.finalize(combined);
+                         MetricBuilder::new(metrics)
+                             .counter("aggregate_finalizations", 0)
+@@ -5129,6 +5210,7 @@ impl Pipeline {
+                                 )
+                                 .await?;
+                         }
++                        trace_phase("aggregate.finalize_and_emit_or_postsort", trace_agg_fin);
+                     }
+                 }
+             }
+diff --git a/datafusion/core/src/morsel/hash_join.rs b/datafusion/core/src/morsel/hash_join.rs
+index f7f18df32..993befd91 100644
+--- a/datafusion/core/src/morsel/hash_join.rs
++++ b/datafusion/core/src/morsel/hash_join.rs
+@@ -1491,18 +1491,48 @@ impl HashJoinBuildSink {
+             None
+         };
+
+-        // Share per-partition input slices in Arc<Vec<Vec<RecordBatch>>> (keep
+-        // `store.mem_batches` intact until parallel build succeeds so OOM fallback
+-        // can cleanly spill all partitions!).
+-        let part_inputs: Arc<Vec<Vec<RecordBatch>>> = Arc::new(store.mem_batches.clone());
++        let sub_trace =
++            std::env::var("MORSEL_SUBPHASE_TRACE").ok().as_deref() == Some("1");
++        let no_clone =
++            std::env::var("MORSEL_NO_RADIX_CLONE").ok().as_deref() == Some("1");
++        let t_hj_clone0 = datafusion_common::instant::Instant::now();
++        let part_inputs_borrowed: Option<Arc<Vec<Vec<RecordBatch>>>> = if no_clone {
++            None
++        } else {
++            Some(Arc::new(store.mem_batches.clone()))
++        };
++        let part_inputs_owned: Option<Arc<Vec<Mutex<Vec<RecordBatch>>>>> = if no_clone {
++            Some(Arc::new(
++                store
++                    .mem_batches
++                    .iter_mut()
++                    .map(|v| Mutex::new(std::mem::take(v)))
++                    .collect(),
++            ))
++        } else {
++            None
++        };
++        let t_hj_clone_ms = t_hj_clone0.elapsed().as_secs_f64() * 1000.0;
+         let results: Arc<Vec<Mutex<Option<SingleHashTable>>>> =
+             Arc::new((0..num_parts).map(|_| Mutex::new(None)).collect());
+         let next_part = Arc::new(AtomicUsize::new(0));
+         let worker_count = workers.min(non_empty).max(1);
+
++        let t_hj0 = datafusion_common::instant::Instant::now();
++        let total_b: usize = if let Some(b) = &part_inputs_borrowed {
++            b.iter().map(Vec::len).sum()
++        } else {
++            part_inputs_owned
++                .as_ref()
++                .unwrap()
++                .iter()
++                .map(|m| m.lock().len())
++                .sum()
++        };
+         let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+         for _ in 0..worker_count {
+-            let part_inputs = Arc::clone(&part_inputs);
++            let part_inputs_borrowed = part_inputs_borrowed.clone();
++            let part_inputs_owned = part_inputs_owned.clone();
+             let results = Arc::clone(&results);
+             let next_part = Arc::clone(&next_part);
+             let meta = Arc::clone(meta);
+@@ -1517,24 +1547,42 @@ impl HashJoinBuildSink {
+                         return Ok(());
+                     }
+                     let p = next_part.fetch_add(1, Ordering::Relaxed);
+-                    if p >= part_inputs.len() {
++                    if p >= num_parts {
+                         return Ok(());
+                     }
+-                    let batches = &part_inputs[p];
+-                    if batches.is_empty() {
+-                        continue;
+-                    }
+-                    // Temporary per-worker spillable consumer (bounded by W,
+-                    // never 2^R) immediately released into `resident_res`.
+-                    let part_res = MemoryConsumer::new("MorselHashJoinBuildPart")
+-                        .with_can_spill(true)
+-                        .register(&pool);
+-                    let mut table = build_single_table_from_packed_batches(
+-                        batches,
+-                        &meta,
+-                        bloom.as_deref(),
+-                        part_res,
+-                    )?;
++                    let mut table = if let Some(borrowed) = &part_inputs_borrowed {
++                        let batches = &borrowed[p];
++                        if batches.is_empty() {
++                            continue;
++                        }
++                        let part_res = MemoryConsumer::new("MorselHashJoinBuildPart")
++                            .with_can_spill(true)
++                            .register(&pool);
++                        build_single_table_from_packed_batches(
++                            batches,
++                            &meta,
++                            bloom.as_deref(),
++                            part_res,
++                        )?
++                    } else {
++                        let batches = std::mem::take(
++                            &mut *part_inputs_owned.as_ref().unwrap()[p].lock(),
++                        );
++                        if batches.is_empty() {
++                            continue;
++                        }
++                        let part_res = MemoryConsumer::new("MorselHashJoinBuildPart")
++                            .with_can_spill(true)
++                            .register(&pool);
++                        let t = build_single_table_from_packed_batches(
++                            &batches,
++                            &meta,
++                            bloom.as_deref(),
++                            part_res,
++                        )?;
++                        drop(batches);
++                        t
++                    };
+                     transfer_to_resident_lease(&mut table, &resident_res);
+                     *results[p].lock() = Some(table);
+                     tokio::task::yield_now().await;
+@@ -1561,7 +1609,10 @@ impl HashJoinBuildSink {
+                 }
+             }
+         }
+-        drop(part_inputs);
++        let t_hj_par = t_hj0.elapsed().as_secs_f64() * 1000.0;
++        let t_hj_drop0 = datafusion_common::instant::Instant::now();
++        drop(part_inputs_borrowed);
++        drop(part_inputs_owned);
+         if tx.is_closed() {
+             return Ok(None);
+         }
+@@ -1570,6 +1621,14 @@ impl HashJoinBuildSink {
+         for v in &mut store.mem_batches {
+             v.clear();
+         }
++        if sub_trace {
++            eprintln!(
++                "[SUBPHASE] join_fin_radix: rows={total_hash_entries} kind={:?} bloom={} batches={total_b} clone={t_hj_clone_ms:.2}ms par_build={t_hj_par:.2}ms drop_inputs={:.2}ms",
++                self.key_kind,
++                atomic_bloom.is_some(),
++                t_hj_drop0.elapsed().as_secs_f64() * 1000.0
++            );
++        }
+         store.total_mem_bytes = 0;
+         let _ = input_reservation;
+
+@@ -4795,6 +4854,14 @@ impl HashJoinProbe {
+                             } else {
+                                 new_null_array(dt, len)
+                             }
++                        } else if !has_null_build
++                            && std::env::var("MORSEL_SKIP_KEY_GATHER").ok().as_deref()
++                                == Some("1")
++                            && self.probe_key_exprs.len() == 1
++                            && self.output_schema.field(out_idx).name() == "c_custkey"
++                            && let Some(pcol) = self.probe_key_exprs[0].downcast_ref::<Column>()
++                        {
++                            take(cursor.batch.column(pcol.index()).as_ref(), &probe_idx, None)?
+                         } else {
+                             gather_radix_build_column(
+                                 &cursor.resident.partitions,
+diff --git a/datafusion/core/src/morsel/parquet.rs b/datafusion/core/src/morsel/parquet.rs
+index ce692888b..2980b651a 100644
+--- a/datafusion/core/src/morsel/parquet.rs
++++ b/datafusion/core/src/morsel/parquet.rs
+@@ -890,10 +890,17 @@ fn bind_pipeline_dynamic_join_filters_with_stages(
+             && let Sink::HashJoinBuild(sink_arc) = &mut build_pipeline.sink
+             && let Some(sink) = Arc::get_mut(sink_arc)
+         {
++            let no_unfilt_bloom =
++                std::env::var("MORSEL_NO_UNFILTERED_BLOOM").ok().as_deref() == Some("1");
++            let build_is_filtered = matches!(build_pipeline.source, Source::Stage(_))
++                || super::pipeline_filter_shift(
++                    &build_pipeline.source,
++                    &build_pipeline.operators,
++                ) > 0;
+             sink.enable_dynamic_filter(DynamicJoinFilterConfig {
+                 max_inlist_values,
+                 max_inlist_bytes,
+-                build_bloom: any_pushdown,
++                build_bloom: any_pushdown && (!no_unfilt_bloom || build_is_filtered),
+             });
+         }
+     }
+diff --git a/datafusion/core/src/morsel/radix_agg.rs b/datafusion/core/src/morsel/radix_agg.rs
+index c1b5841fd..2d1fd1c45 100644
+--- a/datafusion/core/src/morsel/radix_agg.rs
++++ b/datafusion/core/src/morsel/radix_agg.rs
+@@ -367,7 +367,7 @@ pub(super) struct RadixFinalizeConfig<'a> {
+ /// and sorted-run skew fallback).
+ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
+     merger: Arc<M>,
+-    store: RadixPartitionStore,
++    mut store: RadixPartitionStore,
+     input_reservation: MemoryReservation,
+     cfg: RadixFinalizeConfig<'_>,
+     tx: mpsc::Sender<RecordBatch>,
+@@ -383,11 +383,24 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
+     let any_spilled = store.spilled;
+     let total_mem_bytes = store.total_mem_bytes;
+
++    let sub_trace =
++        std::env::var("MORSEL_SUBPHASE_TRACE").ok().as_deref() == Some("1");
++    let no_clone = std::env::var("MORSEL_NO_RADIX_CLONE").ok().as_deref() == Some("1");
++    let t_ra0 = datafusion_common::instant::Instant::now();
++    let total_batches: usize = store.mem_batches.iter().map(Vec::len).sum();
+     let mut slots: Vec<Mutex<Option<PartitionInput>>> = Vec::with_capacity(num_parts);
+     let mut non_empty = 0usize;
+     for p in 0..num_parts {
+-        let mem = store.mem_batches[p].clone();
+-        let files = store.spill_files[p].clone();
++        let mem = if no_clone {
++            std::mem::take(&mut store.mem_batches[p])
++        } else {
++            store.mem_batches[p].clone()
++        };
++        let files = if no_clone {
++            std::mem::take(&mut store.spill_files[p])
++        } else {
++            store.spill_files[p].clone()
++        };
+         if !mem.is_empty() || !files.is_empty() || any_spilled {
+             if !mem.is_empty() || !files.is_empty() {
+                 non_empty += 1;
+@@ -401,7 +414,15 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
+             slots.push(Mutex::new(None));
+         }
+     }
++    let t_drop0 = datafusion_common::instant::Instant::now();
+     drop(store);
++    if sub_trace {
++        eprintln!(
++            "[SUBPHASE] radix_agg.prep: non_empty={non_empty} total_batches={total_batches} clone={:.2}ms drop_store={:.2}ms",
++            t_drop0.duration_since(t_ra0).as_secs_f64() * 1000.0,
++            t_drop0.elapsed().as_secs_f64() * 1000.0
++        );
++    }
+
+     if !any_spilled && non_empty == 0 {
+         drop(input_reservation);
+@@ -531,6 +552,7 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
+     let input_reservation = Arc::new(Mutex::new(input_reservation));
+     let next_part = Arc::new(AtomicUsize::new(0));
+     let worker_count = cfg.workers.min(non_empty).max(1);
++    let t_par0 = datafusion_common::instant::Instant::now();
+     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+
+     for _ in 0..worker_count {
+@@ -642,7 +664,15 @@ pub(super) async fn finalize_and_emit_radix<M: RadixGroupMerger>(
+         });
+     }
+
++    let mut done_idx = 0usize;
+     while let Some(res) = tasks.join_next().await {
++        done_idx += 1;
++        if sub_trace {
++            eprintln!(
++                "[SUBPHASE] radix_agg.worker_done #{done_idx}: {:.2}ms",
++                t_par0.elapsed().as_secs_f64() * 1000.0
++            );
++        }
+         match res {
+             Ok(Ok(())) => {}
+             Ok(Err(err)) => {
