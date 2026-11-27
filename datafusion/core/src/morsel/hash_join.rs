@@ -1141,6 +1141,7 @@ impl HashJoinBuildSink {
                         key_kind: self.key_kind,
                         null_equality: self.null_equality,
                         has_floats: self.has_floats,
+                        build_entries: distinct_count,
                         bounds: summary.into_bounds(),
                         membership,
                     }))
@@ -1222,6 +1223,7 @@ impl HashJoinBuildSink {
                         key_kind: self.key_kind,
                         null_equality: self.null_equality,
                         has_floats: self.has_floats,
+                        build_entries: hash_entries,
                         bounds: summary.into_bounds(),
                         membership,
                     }))
@@ -1553,6 +1555,7 @@ impl HashJoinBuildSink {
                 key_kind: self.key_kind,
                 null_equality: self.null_equality,
                 has_floats: self.has_floats,
+                build_entries: 0,
                 bounds: summary.into_bounds(),
                 membership: JoinMembershipFilter::None,
             })),
@@ -1816,6 +1819,7 @@ impl HashJoinBuildSink {
                     key_kind: self.key_kind,
                     null_equality: self.null_equality,
                     has_floats: self.has_floats,
+                    build_entries: total_hash_entries,
                     bounds: summary.clone().into_bounds(),
                     membership,
                 }))

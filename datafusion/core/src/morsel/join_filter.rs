@@ -64,8 +64,15 @@ const SBBF_SALTS: [u32; 8] = [
     0x5c6b_fb31,
 ];
 
-/// Target at least 12 bits per distinct key (~0.9% FPP before power-of-two rounding).
+/// Target at least 12 bits per distinct key (~0.9% FPP before power-of-two rounding)
+/// for larger builds, and higher L1-resident density (32 bits/key up to 8,192 keys,
+/// 16 bits/key up to 16,384 keys — staying <= 32 KiB) for small selective builds so
+/// Bloom false positives drop by 96–99.8% without leaving L1d.
 const MIN_BLOOM_BITS_PER_KEY: usize = 12;
+const SMALL_BLOOM_MAX_KEYS: usize = 8_192;
+const SMALL_BLOOM_BITS_PER_KEY: usize = 32;
+const MEDIUM_L1_BLOOM_MAX_KEYS: usize = 16_384;
+const MEDIUM_L1_BLOOM_BITS_PER_KEY: usize = 16;
 
 /// Hard memory ceiling for a single dynamic join Bloom filter (8 MiB = 262,144 blocks).
 const MAX_BLOOM_BYTES: usize = 8 * 1024 * 1024;
@@ -124,7 +131,14 @@ impl SplitBlockBloomFilter {
         if entries == 0 || entries > MAX_BLOOM_KEYS {
             return None;
         }
-        let needed_bits = entries.saturating_mul(MIN_BLOOM_BITS_PER_KEY);
+        let bits_per_key = if entries <= SMALL_BLOOM_MAX_KEYS {
+            SMALL_BLOOM_BITS_PER_KEY
+        } else if entries <= MEDIUM_L1_BLOOM_MAX_KEYS {
+            MEDIUM_L1_BLOOM_BITS_PER_KEY
+        } else {
+            MIN_BLOOM_BITS_PER_KEY
+        };
+        let needed_bits = entries.saturating_mul(bits_per_key);
         let needed_blocks = needed_bits.div_ceil(256).max(1).next_power_of_two();
         let max_blocks = MAX_BLOOM_BYTES / size_of::<[u32; 8]>();
         Some(needed_blocks.min(max_blocks))
@@ -539,6 +553,7 @@ pub(super) struct DynamicJoinFilterData {
     pub(super) key_kind: KeyKind,
     pub(super) null_equality: NullEquality,
     pub(super) has_floats: bool,
+    pub(super) build_entries: usize,
     pub(super) bounds: Vec<ColumnKeyBounds>,
     pub(super) membership: JoinMembershipFilter,
 }
@@ -554,6 +569,7 @@ impl DynamicJoinFilterData {
             key_kind,
             null_equality,
             has_floats,
+            build_entries: 0,
             bounds: vec![ColumnKeyBounds::default(); num_keys],
             membership: JoinMembershipFilter::Empty,
         }
@@ -764,6 +780,14 @@ pub(super) struct JoinBloomFilterExpr {
 impl JoinBloomFilterExpr {
     pub(super) fn filter_memory_bytes(&self) -> usize {
         self.filter.memory_bytes()
+    }
+
+    pub(super) fn key_exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.key_exprs
+    }
+
+    pub(super) fn null_equality(&self) -> NullEquality {
+        self.null_equality
     }
 }
 
@@ -1413,5 +1437,59 @@ mod tests {
         extreme.update(&[ext_arr], None, NullEquality::NullEqualsNothing)?;
         assert!(!extreme.is_saturated_int_domain(3));
         Ok(())
+    }
+
+    #[test]
+    fn small_build_l1_bloom_density_is_monotonic_and_ultra_low_fpp() {
+        // Small selective builds stay L1-resident (<= 32 KiB) at 32 bits/key
+        // and block counts remain monotonically non-decreasing across cutoffs.
+        assert_eq!(
+            SplitBlockBloomFilter::num_blocks_for_entries(1_021),
+            Some(128)
+        );
+        assert_eq!(
+            SplitBlockBloomFilter::num_blocks_for_entries(2_028),
+            Some(256)
+        );
+        let mut prev = 0usize;
+        for n in [
+            1, 64, 512, 1_021, 2_028, 4_096, 8_192, 8_193, 12_000, 16_384, 16_385,
+            25_000, 100_000,
+        ] {
+            let blocks = SplitBlockBloomFilter::num_blocks_for_entries(n).unwrap();
+            assert!(
+                blocks >= prev,
+                "num_blocks_for_entries decreased at n={n}: {blocks} < {prev}"
+            );
+            if n <= MEDIUM_L1_BLOOM_MAX_KEYS {
+                assert!(
+                    SplitBlockBloomFilter::estimated_bytes(blocks) <= 32 * 1024,
+                    "L1 Bloom exceeded 32 KiB at n={n}"
+                );
+            }
+            prev = blocks;
+        }
+
+        // Verify < 0.1% FPP at Q17-like (1,021 keys) and Q20-like (2,028 keys) sizes.
+        for n in [1_021usize, 2_028usize] {
+            let blocks = SplitBlockBloomFilter::num_blocks_for_entries(n).unwrap();
+            let mut bloom = SplitBlockBloomFilter::with_blocks(blocks);
+            for k in 0..n as u64 {
+                bloom.insert(mix_u64(k));
+            }
+            for k in 0..n as u64 {
+                assert!(bloom.might_contain(mix_u64(k)));
+            }
+            let probes = 100_000usize;
+            let fps = (0..probes as u64)
+                .filter(|&k| bloom.might_contain(mix_u64(k + 1_000_000)))
+                .count();
+            let fpp = fps as f64 / probes as f64;
+            assert!(
+                fpp < 0.001,
+                "expected FPP < 0.1% at n={n}, got {:.4}%",
+                fpp * 100.0
+            );
+        }
     }
 }
