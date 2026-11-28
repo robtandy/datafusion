@@ -29,11 +29,11 @@ onto `morsel-execution`:
    L1-resident small-build Bloom density + `skip_bulk_probe` fast path, and
 3. **`q4`, `q11`, `q16`, and `q22` Stock-gap fixes (`#219`):** widened
    `ensure_stage` channel capacity (`4 → 16`), batch-inlined flat-int
-   `BuildSemi`/`BuildAnti` probe + L2-resident `RegisterBloom64` prefilter +
+   `BuildSemi`/`BuildAnti` probe, L2-resident `RegisterBloom64` prefilter,
    cache-line-aligned NEON `SplitBlockBloomFilter`, concurrent small-build waves
-   - 1-worker fast path for 1-RG builds, compact-span `DenseIntTable` down to
-     1% density, and scoped `BulkDecode` policies for small-build, all-predicate
-     radix, and narrow-payload scans.
+   and a 1-worker fast path for 1-RG builds, compact-span `DenseIntTable` down
+   to 1% density, and scoped `BulkDecode` policies for small-build,
+   all-predicate radix, and narrow-payload scans.
 
 It re-runs the exact `#209` 6-arm warm-cache protocol on the identical SF5
 Parquet dataset and host, comparing Wave-5 directly against Wave-4
@@ -61,10 +61,10 @@ overwriting it) as well as the earlier `#195`
     **`stock_pushdown` (`11,580.1 ms`) at `0.71×` (`1.41×` faster, `−3.35 s`)**,
     and narrowing the sum gap to **DuckDB 2.0.1 (`7,651.6 ms`)** from
     **`1.32× → 1.08×`** (`+580.6 ms` total across all 22 queries — of which
-    `+414.5 ms` / `71.4%` is the single un-CSE'd double `lineitem` scan in
-    `q15`; across the other **21 / 22 queries**, `morsel_pushdown` is at
-    **`1.01×` geomean (`306.7` vs. `303.6 ms`)** and **`1.02×` sum (`7,552.4`
-    vs. `7,386.3 ms`)** of DuckDB 2.0.1).
+    `q15` accounts for `+414.5 ms` / `71.4%`, mostly from its un-CSE'd double
+    `lineitem` scan; across the other **21 / 22 queries**, `morsel_pushdown` is
+    at **`1.01×` geomean (`306.7` vs. `303.6 ms`)** and **`1.02×` sum
+    (`7,552.4` vs. `7,386.3 ms`)** of DuckDB 2.0.1).
   - **Even non-pushdown Morsel beats `stock_default`:** Both
     `morsel_no_pushdown` (`432.0 ms`, `1.26×` faster vs. Wave-4) and
     `morsel_pruning` (`431.6 ms`, `1.27×` faster vs. Wave-4) now beat
@@ -89,15 +89,19 @@ overwriting it) as well as the earlier `#195`
     **`q20` (`0.96×`)**, and **`q8` (`0.99×`)** — and lands within **2–9% of
     DuckDB 2.0.1** on 5 more (`q21` `1.02×`, `q5` `1.08×`, `q9` `1.08×`, `q10`
     `1.08×`, `q19` `1.09×`).
-  - **22 / 22 queries faster than Wave-4 (`0` regressions):** All 10 targeted
-    Stock-gap queries (`q4`, `q9`, `q10`, `q11`, `q13`, `q14`, `q16`, `q17`,
-    `q20`, `q22`) dropped **`4,434.3 → 3,090.5 ms`** combined (**`1.43×`
-    faster**, `−1,343.8 ms`; **`1.35×`** on 10Q geomean), flipping to beat BOTH
-    Stock arms on all `10 / 10` queries and beating DuckDB 2.0.1 as a 10-query
-    subset (**`0.92×` geomean / `0.93×` sum**). The remaining 12 non-targeted
-    queries gained an additional **`−743.9 ms`** combined (`5,885.6 → 5,141.7
-ms`), led by `q21` (`−208.0 ms`), `q8` (`−121.4 ms`), `q18` (`−99.6 ms`),
-    `q3` (`−69.0 ms`), and `q7` (`−68.8 ms`).
+  - **Zero regressions vs. Wave-4 (19 / 22 genuinely faster beyond host
+    drift):** All 10 targeted Stock-gap queries (`q4`, `q9`, `q10`, `q11`,
+    `q13`, `q14`, `q16`, `q17`, `q20`, `q22`) dropped **`4,434.3 → 3,090.5 ms`**
+    combined (**`1.43×` faster**, `−1,343.8 ms`; **`1.35×`** on 10Q geomean),
+    flipping to beat BOTH Stock arms on all `10 / 10` queries and beating DuckDB
+    2.0.1 as a 10-query subset (**`0.92×` geomean / `0.93×` sum**). Among the 12
+    non-targeted queries (`5,885.6 → 5,141.7 ms`, `−743.9 ms` raw), 9 join
+    queries achieved genuine Wave-5 speedups beyond host drift (`q21`
+    `−208.0 ms`, `q8` `−121.4 ms`, `q18` `−99.6 ms`, `q3` `−69.0 ms`, `q7`
+    `−68.8 ms`, `q5` `−40.2 ms`, `q19` `−39.5 ms`, `q2` `−25.5 ms`, `q12`
+    `−13.1 ms`), while `q1` (`−3.3%`), `q6` (`−4.0%`), and `q15` (`−3.5%`) moved
+    within the `2.5–3.8%` session-to-session host drift observed on the
+    unchanged reference arms.
 - **100% native admission, 100% DuckDB parity, 100% warm cache, zero output
   backpressure:** All `22 / 22` standard TPC-H queries passed lossless Arrow IPC
   parity against **DuckDB 2.0.1** at both `--sf 0.01` (`21 / 21` `morsel_tpch`
@@ -120,12 +124,12 @@ ms`), led by `q21` (`−208.0 ms`), `q8` (`−121.4 ms`), `q18` (`−99.6 ms`),
 _(Baseline stability check: all three unchanged reference arms ran `2.5–3.4%`
 faster in Wave-5 than in Wave-4 — `stock_default` `471.3 → 458.3 ms` (`−2.8%`),
 `stock_pushdown` `435.7 → 421.0 ms` (`−3.4%`), and `duckdb_default`
-`309.5 → 301.8 ms` (`−2.5%`) — reflecting an even quieter `rob-tandy-dduck2`
-during Wave-5 (`99–100%` post-run idle vs. `92–93%` in Wave-4). Because all 6
-arms ran counterbalanced in the same session, the head-to-head ratios are
-immune to that `~2.8%` host-quietness shift and confirm a genuine `~1.20×`
-normalized geomean gain (`morsel_pushdown / stock_default`: `0.83× → 0.69×`;
-`morsel_pushdown / stock_pushdown`: `0.90× → 0.76×`;
+`309.5 → 301.8 ms` (`−2.5%`). Pre-run `vmstat` idle was `92–93%` in both waves,
+while post-run idle settled at `99–100%` in Wave-5 vs. `93%` in Wave-4. Because
+all 6 arms ran counterbalanced in the same session, the head-to-head ratios are
+immune to that `~2.5–3.4%` session-to-session host drift and confirm a genuine
+`~1.19–1.20×` normalized geomean gain (`morsel_pushdown / stock_default`:
+`0.83× → 0.69×`; `morsel_pushdown / stock_pushdown`: `0.90× → 0.76×`;
 `morsel_pushdown / duckdb_default`: `1.26× → 1.05×`).)_
 
 - **Wave-5 pillar-by-pillar headline gains (single-config `morsel_pushdown`,
@@ -371,8 +375,8 @@ In Wave-4 (`#209`), these 10 queries were the **only** queries in the entire
 | **`q17`**   | `#218` |                  **0.41×** |                      **0.33×** |                     1.07× |                     **0.84×** |        `499.8 → 382.9` |    **1.31×** |         **0.96×** |
 | **`q20`**   | `#218` |                  **0.70×** |                      **0.61×** |                     1.02× |                     **0.94×** |        `329.3 → 283.9` |    **1.16×** |         **0.96×** |
 | **`q22`**   | `#219` |                      1.02× |                      **0.97×** |                 **0.89×** |                     **0.83×** |        `126.3 → 114.7` |    **1.10×** |         **0.82×** |
-| **10Q GM**  | —      |                      0.96× |                      **0.73×** |                     1.01× |                     **0.78×** |        `337.2 → 249.7` |    **1.35×** |         **0.92×** |
-| **10Q Sum** | —      |                      0.91× |                      **0.66×** |                     0.99× |                     **0.72×** |    `4,434.3 → 3,090.5` |    **1.43×** |         **0.93×** |
+| **10Q GM**  | —      |                      0.96× |                      **0.73×** |                     1.02× |                     **0.78×** |        `337.2 → 249.7` |    **1.35×** |         **0.92×** |
+| **10Q Sum** | —      |                      0.92× |                      **0.66×** |                     1.00× |                     **0.72×** |    `4,434.3 → 3,090.5` |    **1.43×** |         **0.93×** |
 
 ## 3. Deep-Dive Attribution Across the Three Wave-5 Stock-Gap Pillars
 
@@ -415,12 +419,14 @@ overhead on fixed-width/non-equality scans), flipping `q4` (`0.88×`), `q16`
 | **`q16`** |            `172.0 → 123.4 ms` | **1.39×** |      `737 → 646` |           `254 → 209` |        `266.2 → 269.9` |   **`119.5 → 31.6`** |      **`39/2 → 29/12`** | Widened `ensure_stage` channel (`4 → 16`, `other` `86.4 → 47.8 ms`) + concurrent small-build wave & 1-worker 1-RG (`stage_0_build_1` `rw` `91.6 → 1.2 ms`) + `part` `BulkDecode` |
 | **`q22`** |            `126.3 → 114.7 ms` | **1.10×** |      `722 → 609` |       **`528 → 403`** |        `129.3 → 150.9` |      `140.0 → 126.5` |      **`74/2 → 12/64`** | Scoped `BulkDecode` on all-predicate `orders` + fused `RegisterBloom64` `BuildAnti` probe (`morsel_no_pd` drops `169.0 → 110.8 ms`, `1.53×`)                                     |
 
-### 3.4 Bonus Gains Across the 12 Non-Targeted Queries (`−743.9 ms` Combined)
+### 3.4 Bonus Gains Across the 12 Non-Targeted Queries (`−743.9 ms` Raw Combined)
 
 Because `#217`, `#218`, and `#219` fixed core architectural bottlenecks
 (`RadixChunk`, lock-free radix Bloom + NEON SIMD, `DenseIntTable`, infallible
-Bloom, `2×` ready queue, `skip_bulk_probe`, and concurrent 1-RG builds), **every
-single one of the 12 non-targeted queries also got faster** (`0` regressions):
+Bloom, `2×` ready queue, `skip_bulk_probe`, and concurrent 1-RG builds), **9 of
+the 12 non-targeted queries delivered genuine speedups well beyond the
+`2.5–3.4%` session-to-session host drift** (`0` regressions), while `q1`, `q6`,
+and `q15` moved in line with the unchanged reference arms:
 
 - **`q21` (`937.0 → 729.0 ms`, `1.29×`, `−208.0 ms`):** `join_finalize` drops
   **`3.92×`** (`150.0 → 38.3 ms`), `ready_wait` drops **`2.85×`**
@@ -441,9 +447,14 @@ single one of the 12 non-targeted queries also got faster** (`0` regressions):
   `q7` (`0.91×`) ahead of DuckDB 2.0.1**!
 - **`q5` (`−40.2 ms`, `1.10×`, `dyn_filters 15 → 18`), `q19` (`−39.5 ms`,
   `1.11×`, `adapt 245/3 → 248/0`), `q2` (`−25.5 ms`, `1.18×`, `ready_wait`
-  `111.1 → 41.2 ms`), `q15` (`−24.6 ms`, `1.04×`), `q1` (`−20.1 ms`, `1.03×`),
-  `q6` (`−13.9 ms`, `1.04×`), and `q12` (`−13.1 ms`, `1.07×`)** all improved
-  cleanly.
+  `111.1 → 41.2 ms`), and `q12` (`−13.1 ms`, `1.07×`, `morsel_pd / stock_def`
+  `0.95× → 0.90×`)** also achieved genuine Wave-5 speedups beyond host drift.
+- **Within host drift (`q1`, `q6`, `q15`):** `q1` (`611.2 → 591.2 ms`, `−3.3%`,
+  vs. `stock_default` `−3.2%` and DuckDB `−3.6%`), `q6` (`345.0 → 331.1 ms`,
+  `−4.0%`, vs. `stock_default` `−4.0%`), and `q15` (`704.4 → 679.8 ms`, `−3.5%`,
+  vs. `stock_default` `−3.8%` and DuckDB `−2.6%`) are effectively flat once
+  adjusted for session-to-session host drift (`morsel_pd / stock_def` stays
+  `0.77×`, `0.93×`, and `0.96×`).
 
 ## 4. Native `MorselExec` Execution & `#138` Wait/Work Summary (Single-Config `morsel_pushdown`)
 
@@ -493,16 +504,18 @@ Morsel trials. Compared to Wave-4 (`#209`)'s `morsel_pushdown` totals across
 
 With single-config `morsel_pushdown` now beating Stock DataFusion `22 / 22`
 (both `stock_default` and `stock_pushdown`) and beating DuckDB 2.0.1 on
-`11 / 22` queries, the entire remaining **`+580.6 ms` net sum gap** to DuckDB
-2.0.1 (`8,232.2` vs. `7,651.6 ms`) is dominated by just **four** queries
-(offset by `−415.0 ms` of net wins across the 11 queries where Morsel is faster
-than DuckDB):
+`11 / 22` queries, the remaining **`+580.6 ms` net sum gap** to DuckDB 2.0.1
+(`8,232.2` vs. `7,651.6 ms`) consists of `+785.7 ms` across four top lagging
+queries (`q15`, `q6`, `q1`, `q18`) plus `+206.1 ms` across seven smaller
+lagging queries, offset by `−411.1 ms` of net wins across the 11 queries where
+Morsel is faster than DuckDB:
 
 1. **Stage CSE on `q15` (`679.8` vs. `265.3 ms`, `+414.5 ms` — `71.4%` of the
-   entire 22-query net sum gap!):** Materializing `revenue0` once instead of
+   entire 22-query net sum gap):** Materializing `revenue0` once instead of
    scanning `lineitem` twice (`stage_0` + `stage_2`: `605.1 MB` scanned,
-   `4,307.9 ms` decode) would save `~320–340 ms` and alone bring 22/22
-   `morsel_pushdown` to **`~1.01×` geomean / `~1.03×` sum of DuckDB 2.0.1**.
+   `4,307.9 ms` decode) would save `~320–340 ms`, bringing 22/22
+   `morsel_pushdown` to **`308.1–308.9 ms` (`~1.02×` geomean)** and
+   **`7,892–7,912 ms` (`~1.03×` sum)** of DuckDB 2.0.1.
 2. **Parquet `Decimal128` decode throughput on `q6` (`331.1` vs. `202.2 ms`,
    `+128.9 ms`) and `q1` (`591.2` vs. `462.4 ms`, `+128.7 ms`):** `q6` (`90.4%`
    of exec CPU in Parquet decode) and `q1` (`74.9%` in Parquet decode) are now
@@ -512,11 +525,12 @@ than DuckDB):
    `+113.6 ms`):** Splits across Parquet decode (`1,854.2 ms`), 7.5M-group
    `stage_0` aggregation/join processing (`947.9 ms`), and parallel radix
    aggregate finalization (`196.9 ms` wall).
-4. **Tight single-digit residual gaps (`q9` `+59.3 ms` / `1.08×`, `q10`
-   `+34.9 ms` / `1.08×`, `q5` `+30.0 ms` / `1.08×`, `q19` `+28.7 ms` / `1.09×`,
-   `q2` `+27.6 ms` / `1.24×`, `q21` `+13.0 ms` / `1.02×`, `q11` `+12.6 ms` /
-   `1.14×`):** All other join queries now track within `2–14%` of DuckDB 2.0.1
-   (except `q2`'s 8-build small-table latency).
+4. **Seven smaller residual gaps (`+206.1 ms` combined):** Five join queries
+   sit within single-digit percentages of DuckDB 2.0.1 (`q21` `+13.0 ms` /
+   `1.02×`, `q5` `+30.0 ms` / `1.08×`, `q9` `+59.3 ms` / `1.08×`, `q10`
+   `+34.9 ms` / `1.08×`, `q19` `+28.7 ms` / `1.09×`), while small-table `q11`
+   (`+12.6 ms` / `1.14×`) and 8-build `q2` (`+27.6 ms` / `1.24×`) account for
+   the remaining `40.2 ms`.
 
 ## Summary
 
