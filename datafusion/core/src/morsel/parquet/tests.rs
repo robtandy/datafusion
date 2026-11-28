@@ -1048,3 +1048,69 @@ fn build_redundant_dynamic_range_skip_guards_static_and_bloom_invariants() {
         .is_none()
     );
 }
+
+#[test]
+fn is_small_single_file_build_requires_known_bounded_row_count() {
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_common::Statistics;
+    use datafusion_common::stats::Precision;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+    let url = ObjectStoreUrl::parse("memory://small-build").unwrap();
+    let mk_scan = |num_files: usize, file_bytes: u64, num_rows: Precision<usize>| {
+        let files: Vec<PartitionedFile> = (0..num_files)
+            .map(|i| PartitionedFile::new(format!("f{i}.parquet"), file_bytes))
+            .collect();
+        let parquet = ParquetSource::new(Arc::clone(&schema));
+        let mut stats = Statistics::new_unknown(&schema);
+        stats.num_rows = num_rows;
+        let config = FileScanConfigBuilder::new(url.clone(), Arc::new(parquet))
+            .with_file_groups(vec![FileGroup::new(files.clone())])
+            .with_statistics(stats)
+            .build();
+        ParquetScan {
+            table: "t".into(),
+            schema: Arc::clone(&schema),
+            config: Some(Box::new(config)),
+            files: files.into(),
+            pushdown_filters: false,
+            bulk_scan_plan: None,
+            dynamic_join_filters: Vec::new(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    };
+
+    let workers = NonZeroUsize::new(8).unwrap();
+
+    // Missing row stats (e.g. collect_statistics = false) must NOT be treated
+    // as a small 1-worker build.
+    let absent = mk_scan(1, 1024, Precision::Absent);
+    assert!(!absent.is_small_single_file_build());
+    assert_eq!(absent.effective_build_workers(workers), workers);
+
+    // Known row count <= 131,072 and <= 8 MiB single file -> small build (1 worker).
+    let small_exact = mk_scan(1, 2 * 1024 * 1024, Precision::Exact(50_000));
+    assert!(small_exact.is_small_single_file_build());
+    assert_eq!(
+        small_exact.effective_build_workers(workers),
+        NonZeroUsize::MIN
+    );
+
+    let small_inexact = mk_scan(1, 2 * 1024 * 1024, Precision::Inexact(131_072));
+    assert!(small_inexact.is_small_single_file_build());
+
+    // Over row limit, over size limit, or multi-file -> not a small single-file build.
+    assert!(
+        !mk_scan(1, 2 * 1024 * 1024, Precision::Exact(131_073))
+            .is_small_single_file_build()
+    );
+    assert!(
+        !mk_scan(1, 9 * 1024 * 1024, Precision::Exact(50_000))
+            .is_small_single_file_build()
+    );
+    assert!(!mk_scan(2, 1024, Precision::Exact(50_000)).is_small_single_file_build());
+}

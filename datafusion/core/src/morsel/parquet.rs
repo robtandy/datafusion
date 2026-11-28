@@ -896,9 +896,10 @@ impl ParquetScan {
     }
 
     /// Returns `true` when this Parquet scan reads a single small file
-    /// (`<= 8 MiB` compressed and `<= 131,072` rows when row statistics are
-    /// present), typically a 1-row-group dimension table (`supplier`, `nation`,
-    /// `region`).
+    /// (`<= 8 MiB` compressed and a known row count `<= 131,072`), typically a
+    /// 1-row-group dimension table (`supplier`, `nation`, `region`). When row
+    /// statistics are absent (e.g. `collect_statistics = false`), returns
+    /// `false` so builds stay on `max_workers` and sequential scheduling.
     pub(super) fn is_small_single_file_build(&self) -> bool {
         if self.files.len() != 1 {
             return false;
@@ -910,7 +911,7 @@ impl ParquetScan {
         self.config
             .as_ref()
             .and_then(|c| c.statistics().num_rows.get_value().copied())
-            .is_none_or(|rows| rows <= 131_072)
+            .is_some_and(|rows| rows <= 131_072)
     }
 
     pub(super) fn effective_build_workers(
@@ -1215,7 +1216,7 @@ impl ParquetScan {
                 Ok(WorkerState::None)
             });
         }
-        if has_pushed_filter && !is_force_bulk && !self.files.is_empty() {
+        if has_pushed_filter && !self.files.is_empty() {
             // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
             // by workers so workers never await object-store I/O.
             for _ in 0..read_ahead {

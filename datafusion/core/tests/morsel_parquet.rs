@@ -3904,3 +3904,119 @@ async fn adaptive_row_filter_fallible_trailing_guard_parity_across_all_modes()
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intra_rg_splitting_with_force_bulk_does_not_hang_and_matches_stock() -> Result<()>
+{
+    // Regression test: when intra-row-group splitting is enabled, split slices
+    // install a RowFilter and hand Phase-2 I/O to `ready.submit_phase2` even
+    // when `AdaptiveRowFilterMode::ForceBulk` is active (either user-configured
+    // or chosen by the narrow-static-payload heuristic under default Adaptive
+    // mode). `ParquetScan::start` must still spawn Phase-2 I/O lanes so split
+    // scans never deadlock.
+    let dir = split_fixture(1, 2, 2400, true)?;
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+    let stock = split_context(&dir, "off", 4, true, true, None, None, None).await?;
+
+    // 1. User-configured ForceBulk with intra-RG splitting and pushdown on.
+    let sql_user_force_bulk = "SELECT id, payload FROM t WHERE score > 50";
+    let expected_user = collect(
+        stock
+            .sql(sql_user_force_bulk)
+            .await?
+            .create_physical_plan()
+            .await?,
+        stock.task_ctx(),
+    )
+    .await?;
+    let mut cfg_force = SessionConfig::new()
+        .with_target_partitions(4)
+        .with_batch_size(128);
+    cfg_force.options_mut().execution.parquet.pushdown_filters = true;
+    cfg_force.options_mut().execution.parquet.enable_page_index = true;
+    cfg_force.options_mut().execution.collect_statistics = false;
+    cfg_force.set_extension(Arc::new(split_cfg.clone()));
+    cfg_force.set_extension(Arc::new(AdaptiveRowFilterConfig {
+        mode: AdaptiveRowFilterMode::ForceBulk,
+        ..Default::default()
+    }));
+    let native_force = SessionContext::new_with_config(cfg_force);
+    native_force
+        .register_parquet(
+            "t",
+            dir.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    native_force
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    let force_plan = native_force
+        .sql(sql_user_force_bulk)
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(
+        displayable(force_plan.as_ref())
+            .indent(false)
+            .to_string()
+            .contains("MorselExec")
+    );
+    let actual_user = timeout(
+        Duration::from_secs(10),
+        collect(force_plan, native_force.task_ctx()),
+    )
+    .await
+    .expect("user ForceBulk + intra-RG split scan timed out")?;
+    assert_eq!(
+        batches_to_sort_string(&actual_user),
+        batches_to_sort_string(&expected_user),
+        "user ForceBulk + intra-RG split parity mismatch"
+    );
+
+    // 2. Default Adaptive mode where narrow-static-payload heuristic selects
+    //    ForceBulk (`id` 8B + `payload` 8B in predicates vs `score` 4B payload).
+    let sql_narrow_adaptive =
+        "SELECT id, score, payload FROM t WHERE id > 100 AND payload > 500";
+    let expected_narrow = collect(
+        stock
+            .sql(sql_narrow_adaptive)
+            .await?
+            .create_physical_plan()
+            .await?,
+        stock.task_ctx(),
+    )
+    .await?;
+    let native_adaptive =
+        split_context(&dir, "required", 4, true, true, Some(split_cfg), None, None)
+            .await?;
+    let narrow_plan = native_adaptive
+        .sql(sql_narrow_adaptive)
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(
+        displayable(narrow_plan.as_ref())
+            .indent(false)
+            .to_string()
+            .contains("MorselExec")
+    );
+    let actual_narrow = timeout(
+        Duration::from_secs(10),
+        collect(narrow_plan, native_adaptive.task_ctx()),
+    )
+    .await
+    .expect("Adaptive narrow-static-payload + intra-RG split scan timed out")?;
+    assert_eq!(
+        batches_to_sort_string(&actual_narrow),
+        batches_to_sort_string(&expected_narrow),
+        "Adaptive narrow-static-payload + intra-RG split parity mismatch"
+    );
+
+    Ok(())
+}
