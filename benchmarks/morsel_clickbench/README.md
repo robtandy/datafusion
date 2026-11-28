@@ -52,9 +52,13 @@ directory so no `default.hits` catalog state leaks across trials or into
 - **Deterministic smoke fixture (`generate-smoke`):** Generates a fast,
   byte-for-byte deterministic Parquet dataset (default `50,000` rows across 4
   files `hits_0.parquet`..`hits_3.parquet`, `12,500`-row row groups, Zstd level 3) matching the **exact 105-column ClickBench `hits_partitioned` schema**
-  (including `binary` string columns and `uint16` `EventDate`), populated so all
-  43 queries exercise their predicates, aggregates, regexes, `OFFSET`s, and
-  multi-byte UTF-8 semantics cleanly.
+  (including `binary` string columns and `uint16` `EventDate`). The 40 queries
+  whose thresholds fit 50K rows return non-empty results directly, while `q27`,
+  `q28` (`HAVING COUNT(*) > 100000`), and `q41` (`OFFSET 10000`) return 0 rows
+  at the official 100M-row thresholds; `test_harness.py` additionally runs
+  fixture-sized variants (`HAVING COUNT(*) > 100` for `q27`/`q28` and `OFFSET
+100` for `q41`) through all 5 arms (plus a negative ClickHouse `q28` test
+  without `(?-s)`) so every dialect adaptation is exercised on non-empty rows.
 
 ## Controlled Arms, Timing Boundaries, and Parity
 
@@ -99,8 +103,12 @@ parquet`, and `SELECT 1` Arrow C-stream warmup. Starts the clock immediately
   verifies `output_rows` losslessly): the first `--time` value is `CREATE VIEW
 hits` (`register_seconds`, Parquet footer/schema binding) and the second is
   the `SELECT` statement (`exec_seconds`). Total reported `seconds` =
-  `register_seconds + exec_seconds`. (Process wall time is also recorded in the
-  JSONL as `process_wall_seconds`.)
+  `register_seconds + exec_seconds`. Because each trial runs in a fresh process,
+  ClickHouse `--time` includes ~15 ms of first-statement warm-up (repeating
+  statements in a single `clickhouse local` process on the 20-file dataset drops
+  `CREATE VIEW` from ~15 ms to ~6 ms and `q0` `SELECT COUNT(*)` from ~27 ms to
+  ~15 ms). Process wall time is also recorded in the JSONL as
+  `process_wall_seconds`.
 
 ### Per-Query SQL Dialect Adaptations
 
@@ -130,12 +138,23 @@ ClickHouse so all 4 engines compute identical semantics:
     (`q0`–`q6`, `q20`, `q25`, `q26`, `q29`, `q42`).
   - Exact multiset equality for unordered queries (`q19`) and equal-key tie
     groups without `LIMIT` (`q7`).
-  - Exact sort-key sequence verification + exact interior tie-group multiset
-    equality for `ORDER BY ... LIMIT K [OFFSET O]` queries (`q8`–`q16`, `q18`,
-    `q21`–`q23`, `q27`–`q28`, `q30`–`q41`), allowing standard SQL tie-breaking
-    only at the `LIMIT`/`OFFSET` cut boundary.
-  - Row count and positive-count / non-empty checks for `q17` (no `ORDER BY`)
-    and `q24` (hidden `EventTime` sort key with potential ties).
+  - For `ORDER BY ... LIMIT K [OFFSET O]` queries (`q8`–`q16`, `q18`,
+    `q21`–`q23`, `q27`–`q28`, `q30`–`q41`): exact sort-key sequence matching at
+    every position, unique group keys for `GROUP BY` queries, and exact multiset
+    equality for all interior tie groups as well as any final group when
+    `num_rows < LIMIT`. When a tie straddles an actual `LIMIT` (`num_rows ==
+LIMIT`) or `OFFSET` boundary and differs from the oracle's arbitrary tie
+    choice, every boundary row is verified against DuckDB's full un-limited
+    relation (exact group existence + all aggregate columns for `GROUP BY`
+    queries, or exact full-row multiset containment for `q23`).
+  - For `q17` (`GROUP BY ... LIMIT 10`, no `ORDER BY`): unique `(UserID,
+SearchPhrase)` keys, with every returned group verified for existence and
+    exact `COUNT(*)` against DuckDB's full `GROUP BY`.
+  - For `q24` (`SELECT "SearchPhrase" ... ORDER BY "EventTime" LIMIT 10`):
+    verified against a DuckDB oracle query that also projects `"EventTime"`,
+    requiring every row with `"EventTime"` strictly below the 10th value to
+    appear in ascending `EventTime` group order and every remaining row to come
+    from the exact `EventTime == 10th` multiset.
 - Under `--cache warm`, `warm_files` reads every Parquet file twice (promoting
   pages to Linux's `active_file` LRU list), and `require_warm_cache` checks via
   Linux `mincore` that **100% of 4 KiB pages** are resident **before and after**
@@ -345,12 +364,14 @@ ORDER BY "EventTime" LIMIT 10`, `1344.2 ms` vs `stock_pushdown` `310.1 ms`,
   (`24.4` vs `17.2 ms`):** Stock folds `COUNT(*)` and `MIN`/`MAX` via
   `AggregateStatistics` (`PlaceholderRowExec`), whereas `morsel_mode=required`
   executes `NativeParquet -> CountSink`/`AggregateSink`.
-- **High-cardinality `COUNT(DISTINCT)` / string `GROUP BY` — `q4`, `q5`, `q13`,
-  `q15`, `q33`, `q34`:** `morsel_pushdown` already outperforms `stock_pushdown`
-  by `10–36%` (`q5`: `0.77x`, `q10`: `0.62x`, `q15`: `0.75x`, `q35`: `0.64x`),
-  while ClickHouse's specialized `uniq` and string hash tables lead on `q4`
-  (`75 ms` vs `186 ms`), `q5` (`133 ms` vs `252 ms`), and `q33`/`q34`
-  (`536–539 ms` vs `800–826 ms`).
+- **High-cardinality `COUNT(DISTINCT)` and `GROUP BY` queries:**
+  `morsel_pushdown` outperforms `stock_pushdown` on `q4` (`0.93x`), `q5`
+  (`0.77x`), `q10` (`0.62x`), `q11` (`0.70x`), `q15` (`0.75x`), `q16` (`0.87x`),
+  `q33` (`0.90x`), `q34` (`0.92x`), and `q35` (`0.64x`), while trailing slightly
+  on `q13` (`436.7` vs `415.5 ms`, `1.05x`) and `q32` (`871.3` vs `848.4 ms`,
+  `1.03x`). ClickHouse's specialized `uniq` and string hash tables still lead on
+  `q4` (`75 ms` vs `186 ms`), `q5` (`133 ms` vs `252 ms`), `q13` (`268 ms` vs
+  `437 ms`), and `q33`/`q34` (`536–539 ms` vs `800–826 ms`).
 - **Regex throughput — `q28` (`REGEXP_REPLACE`):** DataFusion (`morsel_pushdown`
   `1,663.9 ms`, `stock_pushdown` `1,832.6 ms`) is `2.8–3.2x` faster than DuckDB
   (`4,733.7 ms`) and ClickHouse (`5,313.0 ms`) thanks to Rust `regex` SIMD vs

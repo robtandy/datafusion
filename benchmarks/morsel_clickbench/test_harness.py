@@ -3,16 +3,19 @@
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 from contextlib import redirect_stdout
+from dataclasses import replace
 import datetime
 import io
 import json
 import os
 from pathlib import Path
 import platform
+import subprocess
 import tempfile
 import unittest
 
 import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from harness import (
@@ -26,6 +29,7 @@ from harness import (
     QUERIES,
     ClickHouseRunner,
     DataFusionRunner,
+    DuckDbOracle,
     DuckDbRunner,
     QuerySpec,
     adapt_sql_for_clickhouse,
@@ -43,6 +47,7 @@ from harness import (
     require_warm_cache,
     resolve_arms,
     resolve_queries,
+    strip_order_limit,
     summarize_jsonl,
     validate_plan,
     verify_suite,
@@ -207,21 +212,290 @@ class ClickBenchUnitTests(unittest.TestCase):
         empty_ch = pa.table({})
         compare_tables(empty_oracle, empty_ch, spec_exact, "clickhouse_default")
 
-        # TopN tie handling: interior ties must match as multiset; boundary ties allowed.
-        spec_topn = QuerySpec("q_topn", 12, "SELECT ...", "topn", sort_key_cols=(1,))
-        oracle_topn = pa.table({"k": ["a", "b", "c", "d"], "c": [10, 5, 5, 2]})
-        actual_reordered_tie = pa.table({"k": ["a", "c", "b", "z"], "c": [10, 5, 5, 2]})
-        compare_tables(oracle_topn, actual_reordered_tie, spec_topn, "test_arm")
+        # TopN tie handling: interior ties must match as multiset; boundary ties
+        # require oracle_lookup verification when cut by LIMIT (n == limit).
+        spec_topn = QuerySpec(
+            "q_topn",
+            12,
+            "SELECT k, c, s FROM t GROUP BY k ORDER BY c DESC LIMIT 4",
+            "topn",
+            sort_key_cols=(1,),
+            limit=4,
+            group_key_cols=(0,),
+        )
+        oracle_topn = pa.table(
+            {"k": ["a", "b", "c", "d"], "c": [10, 5, 5, 2], "s": [100, 50, 51, 20]}
+        )
+        oracle_full = pa.table(
+            {
+                "k": ["a", "b", "c", "d", "z"],
+                "c": [10, 5, 5, 2, 2],
+                "s": [100, 50, 51, 20, 29],
+            }
+        )
+        actual_valid_tie = pa.table(
+            {"k": ["a", "c", "b", "z"], "c": [10, 5, 5, 2], "s": [100, 51, 50, 29]}
+        )
+        compare_tables(
+            oracle_topn,
+            actual_valid_tie,
+            spec_topn,
+            "test_arm",
+            oracle_lookup=oracle_full,
+        )
+
+        # Without oracle_lookup, boundary mismatch must fail (never silently skip).
+        with self.assertRaises(ValueError):
+            compare_tables(oracle_topn, actual_valid_tie, spec_topn, "test_arm")
+
+        # Made-up group key at boundary with matching sort key must fail.
+        made_up_boundary = pa.table(
+            {"k": ["a", "b", "c", "FAKE"], "c": [10, 5, 5, 2], "s": [100, 50, 51, 20]}
+        )
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_topn,
+                made_up_boundary,
+                spec_topn,
+                "test_arm",
+                oracle_lookup=oracle_full,
+            )
+
+        # Valid group key at boundary with wrong non-sort aggregate must fail.
+        wrong_agg_boundary = pa.table(
+            {"k": ["a", "b", "c", "z"], "c": [10, 5, 5, 2], "s": [100, 50, 51, 999]}
+        )
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_topn,
+                wrong_agg_boundary,
+                spec_topn,
+                "test_arm",
+                oracle_lookup=oracle_full,
+            )
+
+        # Duplicate group key at boundary (repeating a valid key) must fail.
+        spec_topn_dup = replace(spec_topn, limit=5)
+        oracle_dup = pa.table(
+            {
+                "k": ["a", "b", "c", "d", "z"],
+                "c": [10, 5, 5, 2, 2],
+                "s": [100, 50, 51, 20, 29],
+            }
+        )
+        actual_dup = pa.table(
+            {
+                "k": ["a", "b", "c", "d", "d"],
+                "c": [10, 5, 5, 2, 2],
+                "s": [100, 50, 51, 20, 20],
+            }
+        )
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_dup,
+                actual_dup,
+                spec_topn_dup,
+                "test_arm",
+                oracle_lookup=oracle_full,
+            )
+
+        # When result was NOT cut by LIMIT (num_rows < limit), final group is NOT a
+        # boundary: even a key present in oracle_full must fail exact multiset check.
+        spec_uncut = QuerySpec(
+            "q21",
+            21,
+            "SELECT k, c, s FROM t GROUP BY k ORDER BY c DESC LIMIT 10",
+            "topn",
+            sort_key_cols=(1,),
+            limit=10,
+            group_key_cols=(0,),
+        )
+        oracle_uncut = pa.table({"k": ["a"], "c": [5], "s": [50]})
+        actual_uncut_fake = pa.table({"k": ["z"], "c": [5], "s": [50]})
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_uncut,
+                actual_uncut_fake,
+                spec_uncut,
+                "test_arm",
+                oracle_lookup=pa.table({"k": ["a", "z"], "c": [5, 5], "s": [50, 50]}),
+            )
 
         # Interior mismatch must fail.
-        bad_interior = pa.table({"k": ["a", "x", "b", "d"], "c": [10, 5, 5, 2]})
+        bad_interior = pa.table(
+            {"k": ["a", "x", "b", "d"], "c": [10, 5, 5, 2], "s": [100, 50, 51, 20]}
+        )
         with self.assertRaises(ValueError):
-            compare_tables(oracle_topn, bad_interior, spec_topn, "test_arm")
+            compare_tables(
+                oracle_topn,
+                bad_interior,
+                spec_topn,
+                "test_arm",
+                oracle_lookup=oracle_full,
+            )
 
         # Sort-key mismatch at boundary must fail.
-        bad_key = pa.table({"k": ["a", "b", "c", "d"], "c": [10, 5, 5, 1]})
+        bad_key = pa.table(
+            {"k": ["a", "b", "c", "d"], "c": [10, 5, 5, 1], "s": [100, 50, 51, 20]}
+        )
         with self.assertRaises(ValueError):
-            compare_tables(oracle_topn, bad_key, spec_topn, "test_arm")
+            compare_tables(
+                oracle_topn,
+                bad_key,
+                spec_topn,
+                "test_arm",
+                oracle_lookup=oracle_full,
+            )
+
+    def test_compare_tables_rejects_made_up_q17_q23_q24(self):
+        # q17 (limit_unordered): must verify existence, aggregate count, and uniqueness.
+        spec_q17 = QuerySpec(
+            "q17",
+            17,
+            'SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 2',
+            "limit_unordered",
+            limit=2,
+            group_key_cols=(0, 1),
+        )
+        oracle_q17 = pa.table({"u": [1, 2], "p": ["a", "b"], "c": [3, 4]})
+        full_q17 = pa.table({"u": [1, 2, 3], "p": ["a", "b", "c"], "c": [3, 4, 5]})
+        compare_tables(
+            oracle_q17,
+            pa.table({"u": [3, 1], "p": ["c", "a"], "c": [5, 3]}),
+            spec_q17,
+            "test_arm",
+            oracle_lookup=full_q17,
+        )
+        # Made-up group with positive count must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q17,
+                pa.table({"u": [999, 1], "p": ["fake", "a"], "c": [1, 3]}),
+                spec_q17,
+                "test_arm",
+                oracle_lookup=full_q17,
+            )
+        # Wrong count on valid group must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q17,
+                pa.table({"u": [3, 1], "p": ["c", "a"], "c": [99, 3]}),
+                spec_q17,
+                "test_arm",
+                oracle_lookup=full_q17,
+            )
+        # Duplicate valid group must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q17,
+                pa.table({"u": [1, 1], "p": ["a", "a"], "c": [3, 3]}),
+                spec_q17,
+                "test_arm",
+                oracle_lookup=full_q17,
+            )
+
+        # q23 (non-GROUP-BY topn boundary tie): multiset subset check rejects made-up/over-duplicated rows.
+        spec_q23 = QuerySpec(
+            "q23",
+            23,
+            "SELECT id, ts FROM hits ORDER BY ts LIMIT 2",
+            "topn",
+            sort_key_cols=(1,),
+            limit=2,
+            group_key_cols=(),
+        )
+        oracle_q23 = pa.table({"id": [1, 2], "ts": [10, 20]})
+        cand_q23 = pa.table({"id": [2, 3], "ts": [20, 20]})
+        compare_tables(
+            oracle_q23,
+            pa.table({"id": [1, 3], "ts": [10, 20]}),
+            spec_q23,
+            "test_arm",
+            oracle_lookup=cand_q23,
+        )
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q23,
+                pa.table({"id": [1, 999], "ts": [10, 20]}),
+                spec_q23,
+                "test_arm",
+                oracle_lookup=cand_q23,
+            )
+
+        # q24 (topn_hidden_key): strict EventTime prefix + cutoff pool check.
+        spec_q24 = QuerySpec(
+            "q24",
+            24,
+            'SELECT "SearchPhrase" FROM hits WHERE "SearchPhrase" <> \'\' ORDER BY "EventTime" LIMIT 4',
+            "topn_hidden_key",
+            limit=4,
+        )
+        oracle_q24_res = pa.table({"SearchPhrase": ["p1", "p2", "p3", "p4"]})
+        q24_pool = pa.table(
+            {
+                "EventTime": [100, 100, 200, 300, 300],
+                "SearchPhrase": ["p1", "p2", "p3", "p4", "p5"],
+            }
+        )
+        # Reordered within EventTime=100 tie + alternative EventTime=300 cutoff row passes.
+        compare_tables(
+            oracle_q24_res,
+            pa.table({"SearchPhrase": ["p2", "p1", "p3", "p5"]}),
+            spec_q24,
+            "test_arm",
+            oracle_q24=q24_pool,
+        )
+        # Made-up non-empty string at cutoff must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q24_res,
+                pa.table({"SearchPhrase": ["p1", "p2", "p3", "MADE_UP"]}),
+                spec_q24,
+                "test_arm",
+                oracle_q24=q24_pool,
+            )
+        # Missing strict-prefix row (EventTime=200 'p3' omitted) must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q24_res,
+                pa.table({"SearchPhrase": ["p1", "p2", "p4", "p5"]}),
+                spec_q24,
+                "test_arm",
+                oracle_q24=q24_pool,
+            )
+        # Out-of-order strict prefix (swapping EventTime=200 before EventTime=100) must fail.
+        with self.assertRaises(ValueError):
+            compare_tables(
+                oracle_q24_res,
+                pa.table({"SearchPhrase": ["p3", "p1", "p2", "p4"]}),
+                spec_q24,
+                "test_arm",
+                oracle_q24=q24_pool,
+            )
+        # Over-duplicating a boundary phrase beyond pool multiplicity must fail.
+        spec_q24_5 = replace(spec_q24, limit=5)
+        q24_pool_extra = pa.table(
+            {
+                "EventTime": [100, 100, 200, 300, 300, 300],
+                "SearchPhrase": ["p1", "p2", "p3", "p4", "p5", "p6"],
+            }
+        )
+        with self.assertRaises(ValueError):
+            compare_tables(
+                pa.table({"SearchPhrase": ["p1", "p2", "p3", "p4", "p5"]}),
+                pa.table({"SearchPhrase": ["p1", "p2", "p3", "p4", "p4"]}),
+                spec_q24_5,
+                "test_arm",
+                oracle_q24=q24_pool_extra,
+            )
+
+        # Verify strip_order_limit cleanly removes ORDER BY / LIMIT / OFFSET.
+        self.assertEqual(
+            strip_order_limit(QUERIES["q17"].sql),
+            'SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase"',
+        )
+        self.assertNotIn("LIMIT", strip_order_limit(QUERIES["q38"].sql))
+        self.assertNotIn("OFFSET", strip_order_limit(QUERIES["q38"].sql))
 
     def test_rejection_grouping(self):
         rejections = {
@@ -354,11 +628,121 @@ class ClickBenchEndToEndSmokeTests(unittest.TestCase):
             )
         dk = DuckDbRunner(self.smoke_dir, threads=4, timeout=60)
         ch = ClickHouseRunner(self.clickhouse, self.smoke_dir, threads=4, timeout=60)
-        for qname in ALL_CLICKBENCH_QUERIES:
-            spec = QUERIES[qname]
-            oracle = dk.query(spec)
-            actual = ch.query(spec)
-            compare_tables(oracle, actual, spec, "clickhouse_default")
+        with DuckDbOracle(self.smoke_dir, threads=4) as oracle_db:
+            for qname in ALL_CLICKBENCH_QUERIES:
+                spec = QUERIES[qname]
+                oracle = dk.query(spec)
+                actual = ch.query(spec)
+                compare_tables(
+                    oracle,
+                    actual,
+                    spec,
+                    "clickhouse_default",
+                    oracle_lookup=oracle_db.lookup_candidates,
+                    oracle_q24=oracle_db.q24_oracle,
+                )
+
+    def test_scaled_threshold_queries_q27_q28_q41_and_q28_newline_sensitivity(self):
+        if self.runner is None or not self.runner.is_file():
+            self.skipTest("DataFusion runner not built; set MORSEL_CLICKBENCH_RUNNER")
+        if self.clickhouse is None or not self.clickhouse.is_file():
+            self.skipTest(
+                "ClickHouse binary not available; set MORSEL_CLICKBENCH_CLICKHOUSE"
+            )
+
+        # Official q27/q28 (HAVING COUNT(*) > 100000) and q41 (OFFSET 10000) return
+        # 0 rows on the 50K smoke fixture. Exercise fixture-sized thresholds through
+        # all 5 arms to actively test DuckDB strlen, ClickHouse (?-s), and q41 OFFSET.
+        scaled_specs = [
+            replace(
+                QUERIES["q27"],
+                sql=QUERIES["q27"].sql.replace(
+                    "HAVING COUNT(*) > 100000", "HAVING COUNT(*) > 100"
+                ),
+            ),
+            replace(
+                QUERIES["q28"],
+                sql=QUERIES["q28"].sql.replace(
+                    "HAVING COUNT(*) > 100000", "HAVING COUNT(*) > 100"
+                ),
+            ),
+            replace(
+                QUERIES["q41"],
+                sql=QUERIES["q41"].sql.replace("OFFSET 10000", "OFFSET 100"),
+            ),
+        ]
+
+        dk = DuckDbRunner(self.smoke_dir, threads=4, timeout=60)
+        ch = ClickHouseRunner(self.clickhouse, self.smoke_dir, threads=4, timeout=60)
+        runners = {
+            "stock_default": DataFusionRunner(
+                self.runner, self.smoke_dir, 4, 60, "off", "default"
+            ),
+            "stock_pushdown": DataFusionRunner(
+                self.runner, self.smoke_dir, 4, 60, "off", "pushdown"
+            ),
+            "morsel_pushdown": DataFusionRunner(
+                self.runner, self.smoke_dir, 4, 60, "required", "pushdown"
+            ),
+            "clickhouse_default": ch,
+        }
+
+        q28_oracle = None
+        with DuckDbOracle(self.smoke_dir, threads=4) as oracle_db:
+            for spec in scaled_specs:
+                oracle = dk.query(spec)
+                self.assertGreater(
+                    oracle.num_rows,
+                    0,
+                    f"expected non-empty smoke rows for scaled {spec.name}",
+                )
+                if spec.name == "q28":
+                    q28_oracle = oracle
+                    # Verify newline-Referer groups appear with distinct AVG lengths (no tie).
+                    ks = oracle.column(0).to_pylist()
+                    ls = oracle.column(1).to_pylist()
+                    nl_ls = [l for k, l in zip(ks, ls) if "nlhost" in str(k)]
+                    self.assertGreaterEqual(len(nl_ls), 5)
+                    self.assertEqual(len(set(round(v, 6) for v in nl_ls)), len(nl_ls))
+                for arm_name, runner in runners.items():
+                    actual = runner.query(spec)
+                    compare_tables(
+                        oracle,
+                        actual,
+                        spec,
+                        arm_name,
+                        oracle_lookup=oracle_db.lookup_candidates,
+                    )
+
+            # Negative check: running ClickHouse on scaled q28 WITHOUT the (?-s)
+            # rewrite must produce different results and be rejected by compare_tables.
+            q28_spec = scaled_specs[1]
+            self.assertIsNotNone(q28_oracle)
+            raw_sql = f"{ch._view_ddl()};\n{q28_spec.sql}"
+            res = subprocess.run(
+                [
+                    str(self.clickhouse),
+                    "local",
+                    "--tmp",
+                    "--max_threads=4",
+                    "--format=ArrowStream",
+                    "-q",
+                    raw_sql,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=True,
+            )
+            ch_unadapted = pa_ipc.open_stream(res.stdout).read_all()
+            with self.assertRaises(ValueError):
+                compare_tables(
+                    q28_oracle,
+                    ch_unadapted,
+                    q28_spec,
+                    "clickhouse_unadapted_q28",
+                    oracle_lookup=oracle_db.lookup_candidates,
+                )
 
     def test_full_4way_parity_and_morsel_admission_all_43_queries(self):
         if self.runner is None or not self.runner.is_file():

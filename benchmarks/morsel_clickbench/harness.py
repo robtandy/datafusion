@@ -3,6 +3,8 @@
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 import argparse
+from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 from dataclasses import dataclass
@@ -194,53 +196,58 @@ class QuerySpec:
     order_mode: str  # "exact" | "unordered" | "ordered_ties" | "topn" | "limit_unordered" | "topn_hidden_key"
     sort_key_cols: tuple[int, ...] = ()
     has_offset: bool = False
+    limit: int | None = None
+    group_key_cols: tuple[int, ...] = ()
 
 
-# Ordering metadata for all 43 official ClickBench queries.
-_QUERY_ORDER_SPECS: dict[int, tuple[str, tuple[int, ...], bool]] = {
-    0: ("exact", (), False),
-    1: ("exact", (), False),
-    2: ("exact", (), False),
-    3: ("exact", (), False),
-    4: ("exact", (), False),
-    5: ("exact", (), False),
-    6: ("exact", (), False),
-    7: ("ordered_ties", (1,), False),
-    8: ("topn", (1,), False),
-    9: ("topn", (2,), False),
-    10: ("topn", (1,), False),
-    11: ("topn", (2,), False),
-    12: ("topn", (1,), False),
-    13: ("topn", (1,), False),
-    14: ("topn", (2,), False),
-    15: ("topn", (1,), False),
-    16: ("topn", (2,), False),
-    17: ("limit_unordered", (), False),
-    18: ("topn", (3,), False),
-    19: ("unordered", (), False),
-    20: ("exact", (), False),
-    21: ("topn", (2,), False),
-    22: ("topn", (3,), False),
-    23: ("topn", (4,), False),
-    24: ("topn_hidden_key", (), False),
-    25: ("exact", (), False),
-    26: ("exact", (), False),
-    27: ("topn", (1,), False),
-    28: ("topn", (1,), False),
-    29: ("exact", (), False),
-    30: ("topn", (2,), False),
-    31: ("topn", (2,), False),
-    32: ("topn", (2,), False),
-    33: ("topn", (1,), False),
-    34: ("topn", (2,), False),
-    35: ("topn", (4,), False),
-    36: ("topn", (1,), False),
-    37: ("topn", (1,), False),
-    38: ("topn", (1,), True),
-    39: ("topn", (5,), True),
-    40: ("topn", (2,), True),
-    41: ("topn", (2,), True),
-    42: ("exact", (), True),
+# Ordering metadata for all 43 official ClickBench queries:
+# (order_mode, sort_key_cols, has_offset, limit, group_key_cols)
+_QUERY_ORDER_SPECS: dict[
+    int, tuple[str, tuple[int, ...], bool, int | None, tuple[int, ...]]
+] = {
+    0: ("exact", (), False, None, ()),
+    1: ("exact", (), False, None, ()),
+    2: ("exact", (), False, None, ()),
+    3: ("exact", (), False, None, ()),
+    4: ("exact", (), False, None, ()),
+    5: ("exact", (), False, None, ()),
+    6: ("exact", (), False, None, ()),
+    7: ("ordered_ties", (1,), False, None, (0,)),
+    8: ("topn", (1,), False, 10, (0,)),
+    9: ("topn", (2,), False, 10, (0,)),
+    10: ("topn", (1,), False, 10, (0,)),
+    11: ("topn", (2,), False, 10, (0, 1)),
+    12: ("topn", (1,), False, 10, (0,)),
+    13: ("topn", (1,), False, 10, (0,)),
+    14: ("topn", (2,), False, 10, (0, 1)),
+    15: ("topn", (1,), False, 10, (0,)),
+    16: ("topn", (2,), False, 10, (0, 1)),
+    17: ("limit_unordered", (), False, 10, (0, 1)),
+    18: ("topn", (3,), False, 10, (0, 1, 2)),
+    19: ("unordered", (), False, None, ()),
+    20: ("exact", (), False, None, ()),
+    21: ("topn", (2,), False, 10, (0,)),
+    22: ("topn", (3,), False, 10, (0,)),
+    23: ("topn", (4,), False, 10, ()),
+    24: ("topn_hidden_key", (), False, 10, ()),
+    25: ("exact", (), False, 10, ()),
+    26: ("exact", (), False, 10, ()),
+    27: ("topn", (1,), False, 25, (0,)),
+    28: ("topn", (1,), False, 25, (0,)),
+    29: ("exact", (), False, None, ()),
+    30: ("topn", (2,), False, 10, (0, 1)),
+    31: ("topn", (2,), False, 10, (0, 1)),
+    32: ("topn", (2,), False, 10, (0, 1)),
+    33: ("topn", (1,), False, 10, (0,)),
+    34: ("topn", (2,), False, 10, (0, 1)),
+    35: ("topn", (4,), False, 10, (0, 1, 2, 3)),
+    36: ("topn", (1,), False, 10, (0,)),
+    37: ("topn", (1,), False, 10, (0,)),
+    38: ("topn", (1,), True, 10, (0,)),
+    39: ("topn", (5,), True, 10, (0, 1, 2, 3, 4)),
+    40: ("topn", (2,), True, 10, (0, 1)),
+    41: ("topn", (2,), True, 10, (0, 1)),
+    42: ("exact", (), True, 10, (0,)),
 }
 
 
@@ -261,7 +268,7 @@ def load_clickbench_query(query_num: int, queries_dir: Path = QUERIES_DIR) -> st
 def _build_queries() -> dict[str, QuerySpec]:
     out: dict[str, QuerySpec] = {}
     for idx in range(43):
-        mode, key_cols, has_offset = _QUERY_ORDER_SPECS[idx]
+        mode, key_cols, has_offset, limit, group_key_cols = _QUERY_ORDER_SPECS[idx]
         name = f"q{idx}"
         out[name] = QuerySpec(
             name=name,
@@ -270,6 +277,8 @@ def _build_queries() -> dict[str, QuerySpec]:
             order_mode=mode,
             sort_key_cols=key_cols,
             has_offset=has_offset,
+            limit=limit,
+            group_key_cols=group_key_cols,
         )
     return out
 
@@ -665,23 +674,34 @@ def generate_smoke(
     title_idx = rng.choice(len(title_pool), size=rows, p=title_probs)
     titles = [title_pool[i] for i in title_idx]
 
-    # Referer: mix of empty, standard URLs, multi-byte UTF-8 URLs, newline URLs (tests q28),
-    # and non-matching strings.
+    # Referer: mix of empty, standard URLs, multi-byte UTF-8 URLs, newline URLs
+    # with distinct byte lengths (so q28's AVG(octet_length) ranks them without
+    # ties and detects ClickHouse RE2 dot_nl differences), and non-matching strings.
     ref_pool = [b""]
     for i in range(1, 201):
         if i <= 10:
+            pad = "p" * (i * 2)
             ref_pool.append(
-                f"https://www.refhost{i}.com/search/item_{i}?a=1&b=2".encode("utf-8")
+                f"https://www.refhost{i}.com/search/{pad}/item_{i}?a=1".encode("utf-8")
             )
         elif i <= 15:
-            # Embedded newline exercises ClickHouse RE2 (?-s) parity on q28.
+            # Distinct lengths and paired non-newline / newline URLs for the same
+            # host exercise ClickHouse RE2 (?-s) parity on smoke-sized q28.
+            pad = "x" * ((i - 10) * 6)
             ref_pool.append(
-                f"http://nlhost{i}.org/path/{i}\nsecond_line".encode("utf-8")
+                f"http://nlhost{i}.org/path/{pad}\nsecond_line_{i}".encode("utf-8")
             )
-        elif i <= 25:
-            ref_pool.append(f"http://ruhost{i}.ru/поиск/{i}/страница".encode("utf-8"))
-        elif i <= 35:
-            ref_pool.append(f"non-url-referer-{i}".encode("utf-8"))
+        elif i <= 20:
+            host_idx = i - 5
+            pad = "a" * ((host_idx - 10) * 3)
+            ref_pool.append(f"http://nlhost{host_idx}.org/base/{pad}".encode("utf-8"))
+        elif i <= 30:
+            pad = "у" * (i - 20)
+            ref_pool.append(
+                f"http://ruhost{i}.ru/поиск/{pad}/{i}/страница".encode("utf-8")
+            )
+        elif i <= 40:
+            ref_pool.append(f"non-url-referer-{i}-{'z' * (i - 30)}".encode("utf-8"))
         else:
             ref_pool.append(f"http://host{i}.net/p/{i}/details".encode("utf-8"))
     ref_probs = np.array(
@@ -1357,6 +1377,156 @@ def _table_rows(tbl: pa.Table) -> list[tuple]:
     return list(zip(*cols))
 
 
+_TRAILING_ORDER_LIMIT_RE = re.compile(
+    r"(?:\s+ORDER\s+BY\s+.+?)?\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_order_limit(sql: str) -> str:
+    """Remove trailing ORDER BY / LIMIT / OFFSET to query the full oracle relation."""
+    stripped = _TRAILING_ORDER_LIMIT_RE.sub("", sql.strip().rstrip(";")).strip()
+    if not stripped:
+        raise ValueError(f"failed to strip ORDER BY/LIMIT from SQL: {sql!r}")
+    return stripped
+
+
+def _arrow_column_for_duckdb_key(col: pa.ChunkedArray | pa.Array) -> pa.Array:
+    typ = col.type
+    if (
+        pa.types.is_binary(typ)
+        or pa.types.is_large_binary(typ)
+        or pa.types.is_binary_view(typ)
+    ):
+        return pa.array(
+            [_normalize_value(v) for v in col.to_pylist()], type=pa.string()
+        )
+    if pa.types.is_timestamp(typ) and typ.tz is not None:
+        return pa.array(
+            [_normalize_value(v) for v in col.to_pylist()],
+            type=pa.timestamp(typ.unit),
+        )
+    if isinstance(col, pa.ChunkedArray):
+        return col.combine_chunks()
+    return col
+
+
+class DuckDbOracle:
+    """In-memory DuckDB oracle for verifying tied LIMIT/OFFSET boundary rows and q17/q24."""
+
+    def __init__(self, data_path: Path, threads: int):
+        self.data_path = data_path.resolve(strict=True)
+        self.threads = threads
+        self._con: duckdb.DuckDBPyConnection | None = None
+        self._q24_cache: dict[tuple[str, int | None], pa.Table] = {}
+
+    def __enter__(self) -> "DuckDbOracle":
+        con = duckdb.connect(":memory:")
+        con.execute(f"SET threads = {self.threads}")
+        con.execute("SET TimeZone = 'UTC'")
+        glob_pattern = _parquet_glob(self.data_path)
+        con.execute(
+            "CREATE VIEW hits AS "
+            'SELECT * EXCLUDE ("EventDate"), '
+            '(DATE \'1970-01-01\' + CAST("EventDate" AS INTEGER)) AS "EventDate" '
+            f"FROM read_parquet('{glob_pattern}', binary_as_string=true)"
+        )
+        self._con = con
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._con is not None:
+            self._con.close()
+            self._con = None
+
+    def _require_con(self) -> duckdb.DuckDBPyConnection:
+        if self._con is None:
+            raise RuntimeError("DuckDbOracle must be used inside a context manager")
+        return self._con
+
+    def lookup_candidates(
+        self, spec: QuerySpec, actual_subset: pa.Table, key_cols: tuple[int, ...]
+    ) -> pa.Table:
+        """Query the full un-limited oracle relation filtered to candidate key tuples."""
+        con = self._require_con()
+        adapted = adapt_sql_for_duckdb(spec.name, spec.sql)
+        base_sql = strip_order_limit(adapted)
+        ncols = actual_subset.num_columns
+        col_aliases = ", ".join(f"c{i}" for i in range(ncols))
+
+        key_arrays = {
+            f"k{idx}": _arrow_column_for_duckdb_key(actual_subset.column(col_idx))
+            for idx, col_idx in enumerate(key_cols)
+        }
+        keys_tbl = pa.table(key_arrays)
+        join_cond = " AND ".join(
+            f"_o.c{col_idx} IS NOT DISTINCT FROM _keys.k{idx}"
+            for idx, col_idx in enumerate(key_cols)
+        )
+        sql = (
+            f"WITH _o({col_aliases}) AS (\n{base_sql}\n)\n"
+            f"SELECT _o.* FROM _o SEMI JOIN _keys ON {join_cond}"
+        )
+        con.register("_keys", keys_tbl)
+        try:
+            return con.sql(sql).to_arrow_table()
+        finally:
+            con.unregister("_keys")
+
+    def q24_oracle(self, spec: QuerySpec) -> pa.Table:
+        """Return all (EventTime, SearchPhrase) rows with EventTime <= Nth smallest."""
+        cache_key = (spec.name, spec.limit)
+        if cache_key in self._q24_cache:
+            return self._q24_cache[cache_key]
+        con = self._require_con()
+        limit = spec.limit if spec.limit is not None else 10
+        sql = (
+            "WITH topk AS (\n"
+            '  SELECT "EventTime" FROM hits WHERE "SearchPhrase" <> \'\' '
+            f'ORDER BY "EventTime" LIMIT {limit}\n'
+            "),\n"
+            'cutoff AS (SELECT MAX("EventTime") AS max_t FROM topk)\n'
+            'SELECT "EventTime", "SearchPhrase"\n'
+            "FROM hits, cutoff\n"
+            'WHERE "SearchPhrase" <> \'\' AND "EventTime" <= cutoff.max_t\n'
+            'ORDER BY "EventTime"'
+        )
+        tbl = con.sql(sql).to_arrow_table()
+        self._q24_cache[cache_key] = tbl
+        return tbl
+
+
+def _normalized_key_tuple(row: tuple, key_cols: tuple[int, ...]) -> tuple:
+    parts = []
+    for c in key_cols:
+        v = _normalize_value(row[c])
+        if isinstance(v, Decimal) and v == int(v):
+            v = int(v)
+        parts.append(v)
+    return tuple(parts)
+
+
+def _check_unique_keys(
+    rows: list[tuple], key_cols: tuple[int, ...], case_name: str, arm_name: str
+):
+    seen: set[tuple] = set()
+    for idx, row in enumerate(rows):
+        key = _normalized_key_tuple(row, key_cols)
+        if key in seen:
+            raise ValueError(
+                f"{arm_name}/{case_name}: duplicate group key {key!r} at row {idx}"
+            )
+        seen.add(key)
+
+
+def _is_multiset_equal(exp_rows: list[tuple], act_rows: list[tuple]) -> bool:
+    if len(exp_rows) != len(act_rows):
+        return False
+    exp_sorted = sorted(exp_rows, key=_sort_key)
+    act_sorted = sorted(act_rows, key=_sort_key)
+    return all(_rows_equal(er, ar) for er, ar in zip(exp_sorted, act_sorted))
+
+
 def _check_multiset_equal(
     exp_rows: list[tuple],
     act_rows: list[tuple],
@@ -1379,13 +1549,144 @@ def _check_multiset_equal(
             )
 
 
+def _resolve_oracle_candidates(
+    oracle_lookup: (
+        Callable[[QuerySpec, pa.Table, tuple[int, ...]], pa.Table] | pa.Table | None
+    ),
+    spec: QuerySpec,
+    actual_subset: pa.Table,
+    key_cols: tuple[int, ...],
+    arm_name: str,
+) -> list[tuple]:
+    if oracle_lookup is None:
+        raise ValueError(
+            f"{arm_name}/{spec.name}: oracle_lookup is required to verify boundary/unordered rows"
+        )
+    tbl = (
+        oracle_lookup
+        if isinstance(oracle_lookup, pa.Table)
+        else oracle_lookup(spec, actual_subset, key_cols)
+    )
+    return _table_rows(tbl)
+
+
+def _verify_group_rows_against_candidates(
+    actual_slice: list[tuple],
+    candidate_rows: list[tuple],
+    group_key_cols: tuple[int, ...],
+    case_name: str,
+    arm_name: str,
+    context: str = "",
+):
+    by_key: dict[tuple, tuple] = {}
+    for er in candidate_rows:
+        by_key[_normalized_key_tuple(er, group_key_cols)] = er
+    for idx, ar in enumerate(actual_slice):
+        key = _normalized_key_tuple(ar, group_key_cols)
+        if key not in by_key:
+            raise ValueError(
+                f"{arm_name}/{case_name}{context}: group key {key!r} at row {idx} "
+                "not found in oracle full GROUP BY result"
+            )
+        er = by_key[key]
+        if not _rows_equal(er, ar):
+            raise ValueError(
+                f"{arm_name}/{case_name}{context}: aggregate mismatch for group {key!r}: "
+                f"expected {er!r}, got {ar!r}"
+            )
+
+
+def _verify_multiset_subset(
+    actual_slice: list[tuple],
+    candidate_rows: list[tuple],
+    case_name: str,
+    arm_name: str,
+    context: str = "",
+):
+    used = [False] * len(candidate_rows)
+    for idx, ar in enumerate(actual_slice):
+        matched = False
+        for cand_idx, er in enumerate(candidate_rows):
+            if not used[cand_idx] and _rows_equal(er, ar):
+                used[cand_idx] = True
+                matched = True
+                break
+        if not matched:
+            raise ValueError(
+                f"{arm_name}/{case_name}{context}: boundary row {idx} ({ar!r}) "
+                "not found in oracle candidate pool (or exceeds multiplicity)"
+            )
+
+
+def _verify_q24_against_oracle(
+    actual_rows: list[tuple],
+    q24_oracle_rows: list[tuple],
+    case_name: str,
+    arm_name: str,
+):
+    n = len(actual_rows)
+    if len(q24_oracle_rows) < n:
+        raise ValueError(
+            f"{arm_name}/{case_name}: oracle q24 pool has only {len(q24_oracle_rows)} rows, "
+            f"fewer than actual {n}"
+        )
+    sorted_oracle = sorted(q24_oracle_rows, key=lambda r: _normalize_value(r[0]))
+    cutoff_t = _normalize_value(sorted_oracle[n - 1][0])
+
+    # Every EventTime strictly below cutoff_t must appear in ascending EventTime
+    # order with exact multiset equality within each equal-EventTime group.
+    strict_rows = [
+        (_normalize_value(t), _normalize_value(p))
+        for t, p in sorted_oracle
+        if _normalize_value(t) < cutoff_t
+    ]
+    pos = 0
+    idx = 0
+    while idx < len(strict_rows):
+        t_val = strict_rows[idx][0]
+        end = idx + 1
+        while end < len(strict_rows) and strict_rows[end][0] == t_val:
+            end += 1
+        expected_phrases = Counter(p for _, p in strict_rows[idx:end])
+        group_len = end - idx
+        actual_phrases = Counter(
+            _normalize_value(r[0]) for r in actual_rows[pos : pos + group_len]
+        )
+        if actual_phrases != expected_phrases:
+            raise ValueError(
+                f"{arm_name}/{case_name}: strict EventTime={t_val} prefix mismatch "
+                f"at rows [{pos}..{pos + group_len}]: "
+                f"expected {dict(expected_phrases)}, got {dict(actual_phrases)}"
+            )
+        pos += group_len
+        idx = end
+
+    # Remaining rows must come from rows with EventTime == cutoff_t (respecting multiplicity).
+    boundary_pool = Counter(
+        _normalize_value(p) for t, p in sorted_oracle if _normalize_value(t) == cutoff_t
+    )
+    tail_counts = Counter(_normalize_value(r[0]) for r in actual_rows[pos:])
+    for phrase, cnt in tail_counts.items():
+        allowed = boundary_pool.get(phrase, 0)
+        if cnt > allowed:
+            raise ValueError(
+                f"{arm_name}/{case_name}: phrase {phrase!r} appears {cnt} time(s) "
+                f"at cutoff EventTime={cutoff_t}, exceeding oracle multiplicity {allowed}"
+            )
+
+
 def compare_tables(
     oracle: pa.Table,
     actual: pa.Table,
     spec: QuerySpec,
     arm_name: str,
+    *,
+    oracle_lookup: (
+        Callable[[QuerySpec, pa.Table, tuple[int, ...]], pa.Table] | pa.Table | None
+    ) = None,
+    oracle_q24: Callable[[QuerySpec], pa.Table] | pa.Table | None = None,
 ):
-    """Verify lossless Arrow result parity against the oracle with explicit SQL tie semantics."""
+    """Verify lossless Arrow result parity against the oracle with strict SQL tie checks."""
     # ClickHouse ArrowStream writes an empty stream when a query returns 0 rows.
     if oracle.num_rows == 0 and actual.num_rows == 0:
         if actual.num_columns != 0 and oracle.num_columns != actual.num_columns:
@@ -1427,26 +1728,42 @@ def compare_tables(
 
     if spec.order_mode == "limit_unordered":
         # q17: GROUP BY ... LIMIT 10 with no ORDER BY.
-        # Verify positive counts and matching non-empty schema/row count.
-        for row_idx, row in enumerate(actual_rows):
-            cnt = row[-1]
-            if not isinstance(cnt, int) or cnt <= 0:
-                raise ValueError(
-                    f"{arm_name}/{spec.name}: invalid count at row {row_idx}: {row!r}"
-                )
+        # Every returned group must be unique and exist in the oracle's full GROUP BY
+        # with identical aggregate values.
+        if not spec.group_key_cols:
+            raise ValueError(
+                f"{arm_name}/{spec.name}: limit_unordered requires group_key_cols"
+            )
+        _check_unique_keys(actual_rows, spec.group_key_cols, spec.name, arm_name)
+        if _is_multiset_equal(oracle_rows, actual_rows):
+            return
+        candidates = _resolve_oracle_candidates(
+            oracle_lookup, spec, actual, spec.group_key_cols, arm_name
+        )
+        _verify_group_rows_against_candidates(
+            actual_rows, candidates, spec.group_key_cols, spec.name, arm_name
+        )
         return
 
     if spec.order_mode == "topn_hidden_key":
         # q24: SELECT "SearchPhrase" ... ORDER BY "EventTime" LIMIT 10.
-        # If there are no EventTime ties, rows match strictly; otherwise check multiset
-        # or non-empty strings (ties on hidden EventTime can reorder rows across engines).
-        if all(_rows_equal(er, ar) for er, ar in zip(oracle_rows, actual_rows)):
+        # Verify against oracle rows including EventTime so every row below the Nth
+        # EventTime appears in order and remaining rows come from the Nth EventTime.
+        if oracle_q24 is not None:
+            q24_tbl = (
+                oracle_q24 if isinstance(oracle_q24, pa.Table) else oracle_q24(spec)
+            )
+            _verify_q24_against_oracle(
+                actual_rows, _table_rows(q24_tbl), spec.name, arm_name
+            )
             return
-        for row_idx, row in enumerate(actual_rows):
-            val = _normalize_value(row[0])
-            if not isinstance(val, str) or val == "":
+        # Without oracle_q24, fall back strictly to exact row-by-row equality.
+        for row_idx, (er, ar) in enumerate(zip(oracle_rows, actual_rows)):
+            if not _rows_equal(er, ar):
                 raise ValueError(
-                    f"{arm_name}/{spec.name}: invalid SearchPhrase at row {row_idx}: {row!r}"
+                    f"{arm_name}/{spec.name}: mismatch at row {row_idx} "
+                    f"(provide oracle_q24 for EventTime-tie verification): "
+                    f"expected {er!r}, got {ar!r}"
                 )
         return
 
@@ -1462,7 +1779,11 @@ def compare_tables(
                     f"expected {ek!r}, got {ak!r}"
                 )
 
-        # 2. Partition rows into contiguous runs of equal sort keys.
+        # 2. For GROUP BY queries, ensure no duplicate group keys appear anywhere.
+        if spec.group_key_cols:
+            _check_unique_keys(actual_rows, spec.group_key_cols, spec.name, arm_name)
+
+        # 3. Partition rows into contiguous runs of equal sort keys.
         runs: list[tuple[int, int]] = []
         i = 0
         n = len(oracle_rows)
@@ -1476,27 +1797,64 @@ def compare_tables(
             runs.append((i, j))
             i = j
 
-        # 3. For ordered_ties (no LIMIT), every tie group must match as an exact multiset.
-        # For topn (LIMIT K [OFFSET O]), every interior tie group (not touching the cut
-        # boundary at the end, or at the start when OFFSET > 0) must match as an exact
-        # multiset; boundary tie groups already passed exact sort-key verification above.
+        # 4. Every non-boundary run must match oracle_rows[lo:hi] as an exact multiset.
+        # A final run is only a LIMIT boundary when the result was actually cut by LIMIT
+        # (n == spec.limit). Any boundary run that differs from oracle_rows[lo:hi] is
+        # verified row-by-row against the oracle's full un-limited relation.
         for lo, hi in runs:
-            is_end_boundary = spec.order_mode == "topn" and hi == n
+            is_end_boundary = (
+                spec.order_mode == "topn"
+                and hi == n
+                and spec.limit is not None
+                and n == spec.limit
+            )
             is_start_boundary = (
                 spec.order_mode == "topn" and spec.has_offset and lo == 0
             )
-            if is_end_boundary or is_start_boundary:
-                # If the rows happen to match exactly as a multiset, great; otherwise
-                # legitimate SQL tie-breaking at LIMIT/OFFSET boundary is allowed since
-                # the sort keys at every position already matched identically.
+            ctx = f"[rows {lo}..{hi}]"
+            if not (is_end_boundary or is_start_boundary):
+                _check_multiset_equal(
+                    oracle_rows[lo:hi],
+                    actual_rows[lo:hi],
+                    spec.name,
+                    arm_name,
+                    context=ctx,
+                )
                 continue
-            _check_multiset_equal(
-                oracle_rows[lo:hi],
-                actual_rows[lo:hi],
-                spec.name,
-                arm_name,
-                context=f"[rows {lo}..{hi}]",
-            )
+            if _is_multiset_equal(oracle_rows[lo:hi], actual_rows[lo:hi]):
+                continue
+            actual_slice_tbl = actual.slice(lo, hi - lo)
+            if spec.group_key_cols:
+                candidates = _resolve_oracle_candidates(
+                    oracle_lookup,
+                    spec,
+                    actual_slice_tbl,
+                    spec.group_key_cols,
+                    arm_name,
+                )
+                _verify_group_rows_against_candidates(
+                    actual_rows[lo:hi],
+                    candidates,
+                    spec.group_key_cols,
+                    spec.name,
+                    arm_name,
+                    context=ctx,
+                )
+            else:
+                candidates = _resolve_oracle_candidates(
+                    oracle_lookup,
+                    spec,
+                    actual_slice_tbl,
+                    key_cols,
+                    arm_name,
+                )
+                _verify_multiset_subset(
+                    actual_rows[lo:hi],
+                    candidates,
+                    spec.name,
+                    arm_name,
+                    context=ctx,
+                )
         return
 
     raise ValueError(f"unknown order_mode: {spec.order_mode}")
@@ -1652,7 +2010,7 @@ def verify_suite(
     runners = _build_runners(
         data_path, runner_bin, clickhouse_bin, threads, timeout, arm_names
     )
-    # Oracle is stock_default if present, else duckdb_default.
+    # Oracle is duckdb_default if present, else the first configured arm.
     oracle_arm = (
         "duckdb_default" if "duckdb_default" in runners else next(iter(runners.keys()))
     )
@@ -1668,33 +2026,41 @@ def verify_suite(
     admitted_set = set(matrix["admitted"])
 
     verified: dict[str, dict] = {}
-    for qname in query_names:
-        spec = QUERIES[qname]
-        oracle_tbl = runners[oracle_arm].query(spec)
-        checked_arms: list[str] = [oracle_arm]
-        for arm_name in arm_names:
-            if arm_name == oracle_arm:
-                continue
-            arm = ARMS[arm_name]
-            if arm.mode == "required" and qname not in admitted_set:
-                # Confirm rejection under this specific morsel arm's profile as well.
-                plan_res = runners[arm_name].plan(spec)
-                if plan_res["admitted"]:
-                    raise ValueError(
-                        f"{arm_name}/{qname}: unexpectedly admitted on verify"
-                    )
-                continue
-            actual_tbl = runners[arm_name].query(spec)
-            compare_tables(oracle_tbl, actual_tbl, spec, arm_name)
-            checked_arms.append(arm_name)
-        verified[qname] = {
-            "rows": oracle_tbl.num_rows,
-            "columns": oracle_tbl.num_columns,
-            "oracle": oracle_arm,
-            "checked_arms": checked_arms,
-            "morsel_admitted": qname in admitted_set,
-            "morsel_rejection": matrix["rejections"].get(qname),
-        }
+    with DuckDbOracle(data_path, threads) as oracle_db:
+        for qname in query_names:
+            spec = QUERIES[qname]
+            oracle_tbl = runners[oracle_arm].query(spec)
+            checked_arms: list[str] = [oracle_arm]
+            for arm_name in arm_names:
+                if arm_name == oracle_arm:
+                    continue
+                arm = ARMS[arm_name]
+                if arm.mode == "required" and qname not in admitted_set:
+                    # Confirm rejection under this specific morsel arm's profile as well.
+                    plan_res = runners[arm_name].plan(spec)
+                    if plan_res["admitted"]:
+                        raise ValueError(
+                            f"{arm_name}/{qname}: unexpectedly admitted on verify"
+                        )
+                    continue
+                actual_tbl = runners[arm_name].query(spec)
+                compare_tables(
+                    oracle_tbl,
+                    actual_tbl,
+                    spec,
+                    arm_name,
+                    oracle_lookup=oracle_db.lookup_candidates,
+                    oracle_q24=oracle_db.q24_oracle,
+                )
+                checked_arms.append(arm_name)
+            verified[qname] = {
+                "rows": oracle_tbl.num_rows,
+                "columns": oracle_tbl.num_columns,
+                "oracle": oracle_arm,
+                "checked_arms": checked_arms,
+                "morsel_admitted": qname in admitted_set,
+                "morsel_rejection": matrix["rejections"].get(qname),
+            }
     return {
         "dataset": dataset_summary(data_path),
         "threads": threads,
@@ -1747,18 +2113,26 @@ def run_bench(args):
         "duckdb_default" if "duckdb_default" in runners else next(iter(runners.keys()))
     )
     if not args.skip_parity:
-        for qname in query_names:
-            spec = QUERIES[qname]
-            oracle_tbl = runners[oracle_arm].query(spec)
-            expected_rows[qname] = oracle_tbl.num_rows
-            for arm_name in arm_names:
-                if arm_name == oracle_arm:
-                    continue
-                arm = ARMS[arm_name]
-                if arm.mode == "required" and qname not in admitted_set:
-                    continue
-                actual_tbl = runners[arm_name].query(spec)
-                compare_tables(oracle_tbl, actual_tbl, spec, arm_name)
+        with DuckDbOracle(data_path, args.threads) as oracle_db:
+            for qname in query_names:
+                spec = QUERIES[qname]
+                oracle_tbl = runners[oracle_arm].query(spec)
+                expected_rows[qname] = oracle_tbl.num_rows
+                for arm_name in arm_names:
+                    if arm_name == oracle_arm:
+                        continue
+                    arm = ARMS[arm_name]
+                    if arm.mode == "required" and qname not in admitted_set:
+                        continue
+                    actual_tbl = runners[arm_name].query(spec)
+                    compare_tables(
+                        oracle_tbl,
+                        actual_tbl,
+                        spec,
+                        arm_name,
+                        oracle_lookup=oracle_db.lookup_candidates,
+                        oracle_q24=oracle_db.q24_oracle,
+                    )
 
     # Warm page cache and verify 100% mincore residency before timing.
     initial_cache_pages = None
