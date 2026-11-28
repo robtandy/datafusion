@@ -40,6 +40,7 @@ use crate::datasource::{MemTable, source_as_provider};
 
 use super::aggregate::{self, AggregateSink};
 use super::count::{self, CountSink};
+use super::cse::CsePlan;
 use super::dag::{
     ScalarSubquerySpec, ScalarSubqueryState, StageId, StageSource, StageSpec,
     collect_pipeline_stage_deps, collect_scalar_subqueries_post_order,
@@ -114,6 +115,7 @@ struct CteBinding {
     ordering: Option<LexOrdering>,
 }
 
+#[derive(Clone)]
 struct StageBinding {
     stage_id: StageId,
     schema: SchemaRef,
@@ -121,12 +123,15 @@ struct StageBinding {
     ordering: Option<LexOrdering>,
 }
 
-struct DagBuilder<'a> {
+struct DagBuilder<'a, 'plan> {
     workers: NonZeroUsize,
     session: &'a dyn Session,
     planning_ctx: PhysicalPlanningContext,
     stages: Vec<StageSpec>,
     cte_stages: HashMap<MaterializedCteId, CteBinding>,
+    cse_plan: CsePlan<'plan>,
+    cse_stages: HashMap<usize, StageBinding>,
+    bypass_cse_ptr: Option<usize>,
     lowered_subqueries: Vec<bool>,
     scalar_subquery_specs: Vec<ScalarSubquerySpec>,
     next_filter_id: usize,
@@ -138,6 +143,7 @@ impl MorselQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Lowering> {
+        let cse_plan = CsePlan::analyze(plan);
         let all_subqueries = collect_scalar_subqueries_post_order(plan);
         let num_subqueries = all_subqueries.len();
         let results = ScalarSubqueryResults::new(num_subqueries);
@@ -160,6 +166,9 @@ impl MorselQueryPlanner {
             planning_ctx,
             stages: Vec::new(),
             cte_stages: HashMap::new(),
+            cse_plan,
+            cse_stages: HashMap::new(),
+            bypass_cse_ptr: None,
             lowered_subqueries,
             scalar_subquery_specs: Vec::new(),
             next_filter_id: 0,
@@ -260,7 +269,7 @@ fn project_ordering(
     Ok(eq.output_ordering())
 }
 
-impl DagBuilder<'_> {
+impl DagBuilder<'_, '_> {
     fn ensure_expr_scalar_subqueries<'b>(
         &'b mut self,
         expr: &'b Expr,
@@ -337,6 +346,99 @@ impl DagBuilder<'_> {
             let mut post_nodes: Vec<&'b LogicalPlan> = Vec::new();
             let mut node = plan;
             loop {
+                let node_ptr = std::ptr::from_ref(node).addr();
+                if self.bypass_cse_ptr != Some(node_ptr)
+                    && let Some(occ) = self.cse_plan.lookup(node).cloned()
+                {
+                    let binding = if let Some(existing) =
+                        self.cse_stages.get(&occ.group_id).cloned()
+                    {
+                        existing
+                    } else {
+                        let prev_bypass = self
+                            .bypass_cse_ptr
+                            .replace(std::ptr::from_ref(occ.representative).addr());
+                        let rep_res = self.lower_node(occ.representative, false).await?;
+                        self.bypass_cse_ptr = prev_bypass;
+                        let rep_node = match rep_res {
+                            Ok(n) => n,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                        let sealed = self.seal_into_stage(
+                            rep_node,
+                            Some(format!("cse_{}", occ.group_id)),
+                        )?;
+                        self.cse_stages.insert(occ.group_id, sealed.clone());
+                        sealed
+                    };
+
+                    let source = Source::Stage(StageSource {
+                        stage_id: binding.stage_id,
+                        schema: Arc::clone(&binding.schema),
+                        ordered: binding.ordered,
+                    });
+                    let mut operators = Vec::new();
+                    let mut out_schema = Arc::clone(&binding.schema);
+                    let target_arrow = node.schema().as_arrow();
+                    let rep_arrow = occ.representative.schema().as_arrow();
+                    if let Some(indices) = occ.col_mapping {
+                        let expressions: ProjectionExprs = indices
+                            .iter()
+                            .enumerate()
+                            .map(|(out_idx, &src_idx)| {
+                                let src_field = binding.schema.field(src_idx);
+                                let dst_field = target_arrow.field(out_idx);
+                                ProjectionExpr {
+                                    expr: Arc::new(Column::new(
+                                        src_field.name(),
+                                        src_idx,
+                                    )),
+                                    alias: dst_field.name().clone(),
+                                }
+                            })
+                            .collect();
+                        let projector = expressions.make_projector_with_schema_metadata(
+                            &binding.schema,
+                            target_arrow,
+                        )?;
+                        out_schema = Arc::clone(projector.output_schema());
+                        operators.push(Operator::Projection(projector));
+                    } else if target_arrow != rep_arrow
+                        && target_arrow.fields().len() == binding.schema.fields().len()
+                    {
+                        let expressions: ProjectionExprs = binding
+                            .schema
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, src_field)| {
+                                let dst_field = target_arrow.field(idx);
+                                ProjectionExpr {
+                                    expr: Arc::new(Column::new(src_field.name(), idx)),
+                                    alias: dst_field.name().clone(),
+                                }
+                            })
+                            .collect();
+                        let projector = expressions.make_projector_with_schema_metadata(
+                            &binding.schema,
+                            target_arrow,
+                        )?;
+                        out_schema = Arc::clone(projector.output_schema());
+                        operators.push(Operator::Projection(projector));
+                    }
+                    let ordering =
+                        project_ordering(&binding.schema, binding.ordering, &operators)?;
+                    let base = LoweredNode::Open(Box::new(OpenPipeline {
+                        source,
+                        #[cfg(feature = "parquet")]
+                        parquet_scan_meta: None,
+                        operators,
+                        schema: out_schema,
+                        ordering,
+                    }));
+                    return self.apply_post_nodes(base, post_nodes).await;
+                }
+
                 match node {
                     LogicalPlan::SubqueryAlias(alias) => {
                         node = &alias.input;
@@ -445,8 +547,24 @@ impl DagBuilder<'_> {
                         Ok(n) => n,
                         Err(reason) => return Ok(Err(reason)),
                     };
-                    let binding = self
-                        .seal_into_stage(body_node, Some(format!("cte_{}", cte.name)))?;
+                    let binding = match body_node {
+                        LoweredNode::Open(open)
+                            if open.operators.is_empty()
+                                && matches!(open.source, Source::Stage(_)) =>
+                        {
+                            let Source::Stage(src) = open.source else {
+                                unreachable!()
+                            };
+                            StageBinding {
+                                stage_id: src.stage_id,
+                                schema: open.schema,
+                                ordered: src.ordered,
+                                ordering: open.ordering,
+                            }
+                        }
+                        other => self
+                            .seal_into_stage(other, Some(format!("cte_{}", cte.name)))?,
+                    };
                     let prev = self.cte_stages.insert(
                         cte.id,
                         CteBinding {
@@ -1427,6 +1545,9 @@ impl DagBuilder<'_> {
             let mut next = cur_limit.input.as_ref();
             let mut projs = Vec::new();
             loop {
+                if self.cse_plan.lookup(next).is_some() {
+                    break;
+                }
                 match next {
                     LogicalPlan::SubqueryAlias(alias) => next = &alias.input,
                     LogicalPlan::Projection(p) => {
@@ -1442,6 +1563,11 @@ impl DagBuilder<'_> {
                     }
                     _ => break,
                 }
+            }
+            if self.cse_plan.lookup(next).is_some() {
+                let mut all_post = post_nodes;
+                all_post.extend(between_projections);
+                break (cur_limit.input.as_ref(), all_post);
             }
             match next {
                 LogicalPlan::Limit(inner_limit) => {
