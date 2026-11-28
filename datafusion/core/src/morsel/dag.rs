@@ -362,6 +362,7 @@ pub(super) struct DagRuntime {
     stages: Arc<Vec<StageSpec>>,
     outputs: Vec<Option<Arc<MaterializedStage>>>,
     executed: Vec<bool>,
+    initial_consumer_counts: Vec<usize>,
     remaining_consumers: Vec<usize>,
     memory: Option<Arc<SharedStageMemory>>,
 }
@@ -379,9 +380,18 @@ impl DagRuntime {
             stages,
             outputs: vec![None; n],
             executed: vec![false; n],
+            initial_consumer_counts: consumer_counts.clone(),
             remaining_consumers: consumer_counts,
             memory,
         }
+    }
+
+    pub(super) fn is_shared_stage(&self, stage_id: StageId) -> bool {
+        self.initial_consumer_counts
+            .get(stage_id.0)
+            .copied()
+            .unwrap_or(0)
+            > 1
     }
 
     #[cfg(feature = "parquet")]
@@ -580,7 +590,61 @@ pub(super) fn validate_dag(
         }
     }
 
+    #[cfg(feature = "parquet")]
+    validate_shared_stage_dynamic_filters(stages, &consumer_counts)?;
+
     Ok(consumer_counts)
+}
+
+#[cfg(feature = "parquet")]
+fn collect_pipeline_defined_filter_ids(
+    pipeline: &Pipeline,
+    stages: &[StageSpec],
+    out: &mut HashSet<usize>,
+) {
+    if let Source::Stage(stage_src) = &pipeline.source
+        && let Some(spec) = stages.get(stage_src.stage_id.0)
+    {
+        collect_pipeline_defined_filter_ids(&spec.pipeline, stages, out);
+    }
+    for op in &pipeline.operators {
+        if let Operator::HashProbe(probe) = op {
+            out.insert(probe.filter_id);
+            collect_pipeline_defined_filter_ids(&probe.build_pipeline, stages, out);
+        }
+    }
+}
+
+/// Plan-time safety guard: a multi-consumer shared stage must never have an
+/// external downstream consumer's dynamic join filter bound onto its scans or
+/// upstream stages.
+#[cfg(feature = "parquet")]
+fn validate_shared_stage_dynamic_filters(
+    stages: &[StageSpec],
+    consumer_counts: &[usize],
+) -> Result<()> {
+    for (idx, stage) in stages.iter().enumerate() {
+        if consumer_counts[idx] <= 1 {
+            continue;
+        }
+        let mut allowed_ids = HashSet::new();
+        collect_pipeline_defined_filter_ids(&stage.pipeline, stages, &mut allowed_ids);
+        let mut bound_ids = HashSet::new();
+        super::parquet::collect_pipeline_bound_filter_ids(
+            &stage.pipeline,
+            stages,
+            &mut bound_ids,
+        );
+        for fid in bound_ids {
+            if !allowed_ids.contains(&fid) {
+                return internal_err!(
+                    "Morsel DAG multi-consumer stage {idx} ({}) must not receive external dynamic join filter {fid}",
+                    stage.label
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collect all unique uncorrelated `Expr::ScalarSubquery` subqueries in
@@ -646,7 +710,13 @@ pub(super) fn ensure_stage<'a>(
 
         // Phase 1: run any join build pipelines and ensure upstream stage
         // dependencies before spawning the streaming producer task.
-        let mut stage_filters = published_filters.clone();
+        // Shared stages (consumer_count > 1) must never inherit a single
+        // consumer's dynamic join filters.
+        let mut stage_filters = if dag.is_shared_stage(stage_id) {
+            HashMap::new()
+        } else {
+            published_filters.clone()
+        };
         let Some(prepared) = stage_pipeline
             .prepare_execution(
                 Some(&stage_label),

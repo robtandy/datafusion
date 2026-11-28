@@ -58,6 +58,7 @@ mod adaptive_filter;
 mod aggregate;
 mod batch;
 mod count;
+mod cse;
 mod dag;
 mod fallback;
 mod group_count;
@@ -5860,7 +5861,11 @@ impl MorselExec {
     }
 }
 
-fn display_source(source: &Source, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn display_source(
+    source: &Source,
+    stages: &[StageSpec],
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
     match source {
         Source::Memory(source) => write!(
             f,
@@ -5875,18 +5880,26 @@ fn display_source(source: &Source, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             None => write!(f, "NativeParquet[{}]", source.table),
         },
         Source::Stage(source) => {
-            if source.ordered {
-                write!(f, "StageSource[stage_{}, ordered]", source.stage_id.0)
-            } else {
-                write!(f, "StageSource[stage_{}]", source.stage_id.0)
+            let label = stages.get(source.stage_id.0).map(|s| s.label.as_str());
+            match (label, source.ordered) {
+                (Some(lbl), true) => write!(f, "StageSource[{lbl}, ordered]"),
+                (Some(lbl), false) => write!(f, "StageSource[{lbl}]"),
+                (None, true) => {
+                    write!(f, "StageSource[stage_{}, ordered]", source.stage_id.0)
+                }
+                (None, false) => write!(f, "StageSource[stage_{}]", source.stage_id.0),
             }
         }
     }
 }
 
-fn display_pipeline_body(pipeline: &Pipeline, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    display_build_pipelines(&pipeline.operators, f)?;
-    display_source(&pipeline.source, f)?;
+fn display_pipeline_body(
+    pipeline: &Pipeline,
+    stages: &[StageSpec],
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    display_build_pipelines(&pipeline.operators, stages, f)?;
+    display_source(&pipeline.source, stages, f)?;
     display_operators(&pipeline.operators, f)?;
     match &pipeline.sink {
         Sink::Result => {}
@@ -5965,14 +5978,15 @@ fn display_pipeline_body(pipeline: &Pipeline, f: &mut fmt::Formatter<'_>) -> fmt
 
 fn display_build_pipelines(
     operators: &[Operator],
+    stages: &[StageSpec],
     f: &mut fmt::Formatter<'_>,
 ) -> fmt::Result {
     for operator in operators {
         if let Operator::HashProbe(probe) = operator {
             let bp = &probe.build_pipeline;
-            display_build_pipelines(&bp.operators, f)?;
+            display_build_pipelines(&bp.operators, stages, f)?;
             write!(f, "[Build: ")?;
-            display_source(&bp.source, f)?;
+            display_source(&bp.source, stages, f)?;
             display_operators(&bp.operators, f)?;
             if let Sink::HashJoinBuild(sink) = &bp.sink {
                 write!(f, " -> ")?;
@@ -5989,11 +6003,20 @@ impl DisplayAs for MorselExec {
         let pipeline = &self.pipeline;
         write!(f, "MorselExec: workers={}, ", pipeline.workers)?;
         for stage in self.stages.iter() {
-            write!(f, "[Stage {}: ", stage.label)?;
-            display_pipeline_body(&stage.pipeline, f)?;
+            let consumers = self.consumer_counts.get(stage.id.0).copied().unwrap_or(0);
+            if consumers > 1 {
+                write!(
+                    f,
+                    "[Stage {} (shared, consumers={consumers}): ",
+                    stage.label
+                )?;
+            } else {
+                write!(f, "[Stage {}: ", stage.label)?;
+            }
+            display_pipeline_body(&stage.pipeline, &self.stages, f)?;
             write!(f, "]; ")?;
         }
-        display_pipeline_body(pipeline, f)?;
+        display_pipeline_body(pipeline, &self.stages, f)?;
         if self.is_inline_memory_stream() {
             write!(f, " -> ResultSink[inline]")
         } else {

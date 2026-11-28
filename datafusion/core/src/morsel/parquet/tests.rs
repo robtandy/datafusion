@@ -1114,3 +1114,85 @@ fn is_small_single_file_build_requires_known_bounded_row_count() {
     );
     assert!(!mk_scan(2, 1024, Precision::Exact(50_000)).is_small_single_file_build());
 }
+
+#[test]
+fn validate_dag_rejects_external_dynamic_join_filter_on_shared_stage() {
+    use crate::morsel::SideEstimate;
+    use crate::morsel::dag::{StageId, StageSource, StageSpec, validate_dag};
+
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+    ]));
+    // Simulate a downstream consumer's dynamic join filter (filter_id=42)
+    // illegally leaking onto a 2-consumer shared stage.
+    let pq_scan = ParquetScan {
+        table: "fact".into(),
+        schema: Arc::clone(&schema),
+        config: None,
+        files: Arc::from([]),
+        pushdown_filters: true,
+        bulk_scan_plan: None,
+        dynamic_join_filters: vec![JoinFilterBinding {
+            filter_id: 42,
+            probe_key_exprs: vec![Some(Arc::new(Column::new("k", 0)))],
+            all_keys_bound: true,
+        }],
+        metrics: ExecutionPlanMetricsSet::new(),
+    };
+
+    let est = SideEstimate {
+        is_empty: false,
+        mem_rows: Some(10),
+        approx_bytes: 80,
+    };
+    let shared_stage = StageSpec {
+        id: StageId(0),
+        label: "cse_0".into(),
+        pipeline: Arc::new(Pipeline {
+            source: Source::Parquet(pq_scan),
+            operators: vec![],
+            workers: NonZeroUsize::new(2).unwrap(),
+            sink: Sink::Result,
+            sink_capacity: 2,
+        }),
+        output_schema: Arc::clone(&schema),
+        estimate: est,
+        dependencies: vec![],
+    };
+    let consumer_stage = StageSpec {
+        id: StageId(1),
+        label: "consumer_1".into(),
+        pipeline: Arc::new(Pipeline {
+            source: Source::Stage(StageSource {
+                stage_id: StageId(0),
+                schema: Arc::clone(&schema),
+                ordered: false,
+            }),
+            operators: vec![],
+            workers: NonZeroUsize::new(2).unwrap(),
+            sink: Sink::Result,
+            sink_capacity: 2,
+        }),
+        output_schema: Arc::clone(&schema),
+        estimate: est,
+        dependencies: vec![StageId(0)],
+    };
+    let root = Pipeline {
+        source: Source::Stage(StageSource {
+            stage_id: StageId(0),
+            schema: Arc::clone(&schema),
+            ordered: false,
+        }),
+        operators: vec![],
+        workers: NonZeroUsize::new(2).unwrap(),
+        sink: Sink::Result,
+        sink_capacity: 2,
+    };
+
+    let err = validate_dag(&[shared_stage, consumer_stage], None, &root).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must not receive external dynamic join filter 42"),
+        "expected external dynamic filter rejection on shared stage, got: {err}"
+    );
+}

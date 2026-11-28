@@ -1086,7 +1086,7 @@ class TpchHarnessTest(unittest.TestCase):
                 morsel_ev[("q13", "morsel_no_pushdown")]["group_count_finalizations"], 1
             )
             self.assertEqual(
-                morsel_ev[("q15", "morsel_no_pushdown")]["aggregate_finalizations"], 3
+                morsel_ev[("q15", "morsel_no_pushdown")]["aggregate_finalizations"], 2
             )
             self.assertEqual(
                 morsel_ev[("q21", "morsel_no_pushdown")]["parquet_morsels_claimed"], 58

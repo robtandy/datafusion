@@ -4,7 +4,7 @@
 
 //! Recursive logical-to-morsel-DAG planner (`MorselQueryPlanner`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -26,12 +26,17 @@ use datafusion_expr::logical_plan::{
 use datafusion_expr::physical_planning_context::{
     PhysicalPlanningContext, ScalarSubqueryResults, SubqueryIndex,
 };
-use datafusion_expr::{ColumnarValue, Expr, FetchType, LogicalPlan, SkipType, Subquery};
+use datafusion_expr::{
+    ColumnarValue, Expr, FetchType, LogicalPlan, Operator as ExprOperator, SkipType,
+    Subquery,
+};
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, InListExpr, Literal};
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
 use datafusion_physical_expr::{
-    EquivalenceProperties, LexOrdering, create_physical_expr, create_physical_sort_exprs,
+    EquivalenceProperties, LexOrdering, PhysicalExpr, create_physical_expr,
+    create_physical_sort_exprs,
 };
 use datafusion_physical_plan::joins::utils::build_join_schema;
 use datafusion_session::Session;
@@ -40,6 +45,7 @@ use crate::datasource::{MemTable, source_as_provider};
 
 use super::aggregate::{self, AggregateSink};
 use super::count::{self, CountSink};
+use super::cse::{CseOccurrence, CsePlan};
 use super::dag::{
     ScalarSubquerySpec, ScalarSubqueryState, StageId, StageSource, StageSpec,
     collect_pipeline_stage_deps, collect_scalar_subqueries_post_order,
@@ -114,6 +120,7 @@ struct CteBinding {
     ordering: Option<LexOrdering>,
 }
 
+#[derive(Clone)]
 struct StageBinding {
     stage_id: StageId,
     schema: SchemaRef,
@@ -121,12 +128,16 @@ struct StageBinding {
     ordering: Option<LexOrdering>,
 }
 
-struct DagBuilder<'a> {
+struct DagBuilder<'a, 'plan> {
     workers: NonZeroUsize,
     session: &'a dyn Session,
     planning_ctx: PhysicalPlanningContext,
     stages: Vec<StageSpec>,
     cte_stages: HashMap<MaterializedCteId, CteBinding>,
+    cse_plan: CsePlan<'plan>,
+    cse_stages: HashMap<usize, StageBinding>,
+    rejected_cse_groups: HashSet<usize>,
+    bypass_cse_ptr: Option<usize>,
     lowered_subqueries: Vec<bool>,
     scalar_subquery_specs: Vec<ScalarSubquerySpec>,
     next_filter_id: usize,
@@ -138,6 +149,7 @@ impl MorselQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Lowering> {
+        let cse_plan = CsePlan::analyze(plan);
         let all_subqueries = collect_scalar_subqueries_post_order(plan);
         let num_subqueries = all_subqueries.len();
         let results = ScalarSubqueryResults::new(num_subqueries);
@@ -160,6 +172,10 @@ impl MorselQueryPlanner {
             planning_ctx,
             stages: Vec::new(),
             cte_stages: HashMap::new(),
+            cse_plan,
+            cse_stages: HashMap::new(),
+            rejected_cse_groups: HashSet::new(),
+            bypass_cse_ptr: None,
             lowered_subqueries,
             scalar_subquery_specs: Vec::new(),
             next_filter_id: 0,
@@ -260,7 +276,284 @@ fn project_ordering(
     Ok(eq.output_ordering())
 }
 
-impl DagBuilder<'_> {
+/// Unconditional tiny-stage budget for blocking stages (e.g. small unit-test
+/// aggregates) under filtered outer joins; non-blocking joins under filtered
+/// outer joins always require genuine internal selectivity (`<= 30%`).
+const CSE_TINY_BLOCKING_BYTES: u64 = 64 * 1024;
+/// Per-saved-consumer materialized output budget (16 MiB per saved scan, capped
+/// at 128 MiB) for CSE candidates under filtered outer joins.
+const CSE_PER_SAVED_CONSUMER_BYTES: u64 = 16 * 1024 * 1024;
+const CSE_MAX_UNDER_FILTERED_JOIN_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum internal selectivity (<= 30%) required to materialize a CSE
+/// candidate when consumers sit under filtered outer joins.
+const CSE_MAX_SELECTIVITY_UNDER_FILTERED_JOIN: f64 = 0.30;
+
+fn estimate_schema_row_bytes(schema: &SchemaRef) -> u64 {
+    let bytes: u64 = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+            DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
+            DataType::Int32
+            | DataType::UInt32
+            | DataType::Float32
+            | DataType::Date32
+            | DataType::Time32(_) => 4,
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Date64
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_) => 8,
+            DataType::Decimal128(_, _) | DataType::Interval(_) => 16,
+            DataType::Decimal256(_, _) => 32,
+            DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView => 24,
+            _ => 16,
+        })
+        .sum();
+    bytes.max(4)
+}
+
+fn is_trivially_true_physical_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if let Some(lit) = expr.downcast_ref::<Literal>() {
+        return matches!(lit.value(), ScalarValue::Boolean(Some(true)));
+    }
+    if let Some(bin) = expr.downcast_ref::<BinaryExpr>()
+        && *bin.op() == ExprOperator::And
+    {
+        return is_trivially_true_physical_expr(bin.left())
+            && is_trivially_true_physical_expr(bin.right());
+    }
+    false
+}
+
+fn is_const_equality(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let Some(bin) = expr.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    if *bin.op() != ExprOperator::Eq {
+        return false;
+    }
+    let l = collect_columns(bin.left()).len();
+    let r = collect_columns(bin.right()).len();
+    (l == 1 && r == 0) || (l == 0 && r == 1)
+}
+
+fn branch_has_const_equality(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    split_conjunction(expr).into_iter().any(is_const_equality)
+}
+
+fn is_or_of_const_equalities(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let Some(bin) = expr.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    if *bin.op() != ExprOperator::Or {
+        return false;
+    }
+    let check_side = |side: &Arc<dyn PhysicalExpr>| {
+        branch_has_const_equality(side) || is_or_of_const_equalities(side)
+    };
+    check_side(bin.left()) && check_side(bin.right())
+}
+
+fn estimate_non_interval_conjunct_selectivity(expr: &Arc<dyn PhysicalExpr>) -> f64 {
+    if is_trivially_true_physical_expr(expr) {
+        1.0
+    } else if is_const_equality(expr) {
+        0.15
+    } else if expr.is::<InListExpr>() || is_or_of_const_equalities(expr) {
+        0.25
+    } else {
+        0.50
+    }
+}
+
+fn estimate_pipeline_selectivity(source: &Source, operators: &[Operator]) -> f64 {
+    let mut sel = 1.0_f64;
+
+    let mut leading_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+    let mut first_join_idx = operators.len();
+    for (idx, op) in operators.iter().enumerate() {
+        match op {
+            Operator::Filter { predicate, .. } => {
+                leading_filters.push(Arc::clone(predicate));
+            }
+            Operator::HashProbe(_) => {
+                first_join_idx = idx;
+                break;
+            }
+            Operator::Projection(_) => {}
+        }
+    }
+
+    #[cfg(feature = "parquet")]
+    if let Source::Parquet(pq) = source {
+        let (interval_sel, remaining) =
+            pq.analyze_interval_selectivity_inclusive(&leading_filters);
+        if let Some(s) = interval_sel {
+            sel *= s.clamp(1e-6, 1.0);
+        }
+        for pred in &remaining {
+            for c in split_conjunction(pred) {
+                sel *= estimate_non_interval_conjunct_selectivity(c);
+            }
+        }
+    } else {
+        for pred in &leading_filters {
+            for c in split_conjunction(pred) {
+                sel *= estimate_non_interval_conjunct_selectivity(c);
+            }
+        }
+    }
+    #[cfg(not(feature = "parquet"))]
+    {
+        let _ = source;
+        for pred in &leading_filters {
+            for c in split_conjunction(pred) {
+                sel *= estimate_non_interval_conjunct_selectivity(c);
+            }
+        }
+    }
+
+    for op in &operators[first_join_idx..] {
+        match op {
+            Operator::Filter { predicate, .. } => {
+                for c in split_conjunction(predicate) {
+                    sel *= estimate_non_interval_conjunct_selectivity(c);
+                }
+            }
+            Operator::HashProbe(probe)
+                if matches!(
+                    probe.kind,
+                    ProbeJoinKind::Inner
+                        | ProbeJoinKind::ProbeSemi
+                        | ProbeJoinKind::BuildSemi
+                ) =>
+            {
+                let build_sel = estimate_pipeline_selectivity(
+                    &probe.build_pipeline.source,
+                    &probe.build_pipeline.operators,
+                );
+                sel *= build_sel;
+            }
+            _ => {}
+        }
+    }
+
+    sel.clamp(1e-6, 1.0)
+}
+
+fn estimate_open_cse_materialization(
+    source: &Source,
+    operators: &[Operator],
+    output_schema: &SchemaRef,
+    stages: &[StageSpec],
+) -> Option<(u64, f64)> {
+    let sel = estimate_pipeline_selectivity(source, operators);
+    let base_bytes = match source {
+        Source::Memory(mem) => {
+            let rows: usize = mem.batches.iter().map(RecordBatch::num_rows).sum();
+            let row_bytes = estimate_schema_row_bytes(output_schema);
+            (rows as u64).saturating_mul(row_bytes)
+        }
+        #[cfg(feature = "parquet")]
+        Source::Parquet(pq) => {
+            if pq.is_empty() {
+                return Some((0, 0.0));
+            }
+            let out_width = estimate_schema_row_bytes(output_schema);
+            if let Some(rows) = pq.known_num_rows() {
+                (rows as u64).saturating_mul(out_width)
+            } else {
+                let file_bytes = pq.total_file_bytes();
+                if file_bytes == 0 {
+                    return None;
+                }
+                let file_width =
+                    estimate_schema_row_bytes(pq.file_schema()).max(out_width);
+                file_bytes.saturating_mul(out_width) / file_width
+            }
+        }
+        Source::Stage(stage_src) => {
+            let est = stages.get(stage_src.stage_id.0)?.estimate;
+            if let Some(rows) = est.mem_rows {
+                (rows as u64).saturating_mul(estimate_schema_row_bytes(output_schema))
+            } else {
+                est.approx_bytes
+            }
+        }
+    };
+    let est_bytes = ((base_bytes as f64) * sel).round() as u64;
+    Some((est_bytes, sel))
+}
+
+impl DagBuilder<'_, '_> {
+    fn estimate_cse_materialization(&self, node: &LoweredNode) -> Option<(u64, f64)> {
+        match node {
+            LoweredNode::Open(open) => estimate_open_cse_materialization(
+                &open.source,
+                &open.operators,
+                &open.schema,
+                &self.stages,
+            ),
+            LoweredNode::Blocking(blocking) => {
+                if matches!(blocking.sink, Sink::Count { .. })
+                    || matches!(&blocking.sink, Sink::Aggregate { sink, .. } if !sink.is_grouped())
+                {
+                    return Some((64, 0.0));
+                }
+                let (input_bytes, sel) = estimate_open_cse_materialization(
+                    &blocking.source,
+                    &blocking.operators,
+                    blocking.source.schema(),
+                    &self.stages,
+                )?;
+                Some((input_bytes.max(blocking.estimate.approx_bytes), sel))
+            }
+        }
+    }
+
+    fn should_share_cse_node(&self, node: &LoweredNode, occ: &CseOccurrence<'_>) -> bool {
+        if !occ.any_under_filtered_outer_join {
+            return true;
+        }
+        // When at least one consumer of a blocking stage is unfiltered (e.g.
+        // TPC-DS Q1/Q30/Q81 `AVG` subquery), that consumer already scans and
+        // materializes 100% of the blocking result, so sharing never increases
+        // bytes scanned or peak memory.
+        if !occ.all_under_filtered_outer_join && matches!(node, LoweredNode::Blocking(_))
+        {
+            return true;
+        }
+        let Some((est_bytes, sel)) = self.estimate_cse_materialization(node) else {
+            return false;
+        };
+        if matches!(node, LoweredNode::Blocking(_))
+            && est_bytes <= CSE_TINY_BLOCKING_BYTES
+        {
+            return true;
+        }
+        if sel > CSE_MAX_SELECTIVITY_UNDER_FILTERED_JOIN {
+            return false;
+        }
+        match node {
+            LoweredNode::Blocking(_) => est_bytes <= CSE_PER_SAVED_CONSUMER_BYTES,
+            LoweredNode::Open(_) => {
+                let saved = occ.consumer_count.saturating_sub(1).max(1) as u64;
+                let max_bytes = CSE_PER_SAVED_CONSUMER_BYTES
+                    .saturating_mul(saved)
+                    .min(CSE_MAX_UNDER_FILTERED_JOIN_BYTES);
+                est_bytes <= max_bytes
+            }
+        }
+    }
     fn ensure_expr_scalar_subqueries<'b>(
         &'b mut self,
         expr: &'b Expr,
@@ -337,6 +630,137 @@ impl DagBuilder<'_> {
             let mut post_nodes: Vec<&'b LogicalPlan> = Vec::new();
             let mut node = plan;
             loop {
+                let node_ptr = std::ptr::from_ref(node).addr();
+                if self.bypass_cse_ptr != Some(node_ptr)
+                    && let Some(occ) = self.cse_plan.lookup(node).cloned()
+                    && !self.rejected_cse_groups.contains(&occ.group_id)
+                {
+                    let binding = if let Some(existing) =
+                        self.cse_stages.get(&occ.group_id).cloned()
+                    {
+                        existing
+                    } else {
+                        let is_rep = std::ptr::eq(node, occ.representative);
+                        let stages_before = self.stages.len();
+                        let sq_before = self.scalar_subquery_specs.len();
+                        let target_to_lower =
+                            if is_rep || !occ.any_under_filtered_outer_join {
+                                occ.representative
+                            } else {
+                                node
+                            };
+                        let prev_bypass = self
+                            .bypass_cse_ptr
+                            .replace(std::ptr::from_ref(target_to_lower).addr());
+                        let lowered_res = self.lower_node(target_to_lower, false).await?;
+                        self.bypass_cse_ptr = prev_bypass;
+                        let lowered_node = match lowered_res {
+                            Ok(n) => n,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+
+                        if !self.should_share_cse_node(&lowered_node, &occ) {
+                            self.rejected_cse_groups.insert(occ.group_id);
+                            return self.apply_post_nodes(lowered_node, post_nodes).await;
+                        }
+
+                        let rep_node =
+                            if std::ptr::eq(target_to_lower, occ.representative) {
+                                lowered_node
+                            } else if self.stages.len() == stages_before
+                                && self.scalar_subquery_specs.len() == sq_before
+                            {
+                                let prev_bypass = self.bypass_cse_ptr.replace(
+                                    std::ptr::from_ref(occ.representative).addr(),
+                                );
+                                let rep_res =
+                                    self.lower_node(occ.representative, false).await?;
+                                self.bypass_cse_ptr = prev_bypass;
+                                match rep_res {
+                                    Ok(n) => n,
+                                    Err(reason) => return Ok(Err(reason)),
+                                }
+                            } else {
+                                self.rejected_cse_groups.insert(occ.group_id);
+                                return self
+                                    .apply_post_nodes(lowered_node, post_nodes)
+                                    .await;
+                            };
+                        let sealed = self.seal_into_stage(
+                            rep_node,
+                            Some(format!("cse_{}", occ.group_id)),
+                        )?;
+                        self.cse_stages.insert(occ.group_id, sealed.clone());
+                        sealed
+                    };
+
+                    let source = Source::Stage(StageSource {
+                        stage_id: binding.stage_id,
+                        schema: Arc::clone(&binding.schema),
+                        ordered: binding.ordered,
+                    });
+                    let mut operators = Vec::new();
+                    let mut out_schema = Arc::clone(&binding.schema);
+                    let target_arrow = node.schema().as_arrow();
+                    let rep_arrow = occ.representative.schema().as_arrow();
+                    if let Some(indices) = occ.col_mapping {
+                        let expressions: ProjectionExprs = indices
+                            .iter()
+                            .enumerate()
+                            .map(|(out_idx, &src_idx)| {
+                                let src_field = binding.schema.field(src_idx);
+                                let dst_field = target_arrow.field(out_idx);
+                                ProjectionExpr {
+                                    expr: Arc::new(Column::new(
+                                        src_field.name(),
+                                        src_idx,
+                                    )),
+                                    alias: dst_field.name().clone(),
+                                }
+                            })
+                            .collect();
+                        let projector = expressions.make_projector_with_schema_metadata(
+                            &binding.schema,
+                            target_arrow,
+                        )?;
+                        out_schema = Arc::clone(projector.output_schema());
+                        operators.push(Operator::Projection(projector));
+                    } else if target_arrow != rep_arrow
+                        && target_arrow.fields().len() == binding.schema.fields().len()
+                    {
+                        let expressions: ProjectionExprs = binding
+                            .schema
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, src_field)| {
+                                let dst_field = target_arrow.field(idx);
+                                ProjectionExpr {
+                                    expr: Arc::new(Column::new(src_field.name(), idx)),
+                                    alias: dst_field.name().clone(),
+                                }
+                            })
+                            .collect();
+                        let projector = expressions.make_projector_with_schema_metadata(
+                            &binding.schema,
+                            target_arrow,
+                        )?;
+                        out_schema = Arc::clone(projector.output_schema());
+                        operators.push(Operator::Projection(projector));
+                    }
+                    let ordering =
+                        project_ordering(&binding.schema, binding.ordering, &operators)?;
+                    let base = LoweredNode::Open(Box::new(OpenPipeline {
+                        source,
+                        #[cfg(feature = "parquet")]
+                        parquet_scan_meta: None,
+                        operators,
+                        schema: out_schema,
+                        ordering,
+                    }));
+                    return self.apply_post_nodes(base, post_nodes).await;
+                }
+
                 match node {
                     LogicalPlan::SubqueryAlias(alias) => {
                         node = &alias.input;
@@ -445,8 +869,24 @@ impl DagBuilder<'_> {
                         Ok(n) => n,
                         Err(reason) => return Ok(Err(reason)),
                     };
-                    let binding = self
-                        .seal_into_stage(body_node, Some(format!("cte_{}", cte.name)))?;
+                    let binding = match body_node {
+                        LoweredNode::Open(open)
+                            if open.operators.is_empty()
+                                && matches!(open.source, Source::Stage(_)) =>
+                        {
+                            let Source::Stage(src) = open.source else {
+                                unreachable!()
+                            };
+                            StageBinding {
+                                stage_id: src.stage_id,
+                                schema: open.schema,
+                                ordered: src.ordered,
+                                ordering: open.ordering,
+                            }
+                        }
+                        other => self
+                            .seal_into_stage(other, Some(format!("cte_{}", cte.name)))?,
+                    };
                     let prev = self.cte_stages.insert(
                         cte.id,
                         CteBinding {
@@ -1427,6 +1867,11 @@ impl DagBuilder<'_> {
             let mut next = cur_limit.input.as_ref();
             let mut projs = Vec::new();
             loop {
+                if let Some(occ) = self.cse_plan.lookup(next)
+                    && !self.rejected_cse_groups.contains(&occ.group_id)
+                {
+                    break;
+                }
                 match next {
                     LogicalPlan::SubqueryAlias(alias) => next = &alias.input,
                     LogicalPlan::Projection(p) => {
@@ -1442,6 +1887,13 @@ impl DagBuilder<'_> {
                     }
                     _ => break,
                 }
+            }
+            if let Some(occ) = self.cse_plan.lookup(next)
+                && !self.rejected_cse_groups.contains(&occ.group_id)
+            {
+                let mut all_post = post_nodes;
+                all_post.extend(between_projections);
+                break (cur_limit.input.as_ref(), all_post);
             }
             match next {
                 LogicalPlan::Limit(inner_limit) => {

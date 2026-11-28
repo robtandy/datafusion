@@ -1020,6 +1020,14 @@ async fn tpch_all_22_queries_native_required_parity() -> Result<()> {
                     "TPC-H Q{q} expected MorselExec, got:\n{}",
                     displayable(native_plan.as_ref()).indent(true)
                 );
+                if q == 11 || q == 15 {
+                    let explain =
+                        displayable(native_plan.as_ref()).indent(false).to_string();
+                    assert!(
+                        explain.contains("(shared, consumers=2)"),
+                        "TPC-H Q{q} expected shared CSE stage, got:\n{explain}"
+                    );
+                }
 
                 let expected = collect(Arc::clone(&stock_plan), stock.task_ctx()).await?;
                 let actual = collect(Arc::clone(&native_plan), native.task_ctx()).await?;
