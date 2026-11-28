@@ -21,8 +21,8 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_datasource_parquet::{
-    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, RowFilterSkipPredicate,
-    file_format::ParquetFormat, source::ParquetSource,
+    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
+    RowFilterSkipPredicate, file_format::ParquetFormat, source::ParquetSource,
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::expr_rewriter::unnormalize_cols;
@@ -45,12 +45,14 @@ use crate::datasource::listing::ListingTable;
 
 use super::adaptive_filter::{self, CompiledFilter};
 use super::dag::{ScalarSubqueryState, StageSpec, count_dag_stage_refs};
-use super::hash_join::{JoinOutputCol, ProbeJoinKind};
+use super::hash_join::{JoinOutputCol, KeyKind, ProbeJoinKind};
 use super::join_filter::{
     BoundJoinPredicates, DynamicJoinFilterConfig, DynamicJoinFilterData,
     JoinBloomFilterExpr, JoinFilterBinding, JoinMembershipFilter,
+    MAX_REGISTER_BLOOM_ROWS,
 };
 use super::metrics::RunMetrics;
+use super::radix_join::RADIX_JOIN_THRESHOLD_ROWS;
 use super::{Operator, Pipeline, PostSort, Sink, Source, WorkerState, supported_expr};
 
 mod ready;
@@ -703,6 +705,225 @@ impl ParquetScan {
         false
     }
 
+    /// Returns `true` when a dynamic-only scan over fixed-width columns probes
+    /// small build table(s) (`<= 16,384` entries, e.g. L1/L2 `ArrayMap` /
+    /// `SingleHashTable`) whose domain selectivity (`> 2%`) is too dense for
+    /// Parquet `RowSelection` to skip compressed pages (e.g. TPC-H Q11
+    /// `partsupp`). In this regime, contiguous `BulkDecode` directly into
+    /// `HashJoinProbe` avoids two-phase I/O, Bloom evaluation, and fragmented
+    /// `RowSelection` decoding.
+    fn should_force_bulk_dynamic_small_build(
+        &self,
+        parquet: &ParquetSource,
+        published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
+    ) -> bool {
+        let Some(config) = &self.config else {
+            return false;
+        };
+        if self
+            .bulk_scan_plan
+            .as_ref()
+            .is_some_and(|p| !p.pushed_static_preds.is_empty())
+        {
+            return false;
+        }
+        if !self
+            .schema
+            .fields()
+            .iter()
+            .all(|f| fixed_type_byte_width(f.data_type()).is_some())
+        {
+            return false;
+        }
+        let Some(pred) = parquet.exact_filter() else {
+            return false;
+        };
+        let pred_cols: HashSet<String> = collect_columns(&pred)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        let has_non_pred_payload = self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| !pred_cols.contains(f.name()));
+        if !has_non_pred_payload {
+            return false;
+        }
+        let file_schema = config.file_schema();
+        let stats = config.statistics();
+        if stats.column_statistics.len() != file_schema.fields().len() {
+            return false;
+        }
+        let mut saw_binding = false;
+        for binding in &self.dynamic_join_filters {
+            let Some(filter_data) = published_filters.get(&binding.filter_id) else {
+                continue;
+            };
+            if !binding.all_keys_bound
+                || binding.probe_key_exprs.len() != 1
+                || filter_data.build_entries == 0
+                || filter_data.build_entries > 16_384
+                || filter_data.null_equality != NullEquality::NullEqualsNothing
+                || !matches!(
+                    filter_data.membership,
+                    JoinMembershipFilter::Bloom(_) | JoinMembershipFilter::InList(_)
+                )
+            {
+                return false;
+            }
+            let Some(col) = binding.probe_key_exprs[0]
+                .as_ref()
+                .and_then(|e| e.downcast_ref::<Column>())
+            else {
+                return false;
+            };
+            let Ok(file_idx) = file_schema.index_of(col.name()) else {
+                return false;
+            };
+            let cs = &stats.column_statistics[file_idx];
+            let Some(span) =
+                scalar_integer_span(cs.min_value.get_value(), cs.max_value.get_value())
+            else {
+                return false;
+            };
+            if span < 100.0 || (filter_data.build_entries as f64 / span) <= 0.02 {
+                return false;
+            }
+            saw_binding = true;
+        }
+        saw_binding
+    }
+
+    /// Returns `true` when every projected column is fixed-width and already
+    /// referenced by pushed predicates (`non_pred_payload_cols == 0`), and
+    /// every pushed dynamic join filter is a flat-int Bloom filter whose build
+    /// table has an L2-resident `RegisterBloom64` prefilter (`16,384 < rows <=
+    /// 524,288`, e.g. TPC-H Q4 `lineitem` and Q22 `orders`). In this regime,
+    /// `RowFilter` cannot skip any non-predicate column, while `BulkDecode` +
+    /// fused in-join `RegisterBloom64` avoids multi-phase I/O, `BooleanArray`
+    /// allocation, and `RowSelection` decode overhead.
+    fn should_force_bulk_dynamic_all_pred_radix(
+        &self,
+        parquet: &ParquetSource,
+        published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
+    ) -> bool {
+        let Some(pred) = parquet.exact_filter() else {
+            return false;
+        };
+        if !self
+            .schema
+            .fields()
+            .iter()
+            .all(|f| fixed_type_byte_width(f.data_type()).is_some())
+        {
+            return false;
+        }
+        let pred_cols: HashSet<String> = collect_columns(&pred)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        let has_non_pred_payload = self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| !pred_cols.contains(f.name()));
+        if has_non_pred_payload {
+            return false;
+        }
+        let mut saw_binding = false;
+        for binding in &self.dynamic_join_filters {
+            let Some(filter_data) = published_filters.get(&binding.filter_id) else {
+                continue;
+            };
+            let flat_int_key = matches!(
+                filter_data.key_kind,
+                KeyKind::Int32
+                    | KeyKind::Int64
+                    | KeyKind::UInt32
+                    | KeyKind::UInt64
+                    | KeyKind::Int32Pair
+                    | KeyKind::Int64Pair
+            );
+            if !flat_int_key
+                || filter_data.null_equality != NullEquality::NullEqualsNothing
+                || !matches!(filter_data.membership, JoinMembershipFilter::Bloom(_))
+                || filter_data.build_entries <= RADIX_JOIN_THRESHOLD_ROWS
+                || filter_data.build_entries > MAX_REGISTER_BLOOM_ROWS
+            {
+                return false;
+            }
+            saw_binding = true;
+        }
+        saw_binding
+    }
+
+    /// Returns `true` for a static-only scan where multi-column predicates
+    /// already decode >= 75% of the projected row width and every remaining
+    /// non-predicate payload column is narrow fixed-width (e.g. TPC-H Q16
+    /// `part`, where `p_brand`/`p_type`/`p_size` are predicate columns and only
+    /// 8-byte `p_partkey` is skipped by `RowFilter`).
+    fn should_force_bulk_narrow_static_payload(&self, parquet: &ParquetSource) -> bool {
+        if self.bulk_scan_plan.is_none() {
+            return false;
+        }
+        let Some(pred) = parquet.exact_filter() else {
+            return false;
+        };
+        let pred_cols: HashSet<String> = collect_columns(&pred)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        if pred_cols.len() < 2 || expr_contains_equality(&pred) {
+            return false;
+        }
+        let mut pred_weight = 0usize;
+        let mut non_pred_weight = 0usize;
+        let mut non_pred_cols = 0usize;
+        for field in self.schema.fields() {
+            let dt = field.data_type();
+            if pred_cols.contains(field.name()) {
+                pred_weight = pred_weight.saturating_add(estimated_col_weight(dt));
+            } else {
+                let Some(w) = fixed_type_byte_width(dt) else {
+                    return false;
+                };
+                non_pred_weight = non_pred_weight.saturating_add(w);
+                non_pred_cols += 1;
+            }
+        }
+        non_pred_cols > 0 && non_pred_weight.saturating_mul(3) < pred_weight
+    }
+
+    /// Returns `true` when this Parquet scan reads a single small file
+    /// (`<= 8 MiB` compressed and `<= 131,072` rows when row statistics are
+    /// present), typically a 1-row-group dimension table (`supplier`, `nation`,
+    /// `region`).
+    pub(super) fn is_small_single_file_build(&self) -> bool {
+        if self.files.len() != 1 {
+            return false;
+        }
+        let total_bytes: u64 = self.files.iter().map(|f| f.object_meta.size).sum();
+        if total_bytes > 8 * 1024 * 1024 {
+            return false;
+        }
+        self.config
+            .as_ref()
+            .and_then(|c| c.statistics().num_rows.get_value().copied())
+            .is_none_or(|rows| rows <= 131_072)
+    }
+
+    pub(super) fn effective_build_workers(
+        &self,
+        max_workers: NonZeroUsize,
+    ) -> NonZeroUsize {
+        if self.files.is_empty() || self.is_small_single_file_build() {
+            NonZeroUsize::MIN
+        } else {
+            max_workers
+        }
+    }
+
     fn should_prefer_rf_wave1(&self, parquet: &ParquetSource) -> bool {
         if self.bulk_scan_plan.is_none() {
             return false;
@@ -904,12 +1125,48 @@ impl ParquetScan {
 
         let prefer_rf_wave1 =
             can_adapt && !pushed_dynamic_filter && self.should_prefer_rf_wave1(parquet);
-        let ready_capacity =
-            if has_pushed_filter && (pushed_dynamic_filter || prefer_rf_wave1) {
-                read_ahead.saturating_mul(2).min(MAX_READ_AHEAD)
-            } else {
-                read_ahead
-            };
+
+        let mut adaptive_cfg_opt = can_adapt.then(|| {
+            context
+                .session_config()
+                .get_extension::<AdaptiveRowFilterConfig>()
+                .map(|c| (*c).clone())
+                .unwrap_or_default()
+        });
+        if let Some(cfg) = adaptive_cfg_opt.as_mut()
+            && cfg.mode == AdaptiveRowFilterMode::Adaptive
+            && cfg.test_mode_costs_ns_per_row.is_none()
+        {
+            let force_bulk_dynamic = pushed_dynamic_filter
+                && (self
+                    .should_force_bulk_dynamic_small_build(parquet, published_filters)
+                    || self.should_force_bulk_dynamic_all_pred_radix(
+                        parquet,
+                        published_filters,
+                    ));
+            let force_bulk_static = !pushed_dynamic_filter
+                && !prefer_rf_wave1
+                && self.should_force_bulk_narrow_static_payload(parquet);
+            if force_bulk_dynamic || force_bulk_static {
+                cfg.mode = AdaptiveRowFilterMode::ForceBulk;
+            }
+        }
+        let is_force_bulk = adaptive_cfg_opt
+            .as_ref()
+            .is_some_and(|c| c.mode == AdaptiveRowFilterMode::ForceBulk);
+        let skip_bulk_probe = can_adapt
+            && !is_force_bulk
+            && pushed_dynamic_filter
+            && self.has_selective_dynamic_bloom(parquet, published_filters);
+
+        let ready_capacity = if has_pushed_filter
+            && !is_force_bulk
+            && (pushed_dynamic_filter || prefer_rf_wave1)
+        {
+            read_ahead.saturating_mul(2).min(MAX_READ_AHEAD)
+        } else {
+            read_ahead
+        };
         let (publish, phase2, ready) = ready::channel(
             ready_capacity,
             measurement.cloned(),
@@ -917,19 +1174,12 @@ impl ParquetScan {
             bulk_filter_plan,
         );
 
-        let adaptive_ctx = can_adapt.then(|| {
-            let adaptive_cfg = context
-                .session_config()
-                .get_extension::<AdaptiveRowFilterConfig>()
-                .map(|c| (*c).clone())
-                .unwrap_or_default();
+        let adaptive_ctx = adaptive_cfg_opt.map(|adaptive_cfg| {
             let bulk_proj = self.bulk_scan_plan.as_ref().and_then(|plan| {
                 plan.bulk_projection
                     .as_ref()
                     .map(|proj| (proj.clone(), Arc::clone(&plan.bulk_schema)))
             });
-            let skip_bulk_probe = pushed_dynamic_filter
-                && self.has_selective_dynamic_bloom(parquet, published_filters);
             let mut ctx = AdaptiveRowFilterContext::new(
                 adaptive_cfg,
                 self.files.len(),
@@ -965,7 +1215,7 @@ impl ParquetScan {
                 Ok(WorkerState::None)
             });
         }
-        if has_pushed_filter && !self.files.is_empty() {
+        if has_pushed_filter && !is_force_bulk && !self.files.is_empty() {
             // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
             // by workers so workers never await object-store I/O.
             for _ in 0..read_ahead {
@@ -979,6 +1229,48 @@ impl ParquetScan {
         }
         Ok(ready)
     }
+}
+
+fn fixed_type_byte_width(dt: &arrow::datatypes::DataType) -> Option<usize> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_) => Some(4),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => Some(8),
+        DataType::Decimal128(_, _) => Some(16),
+        DataType::Decimal256(_, _) => Some(32),
+        DataType::FixedSizeBinary(n) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+fn estimated_col_weight(dt: &arrow::datatypes::DataType) -> usize {
+    fixed_type_byte_width(dt).unwrap_or(32)
+}
+
+fn expr_contains_equality(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|node| {
+        if let Some(bin) = node.downcast_ref::<BinaryExpr>()
+            && matches!(bin.op(), ExprOperator::Eq | ExprOperator::IsNotDistinctFrom)
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn scalar_integer_span(
