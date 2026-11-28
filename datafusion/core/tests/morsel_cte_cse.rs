@@ -1399,3 +1399,295 @@ async fn trivially_true_union_tag_filter_does_not_materialize_unfiltered_join_un
     wait_for_zero_reserved(&pool).await;
     Ok(())
 }
+
+fn build_selective_year_sales_fixture(
+    rows_per_year: usize,
+) -> Result<(TempDir, String, String, String)> {
+    let dir = TempDir::new()?;
+
+    let cust_schema = Arc::new(Schema::new(vec![
+        Field::new("c_customer_sk", DataType::Int64, false),
+        Field::new("c_customer_id", DataType::Utf8, false),
+    ]));
+    let cust_batch = RecordBatch::try_new(
+        cust_schema,
+        vec![
+            Arc::new(Int64Array::from((1..=200).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                (1..=200)
+                    .map(|i| format!("CUSTOMER_IDENTIFIER_{i:04}"))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    // 10 years (2000..=2009), 10 date keys per year -> 100 date_dim rows.
+    let date_schema = Arc::new(Schema::new(vec![
+        Field::new("d_date_sk", DataType::Int64, false),
+        Field::new("d_year", DataType::Int32, false),
+    ]));
+    let date_batch = RecordBatch::try_new(
+        date_schema,
+        vec![
+            Arc::new(Int64Array::from((0..100).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(Int32Array::from(
+                (0..100).map(|d| 2000 + (d / 10)).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    // 10 row groups (1 per year), sorted by ss_sold_date_sk so date_dim
+    // dynamic join filter pruning skips 9 of 10 row groups per branch.
+    // All ss_amt values are strictly positive (1..=1000), making `ss_amt > 0`
+    // a 100%-pass weak predicate.
+    let ss_schema = Arc::new(Schema::new(vec![
+        Field::new("ss_customer_sk", DataType::Int64, false),
+        Field::new("ss_sold_date_sk", DataType::Int64, false),
+        Field::new("ss_amt", DataType::Int64, false),
+    ]));
+    let total_rows = 10 * rows_per_year;
+    let mut csk = Vec::with_capacity(total_rows);
+    let mut dsk = Vec::with_capacity(total_rows);
+    let mut amt = Vec::with_capacity(total_rows);
+    for year_idx in 0..10i64 {
+        for r in 0..rows_per_year as i64 {
+            csk.push((r % 200) + 1);
+            dsk.push(year_idx * 10 + (r % 10));
+            amt.push((r % 1000) + 1);
+        }
+    }
+    let ss_batch = RecordBatch::try_new(
+        ss_schema,
+        vec![
+            Arc::new(Int64Array::from(csk)) as ArrayRef,
+            Arc::new(Int64Array::from(dsk)),
+            Arc::new(Int64Array::from(amt)),
+        ],
+    )?;
+
+    let cust_path = write_parquet_table(&dir, "customer", &[cust_batch], 200)?;
+    let date_path = write_parquet_table(&dir, "date_dim", &[date_batch], 100)?;
+    let ss_path = write_parquet_table(&dir, "store_sales", &[ss_batch], rows_per_year)?;
+    Ok((dir, cust_path, date_path, ss_path))
+}
+
+#[tokio::test]
+async fn weak_predicate_join_under_selective_outer_joins_skips_cse_and_stays_bounded()
+-> Result<()> {
+    // 200,000 rows across 10 RGs (~8+ MB materialized join output), with weak
+    // predicate `ss_amt > 0` (100% pass). Materializing `customer ⋈ store_sales`
+    // would blow a 4 MB pool and scan 5x more row groups than per-branch
+    // `date_dim` dynamic-filter pruning.
+    let (_dir, cust_path, date_path, ss_path) =
+        build_selective_year_sales_fixture(20_000)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * 1024 * 1024));
+    let metrics = Arc::new(MorselMetrics::default());
+    let stock = stock_context(4, 2048);
+    let native = morsel_context(
+        4,
+        2048,
+        true,
+        Some(Arc::clone(&pool)),
+        Some(Arc::clone(&metrics)),
+    );
+    for ctx in [&stock, &native] {
+        ctx.register_parquet("customer", &cust_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("date_dim", &date_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("store_sales", &ss_path, ParquetReadOptions::default())
+            .await?;
+    }
+
+    let shared_shape_sql = "
+        WITH joined AS (
+            SELECT c_customer_id AS cid, ss_sold_date_sk, ss_amt
+            FROM customer, store_sales
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_amt > 0
+        )
+        SELECT t1.cid, t1.y1, t2.y2
+        FROM (
+            SELECT cid, SUM(ss_amt) AS y1
+            FROM joined, date_dim
+            WHERE ss_sold_date_sk = d_date_sk AND d_year = 2001
+            GROUP BY cid
+        ) t1
+        JOIN (
+            SELECT cid, SUM(ss_amt) AS y2
+            FROM joined, date_dim
+            WHERE ss_sold_date_sk = d_date_sk AND d_year = 2002
+            GROUP BY cid
+        ) t2 ON t1.cid = t2.cid
+        ORDER BY t1.cid
+    ";
+
+    let non_shareable_sql = "
+        SELECT t1.cid, t1.y1, t2.y2
+        FROM (
+            SELECT c_customer_id AS cid, SUM(ss_amt) AS y1
+            FROM customer, store_sales, date_dim
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk
+              AND ss_amt > 0
+              AND d_year = 2001
+            GROUP BY c_customer_id
+        ) t1
+        JOIN (
+            SELECT c_customer_id AS cid, SUM(ss_amt) AS y2
+            FROM customer, store_sales, date_dim
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk
+              AND ss_amt > -1
+              AND d_year = 2002
+            GROUP BY c_customer_id
+        ) t2 ON t1.cid = t2.cid
+        ORDER BY t1.cid
+    ";
+
+    // Must succeed under the tight 4 MB pool without OOMing in MorselStageOutput!
+    let (plan, _) = assert_parity(&stock, &native, shared_shape_sql, true).await?;
+    let explain = displayable(plan.as_ref()).indent(false).to_string();
+    assert!(
+        !explain.contains("(shared, consumers="),
+        "weak-predicate join under selective outer joins must not be materialized as a shared stage, got:\n{explain}"
+    );
+    let shared_runs = metrics.take_runs();
+    assert_eq!(shared_runs.len(), 1);
+    let shared_claims: usize = shared_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+    let shared_bytes = plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+
+    let (base_plan, _) = assert_parity(&stock, &native, non_shareable_sql, true).await?;
+    let base_runs = metrics.take_runs();
+    assert_eq!(base_runs.len(), 1);
+    let base_claims: usize = base_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+    let base_bytes = base_plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+
+    assert!(
+        shared_claims <= base_claims,
+        "weak-predicate join claimed more morsels ({shared_claims}) than non-shareable baseline ({base_claims})"
+    );
+    assert!(
+        shared_bytes <= base_bytes,
+        "weak-predicate join scanned more bytes ({shared_bytes}) than non-shareable baseline ({base_bytes})"
+    );
+
+    wait_for_zero_reserved(&pool).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocking_aggregate_under_selective_outer_joins_preserves_cross_aggregate_pushdown()
+-> Result<()> {
+    let (_dir, _cust_path, date_path, ss_path) =
+        build_selective_year_sales_fixture(20_000)?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+    let metrics = Arc::new(MorselMetrics::default());
+    let stock = stock_context(4, 2048);
+    let native = morsel_context(
+        4,
+        2048,
+        true,
+        Some(Arc::clone(&pool)),
+        Some(Arc::clone(&metrics)),
+    );
+    for ctx in [&stock, &native] {
+        ctx.register_parquet("date_dim", &date_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("store_sales", &ss_path, ParquetReadOptions::default())
+            .await?;
+    }
+
+    let shared_shape_sql = "
+        WITH by_date AS (
+            SELECT ss_sold_date_sk, SUM(ss_amt) AS total
+            FROM store_sales
+            GROUP BY ss_sold_date_sk
+        )
+        SELECT a.y1, b.y2
+        FROM (
+            SELECT SUM(total) AS y1
+            FROM by_date JOIN date_dim ON ss_sold_date_sk = d_date_sk
+            WHERE d_year = 2001
+        ) a
+        CROSS JOIN (
+            SELECT SUM(total) AS y2
+            FROM by_date JOIN date_dim ON ss_sold_date_sk = d_date_sk
+            WHERE d_year = 2002
+        ) b
+    ";
+
+    let non_shareable_sql = "
+        SELECT a.y1, b.y2
+        FROM (
+            SELECT SUM(total) AS y1
+            FROM (
+                SELECT ss_sold_date_sk, SUM(ss_amt) AS total
+                FROM store_sales
+                GROUP BY ss_sold_date_sk
+            ) by_date1
+            JOIN date_dim ON ss_sold_date_sk = d_date_sk
+            WHERE d_year = 2001
+        ) a
+        CROSS JOIN (
+            SELECT SUM(total) AS y2
+            FROM (
+                SELECT ss_sold_date_sk, SUM(ss_amt) AS total
+                FROM store_sales
+                WHERE ss_amt > -1
+                GROUP BY ss_sold_date_sk
+            ) by_date2
+            JOIN date_dim ON ss_sold_date_sk = d_date_sk
+            WHERE d_year = 2002
+        ) b
+    ";
+
+    let (plan, _) = assert_parity(&stock, &native, shared_shape_sql, false).await?;
+    let explain = displayable(plan.as_ref()).indent(false).to_string();
+    assert!(
+        !explain.contains("(shared, consumers="),
+        "duplicate GROUP BY under selective outer joins must not block #206 cross-aggregate pushdown, got:\n{explain}"
+    );
+    let shared_runs = metrics.take_runs();
+    assert_eq!(shared_runs.len(), 1);
+    let shared_claims: usize = shared_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+    let shared_bytes = plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+
+    let (base_plan, _) = assert_parity(&stock, &native, non_shareable_sql, false).await?;
+    let base_runs = metrics.take_runs();
+    assert_eq!(base_runs.len(), 1);
+    let base_claims: usize = base_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+    let base_bytes = base_plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+
+    assert!(
+        shared_claims <= base_claims,
+        "duplicate GROUP BY claimed more morsels ({shared_claims}) than non-shareable baseline ({base_claims})"
+    );
+    assert!(
+        shared_bytes <= base_bytes,
+        "duplicate GROUP BY scanned more bytes ({shared_bytes}) than non-shareable baseline ({base_bytes})"
+    );
+
+    wait_for_zero_reserved(&pool).await;
+    Ok(())
+}

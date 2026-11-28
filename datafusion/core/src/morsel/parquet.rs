@@ -557,9 +557,34 @@ impl ParquetScan {
     /// supported by interval analysis (e.g. `Utf8` equality, `LIKE`, `IN`) are
     /// returned in `remaining_non_interval_conjuncts` so heuristic selectivity
     /// (`pipeline_filter_shift`) still accounts for them.
+    pub(super) fn known_num_rows(&self) -> Option<usize> {
+        self.config
+            .as_ref()
+            .and_then(|c| c.statistics().num_rows.get_value().copied())
+    }
+
     pub(super) fn analyze_interval_selectivity(
         &self,
         extra_predicates: &[Arc<dyn PhysicalExpr>],
+    ) -> (Option<f64>, Vec<Arc<dyn PhysicalExpr>>) {
+        self.analyze_interval_selectivity_inner(extra_predicates, false)
+    }
+
+    /// Variant of [`Self::analyze_interval_selectivity`] that also returns
+    /// `Some(1.0)` when statistics prove a predicate passes all rows (e.g.
+    /// `ss_amt > 0` on strictly positive data), so callers can distinguish
+    /// genuinely selective filters from weak/no-op predicates.
+    pub(super) fn analyze_interval_selectivity_inclusive(
+        &self,
+        extra_predicates: &[Arc<dyn PhysicalExpr>],
+    ) -> (Option<f64>, Vec<Arc<dyn PhysicalExpr>>) {
+        self.analyze_interval_selectivity_inner(extra_predicates, true)
+    }
+
+    fn analyze_interval_selectivity_inner(
+        &self,
+        extra_predicates: &[Arc<dyn PhysicalExpr>],
+        allow_one: bool,
     ) -> (Option<f64>, Vec<Arc<dyn PhysicalExpr>>) {
         let mut all_conjuncts: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
         if let Some(pred) = self.pushed_predicate() {
@@ -628,9 +653,16 @@ impl ParquetScan {
             .ok()
         })
         .and_then(|res| res.selectivity)
-        .filter(|sel| sel.is_finite() && (0.0..1.0).contains(sel));
+        .filter(|sel| {
+            sel.is_finite()
+                && if allow_one {
+                    (0.0..=1.0).contains(sel)
+                } else {
+                    (0.0..1.0).contains(sel)
+                }
+        });
         match selectivity {
-            Some(sel) => (Some(sel.max(1e-6)), other_conjuncts),
+            Some(sel) => (Some(sel.clamp(1e-6, 1.0)), other_conjuncts),
             None => (None, all_conjuncts),
         }
     }

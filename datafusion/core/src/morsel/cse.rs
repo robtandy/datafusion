@@ -141,7 +141,6 @@ struct JoinRelInfo {
     rel_id: JoinRelId,
     provenance: Vec<ColOrigin>,
     output_types: Vec<(DataType, bool)>,
-    has_internal_filter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +148,6 @@ struct NodeAnalysis {
     exact_id: ExactId,
     has_blocking: bool,
     has_join: bool,
-    has_filter: bool,
     join_rel: Option<JoinRelInfo>,
 }
 
@@ -163,6 +161,12 @@ pub(super) struct CseOccurrence<'plan> {
     /// When `Some`, selects columns from `representative`'s output schema to
     /// produce this occurrence's narrower output (projection-subsumed Join CSE).
     pub(super) col_mapping: Option<Vec<usize>>,
+    /// Number of unshadowed occurrences of this CSE group across the DAG.
+    pub(super) consumer_count: usize,
+    /// True if at least one occurrence sits beneath a filtered outer join.
+    pub(super) any_under_filtered_outer_join: bool,
+    /// True if every occurrence sits beneath a filtered outer join.
+    pub(super) all_under_filtered_outer_join: bool,
 }
 
 /// Read-only CSE lookup table built once per `MorselQueryPlanner::try_lower`.
@@ -233,6 +237,22 @@ fn is_column_only_projection(proj: &datafusion_expr::logical_plan::Projection) -
     proj.expr
         .iter()
         .all(|e| matches!(strip_alias(e), Expr::Column(_)))
+}
+
+fn unwrap_aliases(mut plan: &LogicalPlan) -> &LogicalPlan {
+    while let LogicalPlan::SubqueryAlias(alias) = plan {
+        plan = &alias.input;
+    }
+    plan
+}
+
+fn is_identical_self_join(
+    join: &datafusion_expr::logical_plan::Join,
+    analyzer: &Analyzer<'_>,
+) -> bool {
+    let l = analyzer.nodes.get(&plan_ptr(unwrap_aliases(&join.left)));
+    let r = analyzer.nodes.get(&plan_ptr(unwrap_aliases(&join.right)));
+    matches!((l, r), (Some(la), Some(ra)) if la.exact_id == ra.exact_id)
 }
 
 fn unwrap_aliases_and_col_projs(mut plan: &LogicalPlan) -> &LogicalPlan {
@@ -496,7 +516,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: false,
                     has_join: false,
-                    has_filter: false,
                     join_rel: None,
                 }
             }
@@ -519,7 +538,6 @@ impl<'plan> Analyzer<'plan> {
                     Some(p) => p.clone(),
                     None => (0..scan.source.schema().fields().len()).collect(),
                 };
-                let has_filter = filters.iter().any(|f| !is_trivially_true_filter(f));
                 let exact_id = self.intern_exact(ExactNode::TableScan {
                     provider_ptr,
                     table_name: scan.table_name.clone(),
@@ -533,7 +551,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: false,
                     has_join: false,
-                    has_filter,
                     join_rel: None,
                 }
             }
@@ -546,7 +563,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: false,
                     has_join: false,
-                    has_filter: false,
                     join_rel: None,
                 }
             }
@@ -569,7 +585,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: false,
                     has_join: false,
-                    has_filter: false,
                     join_rel: None,
                 }
             }
@@ -580,7 +595,6 @@ impl<'plan> Analyzer<'plan> {
                     filter.input.schema(),
                 );
                 let (pred, child) = (pred?, child?);
-                let has_filter = child.has_filter || !is_trivially_true_filter(&pred);
                 let exact_id = self.intern_exact(ExactNode::Filter {
                     input: child.exact_id,
                     predicate: pred,
@@ -589,7 +603,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: child.has_blocking,
                     has_join: child.has_join,
-                    has_filter,
                     join_rel: None,
                 }
             }
@@ -612,11 +625,10 @@ impl<'plan> Analyzer<'plan> {
                 {
                     let mut next_leaf = 0;
                     self.analyze_join_rel(plan, &mut next_leaf).map(
-                        |(rel_id, provenance, has_internal_filter)| JoinRelInfo {
+                        |(rel_id, provenance)| JoinRelInfo {
                             rel_id,
                             provenance,
                             output_types,
-                            has_internal_filter,
                         },
                     )
                 } else {
@@ -626,7 +638,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: child.has_blocking,
                     has_join: child.has_join,
-                    has_filter: child.has_filter,
                     join_rel,
                 }
             }
@@ -652,7 +663,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: true,
                     has_join: child.has_join,
-                    has_filter: child.has_filter,
                     join_rel: None,
                 }
             }
@@ -665,7 +675,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: true,
                     has_join: child.has_join,
-                    has_filter: child.has_filter,
                     join_rel: None,
                 }
             }
@@ -695,11 +704,6 @@ impl<'plan> Analyzer<'plan> {
                     }
                     None => None,
                 };
-                let has_filter = left.has_filter
-                    || right.has_filter
-                    || filter
-                        .as_ref()
-                        .is_some_and(|f| !is_trivially_true_filter(f));
                 let exact_id = self.intern_exact(ExactNode::Join {
                     left: left.exact_id,
                     right: right.exact_id,
@@ -712,18 +716,16 @@ impl<'plan> Analyzer<'plan> {
                 });
                 let mut next_leaf = 0;
                 let join_rel = self.analyze_join_rel(plan, &mut next_leaf).map(
-                    |(rel_id, provenance, has_internal_filter)| JoinRelInfo {
+                    |(rel_id, provenance)| JoinRelInfo {
                         rel_id,
                         provenance,
                         output_types: schema_types(&join.schema),
-                        has_internal_filter,
                     },
                 );
                 NodeAnalysis {
                     exact_id,
                     has_blocking: left.has_blocking || right.has_blocking,
                     has_join: true,
-                    has_filter,
                     join_rel,
                 }
             }
@@ -748,7 +750,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: true,
                     has_join: child.has_join,
-                    has_filter: child.has_filter,
                     join_rel: None,
                 }
             }
@@ -769,7 +770,6 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: true,
                     has_join: child.has_join,
-                    has_filter: child.has_filter,
                     join_rel: None,
                 }
             }
@@ -782,18 +782,18 @@ impl<'plan> Analyzer<'plan> {
 
     /// Analyze a join subtree stripping `SubqueryAlias`, column-only
     /// `Projection`, and `TableScan.projection`, returning
-    /// `(JoinRelId, output_provenance, has_internal_filter)`.
+    /// `(JoinRelId, output_provenance)`.
     fn analyze_join_rel(
         &mut self,
         plan: &'plan LogicalPlan,
         next_leaf: &mut usize,
-    ) -> Option<(JoinRelId, Vec<ColOrigin>, bool)> {
+    ) -> Option<(JoinRelId, Vec<ColOrigin>)> {
         match plan {
             LogicalPlan::SubqueryAlias(alias) => {
                 self.analyze_join_rel(&alias.input, next_leaf)
             }
             LogicalPlan::Projection(proj) if is_column_only_projection(proj) => {
-                let (child_rel, child_prov, has_filter) =
+                let (child_rel, child_prov) =
                     self.analyze_join_rel(&proj.input, next_leaf)?;
                 let in_schema = proj.input.schema();
                 let mut out_prov = Vec::with_capacity(proj.expr.len());
@@ -804,7 +804,7 @@ impl<'plan> Analyzer<'plan> {
                     let idx = in_schema.index_of_column(col).ok()?;
                     out_prov.push(*child_prov.get(idx)?);
                 }
-                Some((child_rel, out_prov, has_filter))
+                Some((child_rel, out_prov))
             }
             LogicalPlan::TableScan(scan) => {
                 if !scan.statistics_requests.is_empty() {
@@ -829,7 +829,6 @@ impl<'plan> Analyzer<'plan> {
                     })?;
                     filters.push(cf);
                 }
-                let has_filter = filters.iter().any(|f| !is_trivially_true_filter(f));
                 let rel_id = self.intern_join_rel(JoinRelNode::TableScan {
                     leaf_idx,
                     provider_ptr,
@@ -848,10 +847,10 @@ impl<'plan> Analyzer<'plan> {
                         .map(|src_col| ColOrigin { leaf_idx, src_col })
                         .collect(),
                 };
-                Some((rel_id, out_prov, has_filter))
+                Some((rel_id, out_prov))
             }
             LogicalPlan::Filter(filter) => {
-                let (child_rel, child_prov, child_filt) =
+                let (child_rel, child_prov) =
                     self.analyze_join_rel(&filter.input, next_leaf)?;
                 let in_schema = filter.input.schema();
                 let predicate = self.canonicalize_expr(&filter.predicate, &|col| {
@@ -859,17 +858,16 @@ impl<'plan> Analyzer<'plan> {
                     let orig = child_prov.get(idx)?;
                     Some(format!("@p_{}_{}", orig.leaf_idx, orig.src_col))
                 })?;
-                let has_filter = child_filt || !is_trivially_true_filter(&predicate);
                 let rel_id = self.intern_join_rel(JoinRelNode::Filter {
                     input: child_rel,
                     predicate,
                 });
-                Some((rel_id, child_prov, has_filter))
+                Some((rel_id, child_prov))
             }
             LogicalPlan::Join(join) => {
-                let (left_rel, left_prov, left_filt) =
+                let (left_rel, left_prov) =
                     self.analyze_join_rel(&join.left, next_leaf)?;
-                let (right_rel, right_prov, right_filt) =
+                let (right_rel, right_prov) =
                     self.analyze_join_rel(&join.right, next_leaf)?;
                 let left_schema = join.left.schema();
                 let right_schema = join.right.schema();
@@ -919,11 +917,6 @@ impl<'plan> Analyzer<'plan> {
                     JoinType::RightSemi | JoinType::RightAnti => right_prov,
                     JoinType::LeftMark | JoinType::RightMark => return None,
                 };
-                let has_filter = left_filt
-                    || right_filt
-                    || filter
-                        .as_ref()
-                        .is_some_and(|f| !is_trivially_true_filter(f));
                 let rel_id = self.intern_join_rel(JoinRelNode::Join {
                     left: left_rel,
                     right: right_rel,
@@ -934,21 +927,20 @@ impl<'plan> Analyzer<'plan> {
                     on,
                     filter,
                 });
-                Some((rel_id, out_prov, has_filter))
+                Some((rel_id, out_prov))
             }
             other => {
                 let info = self.nodes.get(&plan_ptr(other))?;
                 let leaf_idx = *next_leaf;
                 *next_leaf += 1;
                 let exact_id = info.exact_id;
-                let has_filter = info.has_filter;
                 let rel_id =
                     self.intern_join_rel(JoinRelNode::OpaqueLeaf { leaf_idx, exact_id });
                 let num_cols = other.schema().fields().len();
                 let out_prov = (0..num_cols)
                     .map(|src_col| ColOrigin { leaf_idx, src_col })
                     .collect();
-                Some((rel_id, out_prov, has_filter))
+                Some((rel_id, out_prov))
             }
         }
     }
@@ -976,13 +968,6 @@ impl<'plan> Analyzer<'plan> {
                 if !(first_info.has_blocking || first_info.has_join) {
                     continue;
                 }
-                if !first_info.has_blocking {
-                    let any_under_filtered_join =
-                        occs.iter().any(|o| o.under_filtered_outer_join);
-                    if !first_info.has_filter && any_under_filtered_join {
-                        continue;
-                    }
-                }
                 exact_eligible.insert(exact_id);
             }
 
@@ -997,15 +982,6 @@ impl<'plan> Analyzer<'plan> {
                     .all(|o| self.nodes[&plan_ptr(o.plan)].exact_id == first_exact)
                     && exact_eligible.contains(&first_exact)
                 {
-                    continue;
-                }
-                let first_rel = self.nodes[&plan_ptr(occs[0].plan)]
-                    .join_rel
-                    .as_ref()
-                    .unwrap();
-                let any_under_filtered_join =
-                    occs.iter().any(|o| o.under_filtered_outer_join);
-                if !first_rel.has_internal_filter && any_under_filtered_join {
                     continue;
                 }
                 join_rel_eligible.insert(rel_id);
@@ -1028,7 +1004,7 @@ impl<'plan> Analyzer<'plan> {
                 visited_groups: HashSet::new(),
                 visited_subqueries: HashSet::new(),
             };
-            maximal.walk(root, false);
+            maximal.walk(root, false, false);
             let exact_maximal = maximal.exact_maximal;
             let join_rel_maximal = maximal.join_rel_maximal;
 
@@ -1039,14 +1015,22 @@ impl<'plan> Analyzer<'plan> {
                 }
                 let group_id = next_group_id;
                 next_group_id += 1;
-                let rep = occs[0];
-                for &p in occs {
+                let rep = occs[0].plan;
+                let consumer_count = occs.len();
+                let any_under_filtered_outer_join =
+                    occs.iter().any(|o| o.under_filtered_outer_join);
+                let all_under_filtered_outer_join =
+                    occs.iter().all(|o| o.under_filtered_outer_join);
+                for occ in occs {
                     selected.insert(
-                        plan_ptr(p),
+                        plan_ptr(occ.plan),
                         CseOccurrence {
                             group_id,
                             representative: rep,
                             col_mapping: None,
+                            consumer_count,
+                            any_under_filtered_outer_join,
+                            all_under_filtered_outer_join,
                         },
                     );
                 }
@@ -1057,19 +1041,29 @@ impl<'plan> Analyzer<'plan> {
                 if occs.len() < 2 {
                     continue;
                 }
-                let Some((rep, mappings)) = self.find_join_rel_superset(occs) else {
+                let plans: Vec<&'plan LogicalPlan> =
+                    occs.iter().map(|o| o.plan).collect();
+                let Some((rep, mappings)) = self.find_join_rel_superset(&plans) else {
                     continue;
                 };
                 let group_id = next_group_id;
                 next_group_id += 1;
-                for &p in occs {
-                    let ptr = plan_ptr(p);
+                let consumer_count = occs.len();
+                let any_under_filtered_outer_join =
+                    occs.iter().any(|o| o.under_filtered_outer_join);
+                let all_under_filtered_outer_join =
+                    occs.iter().all(|o| o.under_filtered_outer_join);
+                for occ in occs {
+                    let ptr = plan_ptr(occ.plan);
                     selected.insert(
                         ptr,
                         CseOccurrence {
                             group_id,
                             representative: rep,
                             col_mapping: mappings.get(&ptr).cloned().flatten(),
+                            consumer_count,
+                            any_under_filtered_outer_join,
+                            all_under_filtered_outer_join,
                         },
                     );
                 }
@@ -1271,8 +1265,9 @@ impl<'plan> RoundCounter<'plan> {
 
         match plan {
             LogicalPlan::Join(join) => {
-                let left_has_filt = subtree_has_filter(&join.left);
-                let right_has_filt = subtree_has_filter(&join.right);
+                let self_join = is_identical_self_join(join, analyzer);
+                let left_has_filt = !self_join && subtree_has_filter(&join.left);
+                let right_has_filt = !self_join && subtree_has_filter(&join.right);
                 self.walk(
                     &join.left,
                     analyzer,
@@ -1329,30 +1324,35 @@ struct MaximalCollector<'a, 'plan> {
     already_selected: &'a HashMap<usize, CseOccurrence<'plan>>,
     exact_eligible: &'a HashSet<ExactId>,
     join_rel_eligible: &'a HashSet<JoinRelId>,
-    exact_maximal: IndexMap<ExactId, Vec<&'plan LogicalPlan>>,
-    join_rel_maximal: IndexMap<JoinRelId, Vec<&'plan LogicalPlan>>,
+    exact_maximal: IndexMap<ExactId, Vec<OccEntry<'plan>>>,
+    join_rel_maximal: IndexMap<JoinRelId, Vec<OccEntry<'plan>>>,
     visited_groups: HashSet<usize>,
     visited_subqueries: HashSet<Subquery>,
 }
 
 impl<'plan> MaximalCollector<'_, 'plan> {
-    fn walk(&mut self, plan: &'plan LogicalPlan, in_join_rel_chain: bool) {
+    fn walk(
+        &mut self,
+        plan: &'plan LogicalPlan,
+        under_filtered_outer_join: bool,
+        in_join_rel_chain: bool,
+    ) {
         if let LogicalPlan::SubqueryAlias(alias) = plan {
-            self.walk(&alias.input, in_join_rel_chain);
+            self.walk(&alias.input, under_filtered_outer_join, in_join_rel_chain);
             return;
         }
         if let LogicalPlan::MaterializedCte(MaterializedCtePlan::Cte(cte)) = plan {
             if cte.scans().is_ok_and(|s| !s.is_empty()) {
-                self.walk(cte.body(), false);
+                self.walk(cte.body(), false, false);
             }
-            self.walk(cte.continuation(), false);
+            self.walk(cte.continuation(), under_filtered_outer_join, false);
             return;
         }
 
         let ptr = plan_ptr(plan);
         if let Some(occ) = self.already_selected.get(&ptr) {
             if self.visited_groups.insert(occ.group_id) {
-                self.walk_children(occ.representative, false);
+                self.walk_children(occ.representative, false, false);
             }
             return;
         }
@@ -1363,7 +1363,10 @@ impl<'plan> MaximalCollector<'_, 'plan> {
                 self.exact_maximal
                     .entry(info.exact_id)
                     .or_default()
-                    .push(plan);
+                    .push(OccEntry {
+                        plan,
+                        under_filtered_outer_join,
+                    });
                 return;
             }
             if !in_join_rel_chain
@@ -1373,7 +1376,10 @@ impl<'plan> MaximalCollector<'_, 'plan> {
                 self.join_rel_maximal
                     .entry(jr.rel_id)
                     .or_default()
-                    .push(plan);
+                    .push(OccEntry {
+                        plan,
+                        under_filtered_outer_join,
+                    });
                 return;
             }
             if matches!(plan, LogicalPlan::Projection(_))
@@ -1383,33 +1389,53 @@ impl<'plan> MaximalCollector<'_, 'plan> {
             }
         }
 
-        self.walk_children(plan, next_in_join_rel_chain);
+        self.walk_children(plan, under_filtered_outer_join, next_in_join_rel_chain);
     }
 
-    fn walk_children(&mut self, plan: &'plan LogicalPlan, next_in_join_rel_chain: bool) {
+    fn walk_children(
+        &mut self,
+        plan: &'plan LogicalPlan,
+        under_filtered_outer_join: bool,
+        next_in_join_rel_chain: bool,
+    ) {
         let mut sqs: Vec<&'plan Subquery> = Vec::new();
         for_each_scalar_subquery(plan, |sq| sqs.push(sq));
         for sq in sqs {
             if self.visited_subqueries.insert(sq.clone())
                 && let Some(&sub_root) = self.analyzer.subquery_roots.get(sq)
             {
-                self.walk(sub_root, false);
+                self.walk(sub_root, false, false);
             }
         }
 
         match plan {
             LogicalPlan::Join(join) => {
-                self.walk(&join.left, false);
-                self.walk(&join.right, false);
+                let self_join = is_identical_self_join(join, self.analyzer);
+                let left_has_filt = !self_join && subtree_has_filter(&join.left);
+                let right_has_filt = !self_join && subtree_has_filter(&join.right);
+                self.walk(
+                    &join.left,
+                    under_filtered_outer_join || right_has_filt,
+                    false,
+                );
+                self.walk(
+                    &join.right,
+                    under_filtered_outer_join || left_has_filt,
+                    false,
+                );
             }
-            LogicalPlan::Aggregate(agg) => self.walk(&agg.input, false),
-            LogicalPlan::Distinct(Distinct::All(input)) => self.walk(input, false),
-            LogicalPlan::Sort(sort) => self.walk(&sort.input, false),
-            LogicalPlan::Limit(limit) => self.walk(&limit.input, false),
-            LogicalPlan::Projection(proj) => {
-                self.walk(&proj.input, next_in_join_rel_chain)
+            LogicalPlan::Aggregate(agg) => self.walk(&agg.input, false, false),
+            LogicalPlan::Distinct(Distinct::All(input)) => self.walk(input, false, false),
+            LogicalPlan::Sort(sort) => self.walk(&sort.input, false, false),
+            LogicalPlan::Limit(limit) => self.walk(&limit.input, false, false),
+            LogicalPlan::Projection(proj) => self.walk(
+                &proj.input,
+                under_filtered_outer_join,
+                next_in_join_rel_chain,
+            ),
+            LogicalPlan::Filter(filter) => {
+                self.walk(&filter.input, under_filtered_outer_join, false)
             }
-            LogicalPlan::Filter(filter) => self.walk(&filter.input, false),
             _ => {}
         }
     }
