@@ -18,13 +18,13 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    Column, DFSchema, JoinConstraint, JoinType, NullEquality, TableReference,
+    Column, DFSchema, JoinConstraint, JoinType, NullEquality, ScalarValue, TableReference,
 };
 use datafusion_expr::expr::Sort as SortExpr;
 use datafusion_expr::logical_plan::{
     Distinct, FetchType, MaterializedCteId, MaterializedCtePlan, SkipType,
 };
-use datafusion_expr::{Expr, LogicalPlan, Subquery};
+use datafusion_expr::{Expr, LogicalPlan, Operator, Subquery};
 use indexmap::IndexMap;
 
 use crate::datasource::source_as_provider;
@@ -219,6 +219,16 @@ fn strip_alias(mut expr: &Expr) -> &Expr {
     expr
 }
 
+fn is_trivially_true_filter(expr: &Expr) -> bool {
+    match strip_alias(expr) {
+        Expr::Literal(ScalarValue::Boolean(Some(true)), _) => true,
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
+            is_trivially_true_filter(&bin.left) && is_trivially_true_filter(&bin.right)
+        }
+        _ => false,
+    }
+}
+
 fn is_column_only_projection(proj: &datafusion_expr::logical_plan::Projection) -> bool {
     proj.expr
         .iter()
@@ -301,21 +311,30 @@ fn for_each_scalar_subquery<'plan>(
     });
 }
 
-/// Returns true if `plan` contains any `Filter`, `TableScan` filter, or `Join` filter
-/// — used to detect selective outer join siblings.
+/// Returns true if `plan` contains any non-trivial `Filter`, `TableScan` filter,
+/// or `Join` filter — used to detect selective outer join siblings.
 fn subtree_has_filter(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
         match node {
-            LogicalPlan::Filter(_) => {
+            LogicalPlan::Filter(filter)
+                if !is_trivially_true_filter(&filter.predicate) =>
+            {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
-            LogicalPlan::TableScan(scan) if !scan.filters.is_empty() => {
+            LogicalPlan::TableScan(scan)
+                if scan.filters.iter().any(|f| !is_trivially_true_filter(f)) =>
+            {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
-            LogicalPlan::Join(join) if join.filter.is_some() => {
+            LogicalPlan::Join(join)
+                if join
+                    .filter
+                    .as_ref()
+                    .is_some_and(|f| !is_trivially_true_filter(f)) =>
+            {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -500,7 +519,7 @@ impl<'plan> Analyzer<'plan> {
                     Some(p) => p.clone(),
                     None => (0..scan.source.schema().fields().len()).collect(),
                 };
-                let has_filter = !filters.is_empty();
+                let has_filter = filters.iter().any(|f| !is_trivially_true_filter(f));
                 let exact_id = self.intern_exact(ExactNode::TableScan {
                     provider_ptr,
                     table_name: scan.table_name.clone(),
@@ -561,6 +580,7 @@ impl<'plan> Analyzer<'plan> {
                     filter.input.schema(),
                 );
                 let (pred, child) = (pred?, child?);
+                let has_filter = child.has_filter || !is_trivially_true_filter(&pred);
                 let exact_id = self.intern_exact(ExactNode::Filter {
                     input: child.exact_id,
                     predicate: pred,
@@ -569,7 +589,7 @@ impl<'plan> Analyzer<'plan> {
                     exact_id,
                     has_blocking: child.has_blocking,
                     has_join: child.has_join,
-                    has_filter: true,
+                    has_filter,
                     join_rel: None,
                 }
             }
@@ -675,7 +695,11 @@ impl<'plan> Analyzer<'plan> {
                     }
                     None => None,
                 };
-                let has_filter = left.has_filter || right.has_filter || filter.is_some();
+                let has_filter = left.has_filter
+                    || right.has_filter
+                    || filter
+                        .as_ref()
+                        .is_some_and(|f| !is_trivially_true_filter(f));
                 let exact_id = self.intern_exact(ExactNode::Join {
                     left: left.exact_id,
                     right: right.exact_id,
@@ -805,7 +829,7 @@ impl<'plan> Analyzer<'plan> {
                     })?;
                     filters.push(cf);
                 }
-                let has_filter = !filters.is_empty();
+                let has_filter = filters.iter().any(|f| !is_trivially_true_filter(f));
                 let rel_id = self.intern_join_rel(JoinRelNode::TableScan {
                     leaf_idx,
                     provider_ptr,
@@ -827,7 +851,7 @@ impl<'plan> Analyzer<'plan> {
                 Some((rel_id, out_prov, has_filter))
             }
             LogicalPlan::Filter(filter) => {
-                let (child_rel, child_prov, _) =
+                let (child_rel, child_prov, child_filt) =
                     self.analyze_join_rel(&filter.input, next_leaf)?;
                 let in_schema = filter.input.schema();
                 let predicate = self.canonicalize_expr(&filter.predicate, &|col| {
@@ -835,11 +859,12 @@ impl<'plan> Analyzer<'plan> {
                     let orig = child_prov.get(idx)?;
                     Some(format!("@p_{}_{}", orig.leaf_idx, orig.src_col))
                 })?;
+                let has_filter = child_filt || !is_trivially_true_filter(&predicate);
                 let rel_id = self.intern_join_rel(JoinRelNode::Filter {
                     input: child_rel,
                     predicate,
                 });
-                Some((rel_id, child_prov, true))
+                Some((rel_id, child_prov, has_filter))
             }
             LogicalPlan::Join(join) => {
                 let (left_rel, left_prov, left_filt) =
@@ -894,7 +919,11 @@ impl<'plan> Analyzer<'plan> {
                     JoinType::RightSemi | JoinType::RightAnti => right_prov,
                     JoinType::LeftMark | JoinType::RightMark => return None,
                 };
-                let has_filter = left_filt || right_filt || filter.is_some();
+                let has_filter = left_filt
+                    || right_filt
+                    || filter
+                        .as_ref()
+                        .is_some_and(|f| !is_trivially_true_filter(f));
                 let rel_id = self.intern_join_rel(JoinRelNode::Join {
                     left: left_rel,
                     right: right_rel,

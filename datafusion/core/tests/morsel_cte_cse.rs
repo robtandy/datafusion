@@ -1215,3 +1215,187 @@ async fn distinct_topn_empty_shared_stage_and_subset_before_superset_join_cse()
     wait_for_zero_reserved(&pool).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn trivially_true_union_tag_filter_does_not_materialize_unfiltered_join_under_selective_dim()
+-> Result<()> {
+    // Regression test for TPC-DS Q4/Q11/Q74: pushing a literal tag filter
+    // (`sale_type = 's'`) through `UNION ALL` eliminates the other branch but
+    // leaves `partial_filters=[Boolean(true)]` on the surviving `customer`
+    // scan. That trivially-true filter must NOT fool Join CSE into
+    // materializing the unfiltered `customer ⋈ store_sales` join and blocking
+    // per-consumer `date_dim` (`d_year = 2001` vs `d_year = 2002`) dynamic
+    // join filter pruning.
+    let dir = TempDir::new()?;
+
+    let cust_schema = Arc::new(Schema::new(vec![
+        Field::new("c_customer_sk", DataType::Int64, false),
+        Field::new("c_customer_id", DataType::Utf8, false),
+    ]));
+    let cust_batch = RecordBatch::try_new(
+        cust_schema,
+        vec![
+            Arc::new(Int64Array::from((1..=20).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(
+                (1..=20).map(|i| format!("CUST_{i:02}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    // 10 years (2000..=2009), 10 date keys per year -> 100 date_dim rows.
+    let date_schema = Arc::new(Schema::new(vec![
+        Field::new("d_date_sk", DataType::Int64, false),
+        Field::new("d_year", DataType::Int32, false),
+    ]));
+    let date_batch = RecordBatch::try_new(
+        date_schema,
+        vec![
+            Arc::new(Int64Array::from((0..100).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(Int32Array::from(
+                (0..100).map(|d| 2000 + (d / 10)).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    // 10 row groups of 20 rows each, sorted by date_sk so each year occupies
+    // exactly 1 row group (10% of the fact table).
+    let make_sales = |cust_col: &str, date_col: &str, amt_col: &str, scale: i64| {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(cust_col, DataType::Int64, false),
+            Field::new(date_col, DataType::Int64, false),
+            Field::new(amt_col, DataType::Int64, false),
+        ]));
+        let mut csk = Vec::with_capacity(200);
+        let mut dsk = Vec::with_capacity(200);
+        let mut amt = Vec::with_capacity(200);
+        for year_idx in 0..10i64 {
+            for r in 0..20i64 {
+                csk.push((r % 20) + 1);
+                dsk.push(year_idx * 10 + (r % 10));
+                amt.push(scale * (year_idx + 1) * (r + 1));
+            }
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(csk)) as ArrayRef,
+                Arc::new(Int64Array::from(dsk)),
+                Arc::new(Int64Array::from(amt)),
+            ],
+        )
+    };
+    let ss_batch = make_sales("ss_customer_sk", "ss_sold_date_sk", "ss_amt", 10)?;
+    let ws_batch = make_sales("ws_customer_sk", "ws_sold_date_sk", "ws_amt", 20)?;
+
+    let cust_path = write_parquet_table(&dir, "customer", &[cust_batch], 20)?;
+    let date_path = write_parquet_table(&dir, "date_dim", &[date_batch], 100)?;
+    let ss_path = write_parquet_table(&dir, "store_sales", &[ss_batch], 20)?;
+    let ws_path = write_parquet_table(&dir, "web_sales", &[ws_batch], 20)?;
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+    let metrics = Arc::new(MorselMetrics::default());
+    let stock = stock_context(4, 32);
+    let native = morsel_context(
+        4,
+        32,
+        true,
+        Some(Arc::clone(&pool)),
+        Some(Arc::clone(&metrics)),
+    );
+    for ctx in [&stock, &native] {
+        ctx.register_parquet("customer", &cust_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("date_dim", &date_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("store_sales", &ss_path, ParquetReadOptions::default())
+            .await?;
+        ctx.register_parquet("web_sales", &ws_path, ParquetReadOptions::default())
+            .await?;
+    }
+
+    let union_cte_sql = "
+        WITH year_total AS (
+            SELECT c_customer_id AS cid, d_year AS dyear, SUM(ss_amt) AS total, 's' AS sale_type
+            FROM customer, store_sales, date_dim
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk
+            GROUP BY c_customer_id, d_year
+            UNION ALL
+            SELECT c_customer_id AS cid, d_year AS dyear, SUM(ws_amt) AS total, 'w' AS sale_type
+            FROM customer, web_sales, date_dim
+            WHERE c_customer_sk = ws_customer_sk
+              AND ws_sold_date_sk = d_date_sk
+            GROUP BY c_customer_id, d_year
+        )
+        SELECT t1.cid, t1.total AS y1, t2.total AS y2
+        FROM year_total t1, year_total t2
+        WHERE t1.cid = t2.cid
+          AND t1.sale_type = 's'
+          AND t2.sale_type = 's'
+          AND t1.dyear = 2001
+          AND t2.dyear = 2002
+        ORDER BY t1.cid
+    ";
+
+    let direct_sql = "
+        SELECT t1.cid, t1.total AS y1, t2.total AS y2
+        FROM (
+            SELECT c_customer_id AS cid, SUM(ss_amt) AS total
+            FROM customer, store_sales, date_dim
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk
+              AND d_year = 2001
+            GROUP BY c_customer_id
+        ) t1
+        JOIN (
+            SELECT c_customer_id AS cid, SUM(ss_amt) AS total
+            FROM customer, store_sales, date_dim
+            WHERE c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk
+              AND d_year = 2002
+            GROUP BY c_customer_id
+        ) t2 ON t1.cid = t2.cid
+        ORDER BY t1.cid
+    ";
+
+    let (union_plan, _) = assert_parity(&stock, &native, union_cte_sql, true).await?;
+    let union_explain = displayable(union_plan.as_ref()).indent(false).to_string();
+    assert!(
+        !union_explain.contains("(shared, consumers="),
+        "trivially-true UNION ALL tag filter must not create a shared stage over unfiltered fact⋈dim join, got:\n{union_explain}"
+    );
+    let union_runs = metrics.take_runs();
+    assert_eq!(union_runs.len(), 1);
+    let union_claims: usize = union_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+
+    let (direct_plan, _) = assert_parity(&stock, &native, direct_sql, true).await?;
+    let direct_runs = metrics.take_runs();
+    assert_eq!(direct_runs.len(), 1);
+    let direct_claims: usize = direct_runs[0]
+        .sum_by_name("morsels_claimed")
+        .map_or(0, |v| v.as_usize());
+
+    assert_eq!(
+        union_claims,
+        direct_claims,
+        "UNION ALL tagged CTE must preserve the exact same dynamic-filter RG pruning as direct query (union={union_claims}, direct={direct_claims})\nunion plan:\n{union_explain}\ndirect plan:\n{}",
+        displayable(direct_plan.as_ref()).indent(false)
+    );
+    let union_bytes = union_plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+    let direct_bytes = direct_plan
+        .metrics()
+        .and_then(|m| m.sum_by_name("bytes_scanned"))
+        .map_or(0, |v| v.as_usize());
+    assert_eq!(
+        union_bytes, direct_bytes,
+        "expected identical bytes_scanned with dynamic filter pruning preserved"
+    );
+
+    wait_for_zero_reserved(&pool).await;
+    Ok(())
+}
