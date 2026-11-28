@@ -42,6 +42,23 @@ DAG runtime (`datafusion/core/src/morsel/`).
   `q12`, `q13`, `q14`, `q16`, `q17`, `q20`, `q21`, `q22`) and closing the
   22-query sum to **`7,697.1 ms` vs. `7,498.4 ms` (`1.026×`)**.
 
+- **TPC-DS SF=10 verification (`3cc3556f0`, ignoring trivially-true
+  `Boolean(true)` filters in the Join-CSE guard):**
+  - The three `UNION ALL` literal-tag queries (`q4`, `q11`, `q74`) that
+    previously bypassed the Join-CSE guard due to
+    `partial_filters=[Boolean(true)]` return to exact base times and scan
+    metrics (`q4` `3,535.8 → 3,529.8 ms`, `q11` `1,681.1 → 1,660.4 ms`, `q74`
+    `1,040.9 → 1,033.2 ms`), and `q11` succeeds under
+    `MORSEL_MEMORY_LIMIT_MB=3072` in `1,824.7 ms` with `0` spills (matching
+    base's `1,821.1 ms`).
+  - All 12 TPC-DS queries where Stage CSE fires (`q1`, `q24`, `q30`, `q59`,
+    `q61`, `q64`, `q65`, `q81`, `q83`, `q88`, `q90`, `q95`) match base outputs
+    exactly and drop combined execution time from **`9,648.7 → 7,256.7 ms`**
+    (**`1.33×` faster**, **`−2,392.0 ms`**), including **`q88` (`5.01×`)**,
+    **`q90` (`1.80×`)**, **`q65` (`1.67×`)**, **`q1` (`1.50×`)**, **`q24`
+    (`1.50×`)**, and **`q30` (`1.44×`)**, while cutting scanned bytes by
+    **`45.9%`** (`9,259.6 → 5,008.7 MB`).
+
 ## Environment & Protocol
 
 - **Host:** `rob-tandy-dduck1` (16 ARM Neoverse-N1 cores; benchmark pinned to 8
@@ -52,8 +69,10 @@ DAG runtime (`datafusion/core/src/morsel/`).
 - **Engines & Revisions:**
   - **Before (base):** `morsel-execution` at `1663c620e` (`morsel_pushdown`,
     `morsel_mode=required`).
-  - **After (PR `#228`):** `d974cba62` (`morsel_pushdown`,
-    `morsel_mode=required`).
+  - **After (PR `#228`):** `d974cba62` (TPC-H SF=5 tables below) and
+    `3cc3556f0` (adds the trivially-true filter fix in `cse.rs`; verified
+    identical TPC-H SF=5 plans/RGs/bytes and used for all TPC-DS SF=10 tables
+    below), both under `morsel_pushdown`, `morsel_mode=required`.
   - **Reference:** DuckDB `2.0.1` (`duckdb_default`), run paired in both
     sessions to confirm host stability.
 - **Timing Protocol:** Fresh process per trial, `1` unmeasured warmup + `5`
@@ -104,6 +123,44 @@ timing (3 measured warm-cache repeats, 8 pinned cores):
 | `q22`   |      7 |            110.0 (109.6–112.1) |           136.4 (135.7–137.8) |       **0.81×** |          76 |
 | **GM**  | 22/22  |                  **295.2 ms**  |                    296.1 ms   |      **0.997×** |           — |
 | **Sum** | 22/22  |                   7,697.1 ms   |                  7,498.4 ms   |         1.026×  |           — |
+
+## 3. TPC-DS SF=10 Paired Before/After Verification (`1663c620e` vs. `3cc3556f0`)
+
+Paired interleaved `morsel_pushdown` (`morsel_mode=required`, 8 pinned cores via
+`taskset -c 0-7`, `1` warmup/parity verification + `3` interleaved repeats per
+query) on the 3 `UNION ALL` literal-tag regression-guard queries (`q4`, `q11`,
+`q74`) and all 12 natively-admitted TPC-DS queries where Stage CSE fires (`q1`,
+`q24`, `q30`, `q59`, `q61`, `q64`, `q65`, `q81`, `q83`, `q88`, `q90`, `q95`).
+All 15 queries produced exact row-for-row output parity between base and after.
+
+### 3a. Guarded `UNION ALL` Queries (No Unfiltered-Join Materialization)
+
+| Query | Rows | Base `1663c620e` ms (min–max) | After `3cc3556f0` ms (min–max) | Gain | RGs Claimed (B→A) | Scanned MB (B→A) |
+| ----- | ---: | ----------------------------: | -----------------------------: | ---: | ----------------: | ---------------: |
+| `q4`  |  100 |     3,535.8 (3,495.0–3,552.1) |      3,529.8 (3,504.8–3,543.5) | 1.00× |           89 → 89 | 4,893.5 → 4,893.5 |
+| `q11` |  100 |     1,681.1 (1,632.7–1,690.5) |      1,660.4 (1,628.5–1,699.7) | 1.01× |           78 → 78 | 2,465.2 → 2,465.2 |
+| `q74` |  100 |     1,040.9 (1,016.8–1,063.6) |      1,033.2 (1,028.0–1,075.9) | 1.01× |           78 → 78 | 1,284.6 → 1,284.6 |
+
+Under `MORSEL_MEMORY_LIMIT_MB=3072`, `q11` completes cleanly with `0` spills and
+no OOM: **`1,821.1 ms` (base)** vs. **`1,824.7 ms` (after `3cc3556f0`)**.
+
+### 3b. All 12 CSE-Active TPC-DS SF=10 Queries
+
+| Query | Rows | Base `1663c620e` ms (min–max) | After `3cc3556f0` ms (min–max) | Gain | RGs Claimed (B→A) | Scanned MB (B→A) |
+| ----- | ---: | ----------------------------: | -----------------------------: | ---: | ----------------: | ---------------: |
+| `q1`  |  100 |           299.3 (299.1–304.1) |        **199.5** (188.8–203.4) | **1.50×** |           10 → 6  |     161.9 → 88.1 |
+| `q24` |    7 |           949.0 (904.5–968.9) |        **632.7** (614.5–684.0) | **1.50×** |           70 → 38 |  1,279.4 → 656.1 |
+| `q30` |  100 |           306.1 (304.4–324.3) |        **212.1** (211.3–237.7) | **1.44×** |            8 → 5  |      93.6 → 67.0 |
+| `q59` |  100 |           717.0 (694.9–754.8) |        **637.7** (620.0–640.2) | **1.12×** |           62 → 33 |    929.1 → 464.8 |
+| `q61` |    1 |           631.2 (613.5–635.7) |            627.4 (609.1–687.4) |     1.01× |           67 → 38 |  1,188.8 → 636.4 |
+| `q64` |   33 |     2,850.6 (2,806.4–3,044.5) |      2,898.5 (2,844.0–2,911.4) |     0.98× |          128 → 81 | 3,739.9 → 2,132.2 |
+| `q65` |  100 |     1,165.7 (1,145.4–1,181.6) |        **699.5** (699.0–729.0) | **1.67×** |           60 → 31 |  1,110.6 → 562.7 |
+| `q81` |  100 |           309.3 (301.0–318.7) |        **260.3** (245.0–265.0) | **1.19×** |            8 → 5  |      71.6 → 48.5 |
+| `q83` |  100 |           152.5 (151.6–155.2) |            153.5 (153.2–157.1) |     0.99× |           17 → 13 |      34.3 → 32.6 |
+| `q88` |    1 |     1,449.2 (1,397.7–1,505.4) |        **289.3** (281.7–309.1) | **5.01×** |          248 → 45 |     343.3 → 48.1 |
+| `q90` |    1 |           130.7 (129.5–164.9) |         **72.8** (72.0–84.7)   | **1.80×** |           20 → 12 |      29.9 → 15.7 |
+| `q95` |    1 |           688.1 (604.7–697.8) |        **573.4** (569.8–581.5) | **1.20×** |           39 → 25 |    278.7 → 258.5 |
+| **Sum** | 12Q |                    9,648.7 ms |                **7,256.7 ms**  | **1.33×** |       737 → 332   | 9,259.6 → 5,008.7 |
 
 ## Reproduction Commands
 
