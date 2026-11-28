@@ -299,54 +299,60 @@ fn constant_range_bound(expr: &Arc<dyn PhysicalExpr>) -> (bool, bool) {
     }
 }
 
+fn record_conjunct_groups(
+    distinct_groups: &mut BTreeMap<Vec<String>, (u32, bool, bool)>,
+    pred: &Arc<dyn PhysicalExpr>,
+) {
+    for conjunct in split_conjunction(pred) {
+        let mut cols: Vec<String> = collect_columns(conjunct)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        if !cols.is_empty() {
+            let weight = if is_equality_with_constant(conjunct) {
+                2
+            } else {
+                1
+            };
+            let (has_lo, has_hi) = if cols.len() == 1 {
+                constant_range_bound(conjunct)
+            } else {
+                (false, false)
+            };
+            distinct_groups
+                .entry(cols)
+                .and_modify(|(w, lo, hi)| {
+                    *lo |= has_lo;
+                    *hi |= has_hi;
+                    *w = (*w).max(weight);
+                    if *lo && *hi {
+                        *w = (*w).max(2);
+                    }
+                })
+                .or_insert((weight, has_lo, has_hi));
+        }
+    }
+}
+
 fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
     if matches!(source, Source::Stage(_)) {
         return 0;
     }
     let mut distinct_groups: BTreeMap<Vec<String>, (u32, bool, bool)> = BTreeMap::new();
-    let mut record_predicate = |pred: &Arc<dyn PhysicalExpr>| {
-        for conjunct in split_conjunction(pred) {
-            let mut cols: Vec<String> = collect_columns(conjunct)
-                .into_iter()
-                .map(|c| c.name().to_owned())
-                .collect();
-            cols.sort_unstable();
-            cols.dedup();
-            if !cols.is_empty() {
-                let weight = if is_equality_with_constant(conjunct) {
-                    2
-                } else {
-                    1
-                };
-                let (has_lo, has_hi) = if cols.len() == 1 {
-                    constant_range_bound(conjunct)
-                } else {
-                    (false, false)
-                };
-                distinct_groups
-                    .entry(cols)
-                    .and_modify(|(w, lo, hi)| {
-                        *lo |= has_lo;
-                        *hi |= has_hi;
-                        *w = (*w).max(weight);
-                        if *lo && *hi {
-                            *w = (*w).max(2);
-                        }
-                    })
-                    .or_insert((weight, has_lo, has_hi));
-            }
-        }
-    };
     #[cfg(feature = "parquet")]
     if let Source::Parquet(pq) = source
         && let Some(pred) = pq.pushed_predicate()
     {
-        record_predicate(&pred);
+        record_conjunct_groups(&mut distinct_groups, &pred);
     }
     let mut join_shift = 0u32;
     for op in operators {
         match op {
-            Operator::Filter { predicate, .. } => record_predicate(predicate),
+            Operator::Filter { predicate, .. } => {
+                record_conjunct_groups(&mut distinct_groups, predicate);
+            }
             Operator::HashProbe(probe)
                 if matches!(
                     probe.kind,
@@ -367,12 +373,13 @@ fn pipeline_filter_shift(source: &Source, operators: &[Operator]) -> u32 {
 
 /// Join-specific cardinality estimate used only by [`choose_build_side`].
 ///
-/// Counts distinct referenced column sets across conjunctive predicates on
-/// non-`Stage` inputs (giving equality predicates stronger weight than range
-/// predicates) and propagates filter selectivity across probe-filtering joins
-/// (`Inner`/`ProbeSemi`) while bounding `BuildSemi`/`BuildAnti` outputs by
-/// their build side. `StageSource` estimates (which already carry aggregate
-/// reduction) are never double-discounted.
+/// Uses Parquet footer column-statistics interval selectivity (matching Stock
+/// `FilterExec`) when available on `Source::Parquet`, falling back to
+/// [`pipeline_filter_shift`] for non-interval conjuncts (e.g. string equality,
+/// `LIKE`, `IN`) and non-Parquet inputs, while propagating filter selectivity
+/// across probe-filtering joins (`Inner`/`ProbeSemi`) and bounding
+/// `BuildSemi`/`BuildAnti` outputs by their build side. `StageSource` estimates
+/// (which already carry aggregate reduction) are never double-discounted.
 fn estimate_join_side_size(
     source: &Source,
     operators: &[Operator],
@@ -382,14 +389,94 @@ fn estimate_join_side_size(
     if base.is_empty {
         return base;
     }
-    let shift = pipeline_filter_shift(source, operators);
-    let mut est = if shift == 0 {
-        base
+    #[cfg(feature = "parquet")]
+    let mut est = if let Source::Parquet(pq) = source {
+        let mut leading_filters = Vec::new();
+        let mut leading_end = 0usize;
+        for (idx, op) in operators.iter().enumerate() {
+            match op {
+                Operator::Filter { predicate, .. } => {
+                    leading_filters.push(Arc::clone(predicate));
+                    leading_end = idx + 1;
+                }
+                _ => break,
+            }
+        }
+        let (interval_sel, remaining) = pq.analyze_interval_selectivity(&leading_filters);
+        if let Some(sel) = interval_sel {
+            let mut distinct_groups: BTreeMap<Vec<String>, (u32, bool, bool)> =
+                BTreeMap::new();
+            for pred in &remaining {
+                record_conjunct_groups(&mut distinct_groups, pred);
+            }
+            let mut join_shift = 0u32;
+            for op in &operators[leading_end..] {
+                match op {
+                    Operator::Filter { predicate, .. } => {
+                        record_conjunct_groups(&mut distinct_groups, predicate);
+                    }
+                    Operator::HashProbe(probe)
+                        if matches!(
+                            probe.kind,
+                            hash_join::ProbeJoinKind::Inner
+                                | hash_join::ProbeJoinKind::ProbeSemi
+                        ) =>
+                    {
+                        join_shift = join_shift.saturating_add(pipeline_filter_shift(
+                            &probe.build_pipeline.source,
+                            &probe.build_pipeline.operators,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let rem_shift = distinct_groups
+                .values()
+                .map(|&(w, _, _)| w)
+                .sum::<u32>()
+                .saturating_add(join_shift)
+                .min(6);
+            let scaled = ((base.approx_bytes as f64) * sel).max(1.0) as u64;
+            SideEstimate {
+                is_empty: base.is_empty,
+                mem_rows: base.mem_rows,
+                approx_bytes: (scaled >> rem_shift).max(1),
+            }
+        } else {
+            let shift = pipeline_filter_shift(source, operators);
+            if shift == 0 {
+                base
+            } else {
+                SideEstimate {
+                    is_empty: base.is_empty,
+                    mem_rows: base.mem_rows.map(|rows| (rows >> shift).max(1)),
+                    approx_bytes: (base.approx_bytes >> shift).max(1),
+                }
+            }
+        }
     } else {
-        SideEstimate {
-            is_empty: base.is_empty,
-            mem_rows: base.mem_rows.map(|rows| (rows >> shift).max(1)),
-            approx_bytes: (base.approx_bytes >> shift).max(1),
+        let shift = pipeline_filter_shift(source, operators);
+        if shift == 0 {
+            base
+        } else {
+            SideEstimate {
+                is_empty: base.is_empty,
+                mem_rows: base.mem_rows.map(|rows| (rows >> shift).max(1)),
+                approx_bytes: (base.approx_bytes >> shift).max(1),
+            }
+        }
+    };
+    #[cfg(not(feature = "parquet"))]
+    let mut est = {
+        let shift = pipeline_filter_shift(source, operators);
+        if shift == 0 {
+            base
+        } else {
+            SideEstimate {
+                is_empty: base.is_empty,
+                mem_rows: base.mem_rows.map(|rows| (rows >> shift).max(1)),
+                approx_bytes: (base.approx_bytes >> shift).max(1),
+            }
         }
     };
     for op in operators {

@@ -46,7 +46,8 @@ pub use metrics::ParquetFileMetrics;
 #[doc(hidden)]
 pub use opener::{
     AdaptiveRowFilterConfig, AdaptiveRowFilterContext, AdaptiveRowFilterMode,
-    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle, capture_rg_handle,
+    ConjunctAnalyzer, ParquetSplitConfig, RgFilterMode, RgProbeHandle,
+    RowFilterSkipPredicate, capture_rg_handle,
 };
 pub use page_filter::PagePruningAccessPlanFilter;
 pub use reader::*; // Expose so downstream crates can use it

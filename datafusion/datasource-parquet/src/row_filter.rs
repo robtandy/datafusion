@@ -312,11 +312,16 @@ impl FilterCandidateBuilder {
     /// * `Ok(Some(candidate))` if the expression can be used as an ArrowFilter
     /// * `Ok(None)` if the expression cannot be used as an ArrowFilter
     /// * `Err(e)` if an error occurs while building the candidate
-    pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
+    pub fn build_with_infallible(
+        self,
+        metadata: &ParquetMetaData,
+        infallible_check: impl Fn(&Arc<dyn PhysicalExpr>, &Schema) -> bool,
+    ) -> Result<Option<FilterCandidate>> {
         Ok(
             build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
                 |(read_plan, leaf_indices, required_bytes)| {
-                    let last_is_infallible = is_infallible_expr(&self.expr);
+                    let last_is_infallible =
+                        infallible_check(&self.expr, &self.file_schema);
                     FilterCandidate {
                         exprs: vec![self.expr],
                         last_is_infallible,
@@ -327,6 +332,11 @@ impl FilterCandidateBuilder {
                 },
             ),
         )
+    }
+
+    #[cfg(test)]
+    pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
+        self.build_with_infallible(metadata, |e, _| is_infallible_expr(e))
     }
 }
 
@@ -609,7 +619,15 @@ pub(crate) fn prebuild_row_filter_candidates(
     file_schema: &SchemaRef,
     metadata: &ParquetMetaData,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
-    prebuild_row_filter_candidates_with_grouping(expr, file_schema, metadata, false, None)
+    prebuild_row_filter_candidates_with_grouping(
+        expr,
+        file_schema,
+        metadata,
+        false,
+        None,
+        None,
+        None,
+    )
 }
 
 fn contains_float_type(dt: &DataType) -> bool {
@@ -675,7 +693,12 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     metadata: &ParquetMetaData,
     group_same_column: bool,
     surviving_row_groups: Option<&[usize]>,
+    conjunct_analyzer: Option<&crate::opener::ConjunctAnalyzer>,
+    skip_redundant_conjunct: Option<&crate::opener::RowFilterSkipPredicate>,
 ) -> Result<Option<Vec<PrebuiltRowFilterCandidate>>> {
+    let expr_is_infallible = |e: &Arc<dyn PhysicalExpr>, schema: &Schema| {
+        is_infallible_expr(e) || conjunct_analyzer.is_some_and(|a| a(e, schema).0)
+    };
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr);
@@ -694,7 +717,7 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
                 arrow_schema: file_schema.as_ref(),
             }
         });
-    let candidates: Vec<FilterCandidate> = predicates
+    let mut candidates: Vec<FilterCandidate> = predicates
         .into_iter()
         .filter(|pred| {
             pruning_stats
@@ -703,7 +726,7 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
         })
         .map(|expr| {
             FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
-                .build(metadata)
+                .build_with_infallible(metadata, expr_is_infallible)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -712,6 +735,42 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
 
     if candidates.is_empty() {
         return Ok(None);
+    }
+
+    // Drop redundant dynamic range conjuncts only when a non-skipped conjunct
+    // (such as an accompanying single-column Bloom filter) actually survived
+    // on the exact same leaf column set and projected schema.
+    if group_same_column && let Some(should_skip) = skip_redundant_conjunct {
+        let skipped_flags: Vec<bool> = candidates
+            .iter()
+            .map(|c| c.exprs.len() == 1 && should_skip(&c.exprs[0]))
+            .collect();
+        if skipped_flags.iter().any(|&s| s) {
+            let keep_mask: Vec<bool> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if !skipped_flags[i] || c.leaf_indices.is_empty() {
+                        return true;
+                    }
+                    let has_companion =
+                        candidates.iter().enumerate().any(|(j, other)| {
+                            j != i
+                                && !skipped_flags[j]
+                                && other.leaf_indices == c.leaf_indices
+                                && other.read_plan.projected_schema
+                                    == c.read_plan.projected_schema
+                        });
+                    !has_companion
+                })
+                .collect();
+            let mut idx = 0;
+            candidates.retain(|_| {
+                let keep = keep_mask[idx];
+                idx += 1;
+                keep
+            });
+        }
     }
 
     let candidates = if group_same_column && candidates.len() > 1 {
@@ -762,8 +821,11 @@ pub(crate) fn prebuild_row_filter_candidates_with_grouping(
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
-            let has_fallible =
-                group_same_column && !candidate.exprs.iter().all(is_infallible_expr);
+            let has_fallible = group_same_column
+                && !candidate
+                    .exprs
+                    .iter()
+                    .all(|e| expr_is_infallible(e, file_schema.as_ref()));
             let physical_exprs = candidate
                 .exprs
                 .into_iter()
@@ -2488,6 +2550,8 @@ mod test {
             &metadata,
             false,
             None,
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2500,6 +2564,8 @@ mod test {
             &file_schema,
             &metadata,
             true,
+            None,
+            None,
             None,
         )
         .unwrap()
@@ -2572,6 +2638,8 @@ mod test {
             &metadata,
             true,
             Some(&[0]),
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2628,6 +2696,8 @@ mod test {
             &metadata,
             true,
             Some(&[0]),
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2653,6 +2723,8 @@ mod test {
             &metadata,
             true,
             Some(&[0]),
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2708,6 +2780,8 @@ mod test {
             &metadata,
             true,
             None,
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2723,5 +2797,222 @@ mod test {
         assert!(grouped[1].has_fallible);
         assert!(grouped[2].reads_leaf(0));
         assert!(!grouped[2].has_fallible);
+    }
+
+    #[test]
+    fn test_group_same_column_uses_conjunct_analyzer_and_skips_redundant_bounds() {
+        use datafusion_expr::ColumnarValue;
+        use std::fmt::{Display, Formatter};
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Debug)]
+        struct MockBloomExpr {
+            col: Arc<dyn PhysicalExpr>,
+        }
+
+        impl PartialEq for MockBloomExpr {
+            fn eq(&self, other: &Self) -> bool {
+                self.col.as_ref() == other.col.as_ref()
+            }
+        }
+
+        impl Eq for MockBloomExpr {}
+
+        impl Hash for MockBloomExpr {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                "mock_bloom".hash(state);
+                self.col.hash(state);
+            }
+        }
+
+        impl Display for MockBloomExpr {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(f, "mock_bloom({})", self.col)
+            }
+        }
+
+        impl PhysicalExpr for MockBloomExpr {
+            fn data_type(&self, _schema: &Schema) -> Result<DataType> {
+                Ok(DataType::Boolean)
+            }
+
+            fn nullable(&self, _schema: &Schema) -> Result<bool> {
+                Ok(false)
+            }
+
+            fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+                let arr = self.col.evaluate(batch)?.into_array(batch.num_rows())?;
+                let ints = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                let out: BooleanArray =
+                    ints.iter().map(|v| Some(v == Some(20))).collect();
+                Ok(ColumnarValue::Array(Arc::new(out)))
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+                vec![&self.col]
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                mut children: Vec<Arc<dyn PhysicalExpr>>,
+            ) -> Result<Arc<dyn PhysicalExpr>> {
+                Ok(Arc::new(Self {
+                    col: children.remove(0),
+                }))
+            }
+
+            fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{self}")
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                .expect("reader builder");
+        let metadata = reader_builder.metadata().clone();
+        let file_schema = reader_builder.schema().clone();
+
+        let k_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+        let ge_10: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&k_col),
+            Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+        ));
+        let le_40: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&k_col),
+            Operator::LtEq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(40)))),
+        ));
+        let static_ge_15: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&k_col),
+            Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(15)))),
+        ));
+        let bloom: Arc<dyn PhysicalExpr> = Arc::new(MockBloomExpr { col: k_col });
+        let combined = conjunction([
+            Arc::clone(&static_ge_15),
+            Arc::clone(&ge_10),
+            Arc::clone(&le_40),
+            Arc::clone(&bloom),
+        ]);
+
+        // Without analyzer, custom MockBloomExpr is treated as fallible -> staged into 2 exprs.
+        let without_analyzer = prebuild_row_filter_candidates_with_grouping(
+            &combined,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(without_analyzer.len(), 1);
+        assert!(without_analyzer[0].has_fallible);
+        assert_eq!(without_analyzer[0].physical_exprs().len(), 2);
+
+        // With analyzer recognizing MockBloomExpr as infallible -> fused into 1 expr, not fallible.
+        let analyzer: crate::opener::ConjunctAnalyzer = Arc::new(|expr, _| {
+            let inf = is_infallible_expr(expr)
+                || expr.is::<MockBloomExpr>()
+                || expr.downcast_ref::<BinaryExpr>().is_some_and(|b| {
+                    *b.op() == Operator::And
+                        && (is_infallible_expr(b.left())
+                            || b.left().is::<MockBloomExpr>())
+                        && (is_infallible_expr(b.right())
+                            || b.right().is::<MockBloomExpr>())
+                });
+            (inf, 5)
+        });
+        let with_analyzer = prebuild_row_filter_candidates_with_grouping(
+            &combined,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+            Some(&analyzer),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_analyzer.len(), 1);
+        assert!(!with_analyzer[0].has_fallible);
+        assert_eq!(with_analyzer[0].physical_exprs().len(), 1);
+
+        // With skip predicate targeting only dynamic bounds (10, 40), static `k >= 15`
+        // and `mock_bloom(k)` both survive and fuse into 1 infallible expr.
+        let skip: crate::opener::RowFilterSkipPredicate = Arc::new(|expr| {
+            expr.downcast_ref::<BinaryExpr>().is_some_and(|b| {
+                matches!(b.op(), Operator::GtEq | Operator::LtEq)
+                    && b.right().downcast_ref::<Literal>().is_some_and(|l| {
+                        *l.value() == ScalarValue::Int32(Some(10))
+                            || *l.value() == ScalarValue::Int32(Some(40))
+                    })
+            })
+        });
+        let skipped = prebuild_row_filter_candidates_with_grouping(
+            &combined,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+            Some(&analyzer),
+            Some(&skip),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert!(!skipped[0].has_fallible);
+        assert_eq!(skipped[0].physical_exprs().len(), 1);
+        let rendered = format!("{}", skipped[0].physical_exprs()[0]);
+        assert!(rendered.contains("mock_bloom("), "got: {rendered}");
+        assert!(rendered.contains("15"), "static bound lost: {rendered}");
+        assert!(
+            !rendered.contains("10"),
+            "dynamic lo not skipped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("40"),
+            "dynamic hi not skipped: {rendered}"
+        );
+
+        // If no companion survives (only dynamic bounds, no bloom), skip MUST NOT
+        // drop the bounds and empty the filter.
+        let bounds_only = conjunction([Arc::clone(&ge_10), Arc::clone(&le_40)]);
+        let preserved = prebuild_row_filter_candidates_with_grouping(
+            &bounds_only,
+            &file_schema,
+            &metadata,
+            true,
+            None,
+            Some(&analyzer),
+            Some(&skip),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(preserved.len(), 1);
+        let rendered_only = format!("{}", preserved[0].physical_exprs()[0]);
+        assert!(rendered_only.contains("10") && rendered_only.contains("40"));
     }
 }

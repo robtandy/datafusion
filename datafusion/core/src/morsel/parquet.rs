@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::datatypes::SchemaRef;
 use datafusion_catalog::{ScanArgs, TableProvider};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_common::{DFSchema, Result, internal_datafusion_err, internal_err};
+use datafusion_common::{
+    DFSchema, NullEquality, Result, ScalarValue, internal_datafusion_err, internal_err,
+};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
@@ -19,17 +21,19 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_datasource_parquet::{
-    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, file_format::ParquetFormat,
-    source::ParquetSource,
+    AdaptiveRowFilterConfig, AdaptiveRowFilterContext, RowFilterSkipPredicate,
+    file_format::ParquetFormat, source::ParquetSource,
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion_expr::{Expr, TableScan};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_expr::{Expr, Operator as ExprOperator, TableScan};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
-use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
+use datafusion_physical_expr::utils::{
+    collect_columns, reassign_expr_columns, split_conjunction,
+};
 use datafusion_physical_expr::{PhysicalExpr, conjunction, create_physical_expr};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::empty::EmptyExec;
@@ -44,7 +48,7 @@ use super::dag::{ScalarSubqueryState, StageSpec, count_dag_stage_refs};
 use super::hash_join::{JoinOutputCol, ProbeJoinKind};
 use super::join_filter::{
     BoundJoinPredicates, DynamicJoinFilterConfig, DynamicJoinFilterData,
-    JoinFilterBinding,
+    JoinBloomFilterExpr, JoinFilterBinding, JoinMembershipFilter,
 };
 use super::metrics::RunMetrics;
 use super::{Operator, Pipeline, PostSort, Sink, Source, WorkerState, supported_expr};
@@ -543,6 +547,189 @@ impl ParquetScan {
             .map_or(&self.schema, |c| c.file_schema())
     }
 
+    /// Estimate selectivity of interval-analyzable conjuncts over this scan's
+    /// Parquet footer column statistics (`min`/`max`), returning
+    /// `(interval_selectivity, remaining_non_interval_conjuncts)`.
+    ///
+    /// Conjuncts whose referenced columns lack min/max statistics or are not
+    /// supported by interval analysis (e.g. `Utf8` equality, `LIKE`, `IN`) are
+    /// returned in `remaining_non_interval_conjuncts` so heuristic selectivity
+    /// (`pipeline_filter_shift`) still accounts for them.
+    pub(super) fn analyze_interval_selectivity(
+        &self,
+        extra_predicates: &[Arc<dyn PhysicalExpr>],
+    ) -> (Option<f64>, Vec<Arc<dyn PhysicalExpr>>) {
+        let mut all_conjuncts: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        if let Some(pred) = self.pushed_predicate() {
+            all_conjuncts.extend(split_conjunction(&pred).into_iter().cloned());
+        }
+        let Some(config) = &self.config else {
+            all_conjuncts.extend(
+                extra_predicates
+                    .iter()
+                    .flat_map(|p| split_conjunction(p).into_iter().cloned()),
+            );
+            return (None, all_conjuncts);
+        };
+        let file_schema = config.file_schema();
+        for pred in extra_predicates {
+            for c in split_conjunction(pred) {
+                match reassign_expr_columns(Arc::clone(c), file_schema) {
+                    Ok(rebound) => all_conjuncts.push(rebound),
+                    Err(_) => all_conjuncts.push(Arc::clone(c)),
+                }
+            }
+        }
+        if all_conjuncts.is_empty() {
+            return (None, all_conjuncts);
+        }
+        let stats = config.statistics();
+        if stats.column_statistics.len() != file_schema.fields().len() {
+            return (None, all_conjuncts);
+        }
+        let mut interval_conjuncts = Vec::new();
+        let mut other_conjuncts = Vec::new();
+        for c in &all_conjuncts {
+            let cols = collect_columns(c);
+            let cols_have_bounds = !cols.is_empty()
+                && cols.iter().all(|col| {
+                    stats.column_statistics.get(col.index()).is_some_and(|cs| {
+                        cs.min_value.get_value().is_some()
+                            && cs.max_value.get_value().is_some()
+                    })
+                });
+            if cols_have_bounds
+                && datafusion_physical_expr::intervals::utils::check_support(
+                    c,
+                    file_schema,
+                )
+            {
+                interval_conjuncts.push(Arc::clone(c));
+            } else {
+                other_conjuncts.push(Arc::clone(c));
+            }
+        }
+        if interval_conjuncts.is_empty() {
+            return (None, all_conjuncts);
+        }
+        let selectivity = datafusion_physical_expr::AnalysisContext::try_from_statistics(
+            file_schema,
+            &stats.column_statistics,
+        )
+        .ok()
+        .and_then(|ctx| {
+            datafusion_physical_expr::analyze(
+                &conjunction(interval_conjuncts),
+                ctx,
+                file_schema,
+            )
+            .ok()
+        })
+        .and_then(|res| res.selectivity)
+        .filter(|sel| sel.is_finite() && (0.0..1.0).contains(sel));
+        match selectivity {
+            Some(sel) => (Some(sel.max(1e-6)), other_conjuncts),
+            None => (None, all_conjuncts),
+        }
+    }
+
+    fn has_selective_dynamic_bloom(
+        &self,
+        parquet: &ParquetSource,
+        published_filters: &HashMap<usize, Arc<DynamicJoinFilterData>>,
+    ) -> bool {
+        let Some(config) = &self.config else {
+            return false;
+        };
+        // Only skip BulkDecode A/B probing when RowFilter actually has at least
+        // one non-predicate payload column to skip (when every projected column
+        // is already read by predicates, e.g. Q21's l1 scan, single-phase
+        // BulkDecode can beat multi-phase RowFilter).
+        let Some(pred) = parquet.exact_filter() else {
+            return false;
+        };
+        let pred_cols: HashSet<String> = collect_columns(&pred)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        let has_non_pred_payload = self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| !pred_cols.contains(f.name()));
+        if !has_non_pred_payload {
+            return false;
+        }
+        let file_schema = config.file_schema();
+        let stats = config.statistics();
+        if stats.column_statistics.len() != file_schema.fields().len() {
+            return false;
+        }
+        for binding in &self.dynamic_join_filters {
+            if !binding.all_keys_bound || binding.probe_key_exprs.len() != 1 {
+                continue;
+            }
+            let Some(filter_data) = published_filters.get(&binding.filter_id) else {
+                continue;
+            };
+            if filter_data.build_entries == 0
+                || filter_data.null_equality != NullEquality::NullEqualsNothing
+                || !matches!(
+                    filter_data.membership,
+                    JoinMembershipFilter::Bloom(_) | JoinMembershipFilter::InList(_)
+                )
+            {
+                continue;
+            }
+            let Some(col) = binding.probe_key_exprs[0]
+                .as_ref()
+                .and_then(|e| e.downcast_ref::<Column>())
+            else {
+                continue;
+            };
+            let Ok(file_idx) = file_schema.index_of(col.name()) else {
+                continue;
+            };
+            let cs = &stats.column_statistics[file_idx];
+            let Some(span) =
+                scalar_integer_span(cs.min_value.get_value(), cs.max_value.get_value())
+            else {
+                continue;
+            };
+            if span >= 100.0 && (filter_data.build_entries as f64 / span) <= 0.05 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn should_prefer_rf_wave1(&self, parquet: &ParquetSource) -> bool {
+        if self.bulk_scan_plan.is_none() {
+            return false;
+        }
+        let Some(pred) = parquet.exact_filter() else {
+            return false;
+        };
+        let pred_cols: HashSet<String> = collect_columns(&pred)
+            .into_iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        if pred_cols.len() != 1 {
+            return false;
+        }
+        let non_pred_payload_cols = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|f| !pred_cols.contains(f.name()))
+            .count();
+        if non_pred_payload_cols < 2 {
+            return false;
+        }
+        let (interval_sel, remaining) = self.analyze_interval_selectivity(&[]);
+        remaining.is_empty() && interval_sel.is_some_and(|sel| sel <= 0.02)
+    }
+
     pub(super) fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -656,6 +843,18 @@ impl ParquetScan {
             && self.pushdown_filters
             && (self.bulk_scan_plan.is_some() || pushed_dynamic_filter);
 
+        let row_filter_skip = if self.pushdown_filters && !pushed_dynamic_preds.is_empty()
+        {
+            let static_preds = self
+                .bulk_scan_plan
+                .as_ref()
+                .map(|plan| plan.pushed_static_preds.as_slice())
+                .unwrap_or(&[]);
+            build_redundant_dynamic_range_skip(&pushed_dynamic_preds, static_preds)
+        } else {
+            None
+        };
+
         let bulk_filter_plan = if can_adapt {
             let bulk_schema = self.bulk_scan_plan.as_ref().map_or_else(
                 || Arc::clone(&self.schema),
@@ -703,8 +902,16 @@ impl ParquetScan {
             None
         };
 
+        let prefer_rf_wave1 =
+            can_adapt && !pushed_dynamic_filter && self.should_prefer_rf_wave1(parquet);
+        let ready_capacity =
+            if has_pushed_filter && (pushed_dynamic_filter || prefer_rf_wave1) {
+                read_ahead.saturating_mul(2).min(MAX_READ_AHEAD)
+            } else {
+                read_ahead
+            };
         let (publish, phase2, ready) = ready::channel(
-            read_ahead,
+            ready_capacity,
             measurement.cloned(),
             claimed_counter,
             bulk_filter_plan,
@@ -721,14 +928,22 @@ impl ParquetScan {
                     .as_ref()
                     .map(|proj| (proj.clone(), Arc::clone(&plan.bulk_schema)))
             });
-            Arc::new(AdaptiveRowFilterContext::new(
+            let skip_bulk_probe = pushed_dynamic_filter
+                && self.has_selective_dynamic_bloom(parquet, published_filters);
+            let mut ctx = AdaptiveRowFilterContext::new(
                 adaptive_cfg,
                 self.files.len(),
                 pushed_dynamic_filter,
                 bulk_proj,
                 Some(Arc::new(adaptive_filter::analyze_conjunct)),
                 &self.metrics,
-            ))
+            )
+            .with_prefer_rf_wave1(prefer_rf_wave1)
+            .with_skip_bulk_probe(skip_bulk_probe);
+            if let Some(skip) = row_filter_skip {
+                ctx = ctx.with_row_filter_skip(skip);
+            }
+            Arc::new(ctx)
         });
         let work = Arc::new(FileWork {
             morselizer: parquet.create_adaptive_buffered_morselizer(
@@ -764,6 +979,101 @@ impl ParquetScan {
         }
         Ok(ready)
     }
+}
+
+fn scalar_integer_span(
+    min: Option<&ScalarValue>,
+    max: Option<&ScalarValue>,
+) -> Option<f64> {
+    let to_i128 = |sv: &ScalarValue| match sv {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Date32(Some(v)) => Some(i128::from(*v)),
+        _ => None,
+    };
+    let lo = to_i128(min?)?;
+    let hi = to_i128(max?)?;
+    if hi < lo {
+        return None;
+    }
+    Some((hi - lo).saturating_add(1) as f64)
+}
+
+fn extract_col_range_bound(
+    expr: &Arc<dyn PhysicalExpr>,
+) -> Option<(String, ExprOperator, ScalarValue)> {
+    let bin = expr.downcast_ref::<BinaryExpr>()?;
+    if let (Some(col), Some(lit)) = (
+        bin.left().downcast_ref::<Column>(),
+        bin.right().downcast_ref::<Literal>(),
+    ) && matches!(bin.op(), ExprOperator::GtEq | ExprOperator::LtEq)
+    {
+        return Some((col.name().to_owned(), *bin.op(), lit.value().clone()));
+    }
+    if let (Some(lit), Some(col)) = (
+        bin.left().downcast_ref::<Literal>(),
+        bin.right().downcast_ref::<Column>(),
+    ) && let Some(swapped) = bin.op().swap()
+        && matches!(swapped, ExprOperator::GtEq | ExprOperator::LtEq)
+    {
+        return Some((col.name().to_owned(), swapped, lit.value().clone()));
+    }
+    None
+}
+
+fn build_redundant_dynamic_range_skip(
+    pushed_dynamic_preds: &[Arc<dyn PhysicalExpr>],
+    pushed_static_preds: &[Arc<dyn PhysicalExpr>],
+) -> Option<RowFilterSkipPredicate> {
+    let mut bloom_cols: HashSet<String> = HashSet::new();
+    for pred in pushed_dynamic_preds {
+        for c in split_conjunction(pred) {
+            if let Some(bloom) = c.downcast_ref::<JoinBloomFilterExpr>()
+                && bloom.key_exprs().len() == 1
+                && bloom.null_equality() == NullEquality::NullEqualsNothing
+                && let Some(col) = bloom.key_exprs()[0].downcast_ref::<Column>()
+            {
+                bloom_cols.insert(col.name().to_owned());
+            }
+        }
+    }
+    if bloom_cols.is_empty() {
+        return None;
+    }
+    let mut static_bounds: Vec<(String, ExprOperator, ScalarValue)> = Vec::new();
+    for pred in pushed_static_preds {
+        for c in split_conjunction(pred) {
+            if let Some(bound) = extract_col_range_bound(c)
+                && !static_bounds.contains(&bound)
+            {
+                static_bounds.push(bound);
+            }
+        }
+    }
+    let mut redundant_bounds: Vec<(String, ExprOperator, ScalarValue)> = Vec::new();
+    for pred in pushed_dynamic_preds {
+        for c in split_conjunction(pred) {
+            if let Some(bound) = extract_col_range_bound(c)
+                && bloom_cols.contains(&bound.0)
+                && !static_bounds.contains(&bound)
+                && !redundant_bounds.contains(&bound)
+            {
+                redundant_bounds.push(bound);
+            }
+        }
+    }
+    if redundant_bounds.is_empty() {
+        return None;
+    }
+    Some(Arc::new(move |expr: &Arc<dyn PhysicalExpr>| {
+        extract_col_range_bound(expr).is_some_and(|b| redundant_bounds.contains(&b))
+    }))
 }
 
 fn source_schema(source: &Source) -> SchemaRef {
@@ -1581,7 +1891,12 @@ fn remap_probe_key_to_scan(
                     .data;
             }
             Operator::HashProbe(mid_probe) => {
-                if mid_probe.needs_build_emission() {
+                let allow_equijoin_sub = matches!(
+                    mid_probe.kind,
+                    ProbeJoinKind::Inner | ProbeJoinKind::BuildSemi
+                ) && mid_probe.null_equality()
+                    == NullEquality::NullEqualsNothing;
+                if mid_probe.needs_build_emission() && !allow_equijoin_sub {
                     return Ok(None);
                 }
                 let mut unmappable = false;
@@ -1594,6 +1909,37 @@ fn remap_probe_key_to_scan(
                                         prev_schema.field(p_idx).name(),
                                         p_idx,
                                     ))));
+                                }
+                                JoinOutputCol::Build(b_idx) if allow_equijoin_sub => {
+                                    if let Sink::HashJoinBuild(build_sink) =
+                                        &mid_probe.build_pipeline.sink
+                                    {
+                                        let payload_col =
+                                            build_sink.payload_columns()[b_idx];
+                                        if let Some(k) =
+                                            build_sink.key_exprs().iter().position(|ke| {
+                                                ke.downcast_ref::<Column>().is_some_and(
+                                                    |c| c.index() == payload_col,
+                                                )
+                                            })
+                                        {
+                                            let probe_key =
+                                                &mid_probe.probe_key_exprs()[k];
+                                            let out_dt = mid_probe
+                                                .output_schema
+                                                .field(col.index())
+                                                .data_type();
+                                            if probe_key
+                                                .data_type(prev_schema)
+                                                .is_ok_and(|dt| &dt == out_dt)
+                                            {
+                                                return Ok(Transformed::yes(Arc::clone(
+                                                    probe_key,
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    unmappable = true;
                                 }
                                 JoinOutputCol::Build(_) => {
                                     unmappable = true;
