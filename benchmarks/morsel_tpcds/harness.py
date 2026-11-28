@@ -1016,6 +1016,33 @@ def _duckdb_exec(
 # ---------------------------------------------------------------------------
 
 
+def _is_zero_or_none(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, Decimal):
+        return value == 0
+    return False
+
+
+def is_degenerate_table(table: pa.Table) -> bool:
+    """Return True if a result table has 0 rows or 1 row of all NULL/zero values."""
+    if table.num_rows == 0:
+        return True
+    if table.num_rows == 1:
+        row = [col[0].as_py() for col in table.columns]
+        return all(_is_zero_or_none(v) for v in row)
+    return False
+
+
+def is_degenerate_result(tables: list[pa.Table]) -> bool:
+    """Return True if every statement result table for a query is degenerate."""
+    return all(is_degenerate_table(t) for t in tables)
+
+
 def _values_equal(expected, actual, *, strict: bool = False) -> bool:
     if expected is None or actual is None:
         return expected is actual
@@ -1469,15 +1496,18 @@ def audit_suite(
             "all_blockers": [],
             "statement_admitted": [s["admitted"] for s in morsel_plan["statements"]],
             "parity_verified": False,
+            "degenerate_result": None,
             "output_rows": None,
         }
         if admitted:
             if verify_parity:
                 total_rows = 0
+                stock_tables: list[pa.Table] = []
                 for idx in range(workload.statement_count):
                     oracle_tbl = duckdb_oracle.query(workload, stmt_index=idx)
                     stock_tbl = stock_planner.query(workload, stmt_index=idx)
                     morsel_tbl = morsel_planner.query(workload, stmt_index=idx)
+                    stock_tables.append(stock_tbl)
                     ordered = workload.ordered_statements[idx]
                     case_label = (
                         f"{qname}[{idx}]" if workload.statement_count > 1 else qname
@@ -1515,6 +1545,7 @@ def audit_suite(
                         f"morsel_pushdown/{qname}: measure rows {sample['output_rows']} != {total_rows}"
                     )
                 entry["parity_verified"] = True
+                entry["degenerate_result"] = is_degenerate_result(stock_tables)
                 entry["output_rows"] = total_rows
         else:
             stock_plan = stock_planner.plan(workload)
@@ -1529,6 +1560,21 @@ def audit_suite(
         query_results[qname] = entry
 
     rollup = summarize_rejection_audit(query_results)
+    if verify_parity:
+        degen_adm = sorted(
+            q
+            for q, r in query_results.items()
+            if r["admitted"] and r["degenerate_result"] is True
+        )
+        non_degen_adm = sorted(
+            q
+            for q, r in query_results.items()
+            if r["admitted"] and r["degenerate_result"] is False
+        )
+        rollup["degenerate_admitted_count"] = len(degen_adm)
+        rollup["degenerate_admitted_queries"] = degen_adm
+        rollup["non_degenerate_admitted_count"] = len(non_degen_adm)
+        rollup["non_degenerate_admitted_queries"] = non_degen_adm
     return {
         "dataset": summary,
         "summary": rollup,
@@ -1618,11 +1664,13 @@ def verify_suite(
                     "stock_default",
                 )
 
+        degenerate = is_degenerate_result(stock_oracle_tables)
         verified[qname] = {
             "rows": stock_rows,
             "duckdb_rows": duckdb_rows,
             "statement_rows": [t.num_rows for t in stock_oracle_tables],
             "morsel_admitted": admitted,
+            "degenerate_result": degenerate,
             "arms": [],
         }
 
@@ -1682,10 +1730,20 @@ def verify_suite(
             elif arm.engine == "duckdb":
                 verified[qname]["arms"].append(arm_name)
 
+    degenerate_queries = sorted(
+        q for q, v in verified.items() if v.get("degenerate_result")
+    )
+    degenerate_admitted_queries = sorted(
+        q
+        for q, v in verified.items()
+        if v.get("morsel_admitted") and v.get("degenerate_result")
+    )
     return {
         "verified": verified,
         "morsel_audit": morsel_audit,
         "morsel_summary": summarize_rejection_audit(morsel_audit),
+        "degenerate_queries": degenerate_queries,
+        "degenerate_admitted_queries": degenerate_admitted_queries,
         "clickhouse_incompatible": clickhouse_incompatible,
         "clickhouse_parity_notes": clickhouse_parity_notes,
         "datafusion_int_div_notes": datafusion_int_div_notes,
@@ -1760,6 +1818,8 @@ def run_bench(args):
         "verified": verification["verified"],
         "morsel_audit": verification["morsel_audit"],
         "morsel_summary": verification["morsel_summary"],
+        "degenerate_queries": verification["degenerate_queries"],
+        "degenerate_admitted_queries": verification["degenerate_admitted_queries"],
         "clickhouse_incompatible": verification["clickhouse_incompatible"],
         "clickhouse_parity_notes": verification["clickhouse_parity_notes"],
         "datafusion_int_div_notes": verification["datafusion_int_div_notes"],
@@ -1975,25 +2035,49 @@ def summarize_jsonl(path: Path) -> str:
                 else None
             )
 
-        sd_gm = _gm("stock_default", admitted)
-        sp_gm = _gm("stock_pushdown", admitted)
-        mp_gm = _gm("morsel_pushdown", admitted)
-        dk_gm = _gm("duckdb_default", admitted)
-        ch_shared = [q for q in admitted if (q, "clickhouse_default") in medians]
-        ch_gm = _gm("clickhouse_default", ch_shared) if ch_shared else None
-        mp_ch_gm = _gm("morsel_pushdown", ch_shared) if ch_shared else None
+        def _append_geomean_row(label: str, qs: list[str]):
+            sd_gm = _gm("stock_default", qs)
+            sp_gm = _gm("stock_pushdown", qs)
+            mp_gm = _gm("morsel_pushdown", qs)
+            dk_gm = _gm("duckdb_default", qs)
+            ch_shared = [q for q in qs if (q, "clickhouse_default") in medians]
+            ch_gm = _gm("clickhouse_default", ch_shared) if ch_shared else None
+            mp_ch_gm = _gm("morsel_pushdown", ch_shared) if ch_shared else None
+            out.append(
+                f"| **{label}** | — | "
+                f"{f'**{sd_gm:.1f}**' if sd_gm else '—'} | "
+                f"{f'**{sp_gm:.1f}**' if sp_gm else '—'} | "
+                f"{f'**{mp_gm:.1f}**' if mp_gm else '—'} | "
+                f"{f'**{dk_gm:.1f}**' if dk_gm else '—'} | "
+                f"{f'**{ch_gm:.1f}** ({len(ch_shared)}q)' if ch_gm else '—'} | "
+                f"{f'**{mp_gm / sd_gm:.2f}x**' if (mp_gm and sd_gm) else '—'} | "
+                f"{f'**{mp_gm / dk_gm:.2f}x**' if (mp_gm and dk_gm) else '—'} | "
+                f"{f'**{mp_ch_gm / ch_gm:.2f}x**' if (mp_ch_gm and ch_gm) else '—'} |"
+            )
 
-        out.append(
-            f"| **GeoMean ({len(admitted)} admitted)** | — | "
-            f"{f'**{sd_gm:.1f}**' if sd_gm else '—'} | "
-            f"{f'**{sp_gm:.1f}**' if sp_gm else '—'} | "
-            f"{f'**{mp_gm:.1f}**' if mp_gm else '—'} | "
-            f"{f'**{dk_gm:.1f}**' if dk_gm else '—'} | "
-            f"{f'**{ch_gm:.1f}** ({len(ch_shared)}q)' if ch_gm else '—'} | "
-            f"{f'**{mp_gm / sd_gm:.2f}x**' if (mp_gm and sd_gm) else '—'} | "
-            f"{f'**{mp_gm / dk_gm:.2f}x**' if (mp_gm and dk_gm) else '—'} | "
-            f"{f'**{mp_ch_gm / ch_gm:.2f}x**' if (mp_ch_gm and ch_gm) else '—'} |"
-        )
+        _append_geomean_row(f"GeoMean ({len(admitted)} admitted)", admitted)
+        non_degenerate = [
+            q
+            for q in admitted
+            if not (header.get("verified") or {}).get(q, {}).get("degenerate_result")
+        ]
+        degenerate_adm = [
+            q
+            for q in admitted
+            if (header.get("verified") or {}).get(q, {}).get("degenerate_result")
+        ]
+        if non_degenerate:
+            _append_geomean_row(
+                f"GeoMean ({len(non_degenerate)} non-degenerate admitted)",
+                non_degenerate,
+            )
+        if degenerate_adm:
+            out.append("")
+            out.append(
+                f"Degenerate admitted queries ({len(degenerate_adm)}/{len(admitted)}, "
+                f"0 rows or single all-NULL/0 row): "
+                + ", ".join(f"`{q}`" for q in degenerate_adm)
+            )
         out.append("")
 
     # 2. Full-suite table across all queries present

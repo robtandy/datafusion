@@ -264,6 +264,130 @@ class TableComparisonTests(unittest.TestCase):
                 runner._raise_error("query", "q03", 1, non_dialect)
             self.assertNotIsInstance(ctx.exception, harness.ClickHouseDialectError)
 
+    def test_degenerate_result_detection_and_subset_geomean(self):
+        empty = pa.table({"a": pa.array([], type=pa.int64())})
+        all_zero_null = pa.table(
+            {"c": [0], "s": [None], "d": [Decimal("0.00")], "f": [0.0]}
+        )
+        non_zero = pa.table({"c": [1], "s": [None]})
+        two_zero_rows = pa.table({"c": [0, 0]})
+
+        self.assertTrue(harness.is_degenerate_result([empty]))
+        self.assertTrue(harness.is_degenerate_result([all_zero_null]))
+        self.assertTrue(harness.is_degenerate_result([empty, all_zero_null]))
+        self.assertFalse(harness.is_degenerate_result([non_zero]))
+        self.assertFalse(harness.is_degenerate_result([two_zero_rows]))
+        self.assertFalse(harness.is_degenerate_result([empty, non_zero]))
+
+        # Verify summarize_jsonl prints both all-admitted and non-degenerate-admitted geomeans.
+        header = {
+            "record_type": "header",
+            "host": "test-host",
+            "arch": "aarch64",
+            "kernel": "7.0",
+            "threads": 8,
+            "cache_regime": "warm",
+            "warmups": 1,
+            "repeats": 1,
+            "build_revision": "rev",
+            "duckdb_version": "2.0.1",
+            "clickhouse_version": "26.11",
+            "pyarrow_version": "26.0.1",
+            "verified": {
+                "q01": {
+                    "rows": 0,
+                    "morsel_admitted": True,
+                    "degenerate_result": True,
+                },
+                "q03": {
+                    "rows": 38,
+                    "morsel_admitted": True,
+                    "degenerate_result": False,
+                },
+            },
+            "degenerate_queries": ["q01"],
+            "degenerate_admitted_queries": ["q01"],
+        }
+        trials = [
+            # q01 (degenerate): morsel=10ms, stock=20ms, duckdb=40ms, ch=80ms
+            {
+                "record_type": "trial",
+                "case": "q01",
+                "arm": "stock_default",
+                "seconds": 0.020,
+            },
+            {
+                "record_type": "trial",
+                "case": "q01",
+                "arm": "stock_pushdown",
+                "seconds": 0.020,
+            },
+            {
+                "record_type": "trial",
+                "case": "q01",
+                "arm": "morsel_pushdown",
+                "seconds": 0.010,
+            },
+            {
+                "record_type": "trial",
+                "case": "q01",
+                "arm": "duckdb_default",
+                "seconds": 0.040,
+            },
+            {
+                "record_type": "trial",
+                "case": "q01",
+                "arm": "clickhouse_default",
+                "seconds": 0.080,
+            },
+            # q03 (non-degenerate): morsel=90ms, stock=100ms, duckdb=60ms, ch=180ms
+            {
+                "record_type": "trial",
+                "case": "q03",
+                "arm": "stock_default",
+                "seconds": 0.100,
+            },
+            {
+                "record_type": "trial",
+                "case": "q03",
+                "arm": "stock_pushdown",
+                "seconds": 0.095,
+            },
+            {
+                "record_type": "trial",
+                "case": "q03",
+                "arm": "morsel_pushdown",
+                "seconds": 0.090,
+            },
+            {
+                "record_type": "trial",
+                "case": "q03",
+                "arm": "duckdb_default",
+                "seconds": 0.060,
+            },
+            {
+                "record_type": "trial",
+                "case": "q03",
+                "arm": "clickhouse_default",
+                "seconds": 0.180,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "summary_test.jsonl"
+            jsonl_path.write_text(
+                "\n".join(json.dumps(r) for r in [header, *trials]) + "\n"
+            )
+            md = harness.summarize_jsonl(jsonl_path)
+        # All-2 admitted geomean: morsel=sqrt(10*90)=30.0ms, duckdb=sqrt(40*60)=49.0ms
+        self.assertIn("**GeoMean (2 admitted)**", md)
+        self.assertIn("**30.0**", md)
+        # Non-degenerate 1-query geomean: morsel=90.0ms, stock=100.0ms, duckdb=60.0ms (1.50x)
+        self.assertIn("**GeoMean (1 non-degenerate admitted)**", md)
+        self.assertIn("**90.0**", md)
+        self.assertIn("**1.50x**", md)
+        self.assertIn("Degenerate admitted queries (1/2", md)
+        self.assertIn("`q01`", md)
+
 
 class EndToEndSmokeTests(unittest.TestCase):
     @classmethod
@@ -343,6 +467,8 @@ class EndToEndSmokeTests(unittest.TestCase):
         )
         self.assertTrue(audit["queries"]["q03"]["admitted"])
         self.assertTrue(audit["queries"]["q03"]["parity_verified"])
+        self.assertIsInstance(audit["queries"]["q03"]["degenerate_result"], bool)
+        self.assertIn("degenerate_admitted_queries", audit["summary"])
         self.assertFalse(audit["queries"]["q05"]["admitted"])
         self.assertFalse(audit["queries"]["q12"]["admitted"])
         self.assertIn("Window", audit["queries"]["q12"]["all_blockers"])
@@ -368,6 +494,8 @@ class EndToEndSmokeTests(unittest.TestCase):
             clickhouse_bin=self.ch_bin,
         )
         self.assertIn("morsel_pushdown", ver["verified"]["q03"]["arms"])
+        self.assertIsInstance(ver["verified"]["q03"]["degenerate_result"], bool)
+        self.assertIn("degenerate_admitted_queries", ver)
         self.assertNotIn("morsel_pushdown", ver["verified"]["q12"]["arms"])
         if self.ch_bin is not None:
             self.assertIn("clickhouse_default", ver["verified"]["q03"]["arms"])
