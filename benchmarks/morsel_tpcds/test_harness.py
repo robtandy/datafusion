@@ -172,6 +172,98 @@ class TableComparisonTests(unittest.TestCase):
                 oracle, actual, ordered=True, case_name="t", arm_name="a"
             )
 
+    def test_strict_mode_exact_decimals_names_and_floats(self):
+        # Exact Decimals, matching column names, and 1e-10 float tolerance pass.
+        oracle = pa.table(
+            {"k": ["a", "b"], "d": [Decimal("12.345000"), None], "f": [1.0, 2.0]}
+        )
+        same = pa.table(
+            {
+                "k": ["a", "b"],
+                "d": [Decimal("12.345000"), None],
+                "f": [1.0 + 1e-10, 2.0],
+            }
+        )
+        harness.compare_tables(
+            oracle, same, ordered=True, case_name="t", arm_name="morsel", strict=True
+        )
+
+        # Tied ORDER BY rows still pass via ordered-to-multiset fallback in strict mode.
+        swapped = pa.table(
+            {"k": ["b", "a"], "d": [None, Decimal("12.345000")], "f": [2.0, 1.0]}
+        )
+        harness.compare_tables(
+            oracle, swapped, ordered=True, case_name="t", arm_name="morsel", strict=True
+        )
+
+        # Strict mode rejects 1e-6 Decimal drift.
+        dec_drift = pa.table(
+            {"k": ["a", "b"], "d": [Decimal("12.345001"), None], "f": [1.0, 2.0]}
+        )
+        with self.assertRaises(ValueError):
+            harness.compare_tables(
+                oracle,
+                dec_drift,
+                ordered=True,
+                case_name="t",
+                arm_name="morsel",
+                strict=True,
+            )
+
+        # Strict mode rejects 1e-6 float drift.
+        flt_drift = pa.table(
+            {
+                "k": ["a", "b"],
+                "d": [Decimal("12.345000"), None],
+                "f": [1.0 + 1e-6, 2.0],
+            }
+        )
+        with self.assertRaises(ValueError):
+            harness.compare_tables(
+                oracle,
+                flt_drift,
+                ordered=True,
+                case_name="t",
+                arm_name="morsel",
+                strict=True,
+            )
+
+        # Strict mode rejects mismatched column names.
+        bad_names = pa.table(
+            {"k": ["a", "b"], "d_other": [Decimal("12.345000"), None], "f": [1.0, 2.0]}
+        )
+        with self.assertRaises(ValueError):
+            harness.compare_tables(
+                oracle,
+                bad_names,
+                ordered=True,
+                case_name="t",
+                arm_name="morsel",
+                strict=True,
+            )
+
+    def test_clickhouse_error_classification(self):
+        runner = harness.ClickHouseRunner(
+            Path(sys.executable), Path(__file__).resolve().parent, threads=1, timeout=5
+        )
+        for code in (43, 47, 62, 184, 206, 207, 558):
+            with self.assertRaises(harness.ClickHouseDialectError):
+                runner._raise_error(
+                    "query",
+                    "q01",
+                    code,
+                    f"Code: {code}. DB::Exception: dialect error",
+                )
+        for non_dialect in (
+            "Code: 57. DB::Exception: Table default.date_dim already exists. (TABLE_ALREADY_EXISTS)",
+            "Code: 107. DB::Exception: File not found. (FILE_DOESNT_EXIST)",
+            "Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)",
+            "unexpected crash without error code",
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                runner._raise_error("query", "q03", 1, non_dialect)
+            self.assertNotIsInstance(ctx.exception, harness.ClickHouseDialectError)
+
 
 class EndToEndSmokeTests(unittest.TestCase):
     @classmethod
@@ -215,16 +307,24 @@ class EndToEndSmokeTests(unittest.TestCase):
             self.skipTest("clickhouse binary not found")
         ch = harness.ClickHouseRunner(self.ch_bin, self.data_dir, threads=2, timeout=30)
         dk = harness.DuckDbRunner(self.data_dir, threads=2, timeout=30)
-        # q03 is compatible with ClickHouse and must match DuckDB.
+        # q03 is compatible with ClickHouse and must succeed across repeated isolated
+        # invocations (regression guard against ClickHouse 26.12 persistent default DB
+        # causing Code 57 TABLE_ALREADY_EXISTS on the second CREATE VIEW).
         w3 = harness.WORKLOADS["q03"]
+        oracle_q3 = dk.query(w3)
         harness.compare_tables(
-            dk.query(w3), ch.query(w3), True, "q03", "clickhouse_default"
+            oracle_q3, ch.query(w3), True, "q03", "clickhouse_default"
+        )
+        harness.compare_tables(
+            oracle_q3, ch.query(w3), True, "q03", "clickhouse_default"
         )
         m3 = ch.measure(w3)
         self.assertGreaterEqual(m3["seconds"], 0.0)
-        # q01 uses uppercase SR_FEE which ClickHouse rejects with UNKNOWN_IDENTIFIER.
-        with self.assertRaises(harness.ClickHouseDialectError):
+        # q01 uses uppercase SR_FEE which ClickHouse rejects with Code 47 UNKNOWN_IDENTIFIER.
+        with self.assertRaises(harness.ClickHouseDialectError) as ctx:
             ch.query(harness.WORKLOADS["q01"])
+        self.assertIn("Code: 47", str(ctx.exception))
+        self.assertIn("SR_FEE", str(ctx.exception))
 
     def test_4way_audit_verify_bench_and_summarize(self):
         if self.runner is None:

@@ -666,8 +666,28 @@ def require_cold_cache(files: list[Path]) -> dict[str, int]:
     return pages
 
 
+# ClickHouse error codes that represent SQL dialect or query-analysis incompatibilities
+# (as opposed to setup/environment failures like Code 57 TABLE_ALREADY_EXISTS, IO, or OOM):
+#   43:  ILLEGAL_TYPE_OF_ARGUMENT
+#   47:  UNKNOWN_IDENTIFIER
+#   62:  SYNTAX_ERROR
+#   184: ILLEGAL_AGGREGATION
+#   206: ALIAS_REQUIRED
+#   207: AMBIGUOUS_IDENTIFIER
+#   558: EXPECTED_ALL_OR_DISTINCT
+CLICKHOUSE_DIALECT_ERROR_CODES: frozenset[int] = frozenset(
+    {43, 47, 62, 184, 206, 207, 558}
+)
+_CLICKHOUSE_CODE_RE = re.compile(r"\bCode:\s*(\d+)\b")
+
+
+def parse_clickhouse_error_code(error_text: str) -> int | None:
+    match = _CLICKHOUSE_CODE_RE.search(error_text)
+    return int(match.group(1)) if match else None
+
+
 class ClickHouseDialectError(RuntimeError):
-    """Raised when ClickHouse fails to parse or execute unmodified TPC-DS SQL."""
+    """Raised when ClickHouse fails with a SQL dialect or query-analysis error code."""
 
 
 class DataFusionRunner:
@@ -816,53 +836,72 @@ class ClickHouseRunner:
                 return line
         return lines[-1] if lines else "unknown clickhouse-local error"
 
+    def _raise_error(
+        self, operation: str, workload_name: str, returncode: int, stderr_text: str
+    ):
+        err_msg = self._extract_error(stderr_text)
+        code = parse_clickhouse_error_code(err_msg)
+        if code in CLICKHOUSE_DIALECT_ERROR_CODES:
+            raise ClickHouseDialectError(err_msg)
+        raise RuntimeError(
+            f"clickhouse {operation} failed on {workload_name} "
+            f"(rc={returncode}): {err_msg}"
+        )
+
     def query(self, workload: Workload, stmt_index: int = 0) -> pa.Table:
         script = (
             self._views_sql(workload.tables)
             + "\n"
             + f"{workload.statements[stmt_index]}\nFORMAT ArrowStream;\n"
         )
-        res = subprocess.run(
-            [
-                str(self.binary),
-                "local",
-                f"--max_threads={self.threads}",
-                *CLICKHOUSE_SQL_FLAGS,
-                "--progress=0",
-                "-n",
-            ],
-            input=script.encode(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=self.timeout,
-        )
+        with tempfile.TemporaryDirectory(prefix="ch-local-") as ch_path:
+            res = subprocess.run(
+                [
+                    str(self.binary),
+                    "local",
+                    f"--path={ch_path}",
+                    f"--max_threads={self.threads}",
+                    *CLICKHOUSE_SQL_FLAGS,
+                    "--progress=0",
+                    "-n",
+                ],
+                input=script.encode(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.timeout,
+            )
         if res.returncode != 0:
-            raise ClickHouseDialectError(
-                self._extract_error(res.stderr.decode(errors="replace"))
+            self._raise_error(
+                "query",
+                workload.name,
+                res.returncode,
+                res.stderr.decode(errors="replace"),
             )
         return pa_ipc.open_stream(res.stdout).read_all()
 
     def measure(self, workload: Workload) -> dict:
         stmts_sql = "\n".join(f"{s}\nFORMAT Null;" for s in workload.statements)
         script = self._views_sql(workload.tables) + "\n" + stmts_sql + "\n"
-        res = subprocess.run(
-            [
-                str(self.binary),
-                "local",
-                f"--max_threads={self.threads}",
-                *CLICKHOUSE_SQL_FLAGS,
-                "--progress=0",
-                "-n",
-                "--time",
-            ],
-            input=script.encode(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=self.timeout,
-        )
+        with tempfile.TemporaryDirectory(prefix="ch-local-") as ch_path:
+            res = subprocess.run(
+                [
+                    str(self.binary),
+                    "local",
+                    f"--path={ch_path}",
+                    f"--max_threads={self.threads}",
+                    *CLICKHOUSE_SQL_FLAGS,
+                    "--progress=0",
+                    "-n",
+                    "--time",
+                ],
+                input=script.encode(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.timeout,
+            )
         stderr_text = res.stderr.decode(errors="replace")
         if res.returncode != 0:
-            raise ClickHouseDialectError(self._extract_error(stderr_text))
+            self._raise_error("measure", workload.name, res.returncode, stderr_text)
         time_lines: list[float] = []
         for line in stderr_text.splitlines():
             stripped = line.strip()
@@ -977,13 +1016,21 @@ def _duckdb_exec(
 # ---------------------------------------------------------------------------
 
 
-def _values_equal(expected, actual) -> bool:
+def _values_equal(expected, actual, *, strict: bool = False) -> bool:
     if expected is None or actual is None:
         return expected is actual
     if isinstance(expected, float) and math.isnan(expected):
         return isinstance(actual, float) and math.isnan(actual)
     if isinstance(actual, float) and math.isnan(actual):
         return False
+    if strict:
+        if isinstance(expected, Decimal) and isinstance(actual, Decimal):
+            return expected == actual
+        if isinstance(expected, float) and isinstance(actual, float):
+            return math.isclose(expected, actual, rel_tol=1e-9, abs_tol=1e-9)
+        if type(expected) is not type(actual):
+            return False
+        return expected == actual
     if isinstance(expected, Decimal) and isinstance(actual, Decimal):
         if expected == actual:
             return True
@@ -1039,12 +1086,12 @@ def _sort_key(row: tuple):
 
 
 def _rows_match_exact(
-    oracle_rows: list[tuple], actual_rows: list[tuple]
+    oracle_rows: list[tuple], actual_rows: list[tuple], *, strict: bool = False
 ) -> tuple[int, int] | None:
     """Return None if rows match pairwise, or (row_idx, col_idx) of first mismatch."""
     for r_idx, (exp_row, act_row) in enumerate(zip(oracle_rows, actual_rows)):
         for c_idx, (exp_val, act_val) in enumerate(zip(exp_row, act_row)):
-            if not _values_equal(exp_val, act_val):
+            if not _values_equal(exp_val, act_val, strict=strict):
                 return (r_idx, c_idx)
     return None
 
@@ -1055,12 +1102,19 @@ def compare_tables(
     ordered: bool,
     case_name: str,
     arm_name: str,
+    *,
+    strict: bool = False,
 ):
     if oracle.num_columns != actual.num_columns:
         raise ValueError(
             f"{arm_name}/{case_name}: column count mismatch: "
             f"expected {oracle.num_columns} ({oracle.schema.names}), "
             f"got {actual.num_columns} ({actual.schema.names})"
+        )
+    if strict and oracle.schema.names != actual.schema.names:
+        raise ValueError(
+            f"{arm_name}/{case_name}: column name mismatch: "
+            f"expected {oracle.schema.names}, got {actual.schema.names}"
         )
     if oracle.num_rows != actual.num_rows:
         raise ValueError(
@@ -1074,14 +1128,14 @@ def compare_tables(
     actual_rows = list(zip(*(col.to_pylist() for col in actual.columns)))
 
     if ordered:
-        mismatch = _rows_match_exact(oracle_rows, actual_rows)
+        mismatch = _rows_match_exact(oracle_rows, actual_rows, strict=strict)
         if mismatch is None:
             return
         # Check if rows match as a multiset (can happen on ORDER BY with NULLS FIRST/LAST
-        # defaults or ties in non-unique sort keys across engines).
+        # defaults or ties in non-unique sort keys across engines/executions, e.g. q31/q71).
         sorted_oracle = sorted(oracle_rows, key=_sort_key)
         sorted_actual = sorted(actual_rows, key=_sort_key)
-        if _rows_match_exact(sorted_oracle, sorted_actual) is None:
+        if _rows_match_exact(sorted_oracle, sorted_actual, strict=strict) is None:
             return
         r_idx, c_idx = mismatch
         raise ValueError(
@@ -1091,7 +1145,7 @@ def compare_tables(
 
     oracle_rows.sort(key=_sort_key)
     actual_rows.sort(key=_sort_key)
-    mismatch = _rows_match_exact(oracle_rows, actual_rows)
+    mismatch = _rows_match_exact(oracle_rows, actual_rows, strict=strict)
     if mismatch is not None:
         r_idx, c_idx = mismatch
         raise ValueError(
@@ -1428,9 +1482,14 @@ def audit_suite(
                     case_label = (
                         f"{qname}[{idx}]" if workload.statement_count > 1 else qname
                     )
-                    # Always enforce exact Morsel == Stock DataFusion parity.
+                    # Always enforce strict Morsel == Stock DataFusion parity.
                     compare_tables(
-                        stock_tbl, morsel_tbl, ordered, case_label, "morsel_vs_stock"
+                        stock_tbl,
+                        morsel_tbl,
+                        ordered,
+                        case_label,
+                        "morsel_vs_stock",
+                        strict=True,
                     )
                     if qname not in DATAFUSION_INT_DIV_QUERIES:
                         compare_tables(
@@ -1611,6 +1670,7 @@ def verify_suite(
                             workload.ordered_statements[idx],
                             case_label,
                             arm_name,
+                            strict=True,
                         )
                 sample = runner.measure(workload)
                 validate_plan(sample, arm, workload, table_rgs)
