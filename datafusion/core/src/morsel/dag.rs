@@ -662,7 +662,9 @@ pub(super) fn ensure_stage<'a>(
             return Ok(None);
         };
 
-        let channel_cap = stage_pipeline.sink_capacity.max(4);
+        let channel_cap = super::result_capacity(stage_pipeline.workers)
+            .max(stage_pipeline.sink_capacity)
+            .max(4);
         let (stage_tx, mut stage_rx) = mpsc::channel(channel_cap);
 
         let mut stage_tasks: JoinSet<Result<()>> = JoinSet::new();

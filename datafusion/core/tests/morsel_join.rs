@@ -5038,3 +5038,439 @@ async fn static_range_filter_preserved_alongside_dynamic_bloom_on_same_column()
     assert_eq!(metric(p3.as_ref(), "join_dynamic_filters_pushed"), 3);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn radix_build_semi_anti_flat_int_and_prefilter_parity() -> Result<()> {
+    // Build > RADIX_JOIN_THRESHOLD_ROWS (20,000 rows, sparse keys so it enters
+    // 64-partition radix finalize and builds `RegisterBloom64`) and probe with
+    // both `ProbeRows::All` (Q22-like) and `ProbeRows::Mask` (Q4-like) across
+    // BuildSemi (EXISTS) and BuildAnti (NOT EXISTS), including duplicates,
+    // NULLs, and composite 2-key Int64Pair.
+    let build_schema = Arc::new(Schema::new(vec![
+        Field::new("ok", DataType::Int64, true),
+        Field::new("ok2", DataType::Int64, true),
+        Field::new("ok32", DataType::Int32, true),
+        Field::new("prio", DataType::Int32, false),
+    ]));
+    let n_build = 25_000i64;
+    let b_ok: Vec<Option<i64>> = (0..n_build)
+        .map(|i| {
+            if i % 997 == 0 {
+                None
+            } else {
+                // Sparse keys spanning [0..200_000_000] with duplicates every 17th row
+                let base = if i % 17 == 0 { i - 1 } else { i };
+                Some(base.wrapping_mul(10_007))
+            }
+        })
+        .collect();
+    let b_ok2: Vec<Option<i64>> = (0..n_build)
+        .map(|i| if i % 991 == 0 { None } else { Some(i % 13) })
+        .collect();
+    let b_ok32: Vec<Option<i32>> = (0..n_build)
+        .map(|i| {
+            if i % 997 == 0 {
+                None
+            } else {
+                Some(((i.wrapping_mul(10_007)) & 0x3fff_ffff) as i32)
+            }
+        })
+        .collect();
+    let b_prio: Vec<i32> = (0..n_build).map(|i| (i % 5) as i32).collect();
+    let build_batch = RecordBatch::try_new(
+        Arc::clone(&build_schema),
+        vec![
+            Arc::new(Int64Array::from(b_ok)),
+            Arc::new(Int64Array::from(b_ok2)),
+            Arc::new(Int32Array::from(b_ok32)),
+            Arc::new(Int32Array::from(b_prio)),
+        ],
+    )?;
+    let build_batches = vec![
+        build_batch.slice(0, 12_500),
+        build_batch.slice(12_500, 12_500),
+    ];
+    let build_dir = write_parquet_files(&build_batches, 2, 5_000)?;
+
+    let probe_schema = Arc::new(Schema::new(vec![
+        Field::new("lk", DataType::Int64, true),
+        Field::new("lk2", DataType::Int64, true),
+        Field::new("lk32", DataType::Int32, true),
+        Field::new("cdate", DataType::Int32, false),
+        Field::new("rdate", DataType::Int32, false),
+    ]));
+    let n_probe = 60_000i64;
+    let p_lk: Vec<Option<i64>> = (0..n_probe)
+        .map(|i| {
+            if i % 1009 == 0 {
+                None
+            } else if i % 4 == 0 {
+                Some((i % n_build).wrapping_mul(10_007))
+            } else {
+                Some(i.wrapping_mul(10_009) + 3)
+            }
+        })
+        .collect();
+    let p_lk2: Vec<Option<i64>> = (0..n_probe)
+        .map(|i| if i % 1013 == 0 { None } else { Some(i % 13) })
+        .collect();
+    let p_lk32: Vec<Option<i32>> = (0..n_probe)
+        .map(|i| {
+            if i % 1009 == 0 {
+                None
+            } else if i % 4 == 0 {
+                Some((((i % n_build).wrapping_mul(10_007)) & 0x3fff_ffff) as i32)
+            } else {
+                Some(((i.wrapping_mul(10_009) + 3) & 0x3fff_ffff) as i32)
+            }
+        })
+        .collect();
+    let p_cdate: Vec<i32> = (0..n_probe).map(|i| (i % 100) as i32).collect();
+    let p_rdate: Vec<i32> = (0..n_probe).map(|i| ((i * 7 + 30) % 120) as i32).collect();
+    let probe_batch = RecordBatch::try_new(
+        Arc::clone(&probe_schema),
+        vec![
+            Arc::new(Int64Array::from(p_lk)),
+            Arc::new(Int64Array::from(p_lk2)),
+            Arc::new(Int32Array::from(p_lk32)),
+            Arc::new(Int32Array::from(p_cdate)),
+            Arc::new(Int32Array::from(p_rdate)),
+        ],
+    )?;
+    let probe_batches = vec![
+        probe_batch.slice(0, 30_000),
+        probe_batch.slice(30_000, 30_000),
+    ];
+    let probe_dir = write_parquet_files(&probe_batches, 2, 10_000)?;
+
+    let make_ctx = |mode: &str| {
+        let bp = build_dir.path().to_str().unwrap().to_owned();
+        let pp = probe_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("orders", &bp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("lineitem", &pp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+
+    // 1. Q4-like BuildSemi (filtered build > 16,384 rows -> radix + Bloom +
+    //    RegisterBloom64, static probe filter -> ProbeRows::Mask, and
+    //    all-predicate probe columns -> ForceBulk + RegisterBloom64).
+    let q4_like = "SELECT o.prio, COUNT(*) AS cnt \
+                   FROM orders o \
+                   WHERE o.prio < 4 \
+                     AND EXISTS ( \
+                       SELECT 1 FROM lineitem l \
+                       WHERE l.lk = o.ok AND l.cdate < l.rdate \
+                   ) \
+                   GROUP BY o.prio ORDER BY o.prio";
+    let (p_semi, _) = assert_native_parity(&stock, &native, q4_like).await?;
+    assert!(
+        metric(p_semi.as_ref(), "adaptive_bulk_decode_rgs") > 0,
+        "expected Q4-like all-predicate radix probe to use BulkDecode + RegisterBloom64"
+    );
+
+    // 2. Q22-like BuildAnti (NOT EXISTS, single projected probe key -> ProbeRows::All).
+    let q22_like = "SELECT o.prio, COUNT(*) AS cnt \
+                    FROM orders o \
+                    WHERE o.prio < 4 \
+                      AND NOT EXISTS ( \
+                        SELECT 1 FROM lineitem l WHERE l.lk = o.ok \
+                    ) \
+                    GROUP BY o.prio ORDER BY o.prio";
+    let (p_anti, _) = assert_native_parity(&stock, &native, q22_like).await?;
+    assert!(
+        metric(p_anti.as_ref(), "adaptive_bulk_decode_rgs") > 0,
+        "expected Q22-like all-predicate radix probe to use BulkDecode + RegisterBloom64"
+    );
+
+    // 3. Int32 BuildSemi and Int64Pair composite BuildAnti.
+    let int32_semi = "SELECT o.prio, COUNT(*) AS cnt \
+                      FROM orders o \
+                      WHERE EXISTS ( \
+                          SELECT 1 FROM lineitem l \
+                          WHERE l.lk32 = o.ok32 AND l.cdate < l.rdate \
+                      ) \
+                      GROUP BY o.prio ORDER BY o.prio";
+    assert_native_parity(&stock, &native, int32_semi).await?;
+
+    let pair_anti = "SELECT o.prio, COUNT(*) AS cnt \
+                     FROM orders o \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM lineitem l \
+                         WHERE l.lk = o.ok AND l.lk2 = o.ok2 \
+                     ) \
+                     GROUP BY o.prio ORDER BY o.prio";
+    assert_native_parity(&stock, &native, pair_anti).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_span_dense_int_and_small_build_bulk_decode_parity() -> Result<()> {
+    // Q11-like join: filtered 1-file supplier (1,000 rows over span [1..25,000],
+    // 4% density -> compact DenseIntTable) joined with fixed-width Parquet
+    // partsupp (no static filter on partsupp -> ForceBulk directly into ArrayMap).
+    let supp_schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, false),
+        Field::new("s_nationkey", DataType::Int64, false),
+    ]));
+    let n_supp = 25_000i64;
+    let supp_batch = RecordBatch::try_new(
+        Arc::clone(&supp_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=n_supp)),
+            Arc::new(Int64Array::from_iter_values((1..=n_supp).map(|i| i % 25))),
+        ],
+    )?;
+    let supp_dir = write_parquet_files(&[supp_batch], 1, 25_000)?;
+
+    let ps_schema = Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, false),
+        Field::new("ps_suppkey", DataType::Int64, false),
+        Field::new("ps_availqty", DataType::Int32, false),
+        Field::new("ps_supplycost", DataType::Int64, false),
+    ]));
+    let n_ps = 60_000i64;
+    let ps_batch = RecordBatch::try_new(
+        Arc::clone(&ps_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..n_ps).map(|i| (i % 4_000) + 1),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                (0..n_ps).map(|i| ((i.wrapping_mul(1_664_525) + 13) % n_supp) + 1),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..n_ps).map(|i| ((i % 50) + 1) as i32),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                (0..n_ps).map(|i| (i % 1_000) + 10),
+            )),
+        ],
+    )?;
+    let ps_batches = vec![ps_batch.slice(0, 30_000), ps_batch.slice(30_000, 30_000)];
+    let ps_dir = write_parquet_files(&ps_batches, 2, 10_000)?;
+
+    let make_ctx = |mode: &str| {
+        let sp = supp_dir.path().to_str().unwrap().to_owned();
+        let pp = ps_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("supplier", &sp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("partsupp", &pp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let stock = make_ctx("off").await?;
+    let native = make_ctx("required").await?;
+
+    let sql = "SELECT ps.ps_partkey, SUM(ps.ps_supplycost * ps.ps_availqty) AS val \
+               FROM partsupp ps INNER JOIN supplier s ON ps.ps_suppkey = s.s_suppkey \
+               WHERE s.s_nationkey = 7 \
+               GROUP BY ps.ps_partkey \
+               ORDER BY val DESC, ps.ps_partkey ASC \
+               LIMIT 20";
+    let (plan, _) = assert_native_parity(&stock, &native, sql).await?;
+    assert!(
+        metric(plan.as_ref(), "adaptive_bulk_decode_rgs") >= 6,
+        "expected all 6 partsupp RGs to run in ForceBulk against 4%-density small build, got {}",
+        metric(plan.as_ref(), "adaptive_bulk_decode_rgs")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_independent_builds_short_circuit_and_narrow_payload_parity()
+-> Result<()> {
+    // Q16-like 2-build pipeline: multi-file `part` (narrow static payload:
+    // p_brand/p_type/p_size in predicate, only 8-byte p_partkey skipped) +
+    // 1-file `supplier` (independent small build -> concurrent build wave) +
+    // multi-stage COUNT(DISTINCT ps_suppkey).
+    let part_schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_brand", DataType::Utf8, false),
+        Field::new("p_type", DataType::Utf8, false),
+        Field::new("p_size", DataType::Int32, false),
+    ]));
+    let n_part = 8_000i64;
+    let part_batch = RecordBatch::try_new(
+        Arc::clone(&part_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=n_part)),
+            Arc::new(StringArray::from_iter_values(
+                (1..=n_part).map(|i| format!("Brand#{}", (i % 10) + 1)),
+            )),
+            Arc::new(StringArray::from_iter_values((1..=n_part).map(|i| {
+                if i % 7 == 0 {
+                    format!("MEDIUM POLISHED STEEL {i}")
+                } else {
+                    format!("STANDARD BRASS {i}")
+                }
+            }))),
+            Arc::new(Int32Array::from_iter_values(
+                (1..=n_part).map(|i| ((i % 20) + 1) as i32),
+            )),
+        ],
+    )?;
+    let part_batches = vec![part_batch.slice(0, 4_000), part_batch.slice(4_000, 4_000)];
+    let part_dir = write_parquet_files(&part_batches, 2, 2_000)?;
+
+    let supp_schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, true),
+        Field::new("s_comment", DataType::Utf8, false),
+    ]));
+    let n_supp = 500i64;
+    let supp_batch = RecordBatch::try_new(
+        Arc::clone(&supp_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(1..=n_supp)),
+            Arc::new(StringArray::from_iter_values((1..=n_supp).map(|i| {
+                if i % 25 == 0 {
+                    format!("Customer {i} Complaints")
+                } else {
+                    format!("Normal supplier {i}")
+                }
+            }))),
+        ],
+    )?;
+    let supp_dir = write_parquet_files(&[supp_batch], 1, 500)?;
+
+    let supp_null_batch = RecordBatch::try_new(
+        Arc::clone(&supp_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (1..=n_supp)
+                    .map(|i| if i == 25 { None } else { Some(i) })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from_iter_values((1..=n_supp).map(|i| {
+                if i % 25 == 0 {
+                    format!("Customer {i} Complaints")
+                } else {
+                    format!("Normal supplier {i}")
+                }
+            }))),
+        ],
+    )?;
+    let supp_null_dir = write_parquet_files(&[supp_null_batch], 1, 500)?;
+
+    let ps_schema = Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, false),
+        Field::new("ps_suppkey", DataType::Int64, false),
+    ]));
+    let n_ps = 32_000i64;
+    let ps_batch = RecordBatch::try_new(
+        Arc::clone(&ps_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..n_ps).map(|i| (i % n_part) + 1),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                (0..n_ps).map(|i| ((i.wrapping_mul(37)) % n_supp) + 1),
+            )),
+        ],
+    )?;
+    let ps_batches = vec![ps_batch.slice(0, 16_000), ps_batch.slice(16_000, 16_000)];
+    let ps_dir = write_parquet_files(&ps_batches, 2, 8_000)?;
+
+    let make_ctx = |mode: &str, supp_path: &str| {
+        let pp = part_dir.path().to_str().unwrap().to_owned();
+        let sp = supp_path.to_owned();
+        let psp = ps_dir.path().to_str().unwrap().to_owned();
+        let mode = mode.to_owned();
+        async move {
+            let mut cfg = SessionConfig::new().with_target_partitions(4);
+            cfg.options_mut().execution.parquet.pushdown_filters = true;
+            cfg.options_mut().execution.parquet.pruning = true;
+            cfg.options_mut().execution.collect_statistics = true;
+            let ctx = SessionContext::new_with_config(cfg);
+            ctx.register_parquet("part", &pp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("supplier", &sp, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet("partsupp", &psp, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+            Ok::<_, DataFusionError>(ctx)
+        }
+    };
+
+    let supp_path = supp_dir.path().to_str().unwrap();
+    let stock = make_ctx("off", supp_path).await?;
+    let native = make_ctx("required", supp_path).await?;
+
+    // 1. Normal Q16-like query: concurrent `part || supplier` build wave,
+    //    narrow-static-payload ForceBulk on `part`, and multi-stage COUNT(DISTINCT).
+    let q16_sql = "SELECT p.p_brand, p.p_type, p.p_size, COUNT(DISTINCT ps.ps_suppkey) AS cnt \
+                   FROM partsupp ps, part p \
+                   WHERE p.p_partkey = ps.ps_partkey \
+                     AND p.p_brand <> 'Brand#5' \
+                     AND p.p_type NOT LIKE 'MEDIUM POLISHED%' \
+                     AND p.p_size IN (1, 3, 5, 7, 9, 11) \
+                     AND ps.ps_suppkey NOT IN ( \
+                         SELECT s.s_suppkey FROM supplier s \
+                         WHERE s.s_comment LIKE '%Customer%Complaints%' \
+                     ) \
+                   GROUP BY p.p_brand, p.p_type, p.p_size \
+                   ORDER BY cnt DESC, p.p_brand, p.p_type, p.p_size \
+                   LIMIT 20";
+    let (plan, _) = assert_native_parity(&stock, &native, q16_sql).await?;
+    assert!(
+        metric(plan.as_ref(), "adaptive_bulk_decode_rgs") >= 4,
+        "expected narrow-payload part scan (4 RGs) to execute in BulkDecode, got {}",
+        metric(plan.as_ref(), "adaptive_bulk_decode_rgs")
+    );
+
+    // 2. Empty inner build (`part` matches 0 rows) inside concurrent wave must
+    //    short-circuit cleanly and abort the sibling `supplier` build.
+    let empty_part_sql = "SELECT p.p_brand, COUNT(DISTINCT ps.ps_suppkey) AS cnt \
+                          FROM partsupp ps, part p \
+                          WHERE p.p_partkey = ps.ps_partkey \
+                            AND p.p_size > 999 \
+                            AND ps.ps_suppkey NOT IN ( \
+                                SELECT s.s_suppkey FROM supplier s \
+                                WHERE s.s_comment LIKE '%Customer%Complaints%' \
+                            ) \
+                          GROUP BY p.p_brand";
+    let (empty_plan, _) = assert_native_parity(&stock, &native, empty_part_sql).await?;
+    assert_eq!(
+        metric(empty_plan.as_ref(), "join_empty_build_short_circuits"),
+        1
+    );
+
+    // 3. Null-aware anti build with a NULL key inside concurrent wave must
+    //    short-circuit cleanly and return 0 rows.
+    let supp_null_path = supp_null_dir.path().to_str().unwrap();
+    let stock_null = make_ctx("off", supp_null_path).await?;
+    let native_null = make_ctx("required", supp_null_path).await?;
+    let (null_plan, _) = assert_native_parity(&stock_null, &native_null, q16_sql).await?;
+    assert_eq!(
+        metric(null_plan.as_ref(), "join_null_aware_short_circuits"),
+        1
+    );
+    Ok(())
+}

@@ -111,6 +111,15 @@ impl DynamicJoinFilterConfig {
     }
 }
 
+/// Cache-line-aligned 256-bit (8 x `u32`) split-block Bloom filter block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(32))]
+pub(super) struct BloomBlock([u32; 8]);
+
+impl BloomBlock {
+    pub(super) const ZERO: Self = Self([0u32; 8]);
+}
+
 /// Cache-line-friendly 256-bit (8 x `u32`) split-block Bloom filter.
 ///
 /// When `num_blocks >= 64`, the top 6 bits of the block index use the Level-0
@@ -119,7 +128,7 @@ impl DynamicJoinFilterConfig {
 /// atomics or cross-core cache-line contention.
 #[derive(Debug)]
 pub(super) struct SplitBlockBloomFilter {
-    blocks: Vec<[u32; 8]>,
+    blocks: Vec<BloomBlock>,
     block_mask: usize,
     radix_low_bits: Option<u32>,
 }
@@ -140,12 +149,12 @@ impl SplitBlockBloomFilter {
         };
         let needed_bits = entries.saturating_mul(bits_per_key);
         let needed_blocks = needed_bits.div_ceil(256).max(1).next_power_of_two();
-        let max_blocks = MAX_BLOOM_BYTES / size_of::<[u32; 8]>();
+        let max_blocks = MAX_BLOOM_BYTES / size_of::<BloomBlock>();
         Some(needed_blocks.min(max_blocks))
     }
 
     pub(super) fn estimated_bytes(num_blocks: usize) -> usize {
-        num_blocks.saturating_mul(size_of::<[u32; 8]>())
+        num_blocks.saturating_mul(size_of::<BloomBlock>())
     }
 
     #[inline]
@@ -161,7 +170,7 @@ impl SplitBlockBloomFilter {
     pub(super) fn with_blocks(num_blocks: usize) -> Self {
         debug_assert!(num_blocks.is_power_of_two());
         Self {
-            blocks: vec![[0u32; 8]; num_blocks],
+            blocks: vec![BloomBlock::ZERO; num_blocks],
             block_mask: num_blocks - 1,
             radix_low_bits: Self::radix_low_bits_for_blocks(num_blocks),
         }
@@ -169,7 +178,7 @@ impl SplitBlockBloomFilter {
 
     pub(super) fn from_radix_partition_blocks(
         num_blocks: usize,
-        parts: Vec<Option<Vec<[u32; 8]>>>,
+        parts: Vec<Option<Vec<BloomBlock>>>,
     ) -> Self {
         let low_bits = Self::radix_low_bits_for_blocks(num_blocks)
             .expect("radix partition Bloom requires num_blocks >= 64");
@@ -182,7 +191,7 @@ impl SplitBlockBloomFilter {
                     debug_assert_eq!(slice.len(), stride);
                     blocks.extend_from_slice(&slice);
                 }
-                None => blocks.resize(blocks.len() + stride, [0u32; 8]),
+                None => blocks.resize(blocks.len() + stride, BloomBlock::ZERO),
             }
         }
         Self {
@@ -193,7 +202,9 @@ impl SplitBlockBloomFilter {
     }
 
     pub(super) fn memory_bytes(&self) -> usize {
-        self.blocks.capacity().saturating_mul(size_of::<[u32; 8]>())
+        self.blocks
+            .capacity()
+            .saturating_mul(size_of::<BloomBlock>())
     }
 
     #[inline]
@@ -225,11 +236,11 @@ impl SplitBlockBloomFilter {
 
     #[inline]
     pub(super) fn insert_into_partition_slice(
-        slice: &mut [[u32; 8]],
+        slice: &mut [BloomBlock],
         low_mask: usize,
         h: u64,
     ) {
-        let block = &mut slice[(h as usize) & low_mask];
+        let block = &mut slice[(h as usize) & low_mask].0;
         let mask = Self::intra_block_mask(h);
         for (word, bit) in block.iter_mut().zip(mask) {
             *word |= bit;
@@ -239,7 +250,7 @@ impl SplitBlockBloomFilter {
     #[inline]
     pub(super) fn insert(&mut self, h: u64) {
         let idx = self.block_index(h);
-        let block = &mut self.blocks[idx];
+        let block = &mut self.blocks[idx].0;
         let mask = Self::intra_block_mask(h);
         for (word, bit) in block.iter_mut().zip(mask) {
             *word |= bit;
@@ -249,7 +260,7 @@ impl SplitBlockBloomFilter {
     pub(super) fn merge_from(&mut self, other: &Self) {
         debug_assert_eq!(self.blocks.len(), other.blocks.len());
         for (dst, src) in self.blocks.iter_mut().zip(other.blocks.iter()) {
-            for (w_dst, &w_src) in dst.iter_mut().zip(src.iter()) {
+            for (w_dst, &w_src) in dst.0.iter_mut().zip(src.0.iter()) {
                 *w_dst |= w_src;
             }
         }
@@ -257,15 +268,184 @@ impl SplitBlockBloomFilter {
 
     #[cfg(any(feature = "parquet", test))]
     #[inline]
-    pub(super) fn might_contain(&self, h: u64) -> bool {
-        let idx = self.block_index(h);
-        let block = &self.blocks[idx];
-        let mask = Self::intra_block_mask(h);
-        let mut all = true;
-        for (&word, bit) in block.iter().zip(mask) {
-            all &= (word & bit) != 0;
+    fn might_contain_at_block(&self, idx: usize, h: u64) -> bool {
+        let block = &self.blocks[idx].0;
+        let x = (h >> 32) as u32;
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on aarch64 and `block` / `SBBF_SALTS` both
+        // have exactly 8 `u32` elements.
+        unsafe {
+            use std::arch::aarch64::*;
+            let xv = vdupq_n_u32(x);
+            let one = vdupq_n_u32(1);
+            let s0 = vld1q_u32(SBBF_SALTS.as_ptr());
+            let b0 = vld1q_u32(block.as_ptr());
+            let sh0 = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(xv, s0), 27));
+            let m0 = vshlq_u32(one, sh0);
+            let t0 = vtstq_u32(b0, m0);
+            let s1 = vld1q_u32(SBBF_SALTS.as_ptr().add(4));
+            let b1 = vld1q_u32(block.as_ptr().add(4));
+            let sh1 = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(xv, s1), 27));
+            let m1 = vshlq_u32(one, sh1);
+            let t1 = vtstq_u32(b1, m1);
+            vminvq_u32(vandq_u32(t0, t1)) != 0
         }
-        all
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..8 {
+                if (block[i] & (1u32 << (x.wrapping_mul(SBBF_SALTS[i]) >> 27))) == 0 {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    #[cfg(any(feature = "parquet", test))]
+    #[inline]
+    pub(super) fn might_contain(&self, h: u64) -> bool {
+        self.might_contain_at_block(self.block_index(h), h)
+    }
+
+    #[cfg(any(feature = "parquet", test))]
+    #[inline]
+    fn prefetch_block(&self, idx: usize) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `idx < self.blocks.len()` is guaranteed by `block_index`;
+        // `prfm` is a non-faulting read prefetch hint.
+        unsafe {
+            let p = self.blocks.as_ptr().add(idx).cast::<i8>();
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) p,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = idx;
+    }
+}
+
+/// Maximum build rows eligible for an L2-resident [`RegisterBloom64`] prefilter.
+pub(super) const MAX_REGISTER_BLOOM_ROWS: usize = 524_288;
+/// Maximum size of a [`RegisterBloom64`] prefilter (`65,536 * 8B = 512 KiB`),
+/// keeping the entire filter strictly inside each core's L2 cache.
+const MAX_REGISTER_BLOOM_WORDS: usize = 65_536;
+const REGISTER_BLOOM_BITS_PER_KEY: usize = 12;
+
+/// Compact 1-word (64-bit) register-blocked L2-resident prefilter attached to
+/// in-memory flat-int radix hash tables (`R = 6`, `num_rows <= 524,288`).
+///
+/// The word index uses Level-0 radix partition bits `[51..57)` in the high 6
+/// bits and low bits `[0..low_bits)` (`low_bits <= 10`) in the low bits. The 4
+/// intra-word bit positions use disjoint middle bits `[16..40)`.
+#[derive(Debug)]
+pub(super) struct RegisterBloom64 {
+    words: Vec<u64>,
+    low_bits: u32,
+    low_mask: usize,
+    word_mask: usize,
+}
+
+impl RegisterBloom64 {
+    pub(super) fn num_words_for_entries(entries: usize) -> Option<usize> {
+        if entries == 0 || entries > MAX_REGISTER_BLOOM_ROWS {
+            return None;
+        }
+        let min_words = 1usize << DEFAULT_RADIX_BITS;
+        let needed = entries
+            .saturating_mul(REGISTER_BLOOM_BITS_PER_KEY)
+            .div_ceil(64)
+            .max(min_words)
+            .next_power_of_two();
+        Some(needed.min(MAX_REGISTER_BLOOM_WORDS))
+    }
+
+    pub(super) fn estimated_bytes(num_words: usize) -> usize {
+        num_words.saturating_mul(size_of::<u64>())
+    }
+
+    #[inline]
+    pub(super) fn low_bits_for_words(num_words: usize) -> u32 {
+        debug_assert!(num_words.is_power_of_two());
+        debug_assert!(num_words >= (1usize << DEFAULT_RADIX_BITS));
+        num_words.trailing_zeros() - DEFAULT_RADIX_BITS
+    }
+
+    #[inline(always)]
+    fn bit_mask(h: u64) -> u64 {
+        (1u64 << ((h >> 16) & 63))
+            | (1u64 << ((h >> 22) & 63))
+            | (1u64 << ((h >> 28) & 63))
+            | (1u64 << ((h >> 34) & 63))
+    }
+
+    #[inline(always)]
+    pub(super) fn insert_into_partition_slice(
+        slice: &mut [u64],
+        low_mask: usize,
+        h: u64,
+    ) {
+        slice[(h as usize) & low_mask] |= Self::bit_mask(h);
+    }
+
+    pub(super) fn from_radix_partition_words(
+        num_words: usize,
+        parts: Vec<Option<Vec<u64>>>,
+    ) -> Self {
+        let low_bits = Self::low_bits_for_words(num_words);
+        let stride = 1usize << low_bits;
+        debug_assert_eq!(parts.len(), 1usize << DEFAULT_RADIX_BITS);
+        let mut words = Vec::with_capacity(num_words);
+        for part in parts {
+            match part {
+                Some(slice) => {
+                    debug_assert_eq!(slice.len(), stride);
+                    words.extend_from_slice(&slice);
+                }
+                None => words.resize(words.len() + stride, 0u64),
+            }
+        }
+        debug_assert_eq!(words.len(), num_words);
+        Self {
+            words,
+            low_bits,
+            low_mask: stride - 1,
+            word_mask: num_words - 1,
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn should_prefetch(&self) -> bool {
+        self.words.len() > 4096
+    }
+
+    #[inline(always)]
+    pub(super) fn prefetch_in_part(&self, part: usize, h: u64) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `idx < self.words.len()` is guaranteed by `& self.word_mask`;
+        // `prfm` is a non-faulting read prefetch hint.
+        unsafe {
+            let idx = ((part << self.low_bits) | ((h as usize) & self.low_mask))
+                & self.word_mask;
+            let p = self.words.as_ptr().add(idx).cast::<i8>();
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) p,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (part, h);
+    }
+
+    #[inline(always)]
+    pub(super) fn might_contain_in_part(&self, part: usize, h: u64) -> bool {
+        let idx =
+            ((part << self.low_bits) | ((h as usize) & self.low_mask)) & self.word_mask;
+        let word = self.words[idx];
+        let mask = Self::bit_mask(h);
+        (word & mask) == mask
     }
 }
 
@@ -886,9 +1066,39 @@ impl PhysicalExpr for JoinBloomFilterExpr {
                 let filter = self.filter.as_ref();
                 let to_u64: fn(_) -> u64 = $to_u64;
                 let buf = if arr.null_count() == 0 {
-                    BooleanBuffer::collect_bool(num_rows, |i| {
-                        filter.might_contain(mix_u64(to_u64(values[i])))
-                    })
+                    // Prefetch 8 rows ahead when the Bloom filter exceeds L1d
+                    // cache (> 32 KiB), computing each hash once in an 8-slot
+                    // ring buffer.
+                    if filter.memory_bytes() > 32 * 1024 && num_rows > 8 {
+                        const PF_DIST: usize = 8;
+                        let mut ring_h = [0u64; PF_DIST];
+                        let mut ring_idx = [0usize; PF_DIST];
+                        for k in 0..PF_DIST {
+                            let h = mix_u64(to_u64(values[k]));
+                            let idx = filter.block_index(h);
+                            filter.prefetch_block(idx);
+                            ring_h[k] = h;
+                            ring_idx[k] = idx;
+                        }
+                        BooleanBuffer::collect_bool(num_rows, |i| {
+                            let slot = i & (PF_DIST - 1);
+                            let h = ring_h[slot];
+                            let idx = ring_idx[slot];
+                            let next_i = i + PF_DIST;
+                            if next_i < num_rows {
+                                let nh = mix_u64(to_u64(values[next_i]));
+                                let nidx = filter.block_index(nh);
+                                filter.prefetch_block(nidx);
+                                ring_h[slot] = nh;
+                                ring_idx[slot] = nidx;
+                            }
+                            filter.might_contain_at_block(idx, h)
+                        })
+                    } else {
+                        BooleanBuffer::collect_bool(num_rows, |i| {
+                            filter.might_contain(mix_u64(to_u64(values[i])))
+                        })
+                    }
                 } else {
                     let nulls = arr.nulls().unwrap();
                     BooleanBuffer::collect_bool(num_rows, |i| {
@@ -1393,8 +1603,8 @@ mod tests {
         let shift = level0_shift(DEFAULT_RADIX_BITS);
 
         let mut seq = SplitBlockBloomFilter::with_blocks(num_blocks);
-        let mut parts: Vec<Option<Vec<[u32; 8]>>> = (0..num_parts)
-            .map(|_| Some(vec![[0u32; 8]; stride]))
+        let mut parts: Vec<Option<Vec<BloomBlock>>> = (0..num_parts)
+            .map(|_| Some(vec![BloomBlock::ZERO; stride]))
             .collect();
 
         for k in 0..n as u64 {
@@ -1507,5 +1717,114 @@ mod tests {
                 fpp * 100.0
             );
         }
+    }
+
+    #[test]
+    fn register_bloom64_radix_partition_roundtrip_and_fpp() {
+        assert_eq!(RegisterBloom64::num_words_for_entries(0), None);
+        assert_eq!(
+            RegisterBloom64::num_words_for_entries(MAX_REGISTER_BLOOM_ROWS + 1),
+            None
+        );
+        let n = 50_000usize;
+        let num_words = RegisterBloom64::num_words_for_entries(n).unwrap();
+        assert!(num_words.is_power_of_two());
+        assert!(RegisterBloom64::estimated_bytes(num_words) <= 512 * 1024);
+
+        let low_bits = RegisterBloom64::low_bits_for_words(num_words);
+        let stride = 1usize << low_bits;
+        let low_mask = stride - 1;
+        let num_parts = 1usize << DEFAULT_RADIX_BITS;
+        let shift = level0_shift(DEFAULT_RADIX_BITS);
+
+        let mut parts: Vec<Option<Vec<u64>>> =
+            (0..num_parts).map(|_| Some(vec![0u64; stride])).collect();
+        for k in 0..n as u64 {
+            let h = mix_u64(k);
+            let p = radix_partition(h, shift, DEFAULT_RADIX_BITS);
+            RegisterBloom64::insert_into_partition_slice(
+                parts[p].as_mut().unwrap(),
+                low_mask,
+                h,
+            );
+        }
+        let pf = RegisterBloom64::from_radix_partition_words(num_words, parts);
+        assert!(pf.should_prefetch());
+
+        // 0% false negatives across all inserted keys.
+        for k in 0..n as u64 {
+            let h = mix_u64(k);
+            let p = radix_partition(h, shift, DEFAULT_RADIX_BITS);
+            assert!(pf.might_contain_in_part(p, h));
+        }
+
+        // Low false-positive rate on disjoint probe keys.
+        let probes = 50_000usize;
+        let fps = (0..probes as u64)
+            .filter(|&k| {
+                let h = mix_u64(k + 10_000_000);
+                let p = radix_partition(h, shift, DEFAULT_RADIX_BITS);
+                pf.might_contain_in_part(p, h)
+            })
+            .count();
+        assert!(
+            fps < 1_000,
+            "expected RegisterBloom64 FPP < 2%, got {fps}/{probes}"
+        );
+    }
+
+    #[test]
+    fn split_block_bloom_large_prefetch_eval_parity() -> Result<()> {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // 50,000 keys -> > 32 KiB Bloom filter, exercising the 8-slot prefetch
+        // ring buffer and 32-byte aligned NEON check in `JoinBloomFilterExpr`.
+        let n = 50_000usize;
+        let num_blocks = SplitBlockBloomFilter::num_blocks_for_entries(n).unwrap();
+        let mut bloom = SplitBlockBloomFilter::with_blocks(num_blocks);
+        assert!(bloom.memory_bytes() > 32 * 1024);
+        assert_eq!(align_of::<BloomBlock>(), 32);
+        for k in 0..n as i64 {
+            bloom.insert(mix_u64(k as u64));
+        }
+
+        let expr = JoinBloomFilterExpr::new_for_test(
+            vec![Arc::new(Column::new("k", 0))],
+            KeyKind::Int64,
+            NullEquality::NullEqualsNothing,
+            Arc::new(bloom),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        // First 1,000 keys are present, next 1,000 keys are absent.
+        let vals: Vec<i64> = (0..1_000).chain(10_000_000..10_001_000).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vals))],
+        )?;
+        let out = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let bools = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        for i in 0..1_000 {
+            assert!(bools.value(i), "false negative at inserted key {i}");
+        }
+        let fps = (1_000..2_000).filter(|&i| bools.value(i)).count();
+        assert!(fps < 50, "unexpected FPP in prefetch eval path: {fps}/1000");
+
+        // Nullable batch: NULLs must evaluate to false.
+        let nullable_vals: Vec<Option<i64>> =
+            vec![Some(0), None, Some(42), None, Some(99_999_999)];
+        let null_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(nullable_vals))],
+        )?;
+        let null_out = expr
+            .evaluate(&null_batch)?
+            .into_array(null_batch.num_rows())?;
+        let null_bools = null_out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(null_bools.value(0));
+        assert!(!null_bools.value(1));
+        assert!(null_bools.value(2));
+        assert!(!null_bools.value(3));
+        Ok(())
     }
 }

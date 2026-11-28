@@ -46,8 +46,9 @@ use super::batch::{
     BatchView, Selection, collect_expr_column_indices, remap_expr_columns,
 };
 use super::join_filter::{
-    DynamicJoinFilterConfig, DynamicJoinFilterData, JoinMembershipFilter,
-    LocalJoinKeySummary, SplitBlockBloomFilter, try_build_small_inlist_from_chunks,
+    BloomBlock, DynamicJoinFilterConfig, DynamicJoinFilterData, JoinMembershipFilter,
+    LocalJoinKeySummary, RegisterBloom64, SplitBlockBloomFilter,
+    try_build_small_inlist_from_chunks,
 };
 use super::radix::{
     DEFAULT_RADIX_BITS, MAX_RADIX_DEPTH, RECURSIVE_RADIX_BITS, RadixChunk,
@@ -66,6 +67,9 @@ const FINALIZE_YIELD_CHUNK: usize = 4096;
 
 /// Maximum direct-array slot span (`4M * 4B = 16 MiB`) for [`DenseIntTable`].
 const MAX_DENSE_INT_SPAN: usize = 4_194_304;
+/// Compact direct-array span (`256K * 4B = 1 MiB`) allowed down to 1% density
+/// for single-table builds (e.g. TPC-H Q11 filtered `supplier` `[1..50,000]`).
+const DENSE_INT_COMPACT_MAX_SPAN: usize = 262_144;
 /// Small-build row threshold below which wider dense array maps (up to 64K slots)
 /// are preferred over hash probing.
 const DENSE_INT_SMALL_BUILD_ROWS: usize = 1_024;
@@ -1118,6 +1122,7 @@ impl HashJoinBuildSink {
                     hash_entries,
                     bucket_count,
                     keys_peak_bytes,
+                    &reservation,
                     tx,
                 )
                 .await?
@@ -1574,6 +1579,7 @@ impl HashJoinBuildSink {
 
         let resident_parts = ResidentRadixPartitions {
             partitions: resident_vec,
+            prefilter: None,
             _reservation: resident_res,
         };
         let radix_table = RadixHashTable {
@@ -1622,6 +1628,7 @@ impl HashJoinBuildSink {
             return Ok(Some((
                 ResidentRadixPartitions {
                     partitions: (0..num_parts).map(|_| None).collect(),
+                    prefilter: None,
                     _reservation: MemoryConsumer::new("MorselHashJoinResident")
                         .register(memory_pool),
                 },
@@ -1659,7 +1666,7 @@ impl HashJoinBuildSink {
                 .then(|| SplitBlockBloomFilter::radix_low_bits_for_blocks(nb))
                 .flatten()
         });
-        type BloomPartSlot = Mutex<Option<Vec<[u32; 8]>>>;
+        type BloomPartSlot = Mutex<Option<Vec<BloomBlock>>>;
         let bloom_part_slots: Option<Arc<Vec<BloomPartSlot>>> = bloom_radix_low_bits
             .map(|_| Arc::new((0..num_parts).map(|_| Mutex::new(None)).collect()));
         let bloom_small_locals: Option<Arc<Mutex<Vec<SplitBlockBloomFilter>>>> =
@@ -1668,6 +1675,36 @@ impl HashJoinBuildSink {
             } else {
                 None
             };
+
+        let is_flat_int_key = matches!(
+            meta.key_kind,
+            KeyKind::Int32
+                | KeyKind::Int64
+                | KeyKind::UInt32
+                | KeyKind::UInt64
+                | KeyKind::Int32Pair
+                | KeyKind::Int64Pair
+        );
+        let prefilter_num_words = if is_flat_int_key
+            && store.radix_bits == DEFAULT_RADIX_BITS
+            && let Some(num_words) =
+                RegisterBloom64::num_words_for_entries(total_hash_entries)
+        {
+            let est = RegisterBloom64::estimated_bytes(num_words);
+            if bloom_reservation.try_grow(est).is_ok() {
+                Some(num_words)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let prefilter_low_bits =
+            prefilter_num_words.map(RegisterBloom64::low_bits_for_words);
+        type PrefilterPartSlot = Mutex<Option<Vec<u64>>>;
+        let prefilter_part_slots: Option<Arc<Vec<PrefilterPartSlot>>> =
+            prefilter_low_bits
+                .map(|_| Arc::new((0..num_parts).map(|_| Mutex::new(None)).collect()));
 
         // Move `store.mem_chunks` into an `Arc` with zero cloning; on OOM error
         // we restore `store.mem_chunks` after joining workers so fallback spill
@@ -1691,6 +1728,7 @@ impl HashJoinBuildSink {
             let resident_res = Arc::clone(&resident_res);
             let bloom_part_slots = bloom_part_slots.clone();
             let bloom_small_locals = bloom_small_locals.clone();
+            let prefilter_part_slots = prefilter_part_slots.clone();
             let tx = tx.clone();
 
             tasks.spawn(async move {
@@ -1714,8 +1752,8 @@ impl HashJoinBuildSink {
                     let part_res = MemoryConsumer::new("MorselHashJoinBuildPart")
                         .with_can_spill(true)
                         .register(&pool);
-                    let mut part_bloom_vec =
-                        bloom_radix_low_bits.map(|lb| vec![[0u32; 8]; 1usize << lb]);
+                    let mut part_bloom_vec = bloom_radix_low_bits
+                        .map(|lb| vec![BloomBlock::ZERO; 1usize << lb]);
                     let mut bloom_sink = match (
                         part_bloom_vec.as_deref_mut(),
                         bloom_radix_low_bits,
@@ -1728,15 +1766,28 @@ impl HashJoinBuildSink {
                         (_, _, Some(b)) => BloomBuildSink::Full(b),
                         _ => BloomBuildSink::None,
                     };
+                    let mut part_prefilter_vec =
+                        prefilter_low_bits.map(|lb| vec![0u64; 1usize << lb]);
+                    let prefilter_sink =
+                        match (part_prefilter_vec.as_deref_mut(), prefilter_low_bits) {
+                            (Some(slice), Some(lb)) => Some((slice, (1usize << lb) - 1)),
+                            _ => None,
+                        };
                     let mut table = build_single_table_from_radix_chunks(
                         &chunks,
                         p,
                         rows,
                         &meta,
                         &mut bloom_sink,
+                        prefilter_sink,
                         part_res,
                     )?;
                     if let (Some(slots), Some(vec)) = (&bloom_part_slots, part_bloom_vec)
+                    {
+                        *slots[p].lock() = Some(vec);
+                    }
+                    if let (Some(slots), Some(vec)) =
+                        (&prefilter_part_slots, part_prefilter_vec)
                     {
                         *slots[p].lock() = Some(vec);
                     }
@@ -1799,7 +1850,7 @@ impl HashJoinBuildSink {
                 let membership = if let (Some(nb), Some(slots)) =
                     (bloom_num_blocks, bloom_part_slots)
                 {
-                    let parts: Vec<Option<Vec<[u32; 8]>>> =
+                    let parts: Vec<Option<Vec<BloomBlock>>> =
                         slots.iter().map(|s| s.lock().take()).collect();
                     JoinMembershipFilter::Bloom(Arc::new(
                         SplitBlockBloomFilter::from_radix_partition_blocks(nb, parts),
@@ -1827,9 +1878,19 @@ impl HashJoinBuildSink {
             _ => None,
         };
 
+        let prefilter = match (prefilter_num_words, prefilter_part_slots) {
+            (Some(nw), Some(slots)) => {
+                let parts: Vec<Option<Vec<u64>>> =
+                    slots.iter().map(|s| s.lock().take()).collect();
+                Some(RegisterBloom64::from_radix_partition_words(nw, parts))
+            }
+            _ => None,
+        };
+
         Ok(Some((
             ResidentRadixPartitions {
                 partitions,
+                prefilter,
                 _reservation: bloom_reservation,
             },
             resident_mask,
@@ -1959,6 +2020,7 @@ impl HashJoinBuildSink {
         hash_entries: usize,
         slot_count: usize,
         keys_peak_bytes: usize,
+        reservation: &MemoryReservation,
         tx: &mpsc::Sender<RecordBatch>,
     ) -> Result<Option<(BuildKeys, usize)>> {
         macro_rules! build_flat {
@@ -2010,10 +2072,16 @@ impl HashJoinBuildSink {
                         let span = span_u128 as usize;
                         let dense_ok = (hash_entries <= DENSE_INT_SMALL_BUILD_ROWS
                             && span <= DENSE_INT_SMALL_BUILD_MAX_SPAN)
+                            || (span <= DENSE_INT_COMPACT_MAX_SPAN
+                                && (hash_entries as u128).saturating_mul(100)
+                                    >= span_u128)
                             || (hash_entries as u128).saturating_mul(100)
                                 >= span_u128.saturating_mul(15);
+                        let dense_bytes = span.saturating_mul(size_of::<u32>());
+                        let extra_bytes = dense_bytes.saturating_sub(keys_peak_bytes);
                         if dense_ok
-                            && span.saturating_mul(size_of::<u32>()) <= keys_peak_bytes
+                            && (extra_bytes == 0
+                                || reservation.try_grow(extra_bytes).is_ok())
                         {
                             let mut slots = vec![0u32; span];
                             let mut next_row: Vec<u32> = Vec::new();
@@ -3395,6 +3463,7 @@ pub(super) struct RadixBuildMetadata {
 
 pub(super) struct ResidentRadixPartitions {
     pub(super) partitions: Vec<Option<SingleHashTable>>,
+    pub(super) prefilter: Option<RegisterBloom64>,
     _reservation: MemoryReservation,
 }
 
@@ -3514,7 +3583,7 @@ impl FinalizedHashTable {
 pub(super) enum BloomBuildSink<'a> {
     None,
     PartitionSlice {
-        slice: &'a mut [[u32; 8]],
+        slice: &'a mut [BloomBlock],
         low_mask: usize,
     },
     Full(&'a mut SplitBlockBloomFilter),
@@ -3642,6 +3711,7 @@ fn build_single_table_from_radix_chunks(
     num_rows: usize,
     meta: &RadixBuildMetadata,
     bloom: &mut BloomBuildSink<'_>,
+    mut prefilter: Option<(&mut [u64], usize)>,
     reservation: MemoryReservation,
 ) -> Result<SingleHashTable> {
     if num_rows == 0 {
@@ -3792,7 +3862,7 @@ fn build_single_table_from_radix_chunks(
         )?
     };
 
-    if !matches!(bloom, BloomBuildSink::None) {
+    if !matches!(bloom, BloomBuildSink::None) || prefilter.is_some() {
         for chunk in chunks {
             let (off, len) = chunk.part_range(part);
             if len == 0 {
@@ -3808,8 +3878,17 @@ fn build_single_table_from_radix_chunks(
                         "Expected UInt64 __morsel_hash column in RadixChunk"
                     )
                 })?;
-            for &h in &h_arr.values()[off..off + len] {
-                bloom.insert(h);
+            let hashes = &h_arr.values()[off..off + len];
+            if !matches!(bloom, BloomBuildSink::None) {
+                for &h in hashes {
+                    bloom.insert(h);
+                }
+            }
+            if let Some((slice, low_mask)) = prefilter.as_mut() {
+                let mask = *low_mask;
+                for &h in hashes {
+                    RegisterBloom64::insert_into_partition_slice(slice, mask, h);
+                }
             }
         }
     }
@@ -5882,6 +5961,18 @@ impl HashJoinProbe {
             self.kind,
             ProbeJoinKind::BuildSemi | ProbeJoinKind::BuildAnti
         ) {
+            if matches!(
+                cursor.keys,
+                ProbeKeys::Int32(_)
+                    | ProbeKeys::Int64(_)
+                    | ProbeKeys::UInt32(_)
+                    | ProbeKeys::UInt64(_)
+                    | ProbeKeys::Int32Pair(_, _)
+                    | ProbeKeys::Int64Pair(_, _)
+            ) {
+                probe_mark_radix_flat_int(cursor);
+                return Ok(OperatorStep::NeedMoreInput(None));
+            }
             while !cursor.is_exhausted() {
                 let Some((key_idx, _)) = probe_row_at(&cursor.rows, cursor.pos) else {
                     cursor.pos += 1;
@@ -7703,6 +7794,233 @@ fn contiguous_range(indices: &[u32]) -> Option<usize> {
     Some(first)
 }
 
+/// Batch-level specialized flat-integer radix probe for `BuildSemi` /
+/// `BuildAnti` joins: computes `mix_u64` once per row, prefetches and checks
+/// the optional L2-resident [`RegisterBloom64`] prefilter before touching the
+/// 64-partition `FlatIntTable`s, and marks matched build rows inline without
+/// per-row enum dispatch.
+fn probe_mark_radix_flat_int(cursor: &mut RadixProbeCursor) {
+    let shift = cursor.shift;
+    let radix_bits = cursor.radix_bits;
+    let part_mask = (1u64 << radix_bits) - 1;
+    let resident_mask = cursor.resident_mask;
+    let partitions = cursor.resident.partitions.as_slice();
+    let prefilter = cursor.resident.prefilter.as_ref();
+    let valid_mask = cursor.valid_mask.as_ref();
+
+    macro_rules! run_mark {
+        ($get_key:expr, $BuildVariant:ident, $hash_key:expr, $zero_key:expr) => {{
+            let get_key = $get_key;
+            macro_rules! mark_table {
+                ($pk:expr, $h:expr, $p:expr) => {{
+                    if ((resident_mask >> $p) & 1) != 0 {
+                        let pt = partitions[$p].as_ref().unwrap();
+                        let BuildKeys::$BuildVariant(flat) = &pt.keys else {
+                            unreachable!("radix partition key kind mismatch");
+                        };
+                        let slots = flat.slots.as_slice();
+                        let mask = flat.mask;
+                        let mut slot_pos = ($h as usize) & mask;
+                        loop {
+                            let slot = &slots[slot_pos];
+                            if slot.first_row == 0 {
+                                break;
+                            }
+                            if slot.key == $pk {
+                                pt.mark_matched(slot.first_row - 1);
+                                let mut entry = slot.dup_head;
+                                while entry != 0 {
+                                    let b = entry - 1;
+                                    entry = flat.dup_next[b as usize];
+                                    pt.mark_matched(b);
+                                }
+                                break;
+                            }
+                            slot_pos = (slot_pos + 1) & mask;
+                        }
+                    }
+                }};
+            }
+
+            if let Some(pf) = prefilter
+                && pf.should_prefetch()
+                && valid_mask.is_none()
+            {
+                const PF_DIST: usize = 8;
+                let mut ring_pk = [$zero_key; PF_DIST];
+                let mut ring_h = [0u64; PF_DIST];
+                let mut ring_p = [0usize; PF_DIST];
+                let mut ring_len = 0usize;
+                let mut head = 0usize;
+
+                macro_rules! push_key_idx {
+                    ($key_idx:expr) => {{
+                        let pk = get_key($key_idx);
+                        let h = $hash_key(pk);
+                        let p = ((h >> shift) & part_mask) as usize;
+                        pf.prefetch_in_part(p, h);
+                        if ring_len == PF_DIST {
+                            let old_pk = ring_pk[head];
+                            let old_h = ring_h[head];
+                            let old_p = ring_p[head];
+                            ring_pk[head] = pk;
+                            ring_h[head] = h;
+                            ring_p[head] = p;
+                            head = (head + 1) & (PF_DIST - 1);
+                            if pf.might_contain_in_part(old_p, old_h) {
+                                mark_table!(old_pk, old_h, old_p);
+                            }
+                        } else {
+                            let slot = (head + ring_len) & (PF_DIST - 1);
+                            ring_pk[slot] = pk;
+                            ring_h[slot] = h;
+                            ring_p[slot] = p;
+                            ring_len += 1;
+                        }
+                    }};
+                }
+
+                match &cursor.rows {
+                    ProbeRows::All { num_rows } => {
+                        let n = *num_rows;
+                        for i in cursor.pos..n {
+                            push_key_idx!(i);
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::Mask { bits, num_rows } => {
+                        let n = *num_rows;
+                        let start = cursor.pos;
+                        if start < n {
+                            for rel in bits.slice(start, n - start).set_indices() {
+                                push_key_idx!(start + rel);
+                            }
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::BackingIndices(indices) => {
+                        let vals = indices.values();
+                        let n = vals.len();
+                        for i in cursor.pos..n {
+                            push_key_idx!(vals[i] as usize);
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::CompactedKeys { backing_rows } => {
+                        let n = backing_rows.len();
+                        for i in cursor.pos..n {
+                            push_key_idx!(i);
+                        }
+                        cursor.pos = n;
+                    }
+                }
+
+                for k in 0..ring_len {
+                    let slot = (head + k) & (PF_DIST - 1);
+                    let old_p = ring_p[slot];
+                    let old_h = ring_h[slot];
+                    if pf.might_contain_in_part(old_p, old_h) {
+                        mark_table!(ring_pk[slot], old_h, old_p);
+                    }
+                }
+            } else {
+                macro_rules! mark_one {
+                    ($key_idx:expr) => {{
+                        if !valid_mask.is_some_and(|v| !v.value($key_idx)) {
+                            let pk = get_key($key_idx);
+                            let h = $hash_key(pk);
+                            let p = ((h >> shift) & part_mask) as usize;
+                            if prefilter.is_none_or(|pf| pf.might_contain_in_part(p, h)) {
+                                mark_table!(pk, h, p);
+                            }
+                        }
+                    }};
+                }
+
+                match &cursor.rows {
+                    ProbeRows::All { num_rows } => {
+                        let n = *num_rows;
+                        for i in cursor.pos..n {
+                            mark_one!(i);
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::Mask { bits, num_rows } => {
+                        let n = *num_rows;
+                        let start = cursor.pos;
+                        if start < n {
+                            for rel in bits.slice(start, n - start).set_indices() {
+                                mark_one!(start + rel);
+                            }
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::BackingIndices(indices) => {
+                        let vals = indices.values();
+                        let n = vals.len();
+                        for i in cursor.pos..n {
+                            mark_one!(vals[i] as usize);
+                        }
+                        cursor.pos = n;
+                    }
+                    ProbeRows::CompactedKeys { backing_rows } => {
+                        let n = backing_rows.len();
+                        for i in cursor.pos..n {
+                            mark_one!(i);
+                        }
+                        cursor.pos = n;
+                    }
+                }
+            }
+        }};
+    }
+
+    match &cursor.keys {
+        ProbeKeys::Int32(p) => {
+            let vals = p.values();
+            run_mark!(
+                |i: usize| vals[i],
+                Int32,
+                |v: i32| mix_u64(v as u32 as u64),
+                0i32
+            )
+        }
+        ProbeKeys::Int64(p) => {
+            let vals = p.values();
+            run_mark!(|i: usize| vals[i], Int64, |v: i64| mix_u64(v as u64), 0i64)
+        }
+        ProbeKeys::UInt32(p) => {
+            let vals = p.values();
+            run_mark!(|i: usize| vals[i], UInt32, |v: u32| mix_u64(v as u64), 0u32)
+        }
+        ProbeKeys::UInt64(p) => {
+            let vals = p.values();
+            run_mark!(|i: usize| vals[i], UInt64, mix_u64, 0u64)
+        }
+        ProbeKeys::Int32Pair(p0, p1) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            run_mark!(
+                |i: usize| (v0[i], v1[i]),
+                Int32Pair,
+                |(a, b): (i32, i32)| mix_u64_pair(a as u32 as u64, b as u32 as u64),
+                (0i32, 0i32)
+            )
+        }
+        ProbeKeys::Int64Pair(p0, p1) => {
+            let v0 = p0.values();
+            let v1 = p1.values();
+            run_mark!(
+                |i: usize| (v0[i], v1[i]),
+                Int64Pair,
+                |(a, b): (i64, i64)| mix_u64_pair(a as u64, b as u64),
+                (0i64, 0i64)
+            )
+        }
+        _ => unreachable!("probe_mark_radix_flat_int called for non-flat-int key"),
+    }
+}
+
 /// Batch-level specialized flat-integer radix probe for `Inner` / `BuildOuter`
 /// joins: computes `mix_u64` once per row and probes `FlatIntTable<K>` inline
 /// without per-row enum dispatch or intermediate candidate vectors.
@@ -7718,6 +8036,7 @@ fn probe_collect_radix_flat_int(
     let resident_mask = cursor.resident_mask;
     let spilled_build_mask = cursor.spilled_build_mask;
     let partitions = cursor.resident.partitions.as_slice();
+    let prefilter = cursor.resident.prefilter.as_ref();
     let mut single_part_hit: Option<usize> = None;
     let mut multi_part_hit = false;
 
@@ -7745,7 +8064,9 @@ fn probe_collect_radix_flat_int(
                         let pk = get_key($key_idx);
                         let h = $hash_key(pk);
                         let p = ((h >> shift) & part_mask) as usize;
-                        if ((spilled_build_mask >> p) & 1) == 0
+                        if (cursor.next_entry != 0
+                            || prefilter.is_none_or(|pf| pf.might_contain_in_part(p, h)))
+                            && ((spilled_build_mask >> p) & 1) == 0
                             && ((resident_mask >> p) & 1) != 0
                         {
                             let pt = partitions[p].as_ref().unwrap();

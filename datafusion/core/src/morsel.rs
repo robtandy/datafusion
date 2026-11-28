@@ -4,8 +4,6 @@
 
 //! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
-#[cfg(feature = "parquet")]
-use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -121,6 +119,16 @@ const MAX_RESULT_CAPACITY: usize = 32;
 
 fn result_capacity(workers: NonZeroUsize) -> usize {
     workers.get().saturating_mul(2).min(MAX_RESULT_CAPACITY)
+}
+
+#[cfg(feature = "parquet")]
+fn pipeline_uses_stage(pipeline: &Pipeline) -> bool {
+    if matches!(pipeline.source, Source::Stage(_)) {
+        return true;
+    }
+    pipeline.operators.iter().any(|op| {
+        matches!(op, Operator::HashProbe(p) if pipeline_uses_stage(&p.build_pipeline))
+    })
 }
 
 fn sink_result_capacity(sink: &Sink, workers: NonZeroUsize) -> usize {
@@ -2650,11 +2658,12 @@ impl Pipeline {
                 vec![None; probes.len()];
             let mut short_circuit_op: Option<usize> = None;
 
-            // Execute builds in topological order of dynamic-filter dependencies,
-            // breaking ties in reverse probe order (`probes[N-1]` down to `probes[0]`)
-            // so both downstream filters and forward sibling filters (e.g.
-            // `part -> partsupp` in TPC-H Q9) publish before consumers open scans.
-            let build_order: Vec<usize> = {
+            // Group builds into topological waves of dynamic-filter
+            // dependencies, breaking ties in reverse probe order (`probes[N-1]`
+            // down to `probes[0]`) so both downstream filters and forward
+            // sibling filters (e.g. `part -> partsupp` in TPC-H Q9) publish
+            // before consumers open scans.
+            let build_waves: Vec<Vec<usize>> = {
                 #[cfg(feature = "parquet")]
                 {
                     let n = probes.len();
@@ -2682,98 +2691,278 @@ impl Pipeline {
                             }
                         }
                     }
-                    let mut ready = BinaryHeap::new();
-                    for (idx, &deg) in indegree.iter().enumerate() {
-                        if deg == 0 {
-                            ready.push(idx);
-                        }
-                    }
-                    let mut order = Vec::with_capacity(n);
-                    while let Some(u) = ready.pop() {
-                        order.push(u);
-                        for &v in &adj[u] {
-                            indegree[v] -= 1;
-                            if indegree[v] == 0 {
-                                ready.push(v);
+                    let mut ready: Vec<usize> =
+                        (0..n).rev().filter(|&idx| indegree[idx] == 0).collect();
+                    let mut scheduled = vec![false; n];
+                    let mut waves: Vec<Vec<usize>> = Vec::new();
+                    while !ready.is_empty() {
+                        let wave = std::mem::take(&mut ready);
+                        let mut next_ready = Vec::new();
+                        for &u in &wave {
+                            scheduled[u] = true;
+                            for &v in &adj[u] {
+                                indegree[v] -= 1;
+                                if indegree[v] == 0 {
+                                    next_ready.push(v);
+                                }
                             }
                         }
+                        next_ready.sort_unstable_by(|a, b| b.cmp(a));
+                        ready = next_ready;
+                        waves.push(wave);
                     }
-                    if order.len() < n {
+                    let remaining: Vec<usize> =
+                        (0..n).rev().filter(|&idx| !scheduled[idx]).collect();
+                    if !remaining.is_empty() {
                         // Defensive fallback if an unexpected cycle ever occurred.
-                        for idx in (0..n).rev() {
-                            if !order.contains(&idx) {
-                                order.push(idx);
-                            }
+                        for idx in remaining {
+                            waves.push(vec![idx]);
                         }
                     }
-                    order
+                    waves
                 }
                 #[cfg(not(feature = "parquet"))]
                 {
-                    (0..probes.len()).rev().collect()
+                    (0..probes.len()).rev().map(|idx| vec![idx]).collect()
                 }
             };
 
-            for (order_pos, &idx) in build_order.iter().enumerate() {
-                let (op_idx, probe) = probes[idx];
-                if tx.is_closed() {
-                    for &rem_idx in &build_order[order_pos..] {
-                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
-                    }
-                    return Ok(BuildRunOutcome::Cancelled);
-                }
-                let build_label = match (label_prefix, multi) {
-                    (None, false) => "build".to_owned(),
-                    (None, true) => format!("build_{idx}"),
-                    (Some(prefix), false) => format!("{prefix}_build"),
-                    (Some(prefix), true) => format!("{prefix}_build_{idx}"),
-                };
-                let Some(table) = Box::pin(Self::run_single_build_pipeline(
-                    &probe.build_pipeline,
-                    &build_label,
-                    dag,
-                    published_filters,
-                    context,
-                    plan_metrics,
-                    measurement,
-                    tx,
-                ))
-                .await?
-                else {
-                    for &rem_idx in &build_order[order_pos + 1..] {
-                        dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
-                    }
-                    return Ok(BuildRunOutcome::Cancelled);
-                };
-                #[cfg(feature = "parquet")]
-                if let Some(df) = table.dynamic_filter() {
-                    published_filters.insert(probe.filter_id, Arc::clone(df));
-                }
-                if probe.short_circuits_on_table(&table) {
-                    if table.is_empty() && probe.empty_build_short_circuits() {
-                        MetricBuilder::new(plan_metrics)
-                            .counter("join_empty_build_short_circuits", 0)
-                            .add(1);
-                    } else if probe.kind.is_null_aware_anti() && table.has_null_key() {
-                        MetricBuilder::new(plan_metrics)
-                            .counter("join_null_aware_short_circuits", 0)
-                            .add(1);
-                    }
-                    let has_later_build_emission = probes[idx + 1..]
-                        .iter()
-                        .any(|(_, p)| p.needs_build_emission());
-                    if !has_later_build_emission {
-                        for &rem_idx in &build_order[order_pos + 1..] {
-                            dag.release_pipeline_refs(&probes[rem_idx].1.build_pipeline);
+            let mut unstarted = vec![true; probes.len()];
+            let release_unstarted =
+                |dag: &mut DagRuntime,
+                 unstarted: &[bool],
+                 probes: &[(usize, &Arc<HashJoinProbe>)]| {
+                    for (idx, &still_pending) in unstarted.iter().enumerate() {
+                        if still_pending {
+                            dag.release_pipeline_refs(&probes[idx].1.build_pipeline);
                         }
-                        drop(table);
-                        drop(slots);
-                        return Ok(BuildRunOutcome::ShortCircuitAll);
                     }
-                    short_circuit_op =
-                        Some(short_circuit_op.map_or(op_idx, |prev| prev.max(op_idx)));
+                };
+            let build_label_for = |idx: usize| match (label_prefix, multi) {
+                (None, false) => "build".to_owned(),
+                (None, true) => format!("build_{idx}"),
+                (Some(prefix), false) => format!("{prefix}_build"),
+                (Some(prefix), true) => format!("{prefix}_build_{idx}"),
+            };
+
+            for wave in build_waves {
+                if tx.is_closed() {
+                    release_unstarted(dag, &unstarted, &probes);
+                    return Ok(BuildRunOutcome::Cancelled);
                 }
-                slots[idx] = Some(table);
+
+                // Overlap independent small single-file Parquet builds (1-RG
+                // dimension tables like `supplier` / `nation`) with at most one
+                // larger stage-free build in the same topological wave so a
+                // 1-worker build never stalls 7 idle cores, while avoiding
+                // overlapping two large spillable builds.
+                #[cfg(feature = "parquet")]
+                let (concurrent_group, sequential_rest): (
+                    Vec<usize>,
+                    Vec<usize>,
+                ) = {
+                    let mut small_direct = Vec::new();
+                    let mut large_direct = Vec::new();
+                    let mut stage_builds = Vec::new();
+                    for &idx in &wave {
+                        let bp = &probes[idx].1.build_pipeline;
+                        if pipeline_uses_stage(bp) {
+                            stage_builds.push(idx);
+                        } else if matches!(&bp.source, Source::Parquet(s) if s.is_small_single_file_build())
+                        {
+                            small_direct.push(idx);
+                        } else {
+                            large_direct.push(idx);
+                        }
+                    }
+                    let mut group = Vec::new();
+                    let mut rest = Vec::new();
+                    if !small_direct.is_empty()
+                        && small_direct.len() + large_direct.len() >= 2
+                    {
+                        group.extend(small_direct);
+                        let mut large_iter = large_direct.into_iter();
+                        if let Some(first_large) = large_iter.next() {
+                            group.push(first_large);
+                        }
+                        rest.extend(large_iter);
+                        rest.extend(stage_builds);
+                    } else {
+                        rest = wave;
+                    }
+                    (group, rest)
+                };
+                #[cfg(not(feature = "parquet"))]
+                let (concurrent_group, sequential_rest): (
+                    Vec<usize>,
+                    Vec<usize>,
+                ) = (Vec::new(), wave);
+
+                if !concurrent_group.is_empty() {
+                    let mut wave_tasks: JoinSet<
+                        Result<(usize, Option<Arc<FinalizedHashTable>>)>,
+                    > = JoinSet::new();
+                    for &idx in &concurrent_group {
+                        unstarted[idx] = false;
+                        let bp = Arc::clone(&probes[idx].1.build_pipeline);
+                        let lbl = build_label_for(idx);
+                        let mut local_filters = published_filters.clone();
+                        let ctx = Arc::clone(context);
+                        let metrics = plan_metrics.clone();
+                        let meas = measurement.cloned();
+                        let tx_clone = tx.clone();
+                        wave_tasks.spawn(async move {
+                            let mut empty_dag = DagRuntime::new(
+                                Arc::new(Vec::new()),
+                                Vec::new(),
+                                None,
+                                ctx.memory_pool(),
+                            );
+                            let res = Self::run_single_build_pipeline(
+                                &bp,
+                                &lbl,
+                                &mut empty_dag,
+                                &mut local_filters,
+                                &ctx,
+                                &metrics,
+                                meas.as_ref(),
+                                &tx_clone,
+                            )
+                            .await?;
+                            Ok((idx, res))
+                        });
+                    }
+                    while !wave_tasks.is_empty() {
+                        let task_res = tokio::select! {
+                            biased;
+                            _ = tx.closed() => {
+                                abort_and_drain(&mut wave_tasks).await;
+                                release_unstarted(dag, &unstarted, &probes);
+                                drop(slots);
+                                return Ok(BuildRunOutcome::Cancelled);
+                            }
+                            res = wave_tasks.join_next() => res,
+                        };
+                        let Some(res) = task_res else {
+                            break;
+                        };
+                        let (idx, maybe_table) = match res {
+                            Ok(Ok(pair)) => pair,
+                            Ok(Err(err)) => {
+                                abort_and_drain(&mut wave_tasks).await;
+                                release_unstarted(dag, &unstarted, &probes);
+                                drop(slots);
+                                return Err(err);
+                            }
+                            Err(err) if err.is_panic() => {
+                                abort_and_drain(&mut wave_tasks).await;
+                                release_unstarted(dag, &unstarted, &probes);
+                                drop(slots);
+                                std::panic::resume_unwind(err.into_panic())
+                            }
+                            Err(err) => {
+                                abort_and_drain(&mut wave_tasks).await;
+                                release_unstarted(dag, &unstarted, &probes);
+                                drop(slots);
+                                return Err(exec_datafusion_err!(
+                                    "Morsel concurrent build task failed: {err}"
+                                ));
+                            }
+                        };
+                        let Some(table) = maybe_table else {
+                            abort_and_drain(&mut wave_tasks).await;
+                            release_unstarted(dag, &unstarted, &probes);
+                            drop(slots);
+                            return Ok(BuildRunOutcome::Cancelled);
+                        };
+                        let (op_idx, probe) = probes[idx];
+                        #[cfg(feature = "parquet")]
+                        if let Some(df) = table.dynamic_filter() {
+                            published_filters.insert(probe.filter_id, Arc::clone(df));
+                        }
+                        if probe.short_circuits_on_table(&table) {
+                            if table.is_empty() && probe.empty_build_short_circuits() {
+                                MetricBuilder::new(plan_metrics)
+                                    .counter("join_empty_build_short_circuits", 0)
+                                    .add(1);
+                            } else if probe.kind.is_null_aware_anti()
+                                && table.has_null_key()
+                            {
+                                MetricBuilder::new(plan_metrics)
+                                    .counter("join_null_aware_short_circuits", 0)
+                                    .add(1);
+                            }
+                            let has_later_build_emission = probes[idx + 1..]
+                                .iter()
+                                .any(|(_, p)| p.needs_build_emission());
+                            if !has_later_build_emission {
+                                abort_and_drain(&mut wave_tasks).await;
+                                release_unstarted(dag, &unstarted, &probes);
+                                drop(table);
+                                drop(slots);
+                                return Ok(BuildRunOutcome::ShortCircuitAll);
+                            }
+                            short_circuit_op = Some(
+                                short_circuit_op.map_or(op_idx, |prev| prev.max(op_idx)),
+                            );
+                        }
+                        slots[idx] = Some(table);
+                    }
+                }
+
+                for idx in sequential_rest {
+                    let (op_idx, probe) = probes[idx];
+                    if tx.is_closed() {
+                        release_unstarted(dag, &unstarted, &probes);
+                        return Ok(BuildRunOutcome::Cancelled);
+                    }
+                    unstarted[idx] = false;
+                    let build_label = build_label_for(idx);
+                    let Some(table) = Box::pin(Self::run_single_build_pipeline(
+                        &probe.build_pipeline,
+                        &build_label,
+                        dag,
+                        published_filters,
+                        context,
+                        plan_metrics,
+                        measurement,
+                        tx,
+                    ))
+                    .await?
+                    else {
+                        release_unstarted(dag, &unstarted, &probes);
+                        return Ok(BuildRunOutcome::Cancelled);
+                    };
+                    #[cfg(feature = "parquet")]
+                    if let Some(df) = table.dynamic_filter() {
+                        published_filters.insert(probe.filter_id, Arc::clone(df));
+                    }
+                    if probe.short_circuits_on_table(&table) {
+                        if table.is_empty() && probe.empty_build_short_circuits() {
+                            MetricBuilder::new(plan_metrics)
+                                .counter("join_empty_build_short_circuits", 0)
+                                .add(1);
+                        } else if probe.kind.is_null_aware_anti() && table.has_null_key()
+                        {
+                            MetricBuilder::new(plan_metrics)
+                                .counter("join_null_aware_short_circuits", 0)
+                                .add(1);
+                        }
+                        let has_later_build_emission = probes[idx + 1..]
+                            .iter()
+                            .any(|(_, p)| p.needs_build_emission());
+                        if !has_later_build_emission {
+                            release_unstarted(dag, &unstarted, &probes);
+                            drop(table);
+                            drop(slots);
+                            return Ok(BuildRunOutcome::ShortCircuitAll);
+                        }
+                        short_circuit_op = Some(
+                            short_circuit_op.map_or(op_idx, |prev| prev.max(op_idx)),
+                        );
+                    }
+                    slots[idx] = Some(table);
+                }
             }
             let tables: Vec<Arc<FinalizedHashTable>> = slots
                 .into_iter()
@@ -4028,15 +4217,17 @@ impl Pipeline {
                 }
                 #[cfg(feature = "parquet")]
                 Source::Parquet(source) => {
+                    let build_workers =
+                        source.effective_build_workers(build_pipeline.workers);
                     let ready = source.start(
                         context,
                         &mut tasks,
-                        build_pipeline.workers,
+                        build_workers,
                         measurement,
                         published_filters,
                         true,
                     )?;
-                    for id in 0..build_pipeline.workers.get() {
+                    for id in 0..build_workers.get() {
                         let (pipeline, ready, output) = (
                             Arc::clone(build_pipeline),
                             ready.clone(),
